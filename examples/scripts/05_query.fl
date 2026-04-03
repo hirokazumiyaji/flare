@@ -1,0 +1,4 @@
+set("users/1", {age: 19, active: true})
+set("users/2", {age: 30, active: true})
+set("users/3", {age: 40, active: false})
+collection("users").where("age", ">=", 20).where("active", "==", true).get()

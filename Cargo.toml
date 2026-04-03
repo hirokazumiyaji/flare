@@ -1,0 +1,11 @@
+[package]
+name = "firelang"
+version = "0.1.0"
+edition = "2021"
+autobins = false
+
+[dependencies]
+
+[[bin]]
+name = "fl"
+path = "src/main.rs"
