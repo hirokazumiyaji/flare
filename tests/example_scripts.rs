@@ -36,6 +36,7 @@ fn runs_example_scripts_successfully() {
                     .collect(),
             ),
         ),
+        ("examples/scripts/09_emulator_smoke.fl", Value::Int(5)),
     ];
 
     for (path, expected) in cases {

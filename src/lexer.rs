@@ -74,19 +74,26 @@ pub fn lex(input: &str) -> Result<Vec<Token>, Box<dyn Error>> {
             '"' => {
                 chars.next();
                 let mut s = String::new();
-                while let Some(ch) = chars.next() {
+                loop {
+                    let ch = match chars.next() {
+                        None => return Err("unterminated string literal".into()),
+                        Some(c) => c,
+                    };
                     match ch {
                         '"' => break,
                         '\\' => {
-                            if let Some(esc) = chars.next() {
-                                s.push(match esc {
-                                    'n' => '\n',
-                                    't' => '\t',
-                                    '"' => '"',
-                                    '\\' => '\\',
-                                    other => other,
-                                });
-                            }
+                            let esc = match chars.next() {
+                                None => return Err("unterminated string literal".into()),
+                                Some(e) => e,
+                            };
+                            s.push(match esc {
+                                'n' => '\n',
+                                'r' => '\r',
+                                't' => '\t',
+                                '"' => '"',
+                                '\\' => '\\',
+                                other => other,
+                            });
                         }
                         other => s.push(other),
                     }

@@ -1,7 +1,10 @@
 pub mod ast;
+pub mod emulator;
 pub mod lexer;
 pub mod parser;
 pub mod runtime;
+
+pub use emulator::FirestoreEmulator;
 
 use std::error::Error;
 
@@ -25,12 +28,26 @@ pub fn run_script_with_firestore<F: Firestore>(
 #[cfg(test)]
 mod tests {
     use super::run_script;
-    use crate::runtime::Value;
+    use crate::lexer;
+    use crate::parser::Parser;
+    use crate::runtime::{InMemoryFirestore, Runtime, Value};
 
     #[test]
     fn evals_arithmetic() {
         let out = run_script("a = 1 + 2\na + 3").unwrap();
         assert_eq!(out, Value::Int(6));
+    }
+
+    #[test]
+    fn division_by_zero_returns_error() {
+        let err = run_script("1 / 0").unwrap_err();
+        assert!(format!("{err}").contains("division by zero"));
+    }
+
+    #[test]
+    fn unterminated_string_literal_errors() {
+        let err = lexer::lex("\"foo").unwrap_err();
+        assert!(format!("{err}").contains("unterminated"));
     }
 
     #[test]
@@ -110,6 +127,47 @@ mod tests {
         )
         .unwrap();
         assert!(format!("{out:?}").contains("\"n\": Int(2)"));
+    }
+
+    #[test]
+    fn batch_rolls_back_on_runtime_error() {
+        let mut runtime = Runtime::new(InMemoryFirestore::default());
+        let failing = run_in(
+            &mut runtime,
+            "batch { set(\"users/batch_rb\", {x: 1})\nundefined_var }",
+        );
+        assert!(failing.is_err());
+        let out = run_in(&mut runtime, "get(\"users/batch_rb\")").unwrap();
+        assert_eq!(out, Value::Nil);
+    }
+
+    fn run_in(
+        runtime: &mut Runtime<InMemoryFirestore>,
+        source: &str,
+    ) -> Result<Value, Box<dyn std::error::Error>> {
+        let tokens = lexer::lex(source)?;
+        let program = Parser::new(tokens).parse_program()?;
+        runtime.eval_program(&program)
+    }
+
+    #[test]
+    fn transaction_rejects_get_after_write() {
+        let err = run_script("transaction { set(\"users/txa\", {n: 1})\nget(\"users/txa\") }");
+        assert!(err.is_err());
+        assert!(format!("{}", err.unwrap_err()).contains("get is not allowed"));
+    }
+
+    #[test]
+    fn query_limit_is_deterministic_by_path() {
+        let out = run_script(
+            "set(\"users/qz\", {ord: 1})\nset(\"users/qa\", {ord: 2})\nset(\"users/qm\", {ord: 3})\ncollection(\"users\").where(\"ord\", \">=\", 1).limit(1).get()",
+        )
+        .unwrap();
+        let s = format!("{out:?}");
+        assert!(
+            s.contains("qa"),
+            "expected lexicographically first doc users/qa, got {s}"
+        );
     }
 
     #[test]
