@@ -1,0 +1,3 @@
+transaction { set("logs/1", {kind: "start"}) }
+batch { set("logs/2", {kind: "done"}) }
+get("logs/2")

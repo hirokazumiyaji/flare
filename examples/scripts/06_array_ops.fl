@@ -1,0 +1,4 @@
+set("users/au", {tags: ["a", "b"]})
+update("users/au", {tags: array_union(["b", "c"])})
+update("users/au", {tags: array_remove(["a"])})
+get("users/au")

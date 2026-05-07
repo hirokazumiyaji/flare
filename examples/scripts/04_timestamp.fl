@@ -1,0 +1,3 @@
+t1 = timestamp("2026-02-01T00:00:00+09:00")
+t2 = t1.add_seconds(60)
+[t1.to_unix(), t2.to_unix()]

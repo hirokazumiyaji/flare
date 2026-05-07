@@ -1,0 +1,2 @@
+name = "firelang"
+"hello #{name} #{1 + 2}"
