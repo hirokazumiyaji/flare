@@ -103,7 +103,7 @@ set("users/1", {age: 21}, true) # merge
 cargo run --bin fl -- path/to/script.fl
 ```
 
-エミュレータに接続する場合（`FIRESTORE_EMULATOR_HOST` が必須。プロジェクト ID は REST の URL に使われます）:
+エミュレータに接続する場合（`FIRESTORE_EMULATOR_HOST` が必須。プロジェクト ID は Firestore の database path に使われます）:
 
 ```bash
 export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080
@@ -158,7 +158,7 @@ cargo test --test firestore_emulator -- --nocapture
 
 ## Firestore 依存について
 
-- 現状 MVP は Firestore 公式 Rust SDK には依存していません。
+- MVP は Firestore Rust SDK（`firestore` crate）に依存しています。
 - ランタイムは `Firestore` trait で抽象化し、デフォルトは `InMemoryFirestore` を使います。
-- エミュレータ向け実装は Firestore REST を `ureq` で呼び出します（`src/emulator.rs`）。
-- 本番 Firestore 接続には認証付き HTTP クライアント等の追加実装が必要です。
+- エミュレータ向け実装は `FirestoreDb` の gRPC クライアントで Firestore API を呼び出します（`src/emulator.rs`）。
+- 本番 Firestore 接続には認証設定と CLI/backend 選択の追加実装が必要です。

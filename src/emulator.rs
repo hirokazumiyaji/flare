@@ -1,24 +1,33 @@
-//! Firestore REST adapter for the local emulator (`FIRESTORE_EMULATOR_HOST`).
-use std::collections::BTreeMap;
+//! Firestore SDK adapter for the local emulator (`FIRESTORE_EMULATOR_HOST`).
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
-use serde_json::{json, Map, Value as Json};
-use ureq::Error as UreqError;
-use url::Url;
+use firestore::{FirestoreDb, FirestoreDbOptions};
+use gcloud_sdk::google::firestore::v1::{
+    batch_get_documents_request, batch_get_documents_response, document_transform, precondition,
+    run_query_request, structured_query, value, write, ArrayValue, BatchGetDocumentsRequest,
+    BeginTransactionRequest, CommitRequest, Document, DocumentMask, GetDocumentRequest, MapValue,
+    Precondition, RunQueryRequest, StructuredQuery, Value as SdkValue, Write,
+};
+use gcloud_sdk::tonic::{Code, Request, Status};
+use prost_types::{NullValue, Timestamp as ProtoTimestamp};
+use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 use crate::runtime::{Firestore, QueryFilter, Timestamp, Value, WriteOp};
 
 pub struct FirestoreEmulator {
     host: String,
     project_id: String,
-    agent: ureq::Agent,
+    runtime: Runtime,
+    db: RefCell<Option<FirestoreDb>>,
     mode: Option<EmulatorMode>,
 }
 
 enum EmulatorMode {
     Batch(Vec<WriteOp>),
     Transaction {
-        transaction_id: String,
+        transaction_id: Vec<u8>,
         writes: Vec<WriteOp>,
     },
 }
@@ -32,75 +41,37 @@ impl FirestoreEmulator {
     }
 
     pub fn new(host: String, project_id: String) -> Self {
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create tokio runtime for Firestore SDK");
         Self {
             host,
             project_id,
-            agent: ureq::Agent::new(),
+            runtime,
+            db: RefCell::new(None),
             mode: None,
         }
     }
 
-    fn base(&self) -> String {
-        format!(
-            "http://{}/v1/projects/{}/databases/(default)",
-            self.host, self.project_id
-        )
-    }
-
-    fn document_url(&self, path: &str) -> String {
-        let mut u = Url::parse(&self.base()).expect("valid base URL");
+    fn sdk_db(&self) -> Result<FirestoreDb, Box<dyn Error>> {
         {
-            let mut segs = u.path_segments_mut().expect("base must be path-based");
-            segs.push("documents");
-            for s in path.split('/') {
-                segs.push(s);
+            let db = self.db.borrow();
+            if let Some(db) = db.as_ref() {
+                return Ok(db.clone());
             }
         }
-        u.to_string()
-    }
 
-    fn run_query_url(&self, parent: Option<&str>) -> String {
-        let mut u = Url::parse(&self.base()).expect("valid base URL");
-        {
-            let mut segs = u.path_segments_mut().expect("base must be path-based");
-            segs.push("documents");
-            if let Some(p) = parent {
-                for s in p.split('/') {
-                    segs.push(s);
-                }
-            }
-        }
-        format!("{u}:runQuery")
-    }
-
-    fn commit_url(&self) -> String {
-        format!("{}/documents:commit", self.base())
-    }
-
-    fn begin_transaction_url(&self) -> String {
-        format!("{}/documents:beginTransaction", self.base())
-    }
-
-    fn batch_get_url(&self) -> String {
-        format!("{}/documents:batchGet", self.base())
-    }
-
-    fn post_json(&self, url: &str, body: &Json) -> Result<Json, Box<dyn Error>> {
-        let resp = self
-            .agent
-            .post(url)
-            .set("Content-Type", "application/json")
-            .send_json(body)?;
-        parse_json_body(&resp.into_string()?)
-    }
-
-    fn patch_json(&self, url: &str, body: &Json) -> Result<Json, Box<dyn Error>> {
-        let resp = self
-            .agent
-            .request("PATCH", url)
-            .set("Content-Type", "application/json")
-            .send_json(body)?;
-        parse_json_body(&resp.into_string()?)
+        let options = sdk_options(&self.host, &self.project_id);
+        let db = self
+            .runtime
+            .block_on(FirestoreDb::with_options_token_source(
+                options,
+                gcloud_sdk::GCP_DEFAULT_SCOPES.clone(),
+                emulator_token_source(),
+            ))?;
+        *self.db.borrow_mut() = Some(db.clone());
+        Ok(db)
     }
 
     fn document_name(&self, path: &str) -> String {
@@ -110,27 +81,118 @@ impl FirestoreEmulator {
         )
     }
 
+    fn parent_path(&self, relative_parent: Option<&str>) -> String {
+        match relative_parent {
+            Some(parent) if !parent.is_empty() => format!(
+                "projects/{}/databases/(default)/documents/{}",
+                self.project_id, parent
+            ),
+            _ => format!("projects/{}/databases/(default)/documents", self.project_id),
+        }
+    }
+
     fn commit_single_write(&self, op: WriteOp) -> Result<(), Box<dyn Error>> {
         let write = build_write(self, &op)?;
-        self.post_json(&self.commit_url(), &json!({ "writes": [write] }))?;
-        Ok(())
+        self.commit_writes(vec![write], vec![])
+    }
+
+    fn commit_writes(
+        &self,
+        writes: Vec<Write>,
+        transaction: Vec<u8>,
+    ) -> Result<(), Box<dyn Error>> {
+        let db = self.sdk_db()?;
+        let database = db.get_database_path().clone();
+        let not_found_context = write_targets(&writes);
+        let has_exists_precondition = writes.iter().any(write_requires_existing_document);
+        let result = self.runtime.block_on(async move {
+            db.client()
+                .get()
+                .commit(Request::new(CommitRequest {
+                    database,
+                    writes,
+                    transaction,
+                }))
+                .await
+        });
+        match result {
+            Ok(_) => Ok(()),
+            Err(status) if missing_document_status(&status, has_exists_precondition) => {
+                Err(not_found_error(&status, not_found_context.as_deref()).into())
+            }
+            Err(status) => Err(status.into()),
+        }
     }
 }
 
-fn parse_json_body(s: &str) -> Result<Json, Box<dyn Error>> {
-    let t = s.trim();
-    if t.is_empty() {
-        return Ok(Json::Object(Map::new()));
-    }
-    Ok(serde_json::from_str(t)?)
+fn missing_document_status(status: &Status, has_exists_precondition: bool) -> bool {
+    status.code() == Code::NotFound
+        || (status.code() == Code::FailedPrecondition && has_exists_precondition)
 }
 
-fn get_document_resource(agent: &ureq::Agent, url: &str) -> Result<Option<Json>, Box<dyn Error>> {
-    match agent.get(url).call() {
-        Ok(resp) => parse_json_body(&resp.into_string()?).map(Some),
-        Err(UreqError::Status(404, _)) => Ok(None),
-        Err(e) => Err(e.into()),
+fn not_found_error(status: &Status, context: Option<&str>) -> String {
+    let detail = status.message();
+    match (context, detail.is_empty()) {
+        (Some(context), false) => format!("document not found: {context}: {detail}"),
+        (Some(context), true) => format!("document not found: {context}"),
+        (None, false) => format!("document not found: {detail}"),
+        (None, true) => "document not found".to_string(),
     }
+}
+
+fn write_targets(writes: &[Write]) -> Option<String> {
+    let mut targets: Vec<String> = writes.iter().filter_map(write_target).collect();
+    targets.sort();
+    targets.dedup();
+    match targets.as_slice() {
+        [] => None,
+        [single] => Some(single.clone()),
+        _ => Some(targets.join(", ")),
+    }
+}
+
+fn write_requires_existing_document(write: &Write) -> bool {
+    matches!(
+        write
+            .current_document
+            .as_ref()
+            .and_then(|p| p.condition_type),
+        Some(precondition::ConditionType::Exists(true))
+    )
+}
+
+fn write_target(write: &Write) -> Option<String> {
+    let name = match write.operation.as_ref()? {
+        write::Operation::Update(doc) => &doc.name,
+        write::Operation::Delete(name) => name,
+        write::Operation::Transform(transform) => &transform.document,
+    };
+    Some(relative_document_name(name).unwrap_or_else(|_| name.clone()))
+}
+
+fn sdk_options(host: &str, project_id: &str) -> FirestoreDbOptions {
+    FirestoreDbOptions::new(project_id.to_string()).with_firebase_api_url(ensure_url_scheme(host))
+}
+
+fn ensure_url_scheme(host: &str) -> String {
+    if host.contains("://") {
+        host.to_string()
+    } else {
+        format!("http://{host}")
+    }
+}
+
+fn emulator_token_source() -> gcloud_sdk::TokenSourceType {
+    gcloud_sdk::TokenSourceType::ExternalSource(Box::new(
+        gcloud_sdk::ExternalJwtFunctionSource::new(|| {
+            std::future::ready(Ok(gcloud_sdk::Token::new(
+                "Bearer".to_string(),
+                "owner".into(),
+                chrono::DateTime::<chrono::Utc>::from_timestamp(4_102_444_800, 0)
+                    .expect("valid token expiry"),
+            )))
+        }),
+    ))
 }
 
 impl Firestore for FirestoreEmulator {
@@ -138,11 +200,23 @@ impl Firestore for FirestoreEmulator {
         if self.mode.is_some() {
             return Err("internal error: get while in batch/transaction".into());
         }
-        let url = self.document_url(path);
-        let Some(j) = get_document_resource(&self.agent, &url)? else {
-            return Ok(None);
-        };
-        decode_document_for_get(&j).map(Some)
+        let db = self.sdk_db()?;
+        let name = self.document_name(path);
+        let result = self.runtime.block_on(async move {
+            db.client()
+                .get()
+                .get_document(Request::new(GetDocumentRequest {
+                    name,
+                    mask: None,
+                    consistency_selector: None,
+                }))
+                .await
+        });
+        match result {
+            Ok(resp) => decode_document_for_get(&resp.into_inner()).map(Some),
+            Err(status) if status.code() == Code::NotFound => Ok(None),
+            Err(status) => Err(status.into()),
+        }
     }
 
     fn set(
@@ -154,60 +228,30 @@ impl Firestore for FirestoreEmulator {
         if self.mode.is_some() {
             return Err("internal error: set while in batch/transaction".into());
         }
-        if value
-            .values()
-            .any(|v| matches!(v, Value::ArrayUnion(_) | Value::ArrayRemove(_)))
-        {
-            return self.commit_single_write(WriteOp::Set {
-                path: path.to_string(),
-                data: value,
-                merge,
-            });
-        }
-        apply_set_patch(self, path, value, merge)
+        self.commit_single_write(WriteOp::Set {
+            path: path.to_string(),
+            data: value,
+            merge,
+        })
     }
 
     fn update(&mut self, path: &str, value: BTreeMap<String, Value>) -> Result<(), Box<dyn Error>> {
         if self.mode.is_some() {
             return Err("internal error: update while in batch/transaction".into());
         }
-        let url = self.document_url(path);
-        if get_document_resource(&self.agent, &url)?.is_none() {
-            return Err(format!("document not found: {path}").into());
-        }
-        if value
-            .values()
-            .any(|v| matches!(v, Value::ArrayUnion(_) | Value::ArrayRemove(_)))
-        {
-            return self.commit_single_write(WriteOp::Update {
-                path: path.to_string(),
-                data: value,
-            });
-        }
-        let mask: Vec<String> = value.keys().cloned().collect();
-        let patch_url = add_update_mask_query(&url, &mask)?;
-        let body = json!({ "fields": encode_fields(&value)? });
-        self.patch_json(&patch_url, &body)?;
-        Ok(())
+        self.commit_single_write(WriteOp::Update {
+            path: path.to_string(),
+            data: value,
+        })
     }
 
     fn delete(&mut self, path: &str) -> Result<(), Box<dyn Error>> {
         if self.mode.is_some() {
             return Err("internal error: delete while in batch/transaction".into());
         }
-        let url = self.document_url(path);
-        match self.agent.delete(&url).call() {
-            Ok(resp) => {
-                let status = resp.status();
-                if status == 200 || status == 404 {
-                    Ok(())
-                } else {
-                    Err(format!("DELETE {} -> {}", url, status).into())
-                }
-            }
-            Err(UreqError::Status(404, _)) => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        self.commit_single_write(WriteOp::Delete {
+            path: path.to_string(),
+        })
     }
 
     fn query_collection(
@@ -216,21 +260,9 @@ impl Firestore for FirestoreEmulator {
         filters: &[QueryFilter],
         limit: Option<usize>,
     ) -> Result<Vec<Value>, Box<dyn Error>> {
-        let (parent, collection_id) = match path.rsplit_once('/') {
-            Some((p, c)) => (Some(p), c),
-            None => (None, path),
-        };
-        let mut sq = json!({
-            "structuredQuery": {
-                "from": [{ "collectionId": collection_id }],
-            }
-        });
-        if let Some(obj) = sq["structuredQuery"].as_object_mut() {
-            if let Some(w) = build_where(filters)? {
-                obj.insert("where".to_string(), w);
-            }
-        }
-        run_query_sorted(self, parent, &sq, limit)
+        let (parent, collection_id) = split_collection_path(path)?;
+        let query = structured_query(collection_id, false, filters)?;
+        run_query_sorted(self, parent.as_deref(), query, limit)
     }
 
     fn query_collection_group(
@@ -239,17 +271,8 @@ impl Firestore for FirestoreEmulator {
         filters: &[QueryFilter],
         limit: Option<usize>,
     ) -> Result<Vec<Value>, Box<dyn Error>> {
-        let mut sq = json!({
-            "structuredQuery": {
-                "from": [{ "collectionId": id, "allDescendants": true }],
-            }
-        });
-        if let Some(obj) = sq["structuredQuery"].as_object_mut() {
-            if let Some(w) = build_where(filters)? {
-                obj.insert("where".to_string(), w);
-            }
-        }
-        run_query_sorted(self, None, &sq, limit)
+        let query = structured_query(id, true, filters)?;
+        run_query_sorted(self, None, query, limit)
     }
 
     fn begin_batch(&mut self) -> Result<(), Box<dyn Error>> {
@@ -272,10 +295,8 @@ impl Firestore for FirestoreEmulator {
 
     fn commit_batch(&mut self) -> Result<(), Box<dyn Error>> {
         if let Some(EmulatorMode::Batch(ops)) = self.mode.take() {
-            let writes = write_ops_to_json_writes(self, &ops)?;
-            let body = json!({ "writes": writes });
-            self.post_json(&self.commit_url(), &body)?;
-            Ok(())
+            let writes = write_ops_to_sdk_writes(self, &ops)?;
+            self.commit_writes(writes, vec![])
         } else {
             Err("not in batch".into())
         }
@@ -291,13 +312,21 @@ impl Firestore for FirestoreEmulator {
         if self.mode.is_some() {
             return Err("already in batch or transaction".into());
         }
-        let resp = self.post_json(&self.begin_transaction_url(), &json!({}))?;
-        let tid = resp["transaction"]
-            .as_str()
-            .ok_or("beginTransaction missing transaction")?
-            .to_string();
+        let db = self.sdk_db()?;
+        let database = db.get_database_path().clone();
+        let transaction_id = self.runtime.block_on(async move {
+            let resp = db
+                .client()
+                .get()
+                .begin_transaction(Request::new(BeginTransactionRequest {
+                    database,
+                    options: None,
+                }))
+                .await?;
+            Ok::<_, gcloud_sdk::tonic::Status>(resp.into_inner().transaction)
+        })?;
         self.mode = Some(EmulatorMode::Transaction {
-            transaction_id: tid,
+            transaction_id,
             writes: vec![],
         });
         Ok(())
@@ -308,21 +337,35 @@ impl Firestore for FirestoreEmulator {
             Some(EmulatorMode::Transaction { transaction_id, .. }) => transaction_id.clone(),
             _ => return Err("not in transaction".into()),
         };
-        let body = json!({
-            "documents": [self.document_name(path)],
-            "transaction": tid,
-        });
-        // batchGet returns one entry per requested document: `{ "found": Document }`
-        // or `{ "missing": "full/resource/name" }`.
-        let resp = self.post_json(&self.batch_get_url(), &body)?;
-        let row = resp
-            .as_array()
-            .and_then(|rows| rows.first())
-            .ok_or("batchGet response missing row")?;
-        match row.get("found") {
-            Some(doc) if !doc.is_null() => Ok(Some(decode_document_for_get(doc)?)),
-            _ => Ok(None),
-        }
+        let db = self.sdk_db()?;
+        let database = db.get_database_path().clone();
+        let document = self.document_name(path);
+        let result = self.runtime.block_on(async move {
+            let response = db
+                .client()
+                .get()
+                .batch_get_documents(Request::new(BatchGetDocumentsRequest {
+                    database,
+                    documents: vec![document],
+                    mask: None,
+                    consistency_selector: Some(
+                        batch_get_documents_request::ConsistencySelector::Transaction(tid),
+                    ),
+                }))
+                .await?;
+            let mut stream = response.into_inner();
+            while let Some(row) = stream.message().await? {
+                match row.result {
+                    Some(batch_get_documents_response::Result::Found(doc)) => {
+                        return Ok(Some(doc));
+                    }
+                    Some(batch_get_documents_response::Result::Missing(_)) => return Ok(None),
+                    None => {}
+                }
+            }
+            Ok::<_, gcloud_sdk::tonic::Status>(None)
+        })?;
+        result.as_ref().map(decode_document_for_get).transpose()
     }
 
     fn transaction_stage(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
@@ -341,13 +384,8 @@ impl Firestore for FirestoreEmulator {
             writes,
         }) = self.mode.take()
         {
-            let json_writes = write_ops_to_json_writes(self, &writes)?;
-            let body = json!({
-                "transaction": transaction_id,
-                "writes": json_writes,
-            });
-            self.post_json(&self.commit_url(), &body)?;
-            Ok(())
+            let sdk_writes = write_ops_to_sdk_writes(self, &writes)?;
+            self.commit_writes(sdk_writes, transaction_id)
         } else {
             Err("not in transaction".into())
         }
@@ -363,73 +401,110 @@ impl Firestore for FirestoreEmulator {
 fn run_query_sorted(
     fs: &FirestoreEmulator,
     parent: Option<&str>,
-    body: &Json,
+    query: StructuredQuery,
     limit: Option<usize>,
 ) -> Result<Vec<Value>, Box<dyn Error>> {
-    let resp = fs.post_json(&fs.run_query_url(parent), body)?;
-    let rows = resp
-        .as_array()
-        .ok_or("runQuery response must be a JSON array")?;
-    let mut docs: Vec<(String, Value)> = vec![];
-    for row in rows {
-        if let Some(doc) = row.get("document") {
-            let name = doc["name"]
-                .as_str()
-                .ok_or("runQuery row missing document.name")?;
-            let (_, rel) = name
-                .split_once("/documents/")
-                .ok_or("invalid document name")?;
-            let v = decode_document_for_query(doc)?;
-            docs.push((rel.to_string(), v));
+    let db = fs.sdk_db()?;
+    let parent = fs.parent_path(parent);
+    let docs = fs.runtime.block_on(async move {
+        let response = db
+            .client()
+            .get()
+            .run_query(Request::new(RunQueryRequest {
+                parent,
+                explain_options: None,
+                query_type: Some(run_query_request::QueryType::StructuredQuery(query)),
+                consistency_selector: None,
+            }))
+            .await?;
+        let mut stream = response.into_inner();
+        let mut docs = vec![];
+        while let Some(row) = stream.message().await? {
+            if let Some(doc) = row.document {
+                docs.push(doc);
+            }
         }
+        Ok::<_, gcloud_sdk::tonic::Status>(docs)
+    })?;
+
+    let mut out = vec![];
+    for doc in docs {
+        let rel = relative_document_name(&doc.name)?;
+        let value = decode_document_for_query(&doc)?;
+        out.push((rel, value));
     }
-    docs.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut out: Vec<Value> = docs.into_iter().map(|(_, v)| v).collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut values: Vec<Value> = out.into_iter().map(|(_, v)| v).collect();
     if let Some(l) = limit {
-        out.truncate(l);
+        values.truncate(l);
     }
-    Ok(out)
+    Ok(values)
 }
 
-fn build_where(filters: &[QueryFilter]) -> Result<Option<Json>, Box<dyn Error>> {
-    if filters.is_empty() {
-        return Ok(None);
-    }
-    let mut cur: Option<Json> = None;
+fn structured_query(
+    collection_id: &str,
+    all_descendants: bool,
+    filters: &[QueryFilter],
+) -> Result<StructuredQuery, Box<dyn Error>> {
+    Ok(StructuredQuery {
+        select: None,
+        from: vec![structured_query::CollectionSelector {
+            collection_id: collection_id.to_string(),
+            all_descendants,
+        }],
+        r#where: build_where(filters)?,
+        order_by: vec![],
+        start_at: None,
+        end_at: None,
+        offset: 0,
+        limit: None,
+        find_nearest: None,
+    })
+}
+
+fn build_where(
+    filters: &[QueryFilter],
+) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
+    let mut parts = vec![];
     for f in filters {
         let op = match f.op.as_str() {
-            "==" => "EQUAL",
-            ">" => "GREATER_THAN",
-            ">=" => "GREATER_THAN_OR_EQUAL",
-            "<" => "LESS_THAN",
-            "<=" => "LESS_THAN_OR_EQUAL",
+            "==" => structured_query::field_filter::Operator::Equal,
+            ">" => structured_query::field_filter::Operator::GreaterThan,
+            ">=" => structured_query::field_filter::Operator::GreaterThanOrEqual,
+            "<" => structured_query::field_filter::Operator::LessThan,
+            "<=" => structured_query::field_filter::Operator::LessThanOrEqual,
             o => return Err(format!("unsupported query op: {o}").into()),
         };
-        let fv = encode_field_value(&f.value)?;
-        let part = json!({
-            "fieldFilter": {
-                "field": { "fieldPath": f.field },
-                "op": op,
-                "value": fv,
-            }
-        });
-        cur = Some(match cur {
-            None => part,
-            Some(prev) => json!({
-                "compositeFilter": {
-                    "op": "AND",
-                    "filters": [ prev, part ],
-                }
-            }),
+        parts.push(structured_query::Filter {
+            filter_type: Some(structured_query::filter::FilterType::FieldFilter(
+                structured_query::FieldFilter {
+                    field: Some(structured_query::FieldReference {
+                        field_path: f.field.clone(),
+                    }),
+                    op: op.into(),
+                    value: Some(encode_field_value(&f.value)?),
+                },
+            )),
         });
     }
-    Ok(cur)
+    Ok(match parts.len() {
+        0 => None,
+        1 => parts.pop(),
+        _ => Some(structured_query::Filter {
+            filter_type: Some(structured_query::filter::FilterType::CompositeFilter(
+                structured_query::CompositeFilter {
+                    op: structured_query::composite_filter::Operator::And.into(),
+                    filters: parts,
+                },
+            )),
+        }),
+    })
 }
 
-fn write_ops_to_json_writes(
+fn write_ops_to_sdk_writes(
     fs: &FirestoreEmulator,
     ops: &[WriteOp],
-) -> Result<Vec<Json>, Box<dyn Error>> {
+) -> Result<Vec<Write>, Box<dyn Error>> {
     let mut out = vec![];
     for op in ops {
         out.push(build_write(fs, op)?);
@@ -437,36 +512,60 @@ fn write_ops_to_json_writes(
     Ok(out)
 }
 
-fn build_write(fs: &FirestoreEmulator, op: &WriteOp) -> Result<Json, Box<dyn Error>> {
+fn build_write(fs: &FirestoreEmulator, op: &WriteOp) -> Result<Write, Box<dyn Error>> {
     match op {
         WriteOp::Set { path, data, merge } => {
-            let name = fs.document_name(path);
             let (plain, transforms) = split_fields_and_transforms(data);
             let fields = encode_fields(&plain)?;
-            let mut write = json!({
-                "update": { "name": name, "fields": fields },
-            });
-            if *merge {
-                let mask: Vec<String> = plain.keys().cloned().collect();
-                write["updateMask"] = json!({ "fieldPaths": mask });
-            }
-            attach_transforms(&mut write, &transforms)?;
-            Ok(write)
+            Ok(Write {
+                update_mask: if *merge {
+                    Some(DocumentMask {
+                        field_paths: plain.keys().cloned().collect(),
+                    })
+                } else {
+                    None
+                },
+                update_transforms: encode_field_transforms(&transforms)?,
+                current_document: None,
+                operation: Some(gcloud_sdk::google::firestore::v1::write::Operation::Update(
+                    Document {
+                        name: fs.document_name(path),
+                        fields,
+                        create_time: None,
+                        update_time: None,
+                    },
+                )),
+            })
         }
         WriteOp::Update { path, data } => {
-            let name = fs.document_name(path);
             let (plain, transforms) = split_fields_and_transforms(data);
             let fields = encode_fields(&plain)?;
-            let mask: Vec<String> = plain.keys().cloned().collect();
-            let mut write = json!({
-                "update": { "name": name, "fields": fields },
-                "updateMask": { "fieldPaths": mask },
-                "currentDocument": { "exists": true },
-            });
-            attach_transforms(&mut write, &transforms)?;
-            Ok(write)
+            Ok(Write {
+                update_mask: Some(DocumentMask {
+                    field_paths: plain.keys().cloned().collect(),
+                }),
+                update_transforms: encode_field_transforms(&transforms)?,
+                current_document: Some(Precondition {
+                    condition_type: Some(precondition::ConditionType::Exists(true)),
+                }),
+                operation: Some(gcloud_sdk::google::firestore::v1::write::Operation::Update(
+                    Document {
+                        name: fs.document_name(path),
+                        fields,
+                        create_time: None,
+                        update_time: None,
+                    },
+                )),
+            })
         }
-        WriteOp::Delete { path } => Ok(json!({ "delete": fs.document_name(path) })),
+        WriteOp::Delete { path } => Ok(Write {
+            update_mask: None,
+            update_transforms: vec![],
+            current_document: None,
+            operation: Some(gcloud_sdk::google::firestore::v1::write::Operation::Delete(
+                fs.document_name(path),
+            )),
+        }),
     }
 }
 
@@ -477,7 +576,7 @@ fn split_fields_and_transforms(
     let mut transforms = vec![];
     for (k, v) in data {
         match v {
-            Value::ArrayUnion(_) | Value::ArrayRemove(_) => {
+            Value::ArrayUnion(_) | Value::ArrayRemove(_) | Value::ServerTimestamp => {
                 transforms.push((k.clone(), v.clone()));
             }
             _ => {
@@ -488,193 +587,192 @@ fn split_fields_and_transforms(
     (plain, transforms)
 }
 
-fn attach_transforms(
-    write: &mut Json,
+fn encode_field_transforms(
     transforms: &[(String, Value)],
-) -> Result<(), Box<dyn Error>> {
-    if transforms.is_empty() {
-        return Ok(());
-    }
+) -> Result<Vec<document_transform::FieldTransform>, Box<dyn Error>> {
     let mut out = vec![];
     for (path, v) in transforms {
         out.push(encode_field_transform(path, v)?);
     }
-    write["updateTransforms"] = Json::Array(out);
-    Ok(())
+    Ok(out)
 }
 
-fn encode_field_transform(field_path: &str, v: &Value) -> Result<Json, Box<dyn Error>> {
-    let values = match v {
-        Value::ArrayUnion(items) | Value::ArrayRemove(items) => items
-            .iter()
-            .map(encode_field_value)
-            .collect::<Result<Vec<_>, _>>()?,
+fn encode_field_transform(
+    field_path: &str,
+    v: &Value,
+) -> Result<document_transform::FieldTransform, Box<dyn Error>> {
+    let transform_type = match v {
+        Value::ServerTimestamp => {
+            document_transform::field_transform::TransformType::SetToServerValue(
+                document_transform::field_transform::ServerValue::RequestTime.into(),
+            )
+        }
+        Value::ArrayUnion(items) => {
+            document_transform::field_transform::TransformType::AppendMissingElements(ArrayValue {
+                values: encode_array_items(items)?,
+            })
+        }
+        Value::ArrayRemove(items) => {
+            document_transform::field_transform::TransformType::RemoveAllFromArray(ArrayValue {
+                values: encode_array_items(items)?,
+            })
+        }
         _ => return Err("not a transform value".into()),
     };
-    Ok(match v {
-        Value::ArrayUnion(_) => {
-            json!({ "fieldPath": field_path, "appendMissingElements": { "values": values } })
-        }
-        Value::ArrayRemove(_) => {
-            json!({ "fieldPath": field_path, "removeAllFromArray": { "values": values } })
-        }
-        _ => unreachable!(),
+    Ok(document_transform::FieldTransform {
+        field_path: field_path.to_string(),
+        transform_type: Some(transform_type),
     })
 }
 
-/// Firestore REST `PATCH` expects `updateMask` as **query** parameters, not JSON body fields.
-fn add_update_mask_query(
-    document_url: &str,
-    field_paths: &[String],
-) -> Result<String, Box<dyn Error>> {
-    let mut u = Url::parse(document_url)?;
-    {
-        let mut qp = u.query_pairs_mut();
-        for p in field_paths {
-            qp.append_pair("updateMask.fieldPaths", p);
-        }
-    }
-    Ok(u.to_string())
+fn encode_array_items(items: &[Value]) -> Result<Vec<SdkValue>, Box<dyn Error>> {
+    items.iter().map(encode_field_value).collect()
 }
 
-fn apply_set_patch(
-    fs: &mut FirestoreEmulator,
-    path: &str,
-    value: BTreeMap<String, Value>,
-    merge: bool,
-) -> Result<(), Box<dyn Error>> {
-    let base = fs.document_url(path);
-    let fields = encode_fields(&value)?;
-    let body = json!({ "fields": fields });
-    let url = if merge {
-        let mask: Vec<String> = value.keys().cloned().collect();
-        add_update_mask_query(&base, &mask)?
-    } else {
-        base
-    };
-    fs.patch_json(&url, &body)?;
-    Ok(())
-}
-
-fn encode_fields(map: &BTreeMap<String, Value>) -> Result<Map<String, Json>, Box<dyn Error>> {
-    let mut out = Map::new();
+fn encode_fields(
+    map: &BTreeMap<String, Value>,
+) -> Result<HashMap<String, SdkValue>, Box<dyn Error>> {
+    let mut out = HashMap::new();
     for (k, v) in map {
         out.insert(k.clone(), encode_field_value(v)?);
     }
     Ok(out)
 }
 
-fn encode_field_value(v: &Value) -> Result<Json, Box<dyn Error>> {
-    Ok(match v {
-        Value::Str(s) => json!({ "stringValue": s }),
-        Value::Int(i) => json!({ "integerValue": i.to_string() }),
-        Value::Bool(b) => json!({ "booleanValue": *b }),
-        Value::Nil => json!({ "nullValue": null }),
-        Value::Timestamp(ts) => json!({
-            "timestampValue": ts_to_rfc3339(ts.seconds)?
+fn encode_field_value(v: &Value) -> Result<SdkValue, Box<dyn Error>> {
+    Ok(SdkValue {
+        value_type: Some(match v {
+            Value::Str(s) => value::ValueType::StringValue(s.clone()),
+            Value::Int(i) => value::ValueType::IntegerValue(*i),
+            Value::Bool(b) => value::ValueType::BooleanValue(*b),
+            Value::Nil => value::ValueType::NullValue(NullValue::NullValue.into()),
+            Value::Timestamp(ts) => value::ValueType::TimestampValue(ProtoTimestamp {
+                seconds: ts.seconds,
+                nanos: 0,
+            }),
+            Value::Array(items) => value::ValueType::ArrayValue(ArrayValue {
+                values: encode_array_items(items)?,
+            }),
+            Value::Map(m) => value::ValueType::MapValue(MapValue {
+                fields: encode_fields(m)?,
+            }),
+            _ => return Err(format!("unsupported value in emulator write: {v:?}").into()),
         }),
-        Value::ServerTimestamp => json!({
-            "timestampValue": ts_to_rfc3339(crate::runtime::current_unix_seconds()?)?
-        }),
-        Value::Array(items) => {
-            let mut vals = vec![];
-            for x in items {
-                vals.push(encode_field_value(x)?);
-            }
-            json!({ "arrayValue": { "values": vals } })
-        }
-        Value::Map(m) => json!({ "mapValue": { "fields": encode_fields(m)? } }),
-        _ => return Err(format!("unsupported value in emulator write: {v:?}").into()),
     })
 }
 
-fn ts_to_rfc3339(sec: i64) -> Result<String, Box<dyn Error>> {
-    Ok(chrono::DateTime::<chrono::Utc>::from_timestamp(sec, 0)
-        .ok_or("timestamp out of range")?
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-}
-
-fn decode_document_for_get(doc: &Json) -> Result<Value, Box<dyn Error>> {
+fn decode_document_for_get(doc: &Document) -> Result<Value, Box<dyn Error>> {
     decode_document_inner(doc, false)
 }
 
-fn decode_document_for_query(doc: &Json) -> Result<Value, Box<dyn Error>> {
+fn decode_document_for_query(doc: &Document) -> Result<Value, Box<dyn Error>> {
     decode_document_inner(doc, true)
 }
 
-fn decode_document_inner(doc: &Json, include_doc_path: bool) -> Result<Value, Box<dyn Error>> {
+fn decode_document_inner(doc: &Document, include_doc_path: bool) -> Result<Value, Box<dyn Error>> {
     let mut out = BTreeMap::new();
-    if let Some(fields) = doc.get("fields").and_then(|f| f.as_object()) {
-        for (k, fv) in fields {
-            out.insert(k.clone(), decode_field_value(fv)?);
-        }
+    for (k, fv) in &doc.fields {
+        out.insert(k.clone(), decode_field_value(fv)?);
     }
     if include_doc_path {
-        if let Some(name) = doc.get("name").and_then(|n| n.as_str()) {
-            if let Some((_, rel)) = name.split_once("/documents/") {
-                out.insert("__name__".to_string(), Value::Str(rel.to_string()));
-            }
+        if let Ok(rel) = relative_document_name(&doc.name) {
+            out.insert("__name__".to_string(), Value::Str(rel));
         }
     }
     Ok(Value::Map(out))
 }
 
-fn decode_field_value(v: &Json) -> Result<Value, Box<dyn Error>> {
-    if let Some(s) = v.get("stringValue").and_then(|x| x.as_str()) {
-        return Ok(Value::Str(s.to_string()));
-    }
-    if let Some(n) = v.get("integerValue").and_then(|x| x.as_i64()) {
-        return Ok(Value::Int(n));
-    }
-    if let Some(s) = v.get("integerValue").and_then(|x| x.as_str()) {
-        return Ok(Value::Int(s.parse()?));
-    }
-    if let Some(b) = v.get("booleanValue").and_then(|x| x.as_bool()) {
-        return Ok(Value::Bool(b));
-    }
-    if v.get("nullValue").is_some() {
-        return Ok(Value::Nil);
-    }
-    if let Some(ts) = v.get("timestampValue").and_then(|x| x.as_str()) {
-        let sec = chrono::DateTime::parse_from_rfc3339(ts)?.timestamp();
-        return Ok(Value::Timestamp(Timestamp { seconds: sec }));
-    }
-    if let Some(arr) = v
-        .get("arrayValue")
-        .and_then(|a| a.get("values"))
-        .and_then(|x| x.as_array())
+fn decode_field_value(v: &SdkValue) -> Result<Value, Box<dyn Error>> {
+    match v
+        .value_type
+        .as_ref()
+        .ok_or("missing Firestore value type")?
     {
-        let mut out = vec![];
-        for x in arr {
-            out.push(decode_field_value(x)?);
+        value::ValueType::StringValue(s) => Ok(Value::Str(s.clone())),
+        value::ValueType::IntegerValue(n) => Ok(Value::Int(*n)),
+        value::ValueType::BooleanValue(b) => Ok(Value::Bool(*b)),
+        value::ValueType::NullValue(_) => Ok(Value::Nil),
+        value::ValueType::TimestampValue(ts) => Ok(Value::Timestamp(Timestamp {
+            seconds: ts.seconds,
+        })),
+        value::ValueType::ArrayValue(arr) => {
+            let mut out = vec![];
+            for x in &arr.values {
+                out.push(decode_field_value(x)?);
+            }
+            Ok(Value::Array(out))
         }
-        return Ok(Value::Array(out));
-    }
-    if let Some(fields) = v
-        .get("mapValue")
-        .and_then(|m| m.get("fields"))
-        .and_then(|f| f.as_object())
-    {
-        let mut out = BTreeMap::new();
-        for (k, fv) in fields {
-            out.insert(k.clone(), decode_field_value(fv)?);
+        value::ValueType::MapValue(map) => {
+            let mut out = BTreeMap::new();
+            for (k, fv) in &map.fields {
+                out.insert(k.clone(), decode_field_value(fv)?);
+            }
+            Ok(Value::Map(out))
         }
-        return Ok(Value::Map(out));
+        other => Err(format!("unsupported Firestore field value: {other:?}").into()),
     }
-    Err(format!("unsupported Firestore field value: {v}").into())
+}
+
+fn relative_document_name(name: &str) -> Result<String, Box<dyn Error>> {
+    let (_, rel) = name
+        .split_once("/documents/")
+        .ok_or("invalid document name")?;
+    Ok(rel.to_string())
+}
+
+fn split_collection_path(path: &str) -> Result<(Option<String>, &str), Box<dyn Error>> {
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() || parts.len().is_multiple_of(2) {
+        return Err(format!("invalid collection path: {path}").into());
+    }
+    let collection_id = parts[parts.len() - 1];
+    let parent = if parts.len() == 1 {
+        None
+    } else {
+        Some(parts[..parts.len() - 1].join("/"))
+    };
+    Ok((parent, collection_id))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use gcloud_sdk::google::firestore::v1::write;
+
+    #[test]
+    fn sdk_options_targets_emulator_host() {
+        let options = sdk_options("127.0.0.1:9", "p");
+        assert_eq!(options.google_project_id, "p");
+        assert_eq!(
+            options.firebase_api_url.as_deref(),
+            Some("http://127.0.0.1:9")
+        );
+    }
+
+    #[test]
+    fn sdk_options_keeps_explicit_scheme() {
+        let options = sdk_options("http://localhost:8080", "p");
+        assert_eq!(
+            options.firebase_api_url.as_deref(),
+            Some("http://localhost:8080")
+        );
+    }
+
+    #[test]
+    fn split_collection_path_supports_subcollections() {
+        let (parent, collection_id) = split_collection_path("teams/t1/members").unwrap();
+        assert_eq!(parent.as_deref(), Some("teams/t1"));
+        assert_eq!(collection_id, "members");
+    }
 
     #[test]
     fn decode_empty_document_for_get_has_no_name_field() {
-        let doc = json!({
-            "name": "projects/p/databases/(default)/documents/users/x",
-            "fields": {}
-        });
+        let doc = Document {
+            name: "projects/p/databases/(default)/documents/users/x".to_string(),
+            fields: HashMap::new(),
+            create_time: None,
+            update_time: None,
+        };
         let Value::Map(m) = decode_document_for_get(&doc).unwrap() else {
             panic!();
         };
@@ -684,10 +782,17 @@ mod tests {
 
     #[test]
     fn decode_document_for_query_adds_name() {
-        let doc = json!({
-            "name": "projects/p/databases/(default)/documents/users/x",
-            "fields": { "a": { "stringValue": "v" } }
-        });
+        let doc = Document {
+            name: "projects/p/databases/(default)/documents/users/x".to_string(),
+            fields: HashMap::from([(
+                "a".to_string(),
+                SdkValue {
+                    value_type: Some(value::ValueType::StringValue("v".to_string())),
+                },
+            )]),
+            create_time: None,
+            update_time: None,
+        };
         let Value::Map(m) = decode_document_for_query(&doc).unwrap() else {
             panic!();
         };
@@ -695,26 +800,26 @@ mod tests {
     }
 
     #[test]
-    fn batch_get_response_array_with_found_document() {
-        let resp = json!([
-            {
-                "found": {
-                    "name": "projects/p/databases/(default)/documents/a/b",
-                    "fields": { "n": { "integerValue": "1" } }
-                }
-            }
-        ]);
-        let rows = resp.as_array().unwrap();
-        let row = &rows[0];
-        let doc = row.get("found").unwrap();
-        let v = decode_document_for_get(doc).unwrap();
-        assert!(format!("{v:?}").contains("Int(1)"));
+    fn decode_document_for_query_preserves_documents_in_path() {
+        let doc = Document {
+            name: "projects/p/databases/(default)/documents/teams/t1/documents/x".to_string(),
+            fields: HashMap::new(),
+            create_time: None,
+            update_time: None,
+        };
+        let Value::Map(m) = decode_document_for_query(&doc).unwrap() else {
+            panic!();
+        };
+        assert_eq!(
+            m.get("__name__"),
+            Some(&Value::Str("teams/t1/documents/x".to_string()))
+        );
     }
 
     #[test]
-    fn commit_write_update_includes_exists_precondition() {
+    fn build_write_update_includes_exists_precondition() {
         let fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
-        let writes = write_ops_to_json_writes(
+        let writes = write_ops_to_sdk_writes(
             &fs,
             &[WriteOp::Update {
                 path: "c/d".to_string(),
@@ -722,13 +827,60 @@ mod tests {
             }],
         )
         .unwrap();
-        assert_eq!(writes[0]["currentDocument"]["exists"], json!(true));
+        assert_eq!(
+            writes[0]
+                .current_document
+                .as_ref()
+                .and_then(|p| p.condition_type),
+            Some(precondition::ConditionType::Exists(true))
+        );
+    }
+
+    #[test]
+    fn not_found_error_includes_write_target_and_status_message() {
+        let fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
+        let writes = write_ops_to_sdk_writes(
+            &fs,
+            &[WriteOp::Update {
+                path: "users/missing".to_string(),
+                data: BTreeMap::from([("x".to_string(), Value::Int(1))]),
+            }],
+        )
+        .unwrap();
+        let status = Status::not_found("No document to update");
+        let error = not_found_error(&status, write_targets(&writes).as_deref());
+        assert_eq!(
+            error,
+            "document not found: users/missing: No document to update"
+        );
+    }
+
+    #[test]
+    fn failed_precondition_is_missing_document_only_for_exists_precondition() {
+        let fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
+        let writes = write_ops_to_sdk_writes(
+            &fs,
+            &[WriteOp::Update {
+                path: "users/missing".to_string(),
+                data: BTreeMap::from([("x".to_string(), Value::Int(1))]),
+            }],
+        )
+        .unwrap();
+        assert!(write_requires_existing_document(&writes[0]));
+        assert!(missing_document_status(
+            &Status::failed_precondition("No document to update"),
+            true
+        ));
+        assert!(!missing_document_status(
+            &Status::failed_precondition("other precondition failed"),
+            false
+        ));
     }
 
     #[test]
     fn update_mask_excludes_transform_keys() {
         let fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
-        let writes = write_ops_to_json_writes(
+        let writes = write_ops_to_sdk_writes(
             &fs,
             &[WriteOp::Update {
                 path: "c/d".to_string(),
@@ -742,19 +894,16 @@ mod tests {
             }],
         )
         .unwrap();
-        let mask = writes[0]["updateMask"]["fieldPaths"].as_array().unwrap();
+        let mask = &writes[0].update_mask.as_ref().unwrap().field_paths;
         assert!(mask.iter().any(|v| v == "plain"));
-        assert!(
-            !mask.iter().any(|v| v == "tags"),
-            "transform keys must not appear in updateMask: {mask:?}"
-        );
-        assert!(writes[0]["updateTransforms"].is_array());
+        assert!(!mask.iter().any(|v| v == "tags"));
+        assert_eq!(writes[0].update_transforms.len(), 1);
     }
 
     #[test]
     fn set_merge_mask_excludes_transform_keys() {
         let fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
-        let writes = write_ops_to_json_writes(
+        let writes = write_ops_to_sdk_writes(
             &fs,
             &[WriteOp::Set {
                 path: "c/d".to_string(),
@@ -769,37 +918,40 @@ mod tests {
             }],
         )
         .unwrap();
-        let mask = writes[0]["updateMask"]["fieldPaths"].as_array().unwrap();
-        assert_eq!(mask.len(), 1);
-        assert_eq!(mask[0], "plain");
+        let mask = &writes[0].update_mask.as_ref().unwrap().field_paths;
+        assert_eq!(mask, &vec!["plain".to_string()]);
     }
 
     #[test]
-    fn decode_document_for_query_preserves_documents_in_path() {
-        let doc = json!({
-            "name": "projects/p/databases/(default)/documents/teams/t1/documents/x",
-            "fields": {}
-        });
-        let Value::Map(m) = decode_document_for_query(&doc).unwrap() else {
-            panic!();
-        };
-        assert_eq!(
-            m.get("__name__"),
-            Some(&Value::Str("teams/t1/documents/x".to_string()))
-        );
-    }
-
-    #[test]
-    fn document_url_percent_encodes_reserved_chars() {
+    fn server_timestamp_uses_sdk_transform() {
         let fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
-        let url = fs.document_url("users/a?b");
-        assert!(url.ends_with("/documents/users/a%3Fb"), "got: {url}");
+        let writes = write_ops_to_sdk_writes(
+            &fs,
+            &[WriteOp::Set {
+                path: "c/d".to_string(),
+                merge: true,
+                data: BTreeMap::from([("updated_at".to_string(), Value::ServerTimestamp)]),
+            }],
+        )
+        .unwrap();
+        let transform = &writes[0].update_transforms[0];
+        assert_eq!(transform.field_path, "updated_at");
+        assert!(matches!(
+            transform.transform_type,
+            Some(document_transform::field_transform::TransformType::SetToServerValue(_))
+        ));
     }
 
     #[test]
-    fn run_query_url_with_subcollection_parent() {
+    fn delete_write_uses_sdk_delete_operation() {
         let fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
-        let url = fs.run_query_url(Some("teams/t1"));
-        assert!(url.ends_with("/documents/teams/t1:runQuery"), "got: {url}");
+        let write = build_write(
+            &fs,
+            &WriteOp::Delete {
+                path: "users/a?b".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(write.operation, Some(write::Operation::Delete(_))));
     }
 }
