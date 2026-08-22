@@ -201,7 +201,7 @@ collection("users").doc("1")       # doc("users/1") と同等
 - `get()` — 実行して `Array<Map>` を返す。各 Map には `__name__` キーで**相対ドキュメントパス**(例 `"users/1"`)が入る。
 - **決定的順序**: 結果は firelang 相対ドキュメントパス文字列の辞書順でソートされ、`limit` はソート後に適用される。`users/a` < `users/b`、`teams/t1/members/a` < `teams/t2/members/a`。
 - `collection()` のクエリは**直下のドキュメントのみ**対象(サブコレクション内は含まない)。`collection_group(id)` はパス中のいずれかの階層でコレクション名が `id` に一致するドキュメントすべてが対象。
-- クエリの**実行**(`.get()`)は `batch` / `transaction` 内では不可(13 章の既知の非一貫も参照)。
+- クエリの**構築**(`.where()` / `.limit()`)は `batch` / `transaction` 内でも可。**実行**(`.get()`)のみ不可。
 - カーソル・オフセット・`order_by` は非対応(12 章)。
 
 ## 8. batch / transaction
@@ -283,7 +283,6 @@ usage: fl [--backend in-memory|emulator] <script-file>
 | 項目 | 現状の挙動 | 予定 |
 |------|-----------|------|
 
-| `collection(..).limit(n)` を batch/tx 内で呼ぶ | クエリ「構築」なのにエラーになる(`where` はエラーにならず非一貫) | `.get()` のみ禁止に統一(Phase 5) |
 | 未対応の `where` 演算子(例 `"!="`) | in-memory: 黙って全件不一致 / emulator: 実行時エラー | `where()` 呼び出し時に即エラーへ統一(Phase 5) |
 | `#{` のエスケープ | 不可能(`\#{` も補間される) | `\#{` で literal 化(Phase 6) |
 | マップキー内の `#{}` | 補間されず黙ってリテラル扱い | 明示エラー化(Phase 6) |

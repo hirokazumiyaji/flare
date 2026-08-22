@@ -328,81 +328,16 @@ impl<F: Firestore> Runtime<F> {
         args: Vec<Value>,
     ) -> Result<Value, Box<dyn Error>> {
         match receiver {
-            Value::CollectionRef(collection) => match name {
-                "doc" => Ok(Value::DocRef(DocRef {
-                    path: format!("{}/{}", collection.path, expect_string(args.first())?),
-                })),
-                "where" => Ok(Value::QueryRef(QueryRef {
-                    source: QuerySource::Collection(collection.path),
-                    filters: vec![QueryFilter {
-                        field: expect_string(args.first())?.to_string(),
-                        op: expect_string(args.get(1))?.to_string(),
-                        value: args.get(2).cloned().ok_or("where requires value")?,
-                    }],
-                    limit: None,
-                })),
-                "get" => {
-                    self.forbid_query_in_batch_or_transaction()?;
-                    let docs = self.fs.run_query(&collection.to_query())?;
-                    Ok(Value::Array(docs))
-                }
-                "limit" => {
-                    self.forbid_query_in_batch_or_transaction()?;
-                    let n = expect_int(args.first())? as usize;
-                    Ok(Value::QueryRef(QueryRef {
-                        source: QuerySource::Collection(collection.path),
-                        filters: vec![],
-                        limit: Some(n),
-                    }))
-                }
-                _ => Err(format!("unknown collection method: {name}").into()),
-            },
-            Value::CollectionGroupRef(group) => match name {
-                "where" => Ok(Value::QueryRef(QueryRef {
-                    source: QuerySource::CollectionGroup(group.id),
-                    filters: vec![QueryFilter {
-                        field: expect_string(args.first())?.to_string(),
-                        op: expect_string(args.get(1))?.to_string(),
-                        value: args.get(2).cloned().ok_or("where requires value")?,
-                    }],
-                    limit: None,
-                })),
-                "get" => {
-                    self.forbid_query_in_batch_or_transaction()?;
-                    let docs = self.fs.run_query(&group.to_query())?;
-                    Ok(Value::Array(docs))
-                }
-                "limit" => {
-                    self.forbid_query_in_batch_or_transaction()?;
-                    let n = expect_int(args.first())? as usize;
-                    Ok(Value::QueryRef(QueryRef {
-                        source: QuerySource::CollectionGroup(group.id),
-                        filters: vec![],
-                        limit: Some(n),
-                    }))
-                }
-                _ => Err(format!("unknown collection_group method: {name}").into()),
-            },
-            Value::QueryRef(mut query) => match name {
-                "where" => {
-                    query.filters.push(QueryFilter {
-                        field: expect_string(args.first())?.to_string(),
-                        op: expect_string(args.get(1))?.to_string(),
-                        value: args.get(2).cloned().ok_or("where requires value")?,
-                    });
-                    Ok(Value::QueryRef(query))
-                }
-                "limit" => {
-                    query.limit = Some(expect_int(args.first())? as usize);
-                    Ok(Value::QueryRef(query))
-                }
-                "get" => {
-                    self.forbid_query_in_batch_or_transaction()?;
-                    let docs = self.fs.run_query(&query)?;
-                    Ok(Value::Array(docs))
-                }
-                _ => Err(format!("unknown query method: {name}").into()),
-            },
+            Value::CollectionRef(collection) if name == "doc" => Ok(Value::DocRef(DocRef {
+                path: format!("{}/{}", collection.path, expect_string(args.first())?),
+            })),
+            Value::CollectionRef(collection) => {
+                self.eval_query_method(collection.to_query(), name, args)
+            }
+            Value::CollectionGroupRef(group) => {
+                self.eval_query_method(group.to_query(), name, args)
+            }
+            Value::QueryRef(query) => self.eval_query_method(query, name, args),
             Value::Timestamp(ts) => match name {
                 "to_unix" => Ok(Value::Int(ts.seconds)),
                 "add_seconds" => Ok(Value::Timestamp(Timestamp {
@@ -411,6 +346,33 @@ impl<F: Firestore> Runtime<F> {
                 _ => Err(format!("unknown timestamp method: {name}").into()),
             },
             _ => Err("unsupported method receiver".into()),
+        }
+    }
+
+    fn eval_query_method(
+        &mut self,
+        mut query: QueryRef,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, Box<dyn Error>> {
+        match name {
+            "where" => {
+                query.filters.push(QueryFilter {
+                    field: expect_string(args.first())?.to_string(),
+                    op: expect_string(args.get(1))?.to_string(),
+                    value: args.get(2).cloned().ok_or("where requires value")?,
+                });
+                Ok(Value::QueryRef(query))
+            }
+            "limit" => {
+                query.limit = Some(expect_int(args.first())? as usize);
+                Ok(Value::QueryRef(query))
+            }
+            "get" => {
+                self.forbid_query_in_batch_or_transaction()?;
+                Ok(Value::Array(self.fs.run_query(&query)?))
+            }
+            _ => Err(format!("unknown query method: {name}").into()),
         }
     }
 

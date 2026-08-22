@@ -233,3 +233,12 @@ fn update_missing_document_fails_in_memory() {
     let err = run_script("update(\"users/nope\", {x: 1})").unwrap_err();
     assert!(format!("{err}").contains("document not found"));
 }
+
+#[test]
+fn collection_limit_builds_query_inside_transaction() {
+    // クエリの「構築」は batch/transaction 内でも許される。禁止されるのは .get() 実行のみ。
+    let out = run_script(
+        "q = collection(\"users\").limit(1)\ntransaction { q2 = collection(\"users\").limit(1)\nset(\"users/l1\", {n: 1}) }\nq",
+    );
+    assert!(out.is_ok(), "{out:?}");
+}
