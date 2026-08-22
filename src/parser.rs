@@ -270,6 +270,19 @@ impl Parser {
         self.expect(Token::RBracket)?;
         Ok(Expr::Array(items))
     }
+    fn parse_arg_into(
+        &mut self,
+        args: &mut Vec<Expr>,
+        kwargs: &mut Vec<(String, Expr)>,
+    ) -> Result<(), Box<dyn Error>> {
+        if let Some(kw) = self.parse_kwarg()? {
+            kwargs.push(kw);
+        } else {
+            args.push(self.parse_expr()?);
+        }
+        Ok(())
+    }
+
     fn parse_args(&mut self) -> Result<ParsedArgs, Box<dyn Error>> {
         let mut args = vec![];
         let mut kwargs = vec![];
@@ -277,11 +290,7 @@ impl Parser {
             self.bump();
             if !self.at(&Token::RParen) {
                 loop {
-                    if let Some(kw) = self.parse_kwarg()? {
-                        kwargs.push(kw);
-                    } else {
-                        args.push(self.parse_expr()?);
-                    }
+                    self.parse_arg_into(&mut args, &mut kwargs)?;
                     if self.at(&Token::Comma) {
                         self.bump();
                     } else {
@@ -293,17 +302,12 @@ impl Parser {
             return Ok((args, kwargs));
         }
         if self.is_arg_start() {
-            if let Some(kw) = self.parse_kwarg()? {
-                kwargs.push(kw);
-            } else {
-                args.push(self.parse_expr()?);
-            }
-            while self.at(&Token::Comma) {
-                self.bump();
-                if let Some(kw) = self.parse_kwarg()? {
-                    kwargs.push(kw);
+            loop {
+                self.parse_arg_into(&mut args, &mut kwargs)?;
+                if self.at(&Token::Comma) {
+                    self.bump();
                 } else {
-                    args.push(self.parse_expr()?);
+                    break;
                 }
             }
         }
