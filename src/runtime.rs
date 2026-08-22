@@ -9,11 +9,10 @@ use crate::value::{
 };
 use crate::{lexer, parser};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecCtx {
+enum ExecCtx {
     Normal,
-    Batch,
-    Transaction { wrote: bool },
+    Batch { writes: Vec<WriteOp> },
+    Transaction { writes: Vec<WriteOp> },
 }
 
 pub struct Runtime<F: Firestore> {
@@ -108,9 +107,19 @@ impl<F: Firestore> Runtime<F> {
 
     fn forbid_query_in_batch_or_transaction(&self) -> Result<(), Box<dyn Error>> {
         match self.exec {
-            ExecCtx::Batch => Err("queries are not allowed inside batch".into()),
+            ExecCtx::Batch { .. } => Err("queries are not allowed inside batch".into()),
             ExecCtx::Transaction { .. } => Err("queries are not allowed inside transaction".into()),
             ExecCtx::Normal => Ok(()),
+        }
+    }
+
+    fn dispatch_write(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
+        match &mut self.exec {
+            ExecCtx::Normal => self.fs.apply(vec![op]),
+            ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => {
+                writes.push(op);
+                Ok(())
+            }
         }
     }
 
@@ -206,15 +215,17 @@ impl<F: Firestore> Runtime<F> {
             "array_remove" => Ok(Value::ArrayRemove(expect_array(args.first())?.clone())),
             "get" => {
                 let path = expect_doc_path(args.first())?;
-                let v = match self.exec {
-                    ExecCtx::Batch => return Err("get is not allowed inside batch".into()),
-                    ExecCtx::Transaction { wrote: true } => {
+                let v = match &self.exec {
+                    ExecCtx::Batch { .. } => {
+                        return Err("get is not allowed inside batch".into());
+                    }
+                    ExecCtx::Transaction { writes } if !writes.is_empty() => {
                         return Err(
                             "get is not allowed after the first write in a transaction".into()
                         );
                     }
-                    ExecCtx::Transaction { wrote: false } => {
-                        self.fs.get_in_transaction(path)?.unwrap_or(Value::Nil)
+                    ExecCtx::Transaction { .. } => {
+                        self.fs.transaction_get(path)?.unwrap_or(Value::Nil)
                     }
                     ExecCtx::Normal => self.fs.get(path)?.unwrap_or(Value::Nil),
                 };
@@ -230,79 +241,64 @@ impl<F: Firestore> Runtime<F> {
                     _ => return Err("set merge must be bool".into()),
                 };
                 let path = path.to_string();
-                match &mut self.exec {
-                    ExecCtx::Normal => self.fs.set(&path, data, merge)?,
-                    ExecCtx::Batch => self.fs.batch_stage(WriteOp::Set { path, data, merge })?,
-                    ExecCtx::Transaction { wrote } => {
-                        self.fs
-                            .transaction_stage(WriteOp::Set { path, data, merge })?;
-                        *wrote = true;
-                    }
-                }
+                self.dispatch_write(WriteOp::Set { path, data, merge })?;
                 Ok(Value::Nil)
             }
             "update" => {
                 let path = expect_doc_path(args.first())?;
                 let data = expect_map(args.get(1))?.clone();
                 let path = path.to_string();
-                match &mut self.exec {
-                    ExecCtx::Normal => self.fs.update(&path, data)?,
-                    ExecCtx::Batch => self.fs.batch_stage(WriteOp::Update { path, data })?,
-                    ExecCtx::Transaction { wrote } => {
-                        self.fs.transaction_stage(WriteOp::Update { path, data })?;
-                        *wrote = true;
-                    }
-                }
+                self.dispatch_write(WriteOp::Update { path, data })?;
                 Ok(Value::Nil)
             }
             "delete" => {
                 let path = expect_doc_path(args.first())?;
                 let path = path.to_string();
-                match &mut self.exec {
-                    ExecCtx::Normal => self.fs.delete(&path)?,
-                    ExecCtx::Batch => self.fs.batch_stage(WriteOp::Delete { path })?,
-                    ExecCtx::Transaction { wrote } => {
-                        self.fs.transaction_stage(WriteOp::Delete { path })?;
-                        *wrote = true;
-                    }
-                }
+                self.dispatch_write(WriteOp::Delete { path })?;
                 Ok(Value::Nil)
             }
             "batch" => {
                 let Some(stmts) = block else {
                     return Err("batch requires { ... } block".into());
                 };
-                self.fs.begin_batch()?;
-                self.exec = ExecCtx::Batch;
-                let result = match self.eval_block(stmts) {
-                    Ok(flow) => self.fs.commit_batch().map(|()| match flow {
-                        ExecFlow::Value(v) | ExecFlow::Return(v) => v,
-                    }),
-                    Err(e) => {
-                        self.fs.abort_batch();
-                        Err(e)
-                    }
+                if !matches!(self.exec, ExecCtx::Normal) {
+                    return Err("batch cannot be nested inside batch/transaction".into());
+                }
+                self.exec = ExecCtx::Batch { writes: vec![] };
+                let flow = self.eval_block(stmts);
+                let ExecCtx::Batch { writes } = std::mem::replace(&mut self.exec, ExecCtx::Normal)
+                else {
+                    unreachable!("exec ctx changed inside batch");
                 };
-                self.exec = ExecCtx::Normal;
-                result
+                let flow = flow?;
+                self.fs.apply(writes)?;
+                Ok(flow.into_value())
             }
             "transaction" => {
                 let Some(stmts) = block else {
                     return Err("transaction requires { ... } block".into());
                 };
+                if !matches!(self.exec, ExecCtx::Normal) {
+                    return Err("transaction cannot be nested inside batch/transaction".into());
+                }
                 self.fs.begin_transaction()?;
-                self.exec = ExecCtx::Transaction { wrote: false };
-                let result = match self.eval_block(stmts) {
-                    Ok(flow) => self.fs.commit_transaction().map(|()| match flow {
-                        ExecFlow::Value(v) | ExecFlow::Return(v) => v,
-                    }),
+                self.exec = ExecCtx::Transaction { writes: vec![] };
+                let flow = self.eval_block(stmts);
+                let ExecCtx::Transaction { writes } =
+                    std::mem::replace(&mut self.exec, ExecCtx::Normal)
+                else {
+                    unreachable!("exec ctx changed inside transaction");
+                };
+                match flow {
+                    Ok(flow) => {
+                        self.fs.commit_transaction(writes)?;
+                        Ok(flow.into_value())
+                    }
                     Err(e) => {
                         self.fs.abort_transaction();
                         Err(e)
                     }
-                };
-                self.exec = ExecCtx::Normal;
-                result
+                }
             }
             _ => {
                 let Some(Value::Func(func)) = self.get_var(name).cloned() else {
@@ -347,7 +343,7 @@ impl<F: Firestore> Runtime<F> {
                 })),
                 "get" => {
                     self.forbid_query_in_batch_or_transaction()?;
-                    let docs = self.fs.query_collection(&collection.path, &[], None)?;
+                    let docs = self.fs.run_query(&collection.to_query())?;
                     Ok(Value::Array(docs))
                 }
                 "limit" => {
@@ -373,7 +369,7 @@ impl<F: Firestore> Runtime<F> {
                 })),
                 "get" => {
                     self.forbid_query_in_batch_or_transaction()?;
-                    let docs = self.fs.query_collection_group(&group.id, &[], None)?;
+                    let docs = self.fs.run_query(&group.to_query())?;
                     Ok(Value::Array(docs))
                 }
                 "limit" => {
@@ -402,16 +398,7 @@ impl<F: Firestore> Runtime<F> {
                 }
                 "get" => {
                     self.forbid_query_in_batch_or_transaction()?;
-                    let docs = match &query.source {
-                        QuerySource::Collection(path) => {
-                            self.fs
-                                .query_collection(path, &query.filters, query.limit)?
-                        }
-                        QuerySource::CollectionGroup(id) => {
-                            self.fs
-                                .query_collection_group(id, &query.filters, query.limit)?
-                        }
-                    };
+                    let docs = self.fs.run_query(&query)?;
                     Ok(Value::Array(docs))
                 }
                 _ => Err(format!("unknown query method: {name}").into()),
@@ -633,4 +620,12 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
 enum ExecFlow {
     Value(Value),
     Return(Value),
+}
+
+impl ExecFlow {
+    fn into_value(self) -> Value {
+        match self {
+            ExecFlow::Value(v) | ExecFlow::Return(v) => v,
+        }
+    }
 }

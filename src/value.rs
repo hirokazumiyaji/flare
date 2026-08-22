@@ -83,6 +83,26 @@ impl Value {
     }
 }
 
+impl CollectionRef {
+    pub fn to_query(&self) -> QueryRef {
+        QueryRef {
+            source: QuerySource::Collection(self.path.clone()),
+            filters: vec![],
+            limit: None,
+        }
+    }
+}
+
+impl CollectionGroupRef {
+    pub fn to_query(&self) -> QueryRef {
+        QueryRef {
+            source: QuerySource::CollectionGroup(self.id.clone()),
+            filters: vec![],
+            limit: None,
+        }
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

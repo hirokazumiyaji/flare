@@ -2,74 +2,69 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
 use super::{Firestore, WriteOp};
-use crate::value::{QueryFilter, Timestamp, Value};
-
-enum InMemoryMode {
-    Batch(Vec<WriteOp>),
-    Transaction {
-        snapshot: HashMap<String, BTreeMap<String, Value>>,
-        writes: Vec<WriteOp>,
-    },
-}
+use crate::value::{QueryFilter, QueryRef, QuerySource, Timestamp, Value};
 
 #[derive(Default)]
 pub struct InMemoryFirestore {
     docs: HashMap<String, BTreeMap<String, Value>>,
-    mode: Option<InMemoryMode>,
+    tx_snapshot: Option<HashMap<String, BTreeMap<String, Value>>>,
 }
 
 impl Firestore for InMemoryFirestore {
     fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("internal error: get while in batch/transaction".into());
-        }
         Ok(self.docs.get(path).cloned().map(Value::Map))
     }
 
-    fn set(
-        &mut self,
-        path: &str,
-        value: BTreeMap<String, Value>,
-        merge: bool,
-    ) -> Result<(), Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("internal error: set while in batch/transaction".into());
+    fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        let mut next = self.docs.clone();
+        for op in writes {
+            apply_write_to_docs(&mut next, op)?;
         }
-        apply_write_to_docs(
-            &mut self.docs,
-            WriteOp::Set {
-                path: path.to_string(),
-                data: value,
-                merge,
-            },
-        )
+        self.docs = next;
+        Ok(())
     }
 
-    fn update(&mut self, path: &str, value: BTreeMap<String, Value>) -> Result<(), Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("internal error: update while in batch/transaction".into());
+    fn run_query(&self, query: &QueryRef) -> Result<Vec<Value>, Box<dyn Error>> {
+        match &query.source {
+            QuerySource::Collection(path) => {
+                self.query_collection(path, &query.filters, query.limit)
+            }
+            QuerySource::CollectionGroup(id) => {
+                self.query_collection_group(id, &query.filters, query.limit)
+            }
         }
-        apply_write_to_docs(
-            &mut self.docs,
-            WriteOp::Update {
-                path: path.to_string(),
-                data: value,
-            },
-        )
     }
 
-    fn delete(&mut self, path: &str) -> Result<(), Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("internal error: delete while in batch/transaction".into());
+    fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.tx_snapshot.is_some() {
+            return Err("already in transaction".into());
         }
-        apply_write_to_docs(
-            &mut self.docs,
-            WriteOp::Delete {
-                path: path.to_string(),
-            },
-        )
+        self.tx_snapshot = Some(self.docs.clone());
+        Ok(())
     }
 
+    fn transaction_get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+        match &self.tx_snapshot {
+            Some(snapshot) => Ok(snapshot.get(path).cloned().map(Value::Map)),
+            None => Err("not in transaction".into()),
+        }
+    }
+
+    fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        let mut next = self.tx_snapshot.take().ok_or("not in transaction")?;
+        for op in writes {
+            apply_write_to_docs(&mut next, op)?;
+        }
+        self.docs = next;
+        Ok(())
+    }
+
+    fn abort_transaction(&mut self) {
+        self.tx_snapshot = None;
+    }
+}
+
+impl InMemoryFirestore {
     fn query_collection(
         &self,
         path: &str,
@@ -121,92 +116,6 @@ impl Firestore for InMemoryFirestore {
         }
         matches.sort_by(|a, b| a.0.cmp(b.0));
         Ok(take_matches(matches, limit))
-    }
-
-    fn begin_batch(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("already in batch or transaction".into());
-        }
-        self.mode = Some(InMemoryMode::Batch(vec![]));
-        Ok(())
-    }
-
-    fn batch_stage(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
-        match &mut self.mode {
-            Some(InMemoryMode::Batch(ops)) => {
-                ops.push(op);
-                Ok(())
-            }
-            _ => Err("not in batch".into()),
-        }
-    }
-
-    fn commit_batch(&mut self) -> Result<(), Box<dyn Error>> {
-        if let Some(InMemoryMode::Batch(ops)) = self.mode.take() {
-            let mut new_docs = self.docs.clone();
-            for op in ops {
-                apply_write_to_docs(&mut new_docs, op)?;
-            }
-            self.docs = new_docs;
-            Ok(())
-        } else {
-            Err("not in batch".into())
-        }
-    }
-
-    fn abort_batch(&mut self) {
-        if matches!(self.mode, Some(InMemoryMode::Batch(_))) {
-            self.mode = None;
-        }
-    }
-
-    fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("already in batch or transaction".into());
-        }
-        self.mode = Some(InMemoryMode::Transaction {
-            snapshot: self.docs.clone(),
-            writes: vec![],
-        });
-        Ok(())
-    }
-
-    fn get_in_transaction(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>> {
-        match &self.mode {
-            Some(InMemoryMode::Transaction { snapshot, .. }) => {
-                Ok(snapshot.get(path).cloned().map(Value::Map))
-            }
-            _ => Err("not in transaction".into()),
-        }
-    }
-
-    fn transaction_stage(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
-        match &mut self.mode {
-            Some(InMemoryMode::Transaction { writes, .. }) => {
-                writes.push(op);
-                Ok(())
-            }
-            _ => Err("not in transaction".into()),
-        }
-    }
-
-    fn commit_transaction(&mut self) -> Result<(), Box<dyn Error>> {
-        if let Some(InMemoryMode::Transaction { snapshot, writes }) = self.mode.take() {
-            let mut new_docs = snapshot;
-            for op in writes {
-                apply_write_to_docs(&mut new_docs, op)?;
-            }
-            self.docs = new_docs;
-            Ok(())
-        } else {
-            Err("not in transaction".into())
-        }
-    }
-
-    fn abort_transaction(&mut self) {
-        if matches!(self.mode, Some(InMemoryMode::Transaction { .. })) {
-            self.mode = None;
-        }
     }
 }
 
