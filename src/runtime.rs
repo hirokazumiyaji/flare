@@ -4,8 +4,7 @@ use std::error::Error;
 use crate::ast::{BinOp, Expr, Stmt};
 use crate::firestore::{Firestore, WriteOp};
 use crate::value::{
-    CollectionGroupRef, CollectionRef, DocRef, QueryFilter, QueryRef, QuerySource, Timestamp,
-    UserFunc, Value,
+    CollectionGroupRef, CollectionRef, DocRef, QueryFilter, QueryRef, Timestamp, UserFunc, Value,
 };
 use crate::{lexer, parser};
 
