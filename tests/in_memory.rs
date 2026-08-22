@@ -248,3 +248,24 @@ fn where_rejects_unsupported_operator() {
     let err = run_script("collection(\"users\").where(\"a\", \"!=\", 1)").unwrap_err();
     assert!(format!("{err}").contains("unsupported query op"), "{err}");
 }
+
+#[test]
+fn escaped_interpolation_stays_literal() {
+    let out = run_script("\"a \\#{1} b\"").unwrap();
+    assert_eq!(out, Value::Str("a #{1} b".to_string()));
+}
+
+#[test]
+fn interpolation_in_map_key_is_rejected() {
+    let err = run_script("{\"k#{1}\": 1}").unwrap_err();
+    assert!(
+        format!("{err}").contains("interpolation is not allowed in map keys"),
+        "{err}"
+    );
+}
+
+#[test]
+fn unterminated_interpolation_fails_at_lex_time() {
+    let err = firelang::lexer::lex("\"#{1 + 2\"").unwrap_err();
+    assert!(format!("{err}").contains("unterminated"), "{err}");
+}

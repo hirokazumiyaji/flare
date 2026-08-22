@@ -4,6 +4,7 @@ use std::fmt;
 pub enum Expr {
     Int(i64),
     Str(String),
+    StrInterp(Vec<StrPiece>),
     Bool(bool),
     Nil,
     Var(String),
@@ -77,4 +78,10 @@ impl fmt::Display for BinOp {
         };
         write!(f, "{s}")
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StrPiece {
+    Lit(String),
+    Expr(Expr),
 }

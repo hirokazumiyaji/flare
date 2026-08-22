@@ -1,13 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
-use crate::ast::{BinOp, Expr, Stmt};
+use crate::ast::{BinOp, Expr, Stmt, StrPiece};
 use crate::firestore::{Firestore, WriteOp};
 use crate::value::{
     CollectionGroupRef, CollectionRef, DocRef, QueryFilter, QueryOp, QueryRef, Timestamp, UserFunc,
     Value,
 };
-use crate::{lexer, parser};
 
 enum ExecCtx {
     Normal,
@@ -126,7 +125,20 @@ impl<F: Firestore> Runtime<F> {
     fn eval_expr(&mut self, expr: &Expr) -> Result<Value, Box<dyn Error>> {
         match expr {
             Expr::Int(i) => Ok(Value::Int(*i)),
-            Expr::Str(s) => Ok(Value::Str(self.eval_interpolated_string(s)?)),
+            Expr::Str(s) => Ok(Value::Str(s.clone())),
+            Expr::StrInterp(pieces) => {
+                let mut out = String::new();
+                for piece in pieces {
+                    match piece {
+                        StrPiece::Lit(s) => out.push_str(s),
+                        StrPiece::Expr(e) => {
+                            let v = self.eval_expr(e)?;
+                            out.push_str(&v.to_string());
+                        }
+                    }
+                }
+                Ok(Value::Str(out))
+            }
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Nil => Ok(Value::Nil),
             Expr::Var(name) => self
@@ -398,60 +410,6 @@ impl<F: Firestore> Runtime<F> {
 
     fn var_exists(&self, name: &str) -> bool {
         self.scopes.iter().rev().any(|s| s.contains_key(name))
-    }
-
-    fn eval_interpolated_string(&mut self, raw: &str) -> Result<String, Box<dyn Error>> {
-        if !raw.contains("#{") {
-            return Ok(raw.to_string());
-        }
-        let mut out = String::new();
-        let chars: Vec<char> = raw.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i] == '#' && i + 1 < chars.len() && chars[i + 1] == '{' {
-                i += 2;
-                let mut depth = 1;
-                let mut expr = String::new();
-                while i < chars.len() && depth > 0 {
-                    match chars[i] {
-                        '{' => {
-                            depth += 1;
-                            expr.push('{');
-                        }
-                        '}' => {
-                            depth -= 1;
-                            if depth > 0 {
-                                expr.push('}');
-                            }
-                        }
-                        ch => expr.push(ch),
-                    }
-                    i += 1;
-                }
-                if depth != 0 {
-                    return Err("unterminated string interpolation".into());
-                }
-                let value = self.eval_embedded_expr(expr.trim())?;
-                out.push_str(&value.to_string());
-            } else {
-                out.push(chars[i]);
-                i += 1;
-            }
-        }
-        Ok(out)
-    }
-
-    fn eval_embedded_expr(&mut self, expr_src: &str) -> Result<Value, Box<dyn Error>> {
-        let tokens = lexer::lex(expr_src)?;
-        let mut p = parser::Parser::new(tokens);
-        let program = p.parse_program()?;
-        if program.len() != 1 {
-            return Err("interpolation must contain a single expression".into());
-        }
-        match &program[0] {
-            Stmt::Expr(expr) => self.eval_expr(expr),
-            _ => Err("interpolation must contain an expression".into()),
-        }
     }
 }
 
