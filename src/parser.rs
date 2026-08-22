@@ -3,6 +3,8 @@ use std::error::Error;
 use crate::ast::{BinOp, Expr, Stmt};
 use crate::lexer::Token;
 
+type ParsedArgs = (Vec<Expr>, Vec<(String, Expr)>);
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -268,7 +270,7 @@ impl Parser {
         self.expect(Token::RBracket)?;
         Ok(Expr::Array(items))
     }
-    fn parse_args(&mut self) -> Result<(Vec<Expr>, Vec<(String, Expr)>), Box<dyn Error>> {
+    fn parse_args(&mut self) -> Result<ParsedArgs, Box<dyn Error>> {
         let mut args = vec![];
         let mut kwargs = vec![];
         if self.at(&Token::LParen) {
