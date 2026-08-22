@@ -3,12 +3,16 @@ pub mod emulator;
 pub mod lexer;
 pub mod parser;
 pub mod runtime;
+pub mod value;
 
 pub use emulator::FirestoreEmulator;
 
 use std::error::Error;
 
-use runtime::{Firestore, InMemoryFirestore, Runtime, Value};
+use runtime::Runtime;
+
+pub use runtime::{Firestore, InMemoryFirestore};
+pub use value::Value;
 
 pub fn run_script(source: &str) -> Result<Value, Box<dyn Error>> {
     run_script_with_firestore(source, InMemoryFirestore::default())
@@ -30,7 +34,8 @@ mod tests {
     use super::run_script;
     use crate::lexer;
     use crate::parser::Parser;
-    use crate::runtime::{InMemoryFirestore, Runtime, Value};
+    use crate::runtime::{InMemoryFirestore, Runtime};
+    use crate::Value;
 
     #[test]
     fn evals_arithmetic() {

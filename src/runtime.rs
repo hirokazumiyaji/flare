@@ -1,68 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ast::{BinOp, Expr, Stmt};
+use crate::value::{
+    CollectionGroupRef, CollectionRef, DocRef, QueryFilter, QueryRef, QuerySource, Timestamp,
+    UserFunc, Value,
+};
 use crate::{lexer, parser};
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    Int(i64),
-    Str(String),
-    Bool(bool),
-    Nil,
-    Array(Vec<Value>),
-    Map(BTreeMap<String, Value>),
-    Timestamp(Timestamp),
-    ServerTimestamp,
-    ArrayUnion(Vec<Value>),
-    ArrayRemove(Vec<Value>),
-    DocRef(DocRef),
-    CollectionRef(CollectionRef),
-    CollectionGroupRef(CollectionGroupRef),
-    QueryRef(QueryRef),
-    Func(UserFunc),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Timestamp {
-    pub seconds: i64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct DocRef {
-    pub path: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct CollectionRef {
-    pub path: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct CollectionGroupRef {
-    pub id: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct QueryRef {
-    pub source: QuerySource,
-    pub filters: Vec<QueryFilter>,
-    pub limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum QuerySource {
-    Collection(String),
-    CollectionGroup(String),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct QueryFilter {
-    pub field: String,
-    pub op: String,
-    pub value: Value,
-}
 
 #[derive(Debug, Clone)]
 pub enum WriteOp {
@@ -85,12 +29,6 @@ pub enum ExecCtx {
     Normal,
     Batch,
     Transaction { wrote: bool },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct UserFunc {
-    pub params: Vec<String>,
-    pub body: Vec<Stmt>,
 }
 
 pub trait Firestore {
@@ -442,7 +380,7 @@ fn resolve_sentinel_map(
                 Value::Array(base.into_iter().filter(|v| !values.contains(v)).collect())
             }
             Value::ServerTimestamp => Value::Timestamp(Timestamp {
-                seconds: current_unix_seconds()?,
+                seconds: Timestamp::now()?.seconds,
             }),
             other => other,
         };
@@ -510,7 +448,7 @@ impl<F: Firestore> Runtime<F> {
                 then_body,
                 else_body,
             } => {
-                let body = if truthy(&self.eval_expr(cond)?) {
+                let body = if self.eval_expr(cond)?.truthy() {
                     then_body
                 } else {
                     else_body
@@ -519,7 +457,7 @@ impl<F: Firestore> Runtime<F> {
             }
             Stmt::While { cond, body } => {
                 let mut last = Value::Nil;
-                while truthy(&self.eval_expr(cond)?) {
+                while self.eval_expr(cond)?.truthy() {
                     match self.eval_block(body)? {
                         ExecFlow::Value(v) => last = v,
                         ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
@@ -615,7 +553,7 @@ impl<F: Firestore> Runtime<F> {
         match name {
             "puts" => {
                 for v in args {
-                    println!("{}", render(&v));
+                    println!("{v}");
                 }
                 Ok(Value::Nil)
             }
@@ -631,7 +569,7 @@ impl<F: Firestore> Runtime<F> {
             "array" => Ok(Value::Array(args)),
 
             "now" => Ok(Value::Timestamp(Timestamp {
-                seconds: current_unix_seconds()?,
+                seconds: Timestamp::now()?.seconds,
             })),
             "timestamp" => Ok(Value::Timestamp(Timestamp {
                 seconds: parse_timestamp_arg(args.first())?,
@@ -918,7 +856,7 @@ impl<F: Firestore> Runtime<F> {
                     return Err("unterminated string interpolation".into());
                 }
                 let value = self.eval_embedded_expr(expr.trim())?;
-                out.push_str(&render(&value));
+                out.push_str(&value.to_string());
             } else {
                 out.push(chars[i]);
                 i += 1;
@@ -968,10 +906,6 @@ fn bind_function_args(
         return Err(format!("unknown keyword arguments: {}", keys.join(", ")).into());
     }
     Ok(out)
-}
-
-pub(crate) fn current_unix_seconds() -> Result<i64, Box<dyn Error>> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64)
 }
 
 fn parse_timestamp_arg(v: Option<&Value>) -> Result<i64, Box<dyn Error>> {
@@ -1067,30 +1001,6 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
             _ => return Err("unsupported <= operands".into()),
         },
     })
-}
-
-fn truthy(v: &Value) -> bool {
-    !matches!(v, Value::Bool(false) | Value::Nil)
-}
-
-fn render(v: &Value) -> String {
-    match v {
-        Value::Int(i) => i.to_string(),
-        Value::Str(s) => s.clone(),
-        Value::Bool(b) => b.to_string(),
-        Value::Nil => "nil".to_string(),
-        Value::Array(a) => format!("{:?}", a),
-        Value::Map(m) => format!("{:?}", m),
-        Value::Timestamp(ts) => format!("Timestamp({})", ts.seconds),
-        Value::ServerTimestamp => "ServerTimestamp".to_string(),
-        Value::ArrayUnion(v) => format!("ArrayUnion({v:?})"),
-        Value::ArrayRemove(v) => format!("ArrayRemove({v:?})"),
-        Value::DocRef(d) => format!("#<DocRef path={}>", d.path),
-        Value::CollectionRef(c) => format!("#<CollectionRef path={}>", c.path),
-        Value::CollectionGroupRef(cg) => format!("#<CollectionGroupRef id={}>", cg.id),
-        Value::QueryRef(_) => "#<QueryRef>".to_string(),
-        Value::Func(_) => "<func>".to_string(),
-    }
 }
 
 enum ExecFlow {

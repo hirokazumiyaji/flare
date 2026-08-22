@@ -14,7 +14,8 @@ use gcloud_sdk::tonic::{Code, Request, Status};
 use prost_types::{NullValue, Timestamp as ProtoTimestamp};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
-use crate::runtime::{Firestore, QueryFilter, Timestamp, Value, WriteOp};
+use crate::runtime::{Firestore, WriteOp};
+use crate::value::{QueryFilter, Timestamp, Value};
 
 pub struct FirestoreEmulator {
     host: String,

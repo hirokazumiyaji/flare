@@ -1,5 +1,5 @@
 use firelang::run_script;
-use firelang::runtime::Value;
+use firelang::Value;
 
 #[test]
 fn runs_example_scripts_successfully() {

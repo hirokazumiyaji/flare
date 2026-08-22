@@ -1,7 +1,8 @@
 //! In-memory backend behavior tests (language + Firestore API).
 
 use firelang::run_script;
-use firelang::runtime::{InMemoryFirestore, Runtime, Value};
+use firelang::runtime::{InMemoryFirestore, Runtime};
+use firelang::Value;
 
 fn run_in(
     runtime: &mut Runtime<InMemoryFirestore>,
