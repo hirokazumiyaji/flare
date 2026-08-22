@@ -206,7 +206,7 @@ collection("users").doc("1")       # doc("users/1") と同等
 
 ## 8. batch / transaction
 
-どちらも `{ ... }` ブロックが必須で、ブロックの最後の値を返す。ネスト(batch/transaction 内での batch/transaction)は不可。
+どちらも `{ ... }` ブロックが必須で、ブロックの最後の値を返す。ネスト(batch/transaction 内での batch/transaction)は不可(エラーメッセージ: `batch cannot be nested inside batch/transaction` / `transaction cannot be nested inside batch/transaction`)。
 
 ### batch
 
