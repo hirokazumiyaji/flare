@@ -15,7 +15,7 @@ use prost_types::{NullValue, Timestamp as ProtoTimestamp};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 use super::{Firestore, WriteOp};
-use crate::value::{QueryFilter, QueryRef, QuerySource, Timestamp, Value};
+use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value};
 
 pub struct FirestoreEmulator {
     host: String,
@@ -357,13 +357,12 @@ fn build_where(
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
     let mut parts = vec![];
     for f in filters {
-        let op = match f.op.as_str() {
-            "==" => structured_query::field_filter::Operator::Equal,
-            ">" => structured_query::field_filter::Operator::GreaterThan,
-            ">=" => structured_query::field_filter::Operator::GreaterThanOrEqual,
-            "<" => structured_query::field_filter::Operator::LessThan,
-            "<=" => structured_query::field_filter::Operator::LessThanOrEqual,
-            o => return Err(format!("unsupported query op: {o}").into()),
+        let op = match f.op {
+            QueryOp::Eq => structured_query::field_filter::Operator::Equal,
+            QueryOp::Gt => structured_query::field_filter::Operator::GreaterThan,
+            QueryOp::Ge => structured_query::field_filter::Operator::GreaterThanOrEqual,
+            QueryOp::Lt => structured_query::field_filter::Operator::LessThan,
+            QueryOp::Le => structured_query::field_filter::Operator::LessThanOrEqual,
         };
         parts.push(structured_query::Filter {
             filter_type: Some(structured_query::filter::FilterType::FieldFilter(

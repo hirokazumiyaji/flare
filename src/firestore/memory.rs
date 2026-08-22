@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
 use super::{Firestore, WriteOp};
-use crate::value::{QueryFilter, QueryRef, QuerySource, Timestamp, Value};
+use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value};
 
 #[derive(Default)]
 pub struct InMemoryFirestore {
@@ -175,13 +175,12 @@ fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bo
         let Some(actual) = doc.get(&f.field) else {
             return false;
         };
-        match f.op.as_str() {
-            "==" => actual == &f.value,
-            ">" => compare_int(actual, &f.value, |a, b| a > b),
-            ">=" => compare_int(actual, &f.value, |a, b| a >= b),
-            "<" => compare_int(actual, &f.value, |a, b| a < b),
-            "<=" => compare_int(actual, &f.value, |a, b| a <= b),
-            _ => false,
+        match f.op {
+            QueryOp::Eq => actual == &f.value,
+            QueryOp::Gt => compare_int(actual, &f.value, |a, b| a > b),
+            QueryOp::Ge => compare_int(actual, &f.value, |a, b| a >= b),
+            QueryOp::Lt => compare_int(actual, &f.value, |a, b| a < b),
+            QueryOp::Le => compare_int(actual, &f.value, |a, b| a <= b),
         }
     })
 }

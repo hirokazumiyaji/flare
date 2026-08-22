@@ -242,3 +242,9 @@ fn collection_limit_builds_query_inside_transaction() {
     );
     assert!(out.is_ok(), "{out:?}");
 }
+
+#[test]
+fn where_rejects_unsupported_operator() {
+    let err = run_script("collection(\"users\").where(\"a\", \"!=\", 1)").unwrap_err();
+    assert!(format!("{err}").contains("unsupported query op"), "{err}");
+}

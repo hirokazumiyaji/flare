@@ -57,10 +57,32 @@ pub enum QuerySource {
     CollectionGroup(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryOp {
+    Eq,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+}
+
+impl QueryOp {
+    pub fn parse(s: &str) -> Result<Self, Box<dyn Error>> {
+        Ok(match s {
+            "==" => Self::Eq,
+            ">" => Self::Gt,
+            ">=" => Self::Ge,
+            "<" => Self::Lt,
+            "<=" => Self::Le,
+            other => return Err(format!("unsupported query op: {other}").into()),
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryFilter {
     pub field: String,
-    pub op: String,
+    pub op: QueryOp,
     pub value: Value,
 }
 

@@ -4,7 +4,8 @@ use std::error::Error;
 use crate::ast::{BinOp, Expr, Stmt};
 use crate::firestore::{Firestore, WriteOp};
 use crate::value::{
-    CollectionGroupRef, CollectionRef, DocRef, QueryFilter, QueryRef, Timestamp, UserFunc, Value,
+    CollectionGroupRef, CollectionRef, DocRef, QueryFilter, QueryOp, QueryRef, Timestamp, UserFunc,
+    Value,
 };
 use crate::{lexer, parser};
 
@@ -358,7 +359,7 @@ impl<F: Firestore> Runtime<F> {
             "where" => {
                 query.filters.push(QueryFilter {
                     field: expect_string(args.first())?.to_string(),
-                    op: expect_string(args.get(1))?.to_string(),
+                    op: QueryOp::parse(expect_string(args.get(1))?)?,
                     value: args.get(2).cloned().ok_or("where requires value")?,
                 });
                 Ok(Value::QueryRef(query))
