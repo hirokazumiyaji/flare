@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod emulator;
+pub mod firestore;
 pub mod lexer;
 pub mod parser;
 pub mod runtime;
@@ -11,7 +12,7 @@ use std::error::Error;
 
 use runtime::Runtime;
 
-pub use runtime::{Firestore, InMemoryFirestore};
+pub use firestore::{Firestore, InMemoryFirestore};
 pub use value::Value;
 
 pub fn run_script(source: &str) -> Result<Value, Box<dyn Error>> {
@@ -34,8 +35,8 @@ mod tests {
     use super::run_script;
     use crate::lexer;
     use crate::parser::Parser;
-    use crate::runtime::{InMemoryFirestore, Runtime};
-    use crate::Value;
+    use crate::runtime::Runtime;
+    use crate::{InMemoryFirestore, Value};
 
     #[test]
     fn evals_arithmetic() {
