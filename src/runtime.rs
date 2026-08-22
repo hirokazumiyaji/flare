@@ -629,7 +629,7 @@ impl<F: Firestore> Runtime<F> {
                 id: expect_string(args.first())?.to_string(),
             })),
             "array" => Ok(Value::Array(args)),
-            "map" => map_from_kv(&args),
+
             "now" => Ok(Value::Timestamp(Timestamp {
                 seconds: current_unix_seconds()?,
             })),
@@ -941,21 +941,6 @@ impl<F: Firestore> Runtime<F> {
     }
 }
 
-fn map_from_kv(args: &[Value]) -> Result<Value, Box<dyn Error>> {
-    if args.len() % 2 != 0 {
-        return Err("map requires even number of args: key, value, ...".into());
-    }
-    let mut out = BTreeMap::new();
-    let mut i = 0;
-    while i < args.len() {
-        let key = expect_string(args.get(i))?.to_string();
-        let value = args.get(i + 1).cloned().ok_or("map value missing")?;
-        out.insert(key, value);
-        i += 2;
-    }
-    Ok(Value::Map(out))
-}
-
 fn bind_function_args(
     params: &[String],
     positional: Vec<Value>,
@@ -998,42 +983,9 @@ fn parse_timestamp_arg(v: Option<&Value>) -> Result<i64, Box<dyn Error>> {
 }
 
 fn parse_rfc3339_to_unix(s: &str) -> Result<i64, Box<dyn Error>> {
-    if s.len() < 20 {
-        return Err("invalid RFC3339 timestamp".into());
-    }
-    let year: i64 = s[0..4].parse()?;
-    let month: i64 = s[5..7].parse()?;
-    let day: i64 = s[8..10].parse()?;
-    let hour: i64 = s[11..13].parse()?;
-    let minute: i64 = s[14..16].parse()?;
-    let second: i64 = s[17..19].parse()?;
-    let tz = &s[19..];
-    let offset_seconds = if tz == "Z" {
-        0
-    } else {
-        if tz.len() != 6 || (tz.as_bytes()[0] != b'+' && tz.as_bytes()[0] != b'-') {
-            return Err("invalid RFC3339 timezone offset".into());
-        }
-        let sign = if tz.as_bytes()[0] == b'+' { 1 } else { -1 };
-        let off_h: i64 = tz[1..3].parse()?;
-        let off_m: i64 = tz[4..6].parse()?;
-        sign * (off_h * 3600 + off_m * 60)
-    };
-
-    let days = days_from_civil(year, month, day);
-    let local = days * 86_400 + hour * 3600 + minute * 60 + second;
-    Ok(local - offset_seconds)
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    // Howard Hinnant's civil-from-days inverse
-    let y = year - (month <= 2) as i64;
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = month + if month > 2 { -3 } else { 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
+    Ok(chrono::DateTime::parse_from_rfc3339(s)
+        .map_err(|e| format!("invalid RFC3339 timestamp: {e}"))?
+        .timestamp())
 }
 
 fn expect_string(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {

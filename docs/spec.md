@@ -282,7 +282,7 @@ usage: fl [--backend in-memory|emulator] <script-file>
 
 | 項目 | 現状の挙動 | 予定 |
 |------|-----------|------|
-| `map(k, v, ...)` ビルトイン | 未文書のまま存在(`{}` リテラルと重複) | 削除(Phase 2) |
+
 | `collection(..).limit(n)` を batch/tx 内で呼ぶ | クエリ「構築」なのにエラーになる(`where` はエラーにならず非一貫) | `.get()` のみ禁止に統一(Phase 5) |
 | 未対応の `where` 演算子(例 `"!="`) | in-memory: 黙って全件不一致 / emulator: 実行時エラー | `where()` 呼び出し時に即エラーへ統一(Phase 5) |
 | `#{` のエスケープ | 不可能(`\#{` も補間される) | `\#{` で literal 化(Phase 6) |
