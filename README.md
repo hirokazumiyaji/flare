@@ -15,7 +15,7 @@ puts "found #{rows}"
 - [言語仕様 / API リファレンス](docs/spec.md) — 言語・Firestore API・batch/transaction セマンティクスの正式仕様
 - [examples/scripts/](examples/scripts/) — 動くサンプルスクリプト集
 - [リリースチェックリスト](docs/release-checklist.md)
-- [リファクタリング計画](docs/superpowers/plans/2026-06-12-firelang-refactoring.md) / [過去の MVP 計画資料(アーカイブ)](docs/archive/mvp/)
+- [過去の MVP 計画資料(アーカイブ)](docs/archive/mvp/)
 
 ## 使い方
 
