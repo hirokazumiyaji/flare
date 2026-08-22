@@ -1,7 +1,9 @@
 //! Firestore backend abstraction.
 
+mod emulator;
 mod memory;
 
+pub use emulator::FirestoreEmulator;
 pub use memory::InMemoryFirestore;
 
 use std::collections::BTreeMap;

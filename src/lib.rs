@@ -1,18 +1,15 @@
 pub mod ast;
-pub mod emulator;
 pub mod firestore;
 pub mod lexer;
 pub mod parser;
 pub mod runtime;
 pub mod value;
 
-pub use emulator::FirestoreEmulator;
-
 use std::error::Error;
 
 use runtime::Runtime;
 
-pub use firestore::{Firestore, InMemoryFirestore};
+pub use firestore::{Firestore, FirestoreEmulator, InMemoryFirestore};
 pub use value::Value;
 
 pub fn run_script(source: &str) -> Result<Value, Box<dyn Error>> {
