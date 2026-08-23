@@ -83,7 +83,8 @@ name = "fire"
 ```
 
 - `#{}` の中身は**単一の式**でなければならない(文・複数式はエラー)。
-- 現状の制限: `#{` 自体をエスケープして文字として書く手段はない(リファクタリング Phase 6 で `\#{` を導入予定)。
+- `\#{` で `#{` をリテラルとして書ける(エスケープ)。
+- マップリテラルの**キー**内の補間(`{"k#{1}": v}`)はエラー。
 
 ### 配列・マップリテラル
 
@@ -195,18 +196,19 @@ collection("users").doc("1")       # doc("users/1") と同等
 ```
 
 - `where(field, op, value)` — op は `"=="` `">"` `">="` `"<"` `"<="` の 5 種。複数 `where` は AND。
+  - 未対応の op を渡すと `where()` 呼び出し時に即エラー(`unsupported query op: ...`)。
   - `==` は任意の値の構造比較。大小比較(`>` 等)は **Int フィールドのみ**マッチし、他の型は偽。
   - フィールドが存在しないドキュメントはマッチしない。
 - `limit(n)` — 件数上限。後勝ち(複数回呼ぶと最後の値)。
 - `get()` — 実行して `Array<Map>` を返す。各 Map には `__name__` キーで**相対ドキュメントパス**(例 `"users/1"`)が入る。
 - **決定的順序**: 結果は firelang 相対ドキュメントパス文字列の辞書順でソートされ、`limit` はソート後に適用される。`users/a` < `users/b`、`teams/t1/members/a` < `teams/t2/members/a`。
 - `collection()` のクエリは**直下のドキュメントのみ**対象(サブコレクション内は含まない)。`collection_group(id)` はパス中のいずれかの階層でコレクション名が `id` に一致するドキュメントすべてが対象。
-- クエリの**実行**(`.get()`)は `batch` / `transaction` 内では不可(13 章の既知の非一貫も参照)。
+- クエリの**構築**(`.where()` / `.limit()`)は `batch` / `transaction` 内でも可。**実行**(`.get()`)のみ不可。
 - カーソル・オフセット・`order_by` は非対応(12 章)。
 
 ## 8. batch / transaction
 
-どちらも `{ ... }` ブロックが必須で、ブロックの最後の値を返す。ネスト(batch/transaction 内での batch/transaction)は不可。
+どちらも `{ ... }` ブロックが必須で、ブロックの最後の値を返す。ネスト(batch/transaction 内での batch/transaction)は不可(エラーメッセージ: `batch cannot be nested inside batch/transaction` / `transaction cannot be nested inside batch/transaction`)。
 
 ### batch
 
@@ -278,15 +280,13 @@ usage: fl [--backend in-memory|emulator] <script-file>
 
 ## 13. 既知の制限・実装メモ
 
-実装済みコードから確認された、仕様としては保証しない・将来直す予定の挙動。修正計画は [リファクタリング計画](superpowers/plans/2026-06-12-firelang-refactoring.md) を参照。
+実装済みコードから確認された、仕様としては保証しない・将来直す予定の挙動。
 
 | 項目 | 現状の挙動 | 予定 |
 |------|-----------|------|
-| `map(k, v, ...)` ビルトイン | 未文書のまま存在(`{}` リテラルと重複) | 削除(Phase 2) |
-| `collection(..).limit(n)` を batch/tx 内で呼ぶ | クエリ「構築」なのにエラーになる(`where` はエラーにならず非一貫) | `.get()` のみ禁止に統一(Phase 5) |
-| 未対応の `where` 演算子(例 `"!="`) | in-memory: 黙って全件不一致 / emulator: 実行時エラー | `where()` 呼び出し時に即エラーへ統一(Phase 5) |
-| `#{` のエスケープ | 不可能(`\#{` も補間される) | `\#{` で literal 化(Phase 6) |
-| マップキー内の `#{}` | 補間されず黙ってリテラル扱い | 明示エラー化(Phase 6) |
+
+
+
 | ドキュメントパスの検証 | セグメント数の検証なし(`set("users", ...)` が通る)。挙動未定義 | backlog(当面そのまま) |
 | emulator の transaction 中断 | ロールバック RPC を送らない(サーバ側タイムアウト任せ) | backlog |
 | `puts` / `fl` の複合値出力 | Rust の Debug 形式(`Map({"a": Int(1)})`) | backlog |

@@ -4,6 +4,7 @@ Use before tagging a release or publishing binaries.
 
 1. **Local**
    - `cargo fmt --check`
+   - `cargo clippy --all-targets -- -D warnings`
    - `cargo test --all-targets`
    - `cargo build --release --bin fl`
 

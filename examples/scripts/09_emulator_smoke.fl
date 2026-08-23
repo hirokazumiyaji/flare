@@ -1,4 +1,4 @@
-# Same as 01_basic; run with:
+# Emulator smoke: run with
 #   FIRESTORE_EMULATOR_HOST=... FIRESTORE_PROJECT_ID=... fl --backend emulator examples/scripts/09_emulator_smoke.fl
-a = 2 + 3
-a
+set("smoke/fl", {ok: true, checked_at: server_timestamp()})
+get("smoke/fl")

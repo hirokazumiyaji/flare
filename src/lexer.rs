@@ -1,9 +1,16 @@
 use std::error::Error;
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum StrPart {
+    Lit(String),
+    /// `#{ ... }` の中身の生ソース。パースは parser が行う。
+    Interp(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Int(i64),
-    Str(String),
+    Str(Vec<StrPart>),
     Ident(String),
     True,
     False,
@@ -73,32 +80,57 @@ pub fn lex(input: &str) -> Result<Vec<Token>, Box<dyn Error>> {
             }
             '"' => {
                 chars.next();
-                let mut s = String::new();
+                let mut parts: Vec<StrPart> = vec![];
+                let mut lit = String::new();
                 loop {
-                    let ch = match chars.next() {
-                        None => return Err("unterminated string literal".into()),
-                        Some(c) => c,
-                    };
+                    let ch = chars.next().ok_or("unterminated string literal")?;
                     match ch {
                         '"' => break,
                         '\\' => {
-                            let esc = match chars.next() {
-                                None => return Err("unterminated string literal".into()),
-                                Some(e) => e,
-                            };
-                            s.push(match esc {
+                            let esc = chars.next().ok_or("unterminated string literal")?;
+                            lit.push(match esc {
                                 'n' => '\n',
                                 'r' => '\r',
                                 't' => '\t',
                                 '"' => '"',
                                 '\\' => '\\',
+                                '#' => '#',
                                 other => other,
                             });
                         }
-                        other => s.push(other),
+                        '#' if chars.peek() == Some(&'{') => {
+                            chars.next();
+                            if !lit.is_empty() {
+                                parts.push(StrPart::Lit(std::mem::take(&mut lit)));
+                            }
+                            let mut depth = 1;
+                            let mut expr = String::new();
+                            loop {
+                                let ch = chars.next().ok_or("unterminated string interpolation")?;
+                                match ch {
+                                    '{' => {
+                                        depth += 1;
+                                        expr.push('{');
+                                    }
+                                    '}' => {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            break;
+                                        }
+                                        expr.push('}');
+                                    }
+                                    other => expr.push(other),
+                                }
+                            }
+                            parts.push(StrPart::Interp(expr));
+                        }
+                        other => lit.push(other),
                     }
                 }
-                tokens.push(Token::Str(s));
+                if !lit.is_empty() || parts.is_empty() {
+                    parts.push(StrPart::Lit(lit));
+                }
+                tokens.push(Token::Str(parts));
             }
             '(' => {
                 chars.next();

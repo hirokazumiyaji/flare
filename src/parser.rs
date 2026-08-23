@@ -1,7 +1,9 @@
 use std::error::Error;
 
-use crate::ast::{BinOp, Expr, Stmt};
-use crate::lexer::Token;
+use crate::ast::{BinOp, Expr, Stmt, StrPiece};
+use crate::lexer::{self, StrPart, Token};
+
+type ParsedArgs = (Vec<Expr>, Vec<(String, Expr)>);
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -173,9 +175,9 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Int(v))
             }
-            Token::Str(s) => {
+            Token::Str(parts) => {
                 self.bump();
-                Ok(Expr::Str(s))
+                Self::expr_from_string_parts(parts)
             }
             Token::True => {
                 self.bump();
@@ -229,7 +231,14 @@ impl Parser {
         if !self.at(&Token::RBrace) {
             loop {
                 let key = match self.peek().clone() {
-                    Token::Str(s) | Token::Ident(s) => {
+                    Token::Str(parts) => {
+                        self.bump();
+                        match parts.as_slice() {
+                            [lexer::StrPart::Lit(s)] => s.clone(),
+                            _ => return Err("interpolation is not allowed in map keys".into()),
+                        }
+                    }
+                    Token::Ident(s) => {
                         self.bump();
                         s
                     }
@@ -268,18 +277,27 @@ impl Parser {
         self.expect(Token::RBracket)?;
         Ok(Expr::Array(items))
     }
-    fn parse_args(&mut self) -> Result<(Vec<Expr>, Vec<(String, Expr)>), Box<dyn Error>> {
+    fn parse_arg_into(
+        &mut self,
+        args: &mut Vec<Expr>,
+        kwargs: &mut Vec<(String, Expr)>,
+    ) -> Result<(), Box<dyn Error>> {
+        if let Some(kw) = self.parse_kwarg()? {
+            kwargs.push(kw);
+        } else {
+            args.push(self.parse_expr()?);
+        }
+        Ok(())
+    }
+
+    fn parse_args(&mut self) -> Result<ParsedArgs, Box<dyn Error>> {
         let mut args = vec![];
         let mut kwargs = vec![];
         if self.at(&Token::LParen) {
             self.bump();
             if !self.at(&Token::RParen) {
                 loop {
-                    if let Some(kw) = self.parse_kwarg()? {
-                        kwargs.push(kw);
-                    } else {
-                        args.push(self.parse_expr()?);
-                    }
+                    self.parse_arg_into(&mut args, &mut kwargs)?;
                     if self.at(&Token::Comma) {
                         self.bump();
                     } else {
@@ -291,22 +309,42 @@ impl Parser {
             return Ok((args, kwargs));
         }
         if self.is_arg_start() {
-            if let Some(kw) = self.parse_kwarg()? {
-                kwargs.push(kw);
-            } else {
-                args.push(self.parse_expr()?);
-            }
-            while self.at(&Token::Comma) {
-                self.bump();
-                if let Some(kw) = self.parse_kwarg()? {
-                    kwargs.push(kw);
+            loop {
+                self.parse_arg_into(&mut args, &mut kwargs)?;
+                if self.at(&Token::Comma) {
+                    self.bump();
                 } else {
-                    args.push(self.parse_expr()?);
+                    break;
                 }
             }
         }
         Ok((args, kwargs))
     }
+    fn expr_from_string_parts(parts: Vec<StrPart>) -> Result<Expr, Box<dyn Error>> {
+        if let [StrPart::Lit(s)] = parts.as_slice() {
+            return Ok(Expr::Str(s.clone()));
+        }
+        let mut pieces = vec![];
+        for part in parts {
+            match part {
+                StrPart::Lit(s) => pieces.push(StrPiece::Lit(s)),
+                StrPart::Interp(src) => {
+                    pieces.push(StrPiece::Expr(Self::parse_embedded_expr(&src)?))
+                }
+            }
+        }
+        Ok(Expr::StrInterp(pieces))
+    }
+
+    fn parse_embedded_expr(src: &str) -> Result<Expr, Box<dyn Error>> {
+        let tokens = lexer::lex(src)?;
+        let program = Parser::new(tokens).parse_program()?;
+        match program.as_slice() {
+            [Stmt::Expr(e)] => Ok(e.clone()),
+            _ => Err("interpolation must contain a single expression".into()),
+        }
+    }
+
     fn parse_kwarg(&mut self) -> Result<Option<(String, Expr)>, Box<dyn Error>> {
         if let Token::Ident(name) = self.peek().clone() {
             if self.peek_n(1) == Some(&Token::Colon) {

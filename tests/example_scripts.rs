@@ -1,5 +1,5 @@
 use firelang::run_script;
-use firelang::runtime::Value;
+use firelang::Value;
 
 #[test]
 fn runs_example_scripts_successfully() {
@@ -36,7 +36,6 @@ fn runs_example_scripts_successfully() {
                     .collect(),
             ),
         ),
-        ("examples/scripts/09_emulator_smoke.fl", Value::Int(5)),
     ];
 
     for (path, expected) in cases {
@@ -66,4 +65,12 @@ fn runs_error_example_and_fails_as_expected() {
     let src = std::fs::read_to_string("examples/scripts/08_reassignment_error.fl").unwrap();
     let err = run_script(&src).unwrap_err();
     assert!(format!("{err}").contains("reassignment is not allowed"));
+}
+
+#[test]
+fn emulator_smoke_example_round_trips_in_memory() {
+    let src = std::fs::read_to_string("examples/scripts/09_emulator_smoke.fl").unwrap();
+    let out = run_script(&src).unwrap();
+    let s = format!("{out:?}");
+    assert!(s.contains("Bool(true)") && s.contains("Timestamp"), "{s}");
 }

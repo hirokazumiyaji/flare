@@ -14,22 +14,15 @@ use gcloud_sdk::tonic::{Code, Request, Status};
 use prost_types::{NullValue, Timestamp as ProtoTimestamp};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
-use crate::runtime::{Firestore, QueryFilter, Timestamp, Value, WriteOp};
+use super::{Firestore, WriteOp};
+use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value};
 
 pub struct FirestoreEmulator {
     host: String,
     project_id: String,
     runtime: Runtime,
     db: RefCell<Option<FirestoreDb>>,
-    mode: Option<EmulatorMode>,
-}
-
-enum EmulatorMode {
-    Batch(Vec<WriteOp>),
-    Transaction {
-        transaction_id: Vec<u8>,
-        writes: Vec<WriteOp>,
-    },
+    transaction_id: Option<Vec<u8>>,
 }
 
 impl FirestoreEmulator {
@@ -50,7 +43,7 @@ impl FirestoreEmulator {
             project_id,
             runtime,
             db: RefCell::new(None),
-            mode: None,
+            transaction_id: None,
         }
     }
 
@@ -89,11 +82,6 @@ impl FirestoreEmulator {
             ),
             _ => format!("projects/{}/databases/(default)/documents", self.project_id),
         }
-    }
-
-    fn commit_single_write(&self, op: WriteOp) -> Result<(), Box<dyn Error>> {
-        let write = build_write(self, &op)?;
-        self.commit_writes(vec![write], vec![])
     }
 
     fn commit_writes(
@@ -197,9 +185,6 @@ fn emulator_token_source() -> gcloud_sdk::TokenSourceType {
 
 impl Firestore for FirestoreEmulator {
     fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("internal error: get while in batch/transaction".into());
-        }
         let db = self.sdk_db()?;
         let name = self.document_name(path);
         let result = self.runtime.block_on(async move {
@@ -219,98 +204,28 @@ impl Firestore for FirestoreEmulator {
         }
     }
 
-    fn set(
-        &mut self,
-        path: &str,
-        value: BTreeMap<String, Value>,
-        merge: bool,
-    ) -> Result<(), Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("internal error: set while in batch/transaction".into());
-        }
-        self.commit_single_write(WriteOp::Set {
-            path: path.to_string(),
-            data: value,
-            merge,
-        })
+    fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        let sdk_writes = write_ops_to_sdk_writes(self, &writes)?;
+        self.commit_writes(sdk_writes, vec![])
     }
 
-    fn update(&mut self, path: &str, value: BTreeMap<String, Value>) -> Result<(), Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("internal error: update while in batch/transaction".into());
-        }
-        self.commit_single_write(WriteOp::Update {
-            path: path.to_string(),
-            data: value,
-        })
-    }
-
-    fn delete(&mut self, path: &str) -> Result<(), Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("internal error: delete while in batch/transaction".into());
-        }
-        self.commit_single_write(WriteOp::Delete {
-            path: path.to_string(),
-        })
-    }
-
-    fn query_collection(
-        &self,
-        path: &str,
-        filters: &[QueryFilter],
-        limit: Option<usize>,
-    ) -> Result<Vec<Value>, Box<dyn Error>> {
-        let (parent, collection_id) = split_collection_path(path)?;
-        let query = structured_query(collection_id, false, filters)?;
-        run_query_sorted(self, parent.as_deref(), query, limit)
-    }
-
-    fn query_collection_group(
-        &self,
-        id: &str,
-        filters: &[QueryFilter],
-        limit: Option<usize>,
-    ) -> Result<Vec<Value>, Box<dyn Error>> {
-        let query = structured_query(id, true, filters)?;
-        run_query_sorted(self, None, query, limit)
-    }
-
-    fn begin_batch(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("already in batch or transaction".into());
-        }
-        self.mode = Some(EmulatorMode::Batch(vec![]));
-        Ok(())
-    }
-
-    fn batch_stage(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
-        match &mut self.mode {
-            Some(EmulatorMode::Batch(ops)) => {
-                ops.push(op);
-                Ok(())
+    fn run_query(&self, query: &QueryRef) -> Result<Vec<Value>, Box<dyn Error>> {
+        match &query.source {
+            QuerySource::Collection(path) => {
+                let (parent, collection_id) = split_collection_path(path)?;
+                let sq = structured_query(collection_id, false, &query.filters)?;
+                run_query_sorted(self, parent.as_deref(), sq, query.limit)
             }
-            _ => Err("not in batch".into()),
-        }
-    }
-
-    fn commit_batch(&mut self) -> Result<(), Box<dyn Error>> {
-        if let Some(EmulatorMode::Batch(ops)) = self.mode.take() {
-            let writes = write_ops_to_sdk_writes(self, &ops)?;
-            self.commit_writes(writes, vec![])
-        } else {
-            Err("not in batch".into())
-        }
-    }
-
-    fn abort_batch(&mut self) {
-        if matches!(self.mode, Some(EmulatorMode::Batch(_))) {
-            self.mode = None;
+            QuerySource::CollectionGroup(id) => {
+                let sq = structured_query(id, true, &query.filters)?;
+                run_query_sorted(self, None, sq, query.limit)
+            }
         }
     }
 
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("already in batch or transaction".into());
+        if self.transaction_id.is_some() {
+            return Err("already in transaction".into());
         }
         let db = self.sdk_db()?;
         let database = db.get_database_path().clone();
@@ -325,18 +240,12 @@ impl Firestore for FirestoreEmulator {
                 .await?;
             Ok::<_, gcloud_sdk::tonic::Status>(resp.into_inner().transaction)
         })?;
-        self.mode = Some(EmulatorMode::Transaction {
-            transaction_id,
-            writes: vec![],
-        });
+        self.transaction_id = Some(transaction_id);
         Ok(())
     }
 
-    fn get_in_transaction(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>> {
-        let tid = match &self.mode {
-            Some(EmulatorMode::Transaction { transaction_id, .. }) => transaction_id.clone(),
-            _ => return Err("not in transaction".into()),
-        };
+    fn transaction_get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+        let tid = self.transaction_id.clone().ok_or("not in transaction")?;
         let db = self.sdk_db()?;
         let database = db.get_database_path().clone();
         let document = self.document_name(path);
@@ -368,33 +277,14 @@ impl Firestore for FirestoreEmulator {
         result.as_ref().map(decode_document_for_get).transpose()
     }
 
-    fn transaction_stage(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
-        match &mut self.mode {
-            Some(EmulatorMode::Transaction { writes, .. }) => {
-                writes.push(op);
-                Ok(())
-            }
-            _ => Err("not in transaction".into()),
-        }
-    }
-
-    fn commit_transaction(&mut self) -> Result<(), Box<dyn Error>> {
-        if let Some(EmulatorMode::Transaction {
-            transaction_id,
-            writes,
-        }) = self.mode.take()
-        {
-            let sdk_writes = write_ops_to_sdk_writes(self, &writes)?;
-            self.commit_writes(sdk_writes, transaction_id)
-        } else {
-            Err("not in transaction".into())
-        }
+    fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        let tid = self.transaction_id.take().ok_or("not in transaction")?;
+        let sdk_writes = write_ops_to_sdk_writes(self, &writes)?;
+        self.commit_writes(sdk_writes, tid)
     }
 
     fn abort_transaction(&mut self) {
-        if matches!(self.mode, Some(EmulatorMode::Transaction { .. })) {
-            self.mode = None;
-        }
+        self.transaction_id = None;
     }
 }
 
@@ -467,13 +357,12 @@ fn build_where(
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
     let mut parts = vec![];
     for f in filters {
-        let op = match f.op.as_str() {
-            "==" => structured_query::field_filter::Operator::Equal,
-            ">" => structured_query::field_filter::Operator::GreaterThan,
-            ">=" => structured_query::field_filter::Operator::GreaterThanOrEqual,
-            "<" => structured_query::field_filter::Operator::LessThan,
-            "<=" => structured_query::field_filter::Operator::LessThanOrEqual,
-            o => return Err(format!("unsupported query op: {o}").into()),
+        let op = match f.op {
+            QueryOp::Eq => structured_query::field_filter::Operator::Equal,
+            QueryOp::Gt => structured_query::field_filter::Operator::GreaterThan,
+            QueryOp::Ge => structured_query::field_filter::Operator::GreaterThanOrEqual,
+            QueryOp::Lt => structured_query::field_filter::Operator::LessThan,
+            QueryOp::Le => structured_query::field_filter::Operator::LessThanOrEqual,
         };
         parts.push(structured_query::Filter {
             filter_type: Some(structured_query::filter::FilterType::FieldFilter(

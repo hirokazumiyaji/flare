@@ -1,454 +1,17 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ast::{BinOp, Expr, Stmt};
-use crate::{lexer, parser};
+use crate::ast::{BinOp, Expr, Stmt, StrPiece};
+use crate::firestore::{Firestore, WriteOp};
+use crate::value::{
+    CollectionGroupRef, CollectionRef, DocRef, QueryFilter, QueryOp, QueryRef, Timestamp, UserFunc,
+    Value,
+};
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum Value {
-    Int(i64),
-    Str(String),
-    Bool(bool),
-    Nil,
-    Array(Vec<Value>),
-    Map(BTreeMap<String, Value>),
-    Timestamp(Timestamp),
-    ServerTimestamp,
-    ArrayUnion(Vec<Value>),
-    ArrayRemove(Vec<Value>),
-    DocRef(DocRef),
-    CollectionRef(CollectionRef),
-    CollectionGroupRef(CollectionGroupRef),
-    QueryRef(QueryRef),
-    Func(UserFunc),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Timestamp {
-    pub seconds: i64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct DocRef {
-    pub path: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct CollectionRef {
-    pub path: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct CollectionGroupRef {
-    pub id: String,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct QueryRef {
-    pub source: QuerySource,
-    pub filters: Vec<QueryFilter>,
-    pub limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum QuerySource {
-    Collection(String),
-    CollectionGroup(String),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct QueryFilter {
-    pub field: String,
-    pub op: String,
-    pub value: Value,
-}
-
-#[derive(Debug, Clone)]
-pub enum WriteOp {
-    Set {
-        path: String,
-        data: BTreeMap<String, Value>,
-        merge: bool,
-    },
-    Update {
-        path: String,
-        data: BTreeMap<String, Value>,
-    },
-    Delete {
-        path: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecCtx {
+enum ExecCtx {
     Normal,
-    Batch,
-    Transaction { wrote: bool },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct UserFunc {
-    pub params: Vec<String>,
-    pub body: Vec<Stmt>,
-}
-
-pub trait Firestore {
-    fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
-    fn set(
-        &mut self,
-        path: &str,
-        value: BTreeMap<String, Value>,
-        merge: bool,
-    ) -> Result<(), Box<dyn Error>>;
-    fn update(&mut self, path: &str, value: BTreeMap<String, Value>) -> Result<(), Box<dyn Error>>;
-    fn delete(&mut self, path: &str) -> Result<(), Box<dyn Error>>;
-    fn query_collection(
-        &self,
-        path: &str,
-        filters: &[QueryFilter],
-        limit: Option<usize>,
-    ) -> Result<Vec<Value>, Box<dyn Error>>;
-    fn query_collection_group(
-        &self,
-        id: &str,
-        filters: &[QueryFilter],
-        limit: Option<usize>,
-    ) -> Result<Vec<Value>, Box<dyn Error>>;
-
-    fn begin_batch(&mut self) -> Result<(), Box<dyn Error>>;
-    fn batch_stage(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>>;
-    fn commit_batch(&mut self) -> Result<(), Box<dyn Error>>;
-    fn abort_batch(&mut self);
-
-    fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>>;
-    fn get_in_transaction(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
-    fn transaction_stage(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>>;
-    fn commit_transaction(&mut self) -> Result<(), Box<dyn Error>>;
-    fn abort_transaction(&mut self);
-}
-
-enum InMemoryMode {
-    Batch(Vec<WriteOp>),
-    Transaction {
-        snapshot: HashMap<String, BTreeMap<String, Value>>,
-        writes: Vec<WriteOp>,
-    },
-}
-
-#[derive(Default)]
-pub struct InMemoryFirestore {
-    docs: HashMap<String, BTreeMap<String, Value>>,
-    mode: Option<InMemoryMode>,
-}
-
-impl Firestore for InMemoryFirestore {
-    fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("internal error: get while in batch/transaction".into());
-        }
-        Ok(self.docs.get(path).cloned().map(Value::Map))
-    }
-
-    fn set(
-        &mut self,
-        path: &str,
-        value: BTreeMap<String, Value>,
-        merge: bool,
-    ) -> Result<(), Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("internal error: set while in batch/transaction".into());
-        }
-        apply_write_to_docs(
-            &mut self.docs,
-            WriteOp::Set {
-                path: path.to_string(),
-                data: value,
-                merge,
-            },
-        )
-    }
-
-    fn update(&mut self, path: &str, value: BTreeMap<String, Value>) -> Result<(), Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("internal error: update while in batch/transaction".into());
-        }
-        apply_write_to_docs(
-            &mut self.docs,
-            WriteOp::Update {
-                path: path.to_string(),
-                data: value,
-            },
-        )
-    }
-
-    fn delete(&mut self, path: &str) -> Result<(), Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("internal error: delete while in batch/transaction".into());
-        }
-        apply_write_to_docs(
-            &mut self.docs,
-            WriteOp::Delete {
-                path: path.to_string(),
-            },
-        )
-    }
-
-    fn query_collection(
-        &self,
-        path: &str,
-        filters: &[QueryFilter],
-        limit: Option<usize>,
-    ) -> Result<Vec<Value>, Box<dyn Error>> {
-        let mut matches: Vec<(&String, &BTreeMap<String, Value>)> = vec![];
-        let prefix = format!("{path}/");
-        for (doc_path, doc) in &self.docs {
-            if !doc_path.starts_with(&prefix) {
-                continue;
-            }
-            if doc_path[prefix.len()..].contains('/') {
-                continue;
-            }
-            if matches_filters(doc, filters) {
-                matches.push((doc_path, doc));
-            }
-        }
-        matches.sort_by(|a, b| a.0.cmp(b.0));
-        Ok(take_matches(matches, limit))
-    }
-
-    fn query_collection_group(
-        &self,
-        id: &str,
-        filters: &[QueryFilter],
-        limit: Option<usize>,
-    ) -> Result<Vec<Value>, Box<dyn Error>> {
-        let mut matches: Vec<(&String, &BTreeMap<String, Value>)> = vec![];
-        for (doc_path, doc) in &self.docs {
-            let segments: Vec<&str> = doc_path.split('/').collect();
-            if segments.len() < 2 {
-                continue;
-            }
-            let mut matched_group = false;
-            for idx in (0..segments.len() - 1).step_by(2) {
-                if segments[idx] == id {
-                    matched_group = true;
-                    break;
-                }
-            }
-            if !matched_group {
-                continue;
-            }
-            if matches_filters(doc, filters) {
-                matches.push((doc_path, doc));
-            }
-        }
-        matches.sort_by(|a, b| a.0.cmp(b.0));
-        Ok(take_matches(matches, limit))
-    }
-
-    fn begin_batch(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("already in batch or transaction".into());
-        }
-        self.mode = Some(InMemoryMode::Batch(vec![]));
-        Ok(())
-    }
-
-    fn batch_stage(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
-        match &mut self.mode {
-            Some(InMemoryMode::Batch(ops)) => {
-                ops.push(op);
-                Ok(())
-            }
-            _ => Err("not in batch".into()),
-        }
-    }
-
-    fn commit_batch(&mut self) -> Result<(), Box<dyn Error>> {
-        if let Some(InMemoryMode::Batch(ops)) = self.mode.take() {
-            let mut new_docs = self.docs.clone();
-            for op in ops {
-                apply_write_to_docs(&mut new_docs, op)?;
-            }
-            self.docs = new_docs;
-            Ok(())
-        } else {
-            Err("not in batch".into())
-        }
-    }
-
-    fn abort_batch(&mut self) {
-        if matches!(self.mode, Some(InMemoryMode::Batch(_))) {
-            self.mode = None;
-        }
-    }
-
-    fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.mode.is_some() {
-            return Err("already in batch or transaction".into());
-        }
-        self.mode = Some(InMemoryMode::Transaction {
-            snapshot: self.docs.clone(),
-            writes: vec![],
-        });
-        Ok(())
-    }
-
-    fn get_in_transaction(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>> {
-        match &self.mode {
-            Some(InMemoryMode::Transaction { snapshot, .. }) => {
-                Ok(snapshot.get(path).cloned().map(Value::Map))
-            }
-            _ => Err("not in transaction".into()),
-        }
-    }
-
-    fn transaction_stage(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
-        match &mut self.mode {
-            Some(InMemoryMode::Transaction { writes, .. }) => {
-                writes.push(op);
-                Ok(())
-            }
-            _ => Err("not in transaction".into()),
-        }
-    }
-
-    fn commit_transaction(&mut self) -> Result<(), Box<dyn Error>> {
-        if let Some(InMemoryMode::Transaction { snapshot, writes }) = self.mode.take() {
-            let mut new_docs = snapshot;
-            for op in writes {
-                apply_write_to_docs(&mut new_docs, op)?;
-            }
-            self.docs = new_docs;
-            Ok(())
-        } else {
-            Err("not in transaction".into())
-        }
-    }
-
-    fn abort_transaction(&mut self) {
-        if matches!(self.mode, Some(InMemoryMode::Transaction { .. })) {
-            self.mode = None;
-        }
-    }
-}
-
-fn apply_write_to_docs(
-    docs: &mut HashMap<String, BTreeMap<String, Value>>,
-    op: WriteOp,
-) -> Result<(), Box<dyn Error>> {
-    match op {
-        WriteOp::Set {
-            path,
-            mut data,
-            merge,
-        } => {
-            if merge {
-                let current = docs.entry(path).or_default();
-                apply_update_map(current, &mut data)?;
-            } else {
-                resolve_sentinel_map(&mut data, None)?;
-                docs.insert(path, data);
-            }
-            Ok(())
-        }
-        WriteOp::Update { path, mut data } => {
-            let current = docs
-                .get_mut(&path)
-                .ok_or_else(|| format!("document not found: {path}"))?;
-            apply_update_map(current, &mut data)?;
-            Ok(())
-        }
-        WriteOp::Delete { path } => {
-            docs.remove(&path);
-            Ok(())
-        }
-    }
-}
-
-fn wrap_doc(path: &str, doc: &BTreeMap<String, Value>) -> Value {
-    let mut out = doc.clone();
-    out.insert("__name__".to_string(), Value::Str(path.to_string()));
-    Value::Map(out)
-}
-
-fn take_matches(
-    sorted: Vec<(&String, &BTreeMap<String, Value>)>,
-    limit: Option<usize>,
-) -> Vec<Value> {
-    let n = limit.map_or(sorted.len(), |l| l.min(sorted.len()));
-    sorted
-        .into_iter()
-        .take(n)
-        .map(|(p, d)| wrap_doc(p, d))
-        .collect()
-}
-
-fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bool {
-    filters.iter().all(|f| {
-        let Some(actual) = doc.get(&f.field) else {
-            return false;
-        };
-        match f.op.as_str() {
-            "==" => actual == &f.value,
-            ">" => compare_int(actual, &f.value, |a, b| a > b),
-            ">=" => compare_int(actual, &f.value, |a, b| a >= b),
-            "<" => compare_int(actual, &f.value, |a, b| a < b),
-            "<=" => compare_int(actual, &f.value, |a, b| a <= b),
-            _ => false,
-        }
-    })
-}
-
-fn compare_int(a: &Value, b: &Value, pred: impl Fn(i64, i64) -> bool) -> bool {
-    matches!((a, b), (Value::Int(x), Value::Int(y)) if pred(*x, *y))
-}
-
-fn apply_update_map(
-    current: &mut BTreeMap<String, Value>,
-    updates: &mut BTreeMap<String, Value>,
-) -> Result<(), Box<dyn Error>> {
-    resolve_sentinel_map(updates, Some(current))?;
-    for (k, v) in updates.iter() {
-        current.insert(k.clone(), v.clone());
-    }
-    Ok(())
-}
-
-fn resolve_sentinel_map(
-    map: &mut BTreeMap<String, Value>,
-    current: Option<&BTreeMap<String, Value>>,
-) -> Result<(), Box<dyn Error>> {
-    for (k, v) in map.clone() {
-        let resolved = match v {
-            Value::ArrayUnion(values) => {
-                let mut base = match current.and_then(|m| m.get(&k)) {
-                    Some(Value::Array(arr)) => arr.clone(),
-                    _ => vec![],
-                };
-                for item in values {
-                    if !base.contains(&item) {
-                        base.push(item);
-                    }
-                }
-                Value::Array(base)
-            }
-            Value::ArrayRemove(values) => {
-                let base = match current.and_then(|m| m.get(&k)) {
-                    Some(Value::Array(arr)) => arr.clone(),
-                    _ => vec![],
-                };
-                Value::Array(base.into_iter().filter(|v| !values.contains(v)).collect())
-            }
-            Value::ServerTimestamp => Value::Timestamp(Timestamp {
-                seconds: current_unix_seconds()?,
-            }),
-            other => other,
-        };
-        map.insert(k, resolved);
-    }
-    Ok(())
+    Batch { writes: Vec<WriteOp> },
+    Transaction { writes: Vec<WriteOp> },
 }
 
 pub struct Runtime<F: Firestore> {
@@ -510,7 +73,7 @@ impl<F: Firestore> Runtime<F> {
                 then_body,
                 else_body,
             } => {
-                let body = if truthy(&self.eval_expr(cond)?) {
+                let body = if self.eval_expr(cond)?.truthy() {
                     then_body
                 } else {
                     else_body
@@ -519,7 +82,7 @@ impl<F: Firestore> Runtime<F> {
             }
             Stmt::While { cond, body } => {
                 let mut last = Value::Nil;
-                while truthy(&self.eval_expr(cond)?) {
+                while self.eval_expr(cond)?.truthy() {
                     match self.eval_block(body)? {
                         ExecFlow::Value(v) => last = v,
                         ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
@@ -543,16 +106,39 @@ impl<F: Firestore> Runtime<F> {
 
     fn forbid_query_in_batch_or_transaction(&self) -> Result<(), Box<dyn Error>> {
         match self.exec {
-            ExecCtx::Batch => Err("queries are not allowed inside batch".into()),
+            ExecCtx::Batch { .. } => Err("queries are not allowed inside batch".into()),
             ExecCtx::Transaction { .. } => Err("queries are not allowed inside transaction".into()),
             ExecCtx::Normal => Ok(()),
+        }
+    }
+
+    fn dispatch_write(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
+        match &mut self.exec {
+            ExecCtx::Normal => self.fs.apply(vec![op]),
+            ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => {
+                writes.push(op);
+                Ok(())
+            }
         }
     }
 
     fn eval_expr(&mut self, expr: &Expr) -> Result<Value, Box<dyn Error>> {
         match expr {
             Expr::Int(i) => Ok(Value::Int(*i)),
-            Expr::Str(s) => Ok(Value::Str(self.eval_interpolated_string(s)?)),
+            Expr::Str(s) => Ok(Value::Str(s.clone())),
+            Expr::StrInterp(pieces) => {
+                let mut out = String::new();
+                for piece in pieces {
+                    match piece {
+                        StrPiece::Lit(s) => out.push_str(s),
+                        StrPiece::Expr(e) => {
+                            let v = self.eval_expr(e)?;
+                            out.push_str(&v.to_string());
+                        }
+                    }
+                }
+                Ok(Value::Str(out))
+            }
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Nil => Ok(Value::Nil),
             Expr::Var(name) => self
@@ -615,7 +201,7 @@ impl<F: Firestore> Runtime<F> {
         match name {
             "puts" => {
                 for v in args {
-                    println!("{}", render(&v));
+                    println!("{v}");
                 }
                 Ok(Value::Nil)
             }
@@ -629,9 +215,9 @@ impl<F: Firestore> Runtime<F> {
                 id: expect_string(args.first())?.to_string(),
             })),
             "array" => Ok(Value::Array(args)),
-            "map" => map_from_kv(&args),
+
             "now" => Ok(Value::Timestamp(Timestamp {
-                seconds: current_unix_seconds()?,
+                seconds: Timestamp::now()?.seconds,
             })),
             "timestamp" => Ok(Value::Timestamp(Timestamp {
                 seconds: parse_timestamp_arg(args.first())?,
@@ -641,15 +227,17 @@ impl<F: Firestore> Runtime<F> {
             "array_remove" => Ok(Value::ArrayRemove(expect_array(args.first())?.clone())),
             "get" => {
                 let path = expect_doc_path(args.first())?;
-                let v = match self.exec {
-                    ExecCtx::Batch => return Err("get is not allowed inside batch".into()),
-                    ExecCtx::Transaction { wrote: true } => {
+                let v = match &self.exec {
+                    ExecCtx::Batch { .. } => {
+                        return Err("get is not allowed inside batch".into());
+                    }
+                    ExecCtx::Transaction { writes } if !writes.is_empty() => {
                         return Err(
                             "get is not allowed after the first write in a transaction".into()
                         );
                     }
-                    ExecCtx::Transaction { wrote: false } => {
-                        self.fs.get_in_transaction(path)?.unwrap_or(Value::Nil)
+                    ExecCtx::Transaction { .. } => {
+                        self.fs.transaction_get(path)?.unwrap_or(Value::Nil)
                     }
                     ExecCtx::Normal => self.fs.get(path)?.unwrap_or(Value::Nil),
                 };
@@ -665,79 +253,64 @@ impl<F: Firestore> Runtime<F> {
                     _ => return Err("set merge must be bool".into()),
                 };
                 let path = path.to_string();
-                match &mut self.exec {
-                    ExecCtx::Normal => self.fs.set(&path, data, merge)?,
-                    ExecCtx::Batch => self.fs.batch_stage(WriteOp::Set { path, data, merge })?,
-                    ExecCtx::Transaction { wrote } => {
-                        self.fs
-                            .transaction_stage(WriteOp::Set { path, data, merge })?;
-                        *wrote = true;
-                    }
-                }
+                self.dispatch_write(WriteOp::Set { path, data, merge })?;
                 Ok(Value::Nil)
             }
             "update" => {
                 let path = expect_doc_path(args.first())?;
                 let data = expect_map(args.get(1))?.clone();
                 let path = path.to_string();
-                match &mut self.exec {
-                    ExecCtx::Normal => self.fs.update(&path, data)?,
-                    ExecCtx::Batch => self.fs.batch_stage(WriteOp::Update { path, data })?,
-                    ExecCtx::Transaction { wrote } => {
-                        self.fs.transaction_stage(WriteOp::Update { path, data })?;
-                        *wrote = true;
-                    }
-                }
+                self.dispatch_write(WriteOp::Update { path, data })?;
                 Ok(Value::Nil)
             }
             "delete" => {
                 let path = expect_doc_path(args.first())?;
                 let path = path.to_string();
-                match &mut self.exec {
-                    ExecCtx::Normal => self.fs.delete(&path)?,
-                    ExecCtx::Batch => self.fs.batch_stage(WriteOp::Delete { path })?,
-                    ExecCtx::Transaction { wrote } => {
-                        self.fs.transaction_stage(WriteOp::Delete { path })?;
-                        *wrote = true;
-                    }
-                }
+                self.dispatch_write(WriteOp::Delete { path })?;
                 Ok(Value::Nil)
             }
             "batch" => {
                 let Some(stmts) = block else {
                     return Err("batch requires { ... } block".into());
                 };
-                self.fs.begin_batch()?;
-                self.exec = ExecCtx::Batch;
-                let result = match self.eval_block(stmts) {
-                    Ok(flow) => self.fs.commit_batch().map(|()| match flow {
-                        ExecFlow::Value(v) | ExecFlow::Return(v) => v,
-                    }),
-                    Err(e) => {
-                        self.fs.abort_batch();
-                        Err(e)
-                    }
+                if !matches!(self.exec, ExecCtx::Normal) {
+                    return Err("batch cannot be nested inside batch/transaction".into());
+                }
+                self.exec = ExecCtx::Batch { writes: vec![] };
+                let flow = self.eval_block(stmts);
+                let ExecCtx::Batch { writes } = std::mem::replace(&mut self.exec, ExecCtx::Normal)
+                else {
+                    unreachable!("exec ctx changed inside batch");
                 };
-                self.exec = ExecCtx::Normal;
-                result
+                let flow = flow?;
+                self.fs.apply(writes)?;
+                Ok(flow.into_value())
             }
             "transaction" => {
                 let Some(stmts) = block else {
                     return Err("transaction requires { ... } block".into());
                 };
+                if !matches!(self.exec, ExecCtx::Normal) {
+                    return Err("transaction cannot be nested inside batch/transaction".into());
+                }
                 self.fs.begin_transaction()?;
-                self.exec = ExecCtx::Transaction { wrote: false };
-                let result = match self.eval_block(stmts) {
-                    Ok(flow) => self.fs.commit_transaction().map(|()| match flow {
-                        ExecFlow::Value(v) | ExecFlow::Return(v) => v,
-                    }),
+                self.exec = ExecCtx::Transaction { writes: vec![] };
+                let flow = self.eval_block(stmts);
+                let ExecCtx::Transaction { writes } =
+                    std::mem::replace(&mut self.exec, ExecCtx::Normal)
+                else {
+                    unreachable!("exec ctx changed inside transaction");
+                };
+                match flow {
+                    Ok(flow) => {
+                        self.fs.commit_transaction(writes)?;
+                        Ok(flow.into_value())
+                    }
                     Err(e) => {
                         self.fs.abort_transaction();
                         Err(e)
                     }
-                };
-                self.exec = ExecCtx::Normal;
-                result
+                }
             }
             _ => {
                 let Some(Value::Func(func)) = self.get_var(name).cloned() else {
@@ -767,90 +340,16 @@ impl<F: Firestore> Runtime<F> {
         args: Vec<Value>,
     ) -> Result<Value, Box<dyn Error>> {
         match receiver {
-            Value::CollectionRef(collection) => match name {
-                "doc" => Ok(Value::DocRef(DocRef {
-                    path: format!("{}/{}", collection.path, expect_string(args.first())?),
-                })),
-                "where" => Ok(Value::QueryRef(QueryRef {
-                    source: QuerySource::Collection(collection.path),
-                    filters: vec![QueryFilter {
-                        field: expect_string(args.first())?.to_string(),
-                        op: expect_string(args.get(1))?.to_string(),
-                        value: args.get(2).cloned().ok_or("where requires value")?,
-                    }],
-                    limit: None,
-                })),
-                "get" => {
-                    self.forbid_query_in_batch_or_transaction()?;
-                    let docs = self.fs.query_collection(&collection.path, &[], None)?;
-                    Ok(Value::Array(docs))
-                }
-                "limit" => {
-                    self.forbid_query_in_batch_or_transaction()?;
-                    let n = expect_int(args.first())? as usize;
-                    Ok(Value::QueryRef(QueryRef {
-                        source: QuerySource::Collection(collection.path),
-                        filters: vec![],
-                        limit: Some(n),
-                    }))
-                }
-                _ => Err(format!("unknown collection method: {name}").into()),
-            },
-            Value::CollectionGroupRef(group) => match name {
-                "where" => Ok(Value::QueryRef(QueryRef {
-                    source: QuerySource::CollectionGroup(group.id),
-                    filters: vec![QueryFilter {
-                        field: expect_string(args.first())?.to_string(),
-                        op: expect_string(args.get(1))?.to_string(),
-                        value: args.get(2).cloned().ok_or("where requires value")?,
-                    }],
-                    limit: None,
-                })),
-                "get" => {
-                    self.forbid_query_in_batch_or_transaction()?;
-                    let docs = self.fs.query_collection_group(&group.id, &[], None)?;
-                    Ok(Value::Array(docs))
-                }
-                "limit" => {
-                    self.forbid_query_in_batch_or_transaction()?;
-                    let n = expect_int(args.first())? as usize;
-                    Ok(Value::QueryRef(QueryRef {
-                        source: QuerySource::CollectionGroup(group.id),
-                        filters: vec![],
-                        limit: Some(n),
-                    }))
-                }
-                _ => Err(format!("unknown collection_group method: {name}").into()),
-            },
-            Value::QueryRef(mut query) => match name {
-                "where" => {
-                    query.filters.push(QueryFilter {
-                        field: expect_string(args.first())?.to_string(),
-                        op: expect_string(args.get(1))?.to_string(),
-                        value: args.get(2).cloned().ok_or("where requires value")?,
-                    });
-                    Ok(Value::QueryRef(query))
-                }
-                "limit" => {
-                    query.limit = Some(expect_int(args.first())? as usize);
-                    Ok(Value::QueryRef(query))
-                }
-                "get" => {
-                    self.forbid_query_in_batch_or_transaction()?;
-                    let docs = match &query.source {
-                        QuerySource::Collection(path) => {
-                            self.fs
-                                .query_collection(path, &query.filters, query.limit)?
-                        }
-                        QuerySource::CollectionGroup(id) => {
-                            self.fs
-                                .query_collection_group(id, &query.filters, query.limit)?
-                        }
-                    };
-                    Ok(Value::Array(docs))
-                }
-                _ => Err(format!("unknown query method: {name}").into()),
-            },
+            Value::CollectionRef(collection) if name == "doc" => Ok(Value::DocRef(DocRef {
+                path: format!("{}/{}", collection.path, expect_string(args.first())?),
+            })),
+            Value::CollectionRef(collection) => {
+                self.eval_query_method(collection.to_query(), name, args)
+            }
+            Value::CollectionGroupRef(group) => {
+                self.eval_query_method(group.to_query(), name, args)
+            }
+            Value::QueryRef(query) => self.eval_query_method(query, name, args),
             Value::Timestamp(ts) => match name {
                 "to_unix" => Ok(Value::Int(ts.seconds)),
                 "add_seconds" => Ok(Value::Timestamp(Timestamp {
@@ -859,6 +358,33 @@ impl<F: Firestore> Runtime<F> {
                 _ => Err(format!("unknown timestamp method: {name}").into()),
             },
             _ => Err("unsupported method receiver".into()),
+        }
+    }
+
+    fn eval_query_method(
+        &mut self,
+        mut query: QueryRef,
+        name: &str,
+        args: Vec<Value>,
+    ) -> Result<Value, Box<dyn Error>> {
+        match name {
+            "where" => {
+                query.filters.push(QueryFilter {
+                    field: expect_string(args.first())?.to_string(),
+                    op: QueryOp::parse(expect_string(args.get(1))?)?,
+                    value: args.get(2).cloned().ok_or("where requires value")?,
+                });
+                Ok(Value::QueryRef(query))
+            }
+            "limit" => {
+                query.limit = Some(expect_int(args.first())? as usize);
+                Ok(Value::QueryRef(query))
+            }
+            "get" => {
+                self.forbid_query_in_batch_or_transaction()?;
+                Ok(Value::Array(self.fs.run_query(&query)?))
+            }
+            _ => Err(format!("unknown query method: {name}").into()),
         }
     }
 
@@ -885,75 +411,6 @@ impl<F: Firestore> Runtime<F> {
     fn var_exists(&self, name: &str) -> bool {
         self.scopes.iter().rev().any(|s| s.contains_key(name))
     }
-
-    fn eval_interpolated_string(&mut self, raw: &str) -> Result<String, Box<dyn Error>> {
-        if !raw.contains("#{") {
-            return Ok(raw.to_string());
-        }
-        let mut out = String::new();
-        let chars: Vec<char> = raw.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            if chars[i] == '#' && i + 1 < chars.len() && chars[i + 1] == '{' {
-                i += 2;
-                let mut depth = 1;
-                let mut expr = String::new();
-                while i < chars.len() && depth > 0 {
-                    match chars[i] {
-                        '{' => {
-                            depth += 1;
-                            expr.push('{');
-                        }
-                        '}' => {
-                            depth -= 1;
-                            if depth > 0 {
-                                expr.push('}');
-                            }
-                        }
-                        ch => expr.push(ch),
-                    }
-                    i += 1;
-                }
-                if depth != 0 {
-                    return Err("unterminated string interpolation".into());
-                }
-                let value = self.eval_embedded_expr(expr.trim())?;
-                out.push_str(&render(&value));
-            } else {
-                out.push(chars[i]);
-                i += 1;
-            }
-        }
-        Ok(out)
-    }
-
-    fn eval_embedded_expr(&mut self, expr_src: &str) -> Result<Value, Box<dyn Error>> {
-        let tokens = lexer::lex(expr_src)?;
-        let mut p = parser::Parser::new(tokens);
-        let program = p.parse_program()?;
-        if program.len() != 1 {
-            return Err("interpolation must contain a single expression".into());
-        }
-        match &program[0] {
-            Stmt::Expr(expr) => self.eval_expr(expr),
-            _ => Err("interpolation must contain an expression".into()),
-        }
-    }
-}
-
-fn map_from_kv(args: &[Value]) -> Result<Value, Box<dyn Error>> {
-    if args.len() % 2 != 0 {
-        return Err("map requires even number of args: key, value, ...".into());
-    }
-    let mut out = BTreeMap::new();
-    let mut i = 0;
-    while i < args.len() {
-        let key = expect_string(args.get(i))?.to_string();
-        let value = args.get(i + 1).cloned().ok_or("map value missing")?;
-        out.insert(key, value);
-        i += 2;
-    }
-    Ok(Value::Map(out))
 }
 
 fn bind_function_args(
@@ -985,10 +442,6 @@ fn bind_function_args(
     Ok(out)
 }
 
-pub(crate) fn current_unix_seconds() -> Result<i64, Box<dyn Error>> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64)
-}
-
 fn parse_timestamp_arg(v: Option<&Value>) -> Result<i64, Box<dyn Error>> {
     match v {
         Some(Value::Int(i)) => Ok(*i),
@@ -998,42 +451,9 @@ fn parse_timestamp_arg(v: Option<&Value>) -> Result<i64, Box<dyn Error>> {
 }
 
 fn parse_rfc3339_to_unix(s: &str) -> Result<i64, Box<dyn Error>> {
-    if s.len() < 20 {
-        return Err("invalid RFC3339 timestamp".into());
-    }
-    let year: i64 = s[0..4].parse()?;
-    let month: i64 = s[5..7].parse()?;
-    let day: i64 = s[8..10].parse()?;
-    let hour: i64 = s[11..13].parse()?;
-    let minute: i64 = s[14..16].parse()?;
-    let second: i64 = s[17..19].parse()?;
-    let tz = &s[19..];
-    let offset_seconds = if tz == "Z" {
-        0
-    } else {
-        if tz.len() != 6 || (tz.as_bytes()[0] != b'+' && tz.as_bytes()[0] != b'-') {
-            return Err("invalid RFC3339 timezone offset".into());
-        }
-        let sign = if tz.as_bytes()[0] == b'+' { 1 } else { -1 };
-        let off_h: i64 = tz[1..3].parse()?;
-        let off_m: i64 = tz[4..6].parse()?;
-        sign * (off_h * 3600 + off_m * 60)
-    };
-
-    let days = days_from_civil(year, month, day);
-    let local = days * 86_400 + hour * 3600 + minute * 60 + second;
-    Ok(local - offset_seconds)
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    // Howard Hinnant's civil-from-days inverse
-    let y = year - (month <= 2) as i64;
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = month + if month > 2 { -3 } else { 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
+    Ok(chrono::DateTime::parse_from_rfc3339(s)
+        .map_err(|e| format!("invalid RFC3339 timestamp: {e}"))?
+        .timestamp())
 }
 
 fn expect_string(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
@@ -1117,31 +537,15 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
     })
 }
 
-fn truthy(v: &Value) -> bool {
-    !matches!(v, Value::Bool(false) | Value::Nil)
-}
-
-fn render(v: &Value) -> String {
-    match v {
-        Value::Int(i) => i.to_string(),
-        Value::Str(s) => s.clone(),
-        Value::Bool(b) => b.to_string(),
-        Value::Nil => "nil".to_string(),
-        Value::Array(a) => format!("{:?}", a),
-        Value::Map(m) => format!("{:?}", m),
-        Value::Timestamp(ts) => format!("Timestamp({})", ts.seconds),
-        Value::ServerTimestamp => "ServerTimestamp".to_string(),
-        Value::ArrayUnion(v) => format!("ArrayUnion({v:?})"),
-        Value::ArrayRemove(v) => format!("ArrayRemove({v:?})"),
-        Value::DocRef(d) => format!("#<DocRef path={}>", d.path),
-        Value::CollectionRef(c) => format!("#<CollectionRef path={}>", c.path),
-        Value::CollectionGroupRef(cg) => format!("#<CollectionGroupRef id={}>", cg.id),
-        Value::QueryRef(_) => "#<QueryRef>".to_string(),
-        Value::Func(_) => "<func>".to_string(),
-    }
-}
-
 enum ExecFlow {
     Value(Value),
     Return(Value),
+}
+
+impl ExecFlow {
+    fn into_value(self) -> Value {
+        match self {
+            ExecFlow::Value(v) | ExecFlow::Return(v) => v,
+        }
+    }
 }
