@@ -4,7 +4,7 @@ Firestore を操作するための **mruby 風スクリプト言語ランタイ�
 
 ```ruby
 set("users/1", {name: "alice", age: 20})
-rows = collection("users").where("age", ">=", 20).limit(10).get()
+rows = col("users").where("age", ">=", 20).limit(10).get()
 puts "found #{rows}"
 ```
 
