@@ -40,6 +40,7 @@ pub enum Token {
     LBracket,
     RBracket,
     Pipe,
+    Semicolon,
     Colon,
     Newline,
     Eof,
@@ -54,9 +55,13 @@ pub fn lex(input: &str) -> Result<Vec<Token>, Box<dyn Error>> {
             ' ' | '\t' | '\r' => {
                 chars.next();
             }
-            '\n' | ';' => {
+            '\n' => {
                 chars.next();
                 tokens.push(Token::Newline);
+            }
+            ';' => {
+                chars.next();
+                tokens.push(Token::Semicolon);
             }
             '#' => {
                 while let Some(&cc) = chars.peek() {

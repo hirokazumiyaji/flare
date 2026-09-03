@@ -528,3 +528,37 @@ fn newlines_still_separate_statements_outside_brackets() {
     let out = run_script("a = 1\nb = a + 1\nb").unwrap();
     assert_eq!(out, Value::Int(2));
 }
+
+#[test]
+fn newlines_inside_contained_expressions_are_ignored() {
+    // delimiter の内側なら式の途中の改行も無視される。
+    let out = run_script("[\n1 +\n2\n]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(3)]));
+    let out = run_script("{a: 1 +\n2}[\"a\"]").unwrap();
+    assert_eq!(out, Value::Int(3));
+    let out = run_script("fn add(a, b) { a + b }\nadd(1 +\n0, 2)").unwrap();
+    assert_eq!(out, Value::Int(3));
+    let out = run_script("(1 +\n2)").unwrap();
+    assert_eq!(out, Value::Int(3));
+    let out = run_script("m = [1, 2]\nm[1 +\n0]").unwrap();
+    assert_eq!(out, Value::Int(2));
+}
+
+#[test]
+fn semicolons_are_not_treated_as_newlines_inside_delimiters() {
+    // `;` は文の区切りのまま。delimiter の内側ではエラーになる。
+    assert!(run_script("[;1]").is_err());
+    assert!(run_script("{;}").is_err());
+    assert!(run_script("fn f(a) { a }\nf(;)").is_err());
+    assert!(run_script("m = [1]\nm[;0]").is_err());
+}
+
+#[test]
+fn semicolons_remain_statement_separators() {
+    let out = run_script("a = 1; b = a + 1; b").unwrap();
+    assert_eq!(out, Value::Int(2));
+    let out = run_script("fn f() { a = 1; a }\nf()").unwrap();
+    assert_eq!(out, Value::Int(1));
+    let out = run_script("fn f() { return; 1 }\nf()").unwrap();
+    assert_eq!(out, Value::Nil);
+}

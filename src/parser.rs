@@ -12,6 +12,9 @@ pub struct Parser {
     /// 省略可能ブロック(`obj.method { ... }`)を消費しない(制御構文の本体
     /// `{ ... }` と区別するため)。
     suppress_block_calls: usize,
+    /// マップ / 配列リテラル・引数リスト・グループ化・添字・仮引数リストの
+    /// 内側で 1 以上。内側では改行をトークンとして透過的に無視する。
+    depth: usize,
 }
 
 impl Parser {
@@ -20,14 +23,15 @@ impl Parser {
             tokens,
             pos: 0,
             suppress_block_calls: 0,
+            depth: 0,
         }
     }
     pub fn parse_program(&mut self) -> Result<Vec<Stmt>, Box<dyn Error>> {
         let mut out = Vec::new();
-        self.skip_newlines();
+        self.skip_separators();
         while !self.at(&Token::Eof) {
             out.push(self.parse_stmt()?);
-            self.skip_newlines();
+            self.skip_separators();
         }
         Ok(out)
     }
@@ -78,7 +82,10 @@ impl Parser {
     }
     fn parse_return(&mut self) -> Result<Stmt, Box<dyn Error>> {
         self.expect(Token::Return)?;
-        if matches!(self.peek(), Token::Newline | Token::RBrace | Token::Eof) {
+        if matches!(
+            self.peek(),
+            Token::Newline | Token::Semicolon | Token::RBrace | Token::Eof
+        ) {
             Ok(Stmt::Return(None))
         } else {
             Ok(Stmt::Return(Some(self.parse_expr()?)))
@@ -185,8 +192,11 @@ impl Parser {
                 };
             } else if self.at(&Token::LBracket) {
                 self.bump();
+                self.depth += 1;
                 self.skip_newlines();
-                let index = self.parse_expr()?;
+                let index = self.parse_expr();
+                self.depth -= 1;
+                let index = index?;
                 self.skip_newlines();
                 self.expect(Token::RBracket)?;
                 expr = Expr::Index {
@@ -248,19 +258,35 @@ impl Parser {
             }
             Token::LParen => {
                 self.bump();
+                self.depth += 1;
                 self.skip_newlines();
-                let out = self.parse_expr()?;
+                let out = self.parse_expr();
+                self.depth -= 1;
+                let out = out?;
                 self.skip_newlines();
                 self.expect(Token::RParen)?;
                 Ok(out)
             }
             Token::LBrace => self.parse_map_literal(),
             Token::LBracket => self.parse_array_literal(),
+            Token::Newline if self.depth > 0 => {
+                // delimiter の内側では改行を透過的に無視する(式の途中を含む)。
+                self.bump();
+                self.parse_primary()
+            }
             t => Err(format!("unexpected token: {t:?}").into()),
         }
     }
     fn parse_map_literal(&mut self) -> Result<Expr, Box<dyn Error>> {
         self.expect(Token::LBrace)?;
+        self.depth += 1;
+        let entries = self.parse_map_entries();
+        self.depth -= 1;
+        let entries = entries?;
+        self.expect(Token::RBrace)?;
+        Ok(Expr::Map(entries))
+    }
+    fn parse_map_entries(&mut self) -> Result<Vec<(String, Expr)>, Box<dyn Error>> {
         self.skip_newlines();
         let mut entries = vec![];
         if !self.at(&Token::RBrace) {
@@ -298,11 +324,18 @@ impl Parser {
                 }
             }
         }
-        self.expect(Token::RBrace)?;
-        Ok(Expr::Map(entries))
+        Ok(entries)
     }
     fn parse_array_literal(&mut self) -> Result<Expr, Box<dyn Error>> {
         self.expect(Token::LBracket)?;
+        self.depth += 1;
+        let items = self.parse_array_items();
+        self.depth -= 1;
+        let items = items?;
+        self.expect(Token::RBracket)?;
+        Ok(Expr::Array(items))
+    }
+    fn parse_array_items(&mut self) -> Result<Vec<Expr>, Box<dyn Error>> {
         self.skip_newlines();
         let mut items = vec![];
         if !self.at(&Token::RBracket) {
@@ -320,8 +353,7 @@ impl Parser {
                 }
             }
         }
-        self.expect(Token::RBracket)?;
-        Ok(Expr::Array(items))
+        Ok(items)
     }
     fn parse_arg_into(
         &mut self,
@@ -341,22 +373,10 @@ impl Parser {
         let mut kwargs = vec![];
         if self.at(&Token::LParen) {
             self.bump();
-            self.skip_newlines();
-            if !self.at(&Token::RParen) {
-                loop {
-                    self.parse_arg_into(&mut args, &mut kwargs)?;
-                    self.skip_newlines();
-                    if self.at(&Token::Comma) {
-                        self.bump();
-                        self.skip_newlines();
-                        if self.at(&Token::RParen) {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
+            self.depth += 1;
+            let parsed = self.parse_paren_args(&mut args, &mut kwargs);
+            self.depth -= 1;
+            parsed?;
             self.expect(Token::RParen)?;
             return Ok((args, kwargs));
         }
@@ -371,6 +391,30 @@ impl Parser {
             }
         }
         Ok((args, kwargs))
+    }
+
+    fn parse_paren_args(
+        &mut self,
+        args: &mut Vec<Expr>,
+        kwargs: &mut Vec<(String, Expr)>,
+    ) -> Result<(), Box<dyn Error>> {
+        self.skip_newlines();
+        if !self.at(&Token::RParen) {
+            loop {
+                self.parse_arg_into(args, kwargs)?;
+                self.skip_newlines();
+                if self.at(&Token::Comma) {
+                    self.bump();
+                    self.skip_newlines();
+                    if self.at(&Token::RParen) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
     fn expr_from_string_parts(parts: Vec<StrPart>) -> Result<Expr, Box<dyn Error>> {
         if let [StrPart::Lit(s)] = parts.as_slice() {
@@ -426,11 +470,12 @@ impl Parser {
         // `{\n|x| ... }` のようにパラメータリストの直前に改行が置けるようにする。
         self.skip_newlines();
         let params = self.parse_block_params()?;
-        self.skip_newlines();
+        // 本文は「文の並び」なので `;` も文の区切りとして扱う。
+        self.skip_separators();
         let mut body = vec![];
         while !self.at(&Token::RBrace) {
             body.push(self.parse_stmt()?);
-            self.skip_newlines();
+            self.skip_separators();
         }
         self.expect(Token::RBrace)?;
         Ok(Block { params, body })
@@ -474,6 +519,15 @@ impl Parser {
                 | Token::LParen
         )
     }
+    /// 文の区切り(改行または `;`)をスキップする。ブロック本文・プログラム
+    /// トップレベルなど「文の並び」の境界で使う。
+    fn skip_separators(&mut self) {
+        while self.at(&Token::Newline) || self.at(&Token::Semicolon) {
+            self.bump();
+        }
+    }
+    /// delimiter(リテラル・引数リスト・仮引数リスト等)の内側の改行だけを
+    /// スキップする。`;` は文の区切りのままなのでスキップしない(エラーになる)。
     fn skip_newlines(&mut self) {
         while self.at(&Token::Newline) {
             self.bump();
