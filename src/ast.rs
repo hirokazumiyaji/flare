@@ -18,7 +18,7 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
         kwargs: Vec<(String, Expr)>,
-        block: Option<Vec<Stmt>>,
+        block: Option<Block>,
     },
     Map(Vec<(String, Expr)>),
     Array(Vec<Expr>),
@@ -64,6 +64,12 @@ pub enum Stmt {
         cond: Expr,
         body: Vec<Stmt>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Block {
+    pub params: Vec<String>,
+    pub body: Vec<Stmt>,
 }
 
 impl fmt::Display for BinOp {

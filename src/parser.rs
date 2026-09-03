@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use crate::ast::{BinOp, Expr, Stmt, StrPiece};
+use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece};
 use crate::lexer::{self, StrPart, Token};
 
 type ParsedArgs = (Vec<Expr>, Vec<(String, Expr)>);
@@ -382,14 +382,22 @@ impl Parser {
         }
         Ok(None)
     }
-    fn parse_optional_brace_block(&mut self) -> Result<Option<Vec<Stmt>>, Box<dyn Error>> {
+    fn parse_optional_brace_block(&mut self) -> Result<Option<Block>, Box<dyn Error>> {
         if !self.at(&Token::LBrace) || self.suppress_block_calls > 0 {
             return Ok(None);
         }
-        Ok(Some(self.parse_brace_block()?))
+        Ok(Some(self.parse_brace_block_with_params()?))
     }
     fn parse_brace_block(&mut self) -> Result<Vec<Stmt>, Box<dyn Error>> {
+        let block = self.parse_brace_block_with_params()?;
+        if !block.params.is_empty() {
+            return Err("block parameters are not allowed here".into());
+        }
+        Ok(block.body)
+    }
+    fn parse_brace_block_with_params(&mut self) -> Result<Block, Box<dyn Error>> {
         self.expect(Token::LBrace)?;
+        let params = self.parse_block_params()?;
         self.skip_newlines();
         let mut body = vec![];
         while !self.at(&Token::RBrace) {
@@ -397,7 +405,31 @@ impl Parser {
             self.skip_newlines();
         }
         self.expect(Token::RBrace)?;
-        Ok(body)
+        Ok(Block { params, body })
+    }
+    fn parse_block_params(&mut self) -> Result<Vec<String>, Box<dyn Error>> {
+        if !self.at(&Token::Pipe) {
+            return Ok(vec![]);
+        }
+        self.bump();
+        self.skip_newlines();
+        let mut params = vec![];
+        if self.at(&Token::Pipe) {
+            self.bump();
+            return Ok(params);
+        }
+        loop {
+            params.push(self.expect_ident()?);
+            self.skip_newlines();
+            if self.at(&Token::Comma) {
+                self.bump();
+                self.skip_newlines();
+            } else {
+                break;
+            }
+        }
+        self.expect(Token::Pipe)?;
+        Ok(params)
     }
     fn is_arg_start(&self) -> bool {
         matches!(

@@ -359,3 +359,83 @@ fn block_calls_still_work_outside_conditions() {
     let out = run_script("batch { set(\"users/bb\", {n: 1}) }\nget(\"users/bb\")[\"n\"]").unwrap();
     assert_eq!(out, Value::Int(1));
 }
+
+#[test]
+fn each_iterates_query_rows_and_updates_each_document() {
+    let out = run_script(
+        "set(\"users/it1\", {n: 1, seen: false})\nset(\"users/it2\", {n: 2, seen: false})\nrows = col(\"users\").get()\nrows.each { |row| update(row[\"__name__\"], {seen: true}) }\n[get(\"users/it1\")[\"seen\"], get(\"users/it2\")[\"seen\"]]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Bool(true), Value::Bool(true)])
+    );
+}
+
+#[test]
+fn each_returns_nil_and_map_returns_transformed_array() {
+    let out = run_script("[1, 2, 3].map { |x| x * 2 }").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(2), Value::Int(4), Value::Int(6)])
+    );
+    let out = run_script("a = [1]\na.each { |x| x }").unwrap();
+    assert_eq!(out, Value::Nil);
+}
+
+#[test]
+fn map_extracts_fields_from_query_rows() {
+    let out = run_script(
+        "set(\"users/mp1\", {n: 1})\nset(\"users/mp2\", {n: 2})\ncol(\"users\").get().map { |row| row[\"n\"] }",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1), Value::Int(2)]));
+}
+
+#[test]
+fn len_supports_array_map_and_string() {
+    let out = run_script("[len([1, 2, 3]), len({a: 1, b: 2}), len(\"hello\"), [1].len()]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(3),
+            Value::Int(2),
+            Value::Int(5),
+            Value::Int(1)
+        ])
+    );
+}
+
+#[test]
+fn block_param_must_match_yielded_argument_count() {
+    let err = run_script("[1].each { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+}
+
+#[test]
+fn each_and_map_require_block() {
+    let err = run_script("[1].each()").unwrap_err();
+    assert!(
+        format!("{err}").contains("each requires { ... } block"),
+        "{err}"
+    );
+    let err = run_script("[1].map()").unwrap_err();
+    assert!(
+        format!("{err}").contains("map requires { ... } block"),
+        "{err}"
+    );
+}
+
+#[test]
+fn block_params_shadow_outer_variables_like_function_params() {
+    let out = run_script("x = 1\n[2].map { |x| x * 10 }").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(20)]));
+    let out = run_script("[1, 2].each { || 0 }").unwrap_err();
+    assert!(
+        format!("{out}").contains("block expects 0 argument(s), got 1"),
+        "{out}"
+    );
+}

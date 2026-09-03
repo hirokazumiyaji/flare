@@ -39,6 +39,7 @@ pub enum Token {
     RBrace,
     LBracket,
     RBracket,
+    Pipe,
     Colon,
     Newline,
     Eof,
@@ -159,6 +160,10 @@ pub fn lex(input: &str) -> Result<Vec<Token>, Box<dyn Error>> {
             ']' => {
                 chars.next();
                 tokens.push(Token::RBracket);
+            }
+            '|' => {
+                chars.next();
+                tokens.push(Token::Pipe);
             }
             '.' => {
                 chars.next();

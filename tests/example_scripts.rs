@@ -36,6 +36,10 @@ fn runs_example_scripts_successfully() {
                     .collect(),
             ),
         ),
+        (
+            "examples/scripts/10_iteration.fl",
+            Value::Array(vec![Value::Int(2), Value::Int(4), Value::Int(6)]),
+        ),
     ];
 
     for (path, expected) in cases {
