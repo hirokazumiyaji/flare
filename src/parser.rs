@@ -8,11 +8,19 @@ type ParsedArgs = (Vec<Expr>, Vec<(String, Expr)>);
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// if / while の条件式パース中に 1 以上。条件式内ではメソッド呼び出しの
+    /// 省略可能ブロック(`obj.method { ... }`)を消費しない(制御構文の本体
+    /// `{ ... }` と区別するため)。
+    suppress_block_calls: usize,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            suppress_block_calls: 0,
+        }
     }
     pub fn parse_program(&mut self) -> Result<Vec<Stmt>, Box<dyn Error>> {
         let mut out = Vec::new();
@@ -72,7 +80,10 @@ impl Parser {
     }
     fn parse_if(&mut self) -> Result<Stmt, Box<dyn Error>> {
         self.expect(Token::If)?;
-        let cond = self.parse_expr()?;
+        self.suppress_block_calls += 1;
+        let cond = self.parse_expr();
+        self.suppress_block_calls -= 1;
+        let cond = cond?;
         let then_body = self.parse_brace_block()?;
         let mut else_body = vec![];
         if self.at(&Token::Else) {
@@ -87,7 +98,10 @@ impl Parser {
     }
     fn parse_while(&mut self) -> Result<Stmt, Box<dyn Error>> {
         self.expect(Token::While)?;
-        let cond = self.parse_expr()?;
+        self.suppress_block_calls += 1;
+        let cond = self.parse_expr();
+        self.suppress_block_calls -= 1;
+        let cond = cond?;
         let body = self.parse_brace_block()?;
         Ok(Stmt::While { cond, body })
     }
@@ -203,7 +217,9 @@ impl Parser {
             }
             Token::Ident(name) => {
                 self.bump();
-                if self.at(&Token::LParen) || self.is_arg_start() {
+                if self.at(&Token::LParen)
+                    || (self.is_arg_start() && self.suppress_block_calls == 0)
+                {
                     let (args, kwargs) = self.parse_args()?;
                     Ok(Expr::Call {
                         receiver: None,
@@ -212,7 +228,7 @@ impl Parser {
                         kwargs,
                         block: self.parse_optional_brace_block()?,
                     })
-                } else if self.at(&Token::LBrace) {
+                } else if self.at(&Token::LBrace) && self.suppress_block_calls == 0 {
                     Ok(Expr::Call {
                         receiver: None,
                         name,
@@ -367,7 +383,7 @@ impl Parser {
         Ok(None)
     }
     fn parse_optional_brace_block(&mut self) -> Result<Option<Vec<Stmt>>, Box<dyn Error>> {
-        if !self.at(&Token::LBrace) {
+        if !self.at(&Token::LBrace) || self.suppress_block_calls > 0 {
             return Ok(None);
         }
         Ok(Some(self.parse_brace_block()?))

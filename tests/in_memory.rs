@@ -338,3 +338,24 @@ fn index_access_read_value_for_branching() {
     .unwrap();
     assert_eq!(out, Value::Int(1));
 }
+
+#[test]
+fn method_calls_in_conditions_do_not_consume_control_flow_braces() {
+    // Map の m.key 形式・関数呼び出し・素の変数いずれも if / while の条件式に置ける。
+    let out = run_script("m = {active: true}\nif m.active { 1 } else { 2 }").unwrap();
+    assert_eq!(out, Value::Int(1));
+    let out = run_script("m = {count: 0}\nwhile m.count > 0 { 9 }").unwrap();
+    assert_eq!(out, Value::Nil);
+    let out = run_script("fn f() { true }\nif f() { 1 } else { 2 }").unwrap();
+    assert_eq!(out, Value::Int(1));
+    let out = run_script("x = true\nif x { 5 } else { 6 }").unwrap();
+    assert_eq!(out, Value::Int(5));
+    let out = run_script("m = {n: 2}\nif m[\"n\"] >= 2 { 1 } else { 2 }").unwrap();
+    assert_eq!(out, Value::Int(1));
+}
+
+#[test]
+fn block_calls_still_work_outside_conditions() {
+    let out = run_script("batch { set(\"users/bb\", {n: 1}) }\nget(\"users/bb\")[\"n\"]").unwrap();
+    assert_eq!(out, Value::Int(1));
+}
