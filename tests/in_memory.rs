@@ -545,6 +545,46 @@ fn newlines_inside_contained_expressions_are_ignored() {
 }
 
 #[test]
+fn functions_do_not_see_caller_locals() {
+    let err = run_script("fn f() { x }\nfn g() { x = 1\n  f() }\ng()").unwrap_err();
+    assert!(format!("{err}").contains("undefined variable: x"), "{err}");
+}
+
+#[test]
+fn nested_call_does_not_leak_callee_locals() {
+    let err = run_script("fn g() { a }\nfn f() { a = 42\n  g() }\nf()").unwrap_err();
+    assert!(format!("{err}").contains("undefined variable: a"), "{err}");
+}
+
+#[test]
+fn function_local_may_collide_with_caller_local() {
+    let out = run_script("fn f() { x = 9\n  x }\nfn g() { x = 1\n  [f(), x] }\ng()").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(9), Value::Int(1)]));
+}
+
+#[test]
+fn functions_read_globals_but_cannot_assign_them() {
+    let out = run_script("x = 5\nfn f() { x }\nf()").unwrap();
+    assert_eq!(out, Value::Int(5));
+    let err = run_script("x = 5\nfn f() { x = 6 }\nf()").unwrap_err();
+    assert!(
+        format!("{err}").contains("reassignment is not allowed: x"),
+        "{err}"
+    );
+    let err = run_script("fn f() { x = 6\n  x }\nx = 5\nf()").unwrap_err();
+    assert!(
+        format!("{err}").contains("reassignment is not allowed: x"),
+        "{err}"
+    );
+}
+
+#[test]
+fn function_params_may_shadow_globals() {
+    let out = run_script("n = 1\nfn f(n) { n }\nf(2)").unwrap();
+    assert_eq!(out, Value::Int(2));
+}
+
+#[test]
 fn semicolons_are_not_treated_as_newlines_inside_delimiters() {
     // `;` は文の区切りのまま。delimiter の内側ではエラーになる。
     assert!(run_script("[;1]").is_err());
@@ -561,4 +601,11 @@ fn semicolons_remain_statement_separators() {
     assert_eq!(out, Value::Int(1));
     let out = run_script("fn f() { return; 1 }\nf()").unwrap();
     assert_eq!(out, Value::Nil);
+}
+
+#[test]
+fn recursive_functions_still_work() {
+    let out =
+        run_script("fn fact(n) { if n <= 1 { 1 } else { n * fact(n - 1) } }\nfact(5)").unwrap();
+    assert_eq!(out, Value::Int(120));
 }

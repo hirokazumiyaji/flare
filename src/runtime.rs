@@ -337,13 +337,17 @@ impl<F: Firestore> Runtime<F> {
                 if func.params.len() != bound.len() {
                     return Err(format!("arg length mismatch for {name}").into());
                 }
+                // 関数はグローバルスコープと仮引数のみを見える(静的スコープ)。
+                // 呼び出し元のローカル変数・呼び出された関数自身のローカルは隠す。
+                let mut saved = self.scopes.split_off(1);
                 self.scopes.push(HashMap::new());
                 for (param, value) in bound {
                     self.set_var(&param, value)?;
                 }
-                let res = self.eval_block(&func.body)?;
+                let res = self.eval_block(&func.body);
                 self.scopes.pop();
-                Ok(match res {
+                self.scopes.append(&mut saved);
+                Ok(match res? {
                     ExecFlow::Value(v) | ExecFlow::Return(v) => v,
                 })
             }
