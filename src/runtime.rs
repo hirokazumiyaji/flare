@@ -208,10 +208,10 @@ impl<F: Firestore> Runtime<F> {
             "doc" => Ok(Value::DocRef(DocRef {
                 path: expect_string(args.first())?.to_string(),
             })),
-            "collection" => Ok(Value::CollectionRef(CollectionRef {
+            "col" => Ok(Value::CollectionRef(CollectionRef {
                 path: expect_string(args.first())?.to_string(),
             })),
-            "collection_group" => Ok(Value::CollectionGroupRef(CollectionGroupRef {
+            "col_group" => Ok(Value::CollectionGroupRef(CollectionGroupRef {
                 id: expect_string(args.first())?.to_string(),
             })),
             "array" => Ok(Value::Array(args)),

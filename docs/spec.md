@@ -24,7 +24,7 @@ firelang は Firestore を操作するための mruby 風スクリプト言語�
 
 ```ruby
 set("users/1", {name: "alice", age: 20})
-rows = collection("users").where("age", ">=", 20).limit(10).get()
+rows = col("users").where("age", ">=", 20).limit(10).get()
 puts "found #{rows}"
 ```
 
@@ -53,9 +53,9 @@ Firestore 操作のための特殊な値:
 | 型 | 生成方法 | 説明 |
 |----|---------|------|
 | DocRef | `doc("users/1")` | ドキュメント参照 |
-| CollectionRef | `collection("users")` | コレクション参照 |
-| CollectionGroupRef | `collection_group("members")` | コレクショングループ参照 |
-| QueryRef | `collection(..).where(..)` 等 | 構築中のクエリ |
+| CollectionRef | `col("users")` | コレクション参照 |
+| CollectionGroupRef | `col_group("members")` | コレクショングループ参照 |
+| QueryRef | `col(..).where(..)` 等 | 構築中のクエリ |
 | ServerTimestamp | `server_timestamp()` | 書き込み時にサーバ時刻へ解決されるセンチネル |
 | ArrayUnion / ArrayRemove | `array_union([..])` / `array_remove([..])` | 配列フィールド変換センチネル |
 
@@ -163,8 +163,8 @@ while cond { ... }
 | 関数 | 戻り値 | 説明 |
 |------|--------|------|
 | `doc(path)` | DocRef | ドキュメント参照を作る |
-| `collection(path)` | CollectionRef | コレクション参照。`"users"` や `"teams/t1/members"`(サブコレクション)が使える |
-| `collection_group(id)` | CollectionGroupRef | 同名コレクション横断の参照 |
+| `col(path)` | CollectionRef | コレクション参照。`"users"` や `"teams/t1/members"`(サブコレクション)が使える |
+| `col_group(id)` | CollectionGroupRef | 同名コレクション横断の参照 |
 | `get(target)` | Map / Nil | ドキュメント取得。**存在しなければ nil**(エラーにはならない) |
 | `set(target, data_map)` | Nil | ドキュメント全体を書き込み(置換) |
 | `set(target, data_map, merge_bool)` / `set(target, data_map, merge: true)` | Nil | merge=true ならフィールドマージ |
@@ -188,11 +188,11 @@ update("users/1", {tags: array_union(["a"])})
 ## 7. クエリ
 
 ```ruby
-collection("users").where("age", ">=", 20).where("active", "==", true).limit(10).get()
-collection_group("members").where("active", "==", true).get()
-collection("users").get()          # 直下の全ドキュメント
-collection("users").limit(10).get()
-collection("users").doc("1")       # doc("users/1") と同等
+col("users").where("age", ">=", 20).where("active", "==", true).limit(10).get()
+col_group("members").where("active", "==", true).get()
+col("users").get()          # 直下の全ドキュメント
+col("users").limit(10).get()
+col("users").doc("1")       # doc("users/1") と同等
 ```
 
 - `where(field, op, value)` — op は `"=="` `">"` `">="` `"<"` `"<="` の 5 種。複数 `where` は AND。
@@ -202,7 +202,7 @@ collection("users").doc("1")       # doc("users/1") と同等
 - `limit(n)` — 件数上限。後勝ち(複数回呼ぶと最後の値)。
 - `get()` — 実行して `Array<Map>` を返す。各 Map には `__name__` キーで**相対ドキュメントパス**(例 `"users/1"`)が入る。
 - **決定的順序**: 結果は firelang 相対ドキュメントパス文字列の辞書順でソートされ、`limit` はソート後に適用される。`users/a` < `users/b`、`teams/t1/members/a` < `teams/t2/members/a`。
-- `collection()` のクエリは**直下のドキュメントのみ**対象(サブコレクション内は含まない)。`collection_group(id)` はパス中のいずれかの階層でコレクション名が `id` に一致するドキュメントすべてが対象。
+- `col()` のクエリは**直下のドキュメントのみ**対象(サブコレクション内は含まない)。`col_group(id)` はパス中のいずれかの階層でコレクション名が `id` に一致するドキュメントすべてが対象。
 - クエリの**構築**(`.where()` / `.limit()`)は `batch` / `transaction` 内でも可。**実行**(`.get()`)のみ不可。
 - カーソル・オフセット・`order_by` は非対応(12 章)。
 

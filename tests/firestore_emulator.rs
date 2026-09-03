@@ -57,7 +57,7 @@ fn emulator_query_where_and_limit() {
         r#"set("users/{id}_z", {{age: 10}})
 set("users/{id}_a", {{age: 30}})
 set("users/{id}_m", {{age: 25}})
-collection("users").where("age", ">=", 20).limit(2).get()"#
+col("users").where("age", ">=", 20).limit(2).get()"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
     let s = format!("{out:?}");
@@ -75,7 +75,7 @@ fn emulator_collection_group_query() {
     let script = format!(
         r#"set("teams/t1/members/{id}_x", {{active: true}})
 set("teams/t2/members/{id}_y", {{active: true}})
-collection_group("members").where("active", "==", true).get()"#
+col_group("members").where("active", "==", true).get()"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
     let s = format!("{out:?}");

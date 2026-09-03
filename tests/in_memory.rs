@@ -46,7 +46,7 @@ fn set_requires_map_and_get_returns_map() {
 #[test]
 fn supports_timestamp_and_query() {
     let out = run_script(
-        "set(doc(\"users/1\"), {age: 20, created: timestamp(100)})\nset(doc(\"users/2\"), {age: 30, created: now()})\ncollection(\"users\").where(\"age\", \">=\", 21).limit(1).get()",
+        "set(doc(\"users/1\"), {age: 20, created: timestamp(100)})\nset(doc(\"users/2\"), {age: 30, created: now()})\ncol(\"users\").where(\"age\", \">=\", 21).limit(1).get()",
     )
     .unwrap();
     match out {
@@ -130,7 +130,7 @@ fn transaction_rejects_get_after_write() {
 #[test]
 fn query_limit_is_deterministic_by_path() {
     let out = run_script(
-        "set(\"users/qz\", {ord: 1})\nset(\"users/qa\", {ord: 2})\nset(\"users/qm\", {ord: 3})\ncollection(\"users\").where(\"ord\", \">=\", 1).limit(1).get()",
+        "set(\"users/qz\", {ord: 1})\nset(\"users/qa\", {ord: 2})\nset(\"users/qm\", {ord: 3})\ncol(\"users\").where(\"ord\", \">=\", 1).limit(1).get()",
     )
     .unwrap();
     let s = format!("{out:?}");
@@ -222,9 +222,9 @@ fn transaction_rolls_back_on_runtime_error() {
 
 #[test]
 fn query_get_is_rejected_inside_batch_and_transaction() {
-    let err = run_script("batch { collection(\"users\").get() }").unwrap_err();
+    let err = run_script("batch { col(\"users\").get() }").unwrap_err();
     assert!(format!("{err}").contains("not allowed inside batch"));
-    let err = run_script("transaction { collection(\"users\").get() }").unwrap_err();
+    let err = run_script("transaction { col(\"users\").get() }").unwrap_err();
     assert!(format!("{err}").contains("not allowed inside transaction"));
 }
 
@@ -238,14 +238,14 @@ fn update_missing_document_fails_in_memory() {
 fn collection_limit_builds_query_inside_transaction() {
     // クエリの「構築」は batch/transaction 内でも許される。禁止されるのは .get() 実行のみ。
     let out = run_script(
-        "q = collection(\"users\").limit(1)\ntransaction { q2 = collection(\"users\").limit(1)\nset(\"users/l1\", {n: 1}) }\nq",
+        "q = col(\"users\").limit(1)\ntransaction { q2 = col(\"users\").limit(1)\nset(\"users/l1\", {n: 1}) }\nq",
     );
     assert!(out.is_ok(), "{out:?}");
 }
 
 #[test]
 fn where_rejects_unsupported_operator() {
-    let err = run_script("collection(\"users\").where(\"a\", \"!=\", 1)").unwrap_err();
+    let err = run_script("col(\"users\").where(\"a\", \"!=\", 1)").unwrap_err();
     assert!(format!("{err}").contains("unsupported query op"), "{err}");
 }
 
