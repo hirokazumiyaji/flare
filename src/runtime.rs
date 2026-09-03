@@ -368,7 +368,7 @@ impl<F: Firestore> Runtime<F> {
                 self.eval_query_method(group.to_query(), name, args)
             }
             Value::QueryRef(query) => self.eval_query_method(query, name, args),
-            Value::Array(items) => self.eval_array_method(items, name, block),
+            Value::Array(items) => self.eval_array_method(items, name, args, block),
             Value::Timestamp(ts) => match name {
                 "to_unix" => Ok(Value::Int(ts.seconds)),
                 "add_seconds" => Ok(Value::Timestamp(Timestamp {
@@ -392,13 +392,20 @@ impl<F: Firestore> Runtime<F> {
         &mut self,
         items: Vec<Value>,
         name: &str,
+        args: Vec<Value>,
         block: Option<&Block>,
     ) -> Result<Value, Box<dyn Error>> {
+        if !args.is_empty() {
+            return Err(format!("array method {name} does not take arguments").into());
+        }
         match name {
             "each" => {
                 let Some(block) = block else {
                     return Err("each requires { ... } block".into());
                 };
+                // 空配列でも呼び出し側の引数個数違反を検出できるよう、
+                // ループの前にブロック引数の個数を検証する。
+                check_block_arity(block, 1)?;
                 for item in items {
                     self.call_block(block, vec![item])?;
                 }
@@ -408,6 +415,7 @@ impl<F: Firestore> Runtime<F> {
                 let Some(block) = block else {
                     return Err("map requires { ... } block".into());
                 };
+                check_block_arity(block, 1)?;
                 let mut out = vec![];
                 for item in items {
                     out.push(self.call_block(block, vec![item])?);
@@ -420,14 +428,7 @@ impl<F: Firestore> Runtime<F> {
     }
 
     fn call_block(&mut self, block: &Block, args: Vec<Value>) -> Result<Value, Box<dyn Error>> {
-        if args.len() != block.params.len() {
-            return Err(format!(
-                "block expects {} argument(s), got {}",
-                block.params.len(),
-                args.len()
-            )
-            .into());
-        }
+        check_block_arity(block, args.len())?;
         self.scopes.push(HashMap::new());
         for (param, value) in block.params.iter().cloned().zip(args) {
             self.set_var(&param, value)?;
@@ -566,6 +567,18 @@ fn expect_doc_path(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
         Some(Value::DocRef(d)) => Ok(&d.path),
         _ => Err("expected document path string or doc object".into()),
     }
+}
+
+fn check_block_arity(block: &Block, yielded: usize) -> Result<(), Box<dyn Error>> {
+    if block.params.len() != yielded {
+        return Err(format!(
+            "block expects {} argument(s), got {}",
+            block.params.len(),
+            yielded
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {

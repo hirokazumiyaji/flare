@@ -439,3 +439,52 @@ fn block_params_shadow_outer_variables_like_function_params() {
         "{out}"
     );
 }
+
+#[test]
+fn block_params_may_start_on_the_next_line() {
+    let out = run_script("[1, 2, 3].map {\n|x| x * 2\n}").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(2), Value::Int(4), Value::Int(6)])
+    );
+    let out = run_script("[1].each {\n  |n|\n  n\n}").unwrap();
+    assert_eq!(out, Value::Nil);
+}
+
+#[test]
+fn block_arity_is_checked_even_for_empty_arrays() {
+    let err = run_script("[].each { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+    let err = run_script("[].map { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+    let err = run_script("[].each { || 0 }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 0 argument(s), got 1"),
+        "{err}"
+    );
+}
+
+#[test]
+fn array_methods_reject_positional_arguments() {
+    let err = run_script("[1].map(99) { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("does not take arguments"),
+        "{err}"
+    );
+    let err = run_script("[1].len(99)").unwrap_err();
+    assert!(
+        format!("{err}").contains("does not take arguments"),
+        "{err}"
+    );
+    let err = run_script("[1].each(99) { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("does not take arguments"),
+        "{err}"
+    );
+}

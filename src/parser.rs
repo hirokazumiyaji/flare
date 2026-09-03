@@ -397,6 +397,8 @@ impl Parser {
     }
     fn parse_brace_block_with_params(&mut self) -> Result<Block, Box<dyn Error>> {
         self.expect(Token::LBrace)?;
+        // `{\n|x| ... }` のようにパラメータリストの直前に改行が置けるようにする。
+        self.skip_newlines();
         let params = self.parse_block_params()?;
         self.skip_newlines();
         let mut body = vec![];
