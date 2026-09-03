@@ -22,6 +22,10 @@ pub enum Expr {
     },
     Map(Vec<(String, Expr)>),
     Array(Vec<Expr>),
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

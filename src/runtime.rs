@@ -179,6 +179,11 @@ impl<F: Firestore> Runtime<F> {
                 }
                 Ok(Value::Array(out))
             }
+            Expr::Index { base, index } => {
+                let base = self.eval_expr(base)?;
+                let index = self.eval_expr(index)?;
+                eval_index(base, index)
+            }
         }
     }
 
@@ -357,6 +362,14 @@ impl<F: Firestore> Runtime<F> {
                 })),
                 _ => Err(format!("unknown timestamp method: {name}").into()),
             },
+            Value::Map(map) => {
+                // Map レシーバは `m.key` 形式のキーアクセス(Ruby の OpenStruct 風)のみ。
+                // 引数を取るメソッドは持たないので、Args がある場合はエラーにする。
+                if !args.is_empty() {
+                    return Err(format!("unknown map method: {name}").into());
+                }
+                Ok(map.get(name).cloned().unwrap_or(Value::Nil))
+            }
             _ => Err("unsupported method receiver".into()),
         }
     }
@@ -489,6 +502,21 @@ fn expect_doc_path(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
         Some(Value::Str(s)) => Ok(s),
         Some(Value::DocRef(d)) => Ok(&d.path),
         _ => Err("expected document path string or doc object".into()),
+    }
+}
+
+fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {
+    match (base, index) {
+        (Value::Map(map), Value::Str(key)) => Ok(map.get(&key).cloned().unwrap_or(Value::Nil)),
+        (Value::Array(items), Value::Int(i)) => {
+            if i < 0 {
+                return Ok(Value::Nil);
+            }
+            Ok(items.get(i as usize).cloned().unwrap_or(Value::Nil))
+        }
+        (Value::Map(_), _) => Err("map index must be a string".into()),
+        (Value::Array(_), _) => Err("array index must be an int".into()),
+        _ => Err("unsupported index receiver".into()),
     }
 }
 

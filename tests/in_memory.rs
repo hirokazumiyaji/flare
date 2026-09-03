@@ -269,3 +269,72 @@ fn unterminated_interpolation_fails_at_lex_time() {
     let err = firelang::lexer::lex("\"#{1 + 2\"").unwrap_err();
     assert!(format!("{err}").contains("unterminated"), "{err}");
 }
+
+#[test]
+fn supports_map_and_array_index_access() {
+    let out = run_script(
+        "m = {name: \"alice\", nested: {a: [1, 2]}}\n[m[\"name\"], m[\"nested\"][\"a\"][1]]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Str("alice".to_string()), Value::Int(2)])
+    );
+}
+
+#[test]
+fn map_dot_access_returns_key_value() {
+    let out = run_script("m = {name: \"alice\"}\nm.name").unwrap();
+    assert_eq!(out, Value::Str("alice".to_string()));
+}
+
+#[test]
+fn missing_keys_and_out_of_range_indices_return_nil() {
+    let out =
+        run_script("m = {name: \"alice\"}\na = [1]\n[m[\"missing\"], m.missing, a[5], a[0 - 1]]")
+            .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Nil, Value::Nil, Value::Nil, Value::Nil])
+    );
+}
+
+#[test]
+fn index_type_mismatch_is_an_error() {
+    let err = run_script("[1, 2][\"a\"]").unwrap_err();
+    assert!(
+        format!("{err}").contains("array index must be an int"),
+        "{err}"
+    );
+    let err = run_script("{a: 1}[1]").unwrap_err();
+    assert!(
+        format!("{err}").contains("map index must be a string"),
+        "{err}"
+    );
+    let err = run_script("1[0]").unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported index receiver"),
+        "{err}"
+    );
+}
+
+#[test]
+fn query_rows_support_index_access_including_dunder_name() {
+    let out = run_script(
+        "set(\"users/ix1\", {n: 1})\nset(\"users/ix2\", {n: 2})\nrows = col(\"users\").get()\n[rows[0][\"__name__\"], rows[1][\"n\"]]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Str("users/ix1".to_string()), Value::Int(2),])
+    );
+}
+
+#[test]
+fn index_access_read_value_for_branching() {
+    let out = run_script(
+        "set(\"users/br\", {active: true})\nu = get(\"users/br\")\nif u[\"active\"] { 1 } else { 2 }",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(1));
+}

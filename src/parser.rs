@@ -163,6 +163,16 @@ impl Parser {
                     kwargs,
                     block: self.parse_optional_brace_block()?,
                 };
+            } else if self.at(&Token::LBracket) {
+                self.bump();
+                self.skip_newlines();
+                let index = self.parse_expr()?;
+                self.skip_newlines();
+                self.expect(Token::RBracket)?;
+                expr = Expr::Index {
+                    base: Box::new(expr),
+                    index: Box::new(index),
+                };
             } else {
                 break;
             }
@@ -383,7 +393,6 @@ impl Parser {
                 | Token::False
                 | Token::Nil
                 | Token::LParen
-                | Token::LBracket
         )
     }
     fn skip_newlines(&mut self) {
