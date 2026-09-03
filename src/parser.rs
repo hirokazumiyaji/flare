@@ -55,11 +55,17 @@ impl Parser {
         let mut params = vec![];
         if self.at(&Token::LParen) {
             self.bump();
+            self.skip_newlines();
             if !self.at(&Token::RParen) {
                 loop {
                     params.push(self.expect_ident()?);
+                    self.skip_newlines();
                     if self.at(&Token::Comma) {
                         self.bump();
+                        self.skip_newlines();
+                        if self.at(&Token::RParen) {
+                            break;
+                        }
                     } else {
                         break;
                     }
@@ -242,7 +248,9 @@ impl Parser {
             }
             Token::LParen => {
                 self.bump();
+                self.skip_newlines();
                 let out = self.parse_expr()?;
+                self.skip_newlines();
                 self.expect(Token::RParen)?;
                 Ok(out)
             }
@@ -253,6 +261,7 @@ impl Parser {
     }
     fn parse_map_literal(&mut self) -> Result<Expr, Box<dyn Error>> {
         self.expect(Token::LBrace)?;
+        self.skip_newlines();
         let mut entries = vec![];
         if !self.at(&Token::RBrace) {
             loop {
@@ -277,8 +286,13 @@ impl Parser {
                 self.expect(Token::Colon)?;
                 let value = self.parse_expr()?;
                 entries.push((key, value));
+                self.skip_newlines();
                 if self.at(&Token::Comma) {
                     self.bump();
+                    self.skip_newlines();
+                    if self.at(&Token::RBrace) {
+                        break;
+                    }
                 } else {
                     break;
                 }
@@ -289,12 +303,18 @@ impl Parser {
     }
     fn parse_array_literal(&mut self) -> Result<Expr, Box<dyn Error>> {
         self.expect(Token::LBracket)?;
+        self.skip_newlines();
         let mut items = vec![];
         if !self.at(&Token::RBracket) {
             loop {
                 items.push(self.parse_expr()?);
+                self.skip_newlines();
                 if self.at(&Token::Comma) {
                     self.bump();
+                    self.skip_newlines();
+                    if self.at(&Token::RBracket) {
+                        break;
+                    }
                 } else {
                     break;
                 }
@@ -321,11 +341,17 @@ impl Parser {
         let mut kwargs = vec![];
         if self.at(&Token::LParen) {
             self.bump();
+            self.skip_newlines();
             if !self.at(&Token::RParen) {
                 loop {
                     self.parse_arg_into(&mut args, &mut kwargs)?;
+                    self.skip_newlines();
                     if self.at(&Token::Comma) {
                         self.bump();
+                        self.skip_newlines();
+                        if self.at(&Token::RParen) {
+                            break;
+                        }
                     } else {
                         break;
                     }
@@ -426,6 +452,9 @@ impl Parser {
             if self.at(&Token::Comma) {
                 self.bump();
                 self.skip_newlines();
+                if self.at(&Token::Pipe) {
+                    break;
+                }
             } else {
                 break;
             }

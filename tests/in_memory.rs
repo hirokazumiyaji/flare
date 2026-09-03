@@ -488,3 +488,43 @@ fn array_methods_reject_positional_arguments() {
         "{err}"
     );
 }
+
+#[test]
+fn multiline_map_literal_parses() {
+    let out = run_script(
+        "set(\"users/ml\", {\n  name: \"a\",\n  age: 20,\n})\nget(\"users/ml\")[\"age\"]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(20));
+}
+
+#[test]
+fn multiline_array_literal_and_args_parse() {
+    let out =
+        run_script("fn add(a, b) {\n  return a + b\n}\n[\n  1,\n  add(\n    2,\n    3,\n  ),\n]")
+            .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1), Value::Int(5)]));
+}
+
+#[test]
+fn trailing_commas_are_allowed_in_literals_and_args() {
+    let out = run_script("m = {a: 1,}\na = [1, 2,]\n[m[\"a\"], a[1]]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1), Value::Int(2)]));
+    let out = run_script("fn f(a, b,) { a + b }\nf(1, 2,)").unwrap();
+    assert_eq!(out, Value::Int(3));
+}
+
+#[test]
+fn multiline_nested_literals_parse() {
+    let out = run_script(
+        "rows = [\n  {\n    name: \"a\",\n    tags: [\"x\", \"y\"],\n  },\n]\nrows[0][\"tags\"][1]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Str("y".to_string()));
+}
+
+#[test]
+fn newlines_still_separate_statements_outside_brackets() {
+    let out = run_script("a = 1\nb = a + 1\nb").unwrap();
+    assert_eq!(out, Value::Int(2));
+}
