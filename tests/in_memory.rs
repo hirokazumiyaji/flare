@@ -609,3 +609,32 @@ fn recursive_functions_still_work() {
         run_script("fn fact(n) { if n <= 1 { 1 } else { n * fact(n - 1) } }\nfact(5)").unwrap();
     assert_eq!(out, Value::Int(120));
 }
+
+#[test]
+fn integer_overflow_is_an_error_not_a_panic() {
+    let err = run_script("9223372036854775807 + 1").unwrap_err();
+    assert!(format!("{err}").contains("integer overflow"), "{err}");
+    let err = run_script("0 - 9223372036854775807 - 2").unwrap_err();
+    assert!(format!("{err}").contains("integer overflow"), "{err}");
+    let err = run_script("9223372036854775807 * 2").unwrap_err();
+    assert!(format!("{err}").contains("integer overflow"), "{err}");
+    let err = run_script("(0 - 9223372036854775807 - 1) / (0 - 1)").unwrap_err();
+    assert!(format!("{err}").contains("integer overflow"), "{err}");
+}
+
+#[test]
+fn out_of_range_integer_literal_is_an_error() {
+    let err = run_script("99999999999999999999").unwrap_err();
+    assert!(
+        format!("{err}").contains("integer literal out of range"),
+        "{err}"
+    );
+}
+
+#[test]
+fn negative_limit_is_rejected() {
+    let err = run_script("col(\"users\").limit(0 - 1).get()").unwrap_err();
+    assert!(format!("{err}").contains("limit must be >= 0"), "{err}");
+    let out = run_script("set(\"users/lm\", {n: 1})\ncol(\"users\").limit(1).get()").unwrap();
+    assert!(matches!(out, Value::Array(_)));
+}

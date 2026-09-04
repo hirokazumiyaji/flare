@@ -458,7 +458,9 @@ impl<F: Firestore> Runtime<F> {
                 Ok(Value::QueryRef(query))
             }
             "limit" => {
-                query.limit = Some(expect_int(args.first())? as usize);
+                let n = expect_int(args.first())?;
+                let n = usize::try_from(n).map_err(|_| "limit must be >= 0")?;
+                query.limit = Some(n);
                 Ok(Value::QueryRef(query))
             }
             "get" => {
@@ -603,16 +605,16 @@ fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {
 fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
     Ok(match op {
         BinOp::Add => match (l, r) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a + b),
+            (Value::Int(a), Value::Int(b)) => int_binop(a, b, |a, b| a.checked_add(b))?,
             (Value::Str(a), Value::Str(b)) => Value::Str(format!("{a}{b}")),
             _ => return Err("unsupported + operands".into()),
         },
         BinOp::Sub => match (l, r) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a - b),
+            (Value::Int(a), Value::Int(b)) => int_binop(a, b, |a, b| a.checked_sub(b))?,
             _ => return Err("unsupported - operands".into()),
         },
         BinOp::Mul => match (l, r) {
-            (Value::Int(a), Value::Int(b)) => Value::Int(a * b),
+            (Value::Int(a), Value::Int(b)) => int_binop(a, b, |a, b| a.checked_mul(b))?,
             _ => return Err("unsupported * operands".into()),
         },
         BinOp::Div => match (l, r) {
@@ -620,7 +622,7 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
                 if b == 0 {
                     return Err("division by zero".into());
                 }
-                Value::Int(a / b)
+                int_binop(a, b, |a, b| a.checked_div(b))?
             }
             _ => return Err("unsupported / operands".into()),
         },
@@ -643,6 +645,12 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
             _ => return Err("unsupported <= operands".into()),
         },
     })
+}
+
+fn int_binop(a: i64, b: i64, f: impl Fn(i64, i64) -> Option<i64>) -> Result<Value, Box<dyn Error>> {
+    f(a, b)
+        .map(Value::Int)
+        .ok_or_else(|| "integer overflow".into())
 }
 
 enum ExecFlow {
