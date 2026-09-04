@@ -234,6 +234,8 @@ while cond { ... }
 
 ドキュメントパスを取る引数(下記 `target`)には、パス文字列(`"users/1"`)または `doc(...)` の戻り値のどちらでも渡せる。
 
+**パスの検証**: ドキュメントパスは**偶数**個、コレクションパスは**奇数**個の非空セグメントで構成されていなければならない(`"users/1"`、`"teams/t1/members"`)。違反(奇偶の不一致、空セグメント、先頭・末尾の `/`)は `doc()` / `col()` / `col_group()` / `get()` / `set()` / `update()` / `delete()` の呼び出し時点でエラーになり、in-memory / emulator で同じエラーになる。
+
 | 関数 | 戻り値 | 説明 |
 |------|--------|------|
 | `doc(path)` | DocRef | ドキュメント参照を作る |
@@ -358,9 +360,5 @@ usage: fl [--backend in-memory|emulator] <script-file>
 
 | 項目 | 現状の挙動 | 予定 |
 |------|-----------|------|
-
-
-
-| ドキュメントパスの検証 | セグメント数の検証なし(`set("users", ...)` が通る)。挙動未定義 | backlog(当面そのまま) |
 | emulator の transaction 中断 | ロールバック RPC を送らない(サーバ側タイムアウト任せ) | backlog |
 | `puts` / `fl` の複合値出力 | Rust の Debug 形式(`Map({"a": Int(1)})`) | backlog |

@@ -638,3 +638,54 @@ fn negative_limit_is_rejected() {
     let out = run_script("set(\"users/lm\", {n: 1})\ncol(\"users\").limit(1).get()").unwrap();
     assert!(matches!(out, Value::Array(_)));
 }
+
+#[test]
+fn invalid_document_paths_are_rejected() {
+    let cases = [
+        "set(\"users\", {a: 1})",
+        "get(\"users/1/posts\")",
+        "set(\"users//1\", {a: 1})",
+        "set(\"/users/1\", {a: 1})",
+        "set(\"users/1/\", {a: 1})",
+        "doc(\"users\")",
+        "update(\"users\", {a: 1})",
+        "delete(\"teams\")",
+        "get(\"teams\")",
+    ];
+    for src in cases {
+        let err = run_script(src).unwrap_err();
+        assert!(
+            format!("{err}").contains("invalid document path")
+                || format!("{err}").contains("invalid path:"),
+            "{src}: {err}"
+        );
+    }
+}
+
+#[test]
+fn invalid_collection_paths_are_rejected() {
+    let cases = [
+        ("col(\"users/1\")", "invalid collection path"),
+        ("col(\"\")", "invalid path:"),
+        ("col(\"users//members\")", "invalid path: users//members"),
+        ("col(\"/users\")", "invalid path:"),
+        ("col_group(\"a/b\")", "invalid collection group id"),
+        ("col_group(\"\")", "invalid collection group id"),
+        ("col(\"users\").doc(\"a/b\")", "invalid document id"),
+    ];
+    for (src, expected) in cases {
+        let err = run_script(src).unwrap_err();
+        assert!(format!("{err}").contains(expected), "{src}: {err}");
+    }
+}
+
+#[test]
+fn valid_subcollection_paths_still_work() {
+    let out = run_script(
+        "set(\"teams/t1/members/m1\", {n: 1})\ncol(\"teams/t1/members\").get()[0][\"__name__\"]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Str("teams/t1/members/m1".to_string()));
+    let out = run_script("col(\"users\").doc(\"1\")").unwrap();
+    assert!(matches!(out, Value::DocRef(_)));
+}

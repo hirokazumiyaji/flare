@@ -210,15 +210,29 @@ impl<F: Firestore> Runtime<F> {
                 }
                 Ok(Value::Nil)
             }
-            "doc" => Ok(Value::DocRef(DocRef {
-                path: expect_string(args.first())?.to_string(),
-            })),
-            "col" => Ok(Value::CollectionRef(CollectionRef {
-                path: expect_string(args.first())?.to_string(),
-            })),
-            "col_group" => Ok(Value::CollectionGroupRef(CollectionGroupRef {
-                id: expect_string(args.first())?.to_string(),
-            })),
+            "doc" => {
+                let path = expect_string(args.first())?;
+                validate_doc_path(path)?;
+                Ok(Value::DocRef(DocRef {
+                    path: path.to_string(),
+                }))
+            }
+            "col" => {
+                let path = expect_string(args.first())?;
+                validate_collection_path(path)?;
+                Ok(Value::CollectionRef(CollectionRef {
+                    path: path.to_string(),
+                }))
+            }
+            "col_group" => {
+                let id = expect_string(args.first())?;
+                if id.is_empty() || id.contains('/') {
+                    return Err(format!("invalid collection group id: {id}").into());
+                }
+                Ok(Value::CollectionGroupRef(CollectionGroupRef {
+                    id: id.to_string(),
+                }))
+            }
             "array" => Ok(Value::Array(args)),
             "len" => match args.first() {
                 Some(Value::Array(a)) => Ok(Value::Int(a.len() as i64)),
@@ -362,9 +376,15 @@ impl<F: Firestore> Runtime<F> {
         block: Option<&Block>,
     ) -> Result<Value, Box<dyn Error>> {
         match receiver {
-            Value::CollectionRef(collection) if name == "doc" => Ok(Value::DocRef(DocRef {
-                path: format!("{}/{}", collection.path, expect_string(args.first())?),
-            })),
+            Value::CollectionRef(collection) if name == "doc" => {
+                let id = expect_string(args.first())?;
+                if id.is_empty() || id.contains('/') {
+                    return Err(format!("invalid document id: {id}").into());
+                }
+                Ok(Value::DocRef(DocRef {
+                    path: format!("{}/{}", collection.path, id),
+                }))
+            }
             Value::CollectionRef(collection) => {
                 self.eval_query_method(collection.to_query(), name, args)
             }
@@ -569,10 +589,42 @@ fn expect_array(v: Option<&Value>) -> Result<&Vec<Value>, Box<dyn Error>> {
 
 fn expect_doc_path(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
     match v {
-        Some(Value::Str(s)) => Ok(s),
+        Some(Value::Str(s)) => {
+            validate_doc_path(s)?;
+            Ok(s)
+        }
         Some(Value::DocRef(d)) => Ok(&d.path),
         _ => Err("expected document path string or doc object".into()),
     }
+}
+
+/// ドキュメントパスは偶数個・コレクションパスは奇数個の非空セグメントで
+/// 構成されていなければならない(`users/1`、`teams/t1/members`)。
+/// runtime 層で検証するため、in-memory / emulator のどちらのバックエンド
+/// でも同じエラーになる。
+fn validate_doc_path(path: &str) -> Result<(), Box<dyn Error>> {
+    validate_path(path, false)
+}
+
+fn validate_collection_path(path: &str) -> Result<(), Box<dyn Error>> {
+    validate_path(path, true)
+}
+
+fn validate_path(path: &str, collection: bool) -> Result<(), Box<dyn Error>> {
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.iter().any(|s| s.is_empty()) {
+        return Err(format!("invalid path: {path} (empty path segment)").into());
+    }
+    let parity_ok = segments.len() % 2 == if collection { 1 } else { 0 };
+    if !parity_ok {
+        let kind = if collection { "collection" } else { "document" };
+        let expected = if collection { "odd" } else { "even" };
+        return Err(format!(
+            "invalid {kind} path: {path} (expected an {expected} number of segments)"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn check_block_arity(block: &Block, yielded: usize) -> Result<(), Box<dyn Error>> {
