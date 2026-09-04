@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
-use crate::ast::{BinOp, Expr, Stmt, StrPiece};
+use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece};
 use crate::firestore::{Firestore, WriteOp};
 use crate::value::{
     CollectionGroupRef, CollectionRef, DocRef, QueryFilter, QueryOp, QueryRef, Timestamp, UserFunc,
@@ -179,6 +179,11 @@ impl<F: Firestore> Runtime<F> {
                 }
                 Ok(Value::Array(out))
             }
+            Expr::Index { base, index } => {
+                let base = self.eval_expr(base)?;
+                let index = self.eval_expr(index)?;
+                eval_index(base, index)
+            }
         }
     }
 
@@ -188,14 +193,14 @@ impl<F: Firestore> Runtime<F> {
         name: &str,
         args: Vec<Value>,
         kwargs: BTreeMap<String, Value>,
-        block: Option<&Vec<Stmt>>,
+        block: Option<&Block>,
     ) -> Result<Value, Box<dyn Error>> {
         if let Some(r) = receiver {
             let rec = self.eval_expr(r)?;
             if !kwargs.is_empty() {
                 return Err("keyword args are not supported for method calls yet".into());
             }
-            return self.eval_method_call(rec, name, args);
+            return self.eval_method_call(rec, name, args, block);
         }
 
         match name {
@@ -215,6 +220,12 @@ impl<F: Firestore> Runtime<F> {
                 id: expect_string(args.first())?.to_string(),
             })),
             "array" => Ok(Value::Array(args)),
+            "len" => match args.first() {
+                Some(Value::Array(a)) => Ok(Value::Int(a.len() as i64)),
+                Some(Value::Map(m)) => Ok(Value::Int(m.len() as i64)),
+                Some(Value::Str(s)) => Ok(Value::Int(s.chars().count() as i64)),
+                _ => Err("len expects array, map, or string".into()),
+            },
 
             "now" => Ok(Value::Timestamp(Timestamp {
                 seconds: Timestamp::now()?.seconds,
@@ -273,11 +284,14 @@ impl<F: Firestore> Runtime<F> {
                 let Some(stmts) = block else {
                     return Err("batch requires { ... } block".into());
                 };
+                if !stmts.params.is_empty() {
+                    return Err("batch block does not take parameters".into());
+                }
                 if !matches!(self.exec, ExecCtx::Normal) {
                     return Err("batch cannot be nested inside batch/transaction".into());
                 }
                 self.exec = ExecCtx::Batch { writes: vec![] };
-                let flow = self.eval_block(stmts);
+                let flow = self.eval_block(&stmts.body);
                 let ExecCtx::Batch { writes } = std::mem::replace(&mut self.exec, ExecCtx::Normal)
                 else {
                     unreachable!("exec ctx changed inside batch");
@@ -290,12 +304,15 @@ impl<F: Firestore> Runtime<F> {
                 let Some(stmts) = block else {
                     return Err("transaction requires { ... } block".into());
                 };
+                if !stmts.params.is_empty() {
+                    return Err("transaction block does not take parameters".into());
+                }
                 if !matches!(self.exec, ExecCtx::Normal) {
                     return Err("transaction cannot be nested inside batch/transaction".into());
                 }
                 self.fs.begin_transaction()?;
                 self.exec = ExecCtx::Transaction { writes: vec![] };
-                let flow = self.eval_block(stmts);
+                let flow = self.eval_block(&stmts.body);
                 let ExecCtx::Transaction { writes } =
                     std::mem::replace(&mut self.exec, ExecCtx::Normal)
                 else {
@@ -320,13 +337,17 @@ impl<F: Firestore> Runtime<F> {
                 if func.params.len() != bound.len() {
                     return Err(format!("arg length mismatch for {name}").into());
                 }
+                // 関数はグローバルスコープと仮引数のみを見える(静的スコープ)。
+                // 呼び出し元のローカル変数・呼び出された関数自身のローカルは隠す。
+                let mut saved = self.scopes.split_off(1);
                 self.scopes.push(HashMap::new());
                 for (param, value) in bound {
                     self.set_var(&param, value)?;
                 }
-                let res = self.eval_block(&func.body)?;
+                let res = self.eval_block(&func.body);
                 self.scopes.pop();
-                Ok(match res {
+                self.scopes.append(&mut saved);
+                Ok(match res? {
                     ExecFlow::Value(v) | ExecFlow::Return(v) => v,
                 })
             }
@@ -338,6 +359,7 @@ impl<F: Firestore> Runtime<F> {
         receiver: Value,
         name: &str,
         args: Vec<Value>,
+        block: Option<&Block>,
     ) -> Result<Value, Box<dyn Error>> {
         match receiver {
             Value::CollectionRef(collection) if name == "doc" => Ok(Value::DocRef(DocRef {
@@ -350,6 +372,7 @@ impl<F: Firestore> Runtime<F> {
                 self.eval_query_method(group.to_query(), name, args)
             }
             Value::QueryRef(query) => self.eval_query_method(query, name, args),
+            Value::Array(items) => self.eval_array_method(items, name, args, block),
             Value::Timestamp(ts) => match name {
                 "to_unix" => Ok(Value::Int(ts.seconds)),
                 "add_seconds" => Ok(Value::Timestamp(Timestamp {
@@ -357,8 +380,66 @@ impl<F: Firestore> Runtime<F> {
                 })),
                 _ => Err(format!("unknown timestamp method: {name}").into()),
             },
+            Value::Map(map) => {
+                // Map レシーバは `m.key` 形式のキーアクセス(Ruby の OpenStruct 風)のみ。
+                // 引数を取るメソッドは持たないので、Args がある場合はエラーにする。
+                if !args.is_empty() {
+                    return Err(format!("unknown map method: {name}").into());
+                }
+                Ok(map.get(name).cloned().unwrap_or(Value::Nil))
+            }
             _ => Err("unsupported method receiver".into()),
         }
+    }
+
+    fn eval_array_method(
+        &mut self,
+        items: Vec<Value>,
+        name: &str,
+        args: Vec<Value>,
+        block: Option<&Block>,
+    ) -> Result<Value, Box<dyn Error>> {
+        if !args.is_empty() {
+            return Err(format!("array method {name} does not take arguments").into());
+        }
+        match name {
+            "each" => {
+                let Some(block) = block else {
+                    return Err("each requires { ... } block".into());
+                };
+                // 空配列でも呼び出し側の引数個数違反を検出できるよう、
+                // ループの前にブロック引数の個数を検証する。
+                check_block_arity(block, 1)?;
+                for item in items {
+                    self.call_block(block, vec![item])?;
+                }
+                Ok(Value::Nil)
+            }
+            "map" => {
+                let Some(block) = block else {
+                    return Err("map requires { ... } block".into());
+                };
+                check_block_arity(block, 1)?;
+                let mut out = vec![];
+                for item in items {
+                    out.push(self.call_block(block, vec![item])?);
+                }
+                Ok(Value::Array(out))
+            }
+            "len" => Ok(Value::Int(items.len() as i64)),
+            _ => Err(format!("unknown array method: {name}").into()),
+        }
+    }
+
+    fn call_block(&mut self, block: &Block, args: Vec<Value>) -> Result<Value, Box<dyn Error>> {
+        check_block_arity(block, args.len())?;
+        self.scopes.push(HashMap::new());
+        for (param, value) in block.params.iter().cloned().zip(args) {
+            self.set_var(&param, value)?;
+        }
+        let res = self.eval_block(&block.body);
+        self.scopes.pop();
+        Ok(res?.into_value())
     }
 
     fn eval_query_method(
@@ -489,6 +570,33 @@ fn expect_doc_path(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
         Some(Value::Str(s)) => Ok(s),
         Some(Value::DocRef(d)) => Ok(&d.path),
         _ => Err("expected document path string or doc object".into()),
+    }
+}
+
+fn check_block_arity(block: &Block, yielded: usize) -> Result<(), Box<dyn Error>> {
+    if block.params.len() != yielded {
+        return Err(format!(
+            "block expects {} argument(s), got {}",
+            block.params.len(),
+            yielded
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {
+    match (base, index) {
+        (Value::Map(map), Value::Str(key)) => Ok(map.get(&key).cloned().unwrap_or(Value::Nil)),
+        (Value::Array(items), Value::Int(i)) => {
+            if i < 0 {
+                return Ok(Value::Nil);
+            }
+            Ok(items.get(i as usize).cloned().unwrap_or(Value::Nil))
+        }
+        (Value::Map(_), _) => Err("map index must be a string".into()),
+        (Value::Array(_), _) => Err("array index must be an int".into()),
+        _ => Err("unsupported index receiver".into()),
     }
 }
 

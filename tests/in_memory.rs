@@ -269,3 +269,343 @@ fn unterminated_interpolation_fails_at_lex_time() {
     let err = firelang::lexer::lex("\"#{1 + 2\"").unwrap_err();
     assert!(format!("{err}").contains("unterminated"), "{err}");
 }
+
+#[test]
+fn supports_map_and_array_index_access() {
+    let out = run_script(
+        "m = {name: \"alice\", nested: {a: [1, 2]}}\n[m[\"name\"], m[\"nested\"][\"a\"][1]]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Str("alice".to_string()), Value::Int(2)])
+    );
+}
+
+#[test]
+fn map_dot_access_returns_key_value() {
+    let out = run_script("m = {name: \"alice\"}\nm.name").unwrap();
+    assert_eq!(out, Value::Str("alice".to_string()));
+}
+
+#[test]
+fn missing_keys_and_out_of_range_indices_return_nil() {
+    let out =
+        run_script("m = {name: \"alice\"}\na = [1]\n[m[\"missing\"], m.missing, a[5], a[0 - 1]]")
+            .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Nil, Value::Nil, Value::Nil, Value::Nil])
+    );
+}
+
+#[test]
+fn index_type_mismatch_is_an_error() {
+    let err = run_script("[1, 2][\"a\"]").unwrap_err();
+    assert!(
+        format!("{err}").contains("array index must be an int"),
+        "{err}"
+    );
+    let err = run_script("{a: 1}[1]").unwrap_err();
+    assert!(
+        format!("{err}").contains("map index must be a string"),
+        "{err}"
+    );
+    let err = run_script("1[0]").unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported index receiver"),
+        "{err}"
+    );
+}
+
+#[test]
+fn query_rows_support_index_access_including_dunder_name() {
+    let out = run_script(
+        "set(\"users/ix1\", {n: 1})\nset(\"users/ix2\", {n: 2})\nrows = col(\"users\").get()\n[rows[0][\"__name__\"], rows[1][\"n\"]]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Str("users/ix1".to_string()), Value::Int(2),])
+    );
+}
+
+#[test]
+fn index_access_read_value_for_branching() {
+    let out = run_script(
+        "set(\"users/br\", {active: true})\nu = get(\"users/br\")\nif u[\"active\"] { 1 } else { 2 }",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(1));
+}
+
+#[test]
+fn method_calls_in_conditions_do_not_consume_control_flow_braces() {
+    // Map の m.key 形式・関数呼び出し・素の変数いずれも if / while の条件式に置ける。
+    let out = run_script("m = {active: true}\nif m.active { 1 } else { 2 }").unwrap();
+    assert_eq!(out, Value::Int(1));
+    let out = run_script("m = {count: 0}\nwhile m.count > 0 { 9 }").unwrap();
+    assert_eq!(out, Value::Nil);
+    let out = run_script("fn f() { true }\nif f() { 1 } else { 2 }").unwrap();
+    assert_eq!(out, Value::Int(1));
+    let out = run_script("x = true\nif x { 5 } else { 6 }").unwrap();
+    assert_eq!(out, Value::Int(5));
+    let out = run_script("m = {n: 2}\nif m[\"n\"] >= 2 { 1 } else { 2 }").unwrap();
+    assert_eq!(out, Value::Int(1));
+}
+
+#[test]
+fn block_calls_still_work_outside_conditions() {
+    let out = run_script("batch { set(\"users/bb\", {n: 1}) }\nget(\"users/bb\")[\"n\"]").unwrap();
+    assert_eq!(out, Value::Int(1));
+}
+
+#[test]
+fn each_iterates_query_rows_and_updates_each_document() {
+    let out = run_script(
+        "set(\"users/it1\", {n: 1, seen: false})\nset(\"users/it2\", {n: 2, seen: false})\nrows = col(\"users\").get()\nrows.each { |row| update(row[\"__name__\"], {seen: true}) }\n[get(\"users/it1\")[\"seen\"], get(\"users/it2\")[\"seen\"]]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Bool(true), Value::Bool(true)])
+    );
+}
+
+#[test]
+fn each_returns_nil_and_map_returns_transformed_array() {
+    let out = run_script("[1, 2, 3].map { |x| x * 2 }").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(2), Value::Int(4), Value::Int(6)])
+    );
+    let out = run_script("a = [1]\na.each { |x| x }").unwrap();
+    assert_eq!(out, Value::Nil);
+}
+
+#[test]
+fn map_extracts_fields_from_query_rows() {
+    let out = run_script(
+        "set(\"users/mp1\", {n: 1})\nset(\"users/mp2\", {n: 2})\ncol(\"users\").get().map { |row| row[\"n\"] }",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1), Value::Int(2)]));
+}
+
+#[test]
+fn len_supports_array_map_and_string() {
+    let out = run_script("[len([1, 2, 3]), len({a: 1, b: 2}), len(\"hello\"), [1].len()]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(3),
+            Value::Int(2),
+            Value::Int(5),
+            Value::Int(1)
+        ])
+    );
+}
+
+#[test]
+fn block_param_must_match_yielded_argument_count() {
+    let err = run_script("[1].each { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+}
+
+#[test]
+fn each_and_map_require_block() {
+    let err = run_script("[1].each()").unwrap_err();
+    assert!(
+        format!("{err}").contains("each requires { ... } block"),
+        "{err}"
+    );
+    let err = run_script("[1].map()").unwrap_err();
+    assert!(
+        format!("{err}").contains("map requires { ... } block"),
+        "{err}"
+    );
+}
+
+#[test]
+fn block_params_shadow_outer_variables_like_function_params() {
+    let out = run_script("x = 1\n[2].map { |x| x * 10 }").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(20)]));
+    let out = run_script("[1, 2].each { || 0 }").unwrap_err();
+    assert!(
+        format!("{out}").contains("block expects 0 argument(s), got 1"),
+        "{out}"
+    );
+}
+
+#[test]
+fn block_params_may_start_on_the_next_line() {
+    let out = run_script("[1, 2, 3].map {\n|x| x * 2\n}").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(2), Value::Int(4), Value::Int(6)])
+    );
+    let out = run_script("[1].each {\n  |n|\n  n\n}").unwrap();
+    assert_eq!(out, Value::Nil);
+}
+
+#[test]
+fn block_arity_is_checked_even_for_empty_arrays() {
+    let err = run_script("[].each { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+    let err = run_script("[].map { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+    let err = run_script("[].each { || 0 }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 0 argument(s), got 1"),
+        "{err}"
+    );
+}
+
+#[test]
+fn array_methods_reject_positional_arguments() {
+    let err = run_script("[1].map(99) { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("does not take arguments"),
+        "{err}"
+    );
+    let err = run_script("[1].len(99)").unwrap_err();
+    assert!(
+        format!("{err}").contains("does not take arguments"),
+        "{err}"
+    );
+    let err = run_script("[1].each(99) { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("does not take arguments"),
+        "{err}"
+    );
+}
+
+#[test]
+fn multiline_map_literal_parses() {
+    let out = run_script(
+        "set(\"users/ml\", {\n  name: \"a\",\n  age: 20,\n})\nget(\"users/ml\")[\"age\"]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(20));
+}
+
+#[test]
+fn multiline_array_literal_and_args_parse() {
+    let out =
+        run_script("fn add(a, b) {\n  return a + b\n}\n[\n  1,\n  add(\n    2,\n    3,\n  ),\n]")
+            .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1), Value::Int(5)]));
+}
+
+#[test]
+fn trailing_commas_are_allowed_in_literals_and_args() {
+    let out = run_script("m = {a: 1,}\na = [1, 2,]\n[m[\"a\"], a[1]]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1), Value::Int(2)]));
+    let out = run_script("fn f(a, b,) { a + b }\nf(1, 2,)").unwrap();
+    assert_eq!(out, Value::Int(3));
+}
+
+#[test]
+fn multiline_nested_literals_parse() {
+    let out = run_script(
+        "rows = [\n  {\n    name: \"a\",\n    tags: [\"x\", \"y\"],\n  },\n]\nrows[0][\"tags\"][1]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Str("y".to_string()));
+}
+
+#[test]
+fn newlines_still_separate_statements_outside_brackets() {
+    let out = run_script("a = 1\nb = a + 1\nb").unwrap();
+    assert_eq!(out, Value::Int(2));
+}
+
+#[test]
+fn newlines_inside_contained_expressions_are_ignored() {
+    // delimiter の内側なら式の途中の改行も無視される。
+    let out = run_script("[\n1 +\n2\n]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(3)]));
+    let out = run_script("{a: 1 +\n2}[\"a\"]").unwrap();
+    assert_eq!(out, Value::Int(3));
+    let out = run_script("fn add(a, b) { a + b }\nadd(1 +\n0, 2)").unwrap();
+    assert_eq!(out, Value::Int(3));
+    let out = run_script("(1 +\n2)").unwrap();
+    assert_eq!(out, Value::Int(3));
+    let out = run_script("m = [1, 2]\nm[1 +\n0]").unwrap();
+    assert_eq!(out, Value::Int(2));
+}
+
+#[test]
+fn functions_do_not_see_caller_locals() {
+    let err = run_script("fn f() { x }\nfn g() { x = 1\n  f() }\ng()").unwrap_err();
+    assert!(format!("{err}").contains("undefined variable: x"), "{err}");
+}
+
+#[test]
+fn nested_call_does_not_leak_callee_locals() {
+    let err = run_script("fn g() { a }\nfn f() { a = 42\n  g() }\nf()").unwrap_err();
+    assert!(format!("{err}").contains("undefined variable: a"), "{err}");
+}
+
+#[test]
+fn function_local_may_collide_with_caller_local() {
+    let out = run_script("fn f() { x = 9\n  x }\nfn g() { x = 1\n  [f(), x] }\ng()").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(9), Value::Int(1)]));
+}
+
+#[test]
+fn functions_read_globals_but_cannot_assign_them() {
+    let out = run_script("x = 5\nfn f() { x }\nf()").unwrap();
+    assert_eq!(out, Value::Int(5));
+    let err = run_script("x = 5\nfn f() { x = 6 }\nf()").unwrap_err();
+    assert!(
+        format!("{err}").contains("reassignment is not allowed: x"),
+        "{err}"
+    );
+    let err = run_script("fn f() { x = 6\n  x }\nx = 5\nf()").unwrap_err();
+    assert!(
+        format!("{err}").contains("reassignment is not allowed: x"),
+        "{err}"
+    );
+}
+
+#[test]
+fn function_params_may_shadow_globals() {
+    let out = run_script("n = 1\nfn f(n) { n }\nf(2)").unwrap();
+    assert_eq!(out, Value::Int(2));
+}
+
+#[test]
+fn semicolons_are_not_treated_as_newlines_inside_delimiters() {
+    // `;` は文の区切りのまま。delimiter の内側ではエラーになる。
+    assert!(run_script("[;1]").is_err());
+    assert!(run_script("{;}").is_err());
+    assert!(run_script("fn f(a) { a }\nf(;)").is_err());
+    assert!(run_script("m = [1]\nm[;0]").is_err());
+}
+
+#[test]
+fn semicolons_remain_statement_separators() {
+    let out = run_script("a = 1; b = a + 1; b").unwrap();
+    assert_eq!(out, Value::Int(2));
+    let out = run_script("fn f() { a = 1; a }\nf()").unwrap();
+    assert_eq!(out, Value::Int(1));
+    let out = run_script("fn f() { return; 1 }\nf()").unwrap();
+    assert_eq!(out, Value::Nil);
+}
+
+#[test]
+fn recursive_functions_still_work() {
+    let out =
+        run_script("fn fact(n) { if n <= 1 { 1 } else { n * fact(n - 1) } }\nfact(5)").unwrap();
+    assert_eq!(out, Value::Int(120));
+}

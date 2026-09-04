@@ -1,0 +1,9 @@
+# 配列・クエリ結果の反復(each / map / len)
+set("users/alice", {name: "alice", active: true})
+set("users/bob", {name: "bob", active: true})
+
+rows = col("users").where("active", "==", true).get()
+rows.each { |row| update(row["__name__"], {visited: true}) }
+
+doubled = [1, 2, 3].map { |n| n * 2 }
+doubled
