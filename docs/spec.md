@@ -82,7 +82,7 @@ Firestore 操作のための特殊な値:
 
 ### 整数リテラル
 
-10 進のみ。**負のリテラルはない**(単項マイナス非対応)。負値は `0 - 5` のように書く。
+10 進のみ。**負のリテラルはない**(単項マイナス非対応)。負値は `0 - 5` のように書く。i64 の範囲を超えるリテラルは lexer でエラー(`integer literal out of range`)。
 
 ### 文字列リテラル
 
@@ -138,6 +138,8 @@ rows[0]["__name__"]  # => "users/1"(クエリ結果 Map の要素アクセス。
 | 4(最高) | `.method(...)` / `expr[expr]` | メソッド呼び出し・要素アクセス(§4 要素アクセス参照) |
 
 論理演算子(`&&` `||` `!`)はない。括弧 `( )` でグループ化できる。
+
+Int 同士の算術演算(`+` `-` `*` `/`)の結果が i64 の範囲を超えると `integer overflow` エラー(debug ビルドでも panic しない)。`/ 0` は "division by zero" エラー。
 
 ## 5. 変数・関数・制御構文
 
@@ -232,15 +234,17 @@ while cond { ... }
 
 ドキュメントパスを取る引数(下記 `target`)には、パス文字列(`"users/1"`)または `doc(...)` の戻り値のどちらでも渡せる。
 
+**パスの検証**: ドキュメントパスは**偶数**個、コレクションパスは**奇数**個の非空セグメントで構成されていなければならない(`"users/1"`、`"teams/t1/members"`)。違反(奇偶の不一致、空セグメント、先頭・末尾の `/`)は `doc()` / `col()` / `col_group()` / `get()` / `set()` / `update()` / `delete()` の呼び出し時点でエラーになり、in-memory / emulator で同じエラーになる。
+
 | 関数 | 戻り値 | 説明 |
 |------|--------|------|
 | `doc(path)` | DocRef | ドキュメント参照を作る |
 | `col(path)` | CollectionRef | コレクション参照。`"users"` や `"teams/t1/members"`(サブコレクション)が使える |
 | `col_group(id)` | CollectionGroupRef | 同名コレクション横断の参照 |
 | `get(target)` | Map / Nil | ドキュメント取得。**存在しなければ nil**(エラーにはならない) |
-| `set(target, data_map)` | Nil | ドキュメント全体を書き込み(置換) |
-| `set(target, data_map, merge_bool)` / `set(target, data_map, merge: true)` | Nil | merge=true ならフィールドマージ |
-| `update(target, data_map)` | Nil | フィールド更新。**ドキュメントが存在しなければエラー**(作成しない) |
+| `set(target, data_map)` | Nil | ドキュメント全体を書き込み(置換)。キーはリテラルのフィールド名(`.` を含むキーはそのまま保存される) |
+| `set(target, data_map, merge_bool)` / `set(target, data_map, merge: true)` | Nil | merge=true ならフィールドマージ。キーは `.` 区切りの**フィールドパス**として解釈(update と同じ) |
+| `update(target, data_map)` | Nil | フィールド更新。**ドキュメントが存在しなければエラー**(作成しない)。キーは `.` 区切りの**フィールドパス**として解釈し、ネストしたフィールドを更新する(中間 Map は必要なら作成、中間が Map でなければエラー)。パスの各セグメントは Firestore の単純フィールドパス(`[A-Za-z_][A-Za-z0-9_]*`)のみで、バッククォートによるエスケープは非対応 |
 | `delete(target)` | Nil | ドキュメント削除。存在しなくてもエラーにならない |
 | `array(...)` | Array | `[...]` リテラルと同等 |
 | `array_union(array)` | センチネル | 配列フィールドへの追加(重複は追加されない) |
@@ -255,7 +259,10 @@ while cond { ... }
 set(doc("users/1"), {name: "alice", age: 20})
 set("users/1", {age: 21}, true)                       # merge
 update("users/1", {tags: array_union(["a"])})
+update("users/1", {"profile.name": "b"})              # ドット区切りのフィールドパスでネスト更新
 ```
+
+update と merge `set` のキーはフィールドパスとして解釈されるため、`{"profile.name": "b"}` は `profile` マップ内の `name` を更新する(in-memory / emulator で同じ挙動)。キーの各セグメントは単純フィールドパス([A-Za-z_][A-Za-z0-9_]*)のみで、それ以外(`` `a.b` `` のようなバッククォート、空セグメント、記号)はエラー。この検証は**センチネル値(`array_union` 等)を置いたキーにも適用される**。置換の `set` では `{"a.b": 1}` のようなキーはそのままリテラルのフィールド名として保存され、センチネル(`array_union` 等)をドット付きキーに置いた場合もリテラルキーに対して解決される(両バックエンドで同じ)。
 
 ## 7. クエリ
 
@@ -269,9 +276,11 @@ col("users").doc("1")       # doc("users/1") と同等
 
 - `where(field, op, value)` — op は `"=="` `">"` `">="` `"<"` `"<="` の 5 種。複数 `where` は AND。
   - 未対応の op を渡すと `where()` 呼び出し時に即エラー(`unsupported query op: ...`)。
-  - `==` は任意の値の構造比較。大小比較(`>` 等)は **Int フィールドのみ**マッチし、他の型は偽。
+  - `==` は任意の値の構造比較。大小比較(`>` 等)は**同型のフィールド同士のみ**マッチ:Int は数値順、Str は辞書順、Bool は `false < true`、Timestamp は秒。型が異なる・Nil・存在しないフィールドはマッチしない。
+  - **文字列フィルタ値のサイズ制限**: Firestore と同様に、`where` の文字列フィルタ値は **1,500 UTF-8 バイト未満**であること(1,500 バイト以上のフィルタ値はクエリ実行時にエラー:`value for {field} is too large to be used in a query`)。**保存値には長さ制限がない**。有効なフィルタ(< 1,500 バイト)に対しては、保存値との最初の差異位置が常にフィルタ自身の長さ以内に収まるため、全文比較で Firestore と同じ結果になる。in-memory は emulator の Firestore と同じ検証をクエリ実行時に行う。
+  - 異なる型同士の比較は未規定(§13)。in-memory ではマッチしない。
   - フィールドが存在しないドキュメントはマッチしない。
-- `limit(n)` — 件数上限。後勝ち(複数回呼ぶと最後の値)。
+- `limit(n)` — 件数上限。後勝ち(複数回呼ぶと最後の値)。`n` は 0 以上で、負数はエラー(`limit must be >= 0`)。
 - `get()` — 実行して `Array<Map>` を返す。各 Map には `__name__` キーで**相対ドキュメントパス**(例 `"users/1"`)が入る。
 - **決定的順序**: 結果は firelang 相対ドキュメントパス文字列の辞書順でソートされ、`limit` はソート後に適用される。`users/a` < `users/b`、`teams/t1/members/a` < `teams/t2/members/a`。
 - `col()` のクエリは**直下のドキュメントのみ**対象(サブコレクション内は含まない)。`col_group(id)` はパス中のいずれかの階層でコレクション名が `id` に一致するドキュメントすべてが対象。
@@ -356,9 +365,6 @@ usage: fl [--backend in-memory|emulator] <script-file>
 
 | 項目 | 現状の挙動 | 予定 |
 |------|-----------|------|
-
-
-
-| ドキュメントパスの検証 | セグメント数の検証なし(`set("users", ...)` が通る)。挙動未定義 | backlog(当面そのまま) |
+| `where` の異なる型同士の大小比較 | in-memory ではマッチしない。emulator では Firestore の型順序で比較される(§7 は同型のみを規定) | backlog |
 | emulator の transaction 中断 | ロールバック RPC を送らない(サーバ側タイムアウト任せ) | backlog |
 | `puts` / `fl` の複合値出力 | Rust の Debug 形式(`Map({"a": Int(1)})`) | backlog |

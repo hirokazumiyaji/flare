@@ -82,7 +82,10 @@ pub fn lex(input: &str) -> Result<Vec<Token>, Box<dyn Error>> {
                         break;
                     }
                 }
-                tokens.push(Token::Int(s.parse()?));
+                tokens.push(Token::Int(
+                    s.parse::<i64>()
+                        .map_err(|_| format!("integer literal out of range: {s}"))?,
+                ));
             }
             '"' => {
                 chars.next();

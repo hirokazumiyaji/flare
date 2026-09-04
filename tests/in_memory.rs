@@ -609,3 +609,225 @@ fn recursive_functions_still_work() {
         run_script("fn fact(n) { if n <= 1 { 1 } else { n * fact(n - 1) } }\nfact(5)").unwrap();
     assert_eq!(out, Value::Int(120));
 }
+
+#[test]
+fn integer_overflow_is_an_error_not_a_panic() {
+    let err = run_script("9223372036854775807 + 1").unwrap_err();
+    assert!(format!("{err}").contains("integer overflow"), "{err}");
+    let err = run_script("0 - 9223372036854775807 - 2").unwrap_err();
+    assert!(format!("{err}").contains("integer overflow"), "{err}");
+    let err = run_script("9223372036854775807 * 2").unwrap_err();
+    assert!(format!("{err}").contains("integer overflow"), "{err}");
+    let err = run_script("(0 - 9223372036854775807 - 1) / (0 - 1)").unwrap_err();
+    assert!(format!("{err}").contains("integer overflow"), "{err}");
+}
+
+#[test]
+fn out_of_range_integer_literal_is_an_error() {
+    let err = run_script("99999999999999999999").unwrap_err();
+    assert!(
+        format!("{err}").contains("integer literal out of range"),
+        "{err}"
+    );
+}
+
+#[test]
+fn negative_limit_is_rejected() {
+    let err = run_script("col(\"users\").limit(0 - 1).get()").unwrap_err();
+    assert!(format!("{err}").contains("limit must be >= 0"), "{err}");
+    let out = run_script("set(\"users/lm\", {n: 1})\ncol(\"users\").limit(1).get()").unwrap();
+    assert!(matches!(out, Value::Array(_)));
+}
+
+#[test]
+fn invalid_document_paths_are_rejected() {
+    let cases = [
+        "set(\"users\", {a: 1})",
+        "get(\"users/1/posts\")",
+        "set(\"users//1\", {a: 1})",
+        "set(\"/users/1\", {a: 1})",
+        "set(\"users/1/\", {a: 1})",
+        "doc(\"users\")",
+        "update(\"users\", {a: 1})",
+        "delete(\"teams\")",
+        "get(\"teams\")",
+    ];
+    for src in cases {
+        let err = run_script(src).unwrap_err();
+        assert!(
+            format!("{err}").contains("invalid document path")
+                || format!("{err}").contains("invalid path:"),
+            "{src}: {err}"
+        );
+    }
+}
+
+#[test]
+fn invalid_collection_paths_are_rejected() {
+    let cases = [
+        ("col(\"users/1\")", "invalid collection path"),
+        ("col(\"\")", "invalid path:"),
+        ("col(\"users//members\")", "invalid path: users//members"),
+        ("col(\"/users\")", "invalid path:"),
+        ("col_group(\"a/b\")", "invalid collection group id"),
+        ("col_group(\"\")", "invalid collection group id"),
+        ("col(\"users\").doc(\"a/b\")", "invalid document id"),
+    ];
+    for (src, expected) in cases {
+        let err = run_script(src).unwrap_err();
+        assert!(format!("{err}").contains(expected), "{src}: {err}");
+    }
+}
+
+#[test]
+fn valid_subcollection_paths_still_work() {
+    let out = run_script(
+        "set(\"teams/t1/members/m1\", {n: 1})\ncol(\"teams/t1/members\").get()[0][\"__name__\"]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Str("teams/t1/members/m1".to_string()));
+    let out = run_script("col(\"users\").doc(\"1\")").unwrap();
+    assert!(matches!(out, Value::DocRef(_)));
+}
+
+#[test]
+fn where_comparison_supports_str_timestamp_and_bool() {
+    // emulator テスト(emulator_where_compare_matches_in_memory_semantics)と
+    // 同じケース。両バックエンドで同じ結果を返すことを契約とする。
+    let out = run_script(
+        "set(\"users/cmp1\", {name: \"alice\", created: timestamp(100), active: true})\nset(\"users/cmp2\", {name: \"bob\", created: timestamp(200), active: false})\n[\n  col(\"users\").where(\"name\", \">\", \"a\").get().len(),\n  col(\"users\").where(\"created\", \">\", timestamp(150)).get().len(),\n  col(\"users\").where(\"active\", \">\", false).get().len(),\n  col(\"users\").where(\"name\", \">\", 5).get().len(),\n]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(2),
+            Value::Int(1),
+            Value::Int(1),
+            Value::Int(0)
+        ])
+    );
+}
+
+#[test]
+fn update_supports_dotted_field_paths_like_firestore() {
+    // emulator テスト(emulator_dotted_field_path_update_matches_in_memory)と
+    // 同じケース。{"profile.name": ...} はネストしたフィールドを更新する。
+    let out = run_script(
+        "set(\"users/fp1\", {profile: {name: \"a\", age: 1}, n: 5})\nupdate(\"users/fp1\", {\"profile.name\": \"b\"})\nset(\"users/fp1\", {\"profile.age\": 2}, merge: true)\nget(\"users/fp1\")",
+    )
+    .unwrap();
+    let s = format!("{out:?}");
+    assert!(s.contains("\"b\""), "{s}");
+    assert!(s.contains("Int(2)"), "{s}");
+    assert!(s.contains("Int(5)"), "{s}");
+    assert!(!s.contains("profile.name"), "{s}");
+}
+
+#[test]
+fn dotted_update_creates_missing_intermediate_maps() {
+    let out = run_script(
+        "set(\"users/fp2\", {n: 1})\nupdate(\"users/fp2\", {\"outer.inner\": 42})\nget(\"users/fp2\")[\"outer\"][\"inner\"]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(42));
+}
+
+#[test]
+fn dotted_update_fails_when_intermediate_is_not_a_map() {
+    let err = run_script(
+        "set(\"users/fp3\", {profile: 1})\nupdate(\"users/fp3\", {\"profile.name\": \"b\"})",
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("not a map"), "{err}");
+}
+
+#[test]
+fn set_replace_keeps_dotted_keys_literal() {
+    let out = run_script("set(\"users/fp4\", {\"a.b\": 1})\nget(\"users/fp4\")[\"a.b\"]").unwrap();
+    assert_eq!(out, Value::Int(1));
+}
+
+#[test]
+fn dotted_update_supports_nested_array_union() {
+    let out = run_script(
+        "set(\"users/fp5\", {profile: {tags: [\"a\"]}})\nupdate(\"users/fp5\", {\"profile.tags\": array_union([\"b\"])})\nget(\"users/fp5\")[\"profile\"][\"tags\"]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string())
+        ])
+    );
+}
+
+#[test]
+fn update_field_paths_require_simple_field_grammar() {
+    // Firestore の単純フィールドパス([A-Za-z_][A-Za-z0-9_]*)のみ。
+    // バッククォートはエスケープとして解釈されないので、in-memory / emulator
+    // ともに検証エラーになる。センチネル値(transform)のキーも同じ検証を
+    // 受ける(emulator は Firestore が quoted transform パスを受け付けるため
+    // RPC 前に検証して挙動を揃える。emulator テスト
+    // emulator_update_field_paths_match_in_memory_validation と同じケース)。
+    let cases = [
+        "set(\"users/gv1\", {n: 1})\nupdate(\"users/gv1\", {\"`a.b`\": 1})",
+        "set(\"users/gv2\", {n: 1})\nupdate(\"users/gv2\", {\"a..b\": 1})",
+        "set(\"users/gv3\", {n: 1})\nupdate(\"users/gv3\", {\"a b\": 1})",
+        "set(\"users/gv4\", {n: 1})\nupdate(\"users/gv4\", {\"日本語\": 1})",
+        "set(\"users/gv5\", {\"a..b\": 1}, merge: true)",
+        "set(\"users/gv6\", {n: 1})\nupdate(\"users/gv6\", {\"`a.b`\": array_union([1])})",
+        "set(\"users/gv7\", {n: 1})\nset(\"users/gv7\", {\"`a.b`\": array_union([1])}, merge: true)",
+        "set(\"users/gv8\", {n: 1})\nupdate(\"users/gv8\", {\"a..b\": array_union([1])})",
+        "set(\"users/gv9\", {n: 1})\nset(\"users/gv9\", {\"a..b\": array_union([1])}, merge: true)",
+    ];
+    for src in cases {
+        let err = run_script(src).unwrap_err();
+        assert!(
+            format!("{err}").contains("invalid field path"),
+            "{src}: {err}"
+        );
+    }
+}
+
+#[test]
+fn replacement_set_resolves_sentinels_against_literal_dotted_keys() {
+    // emulator テスト(emulator_replacement_set_sentinel_with_dotted_key)と
+    // 同じケース。置換 set ではドット付きキーはリテラルのフィールド名。
+    let out =
+        run_script("set(\"users/gv2\", {\"a.b\": array_union([1])})\nget(\"users/gv2\")[\"a.b\"]")
+            .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1)]));
+    let out = run_script(
+        "set(\"users/gv3\", {\"x.y\": [\"a\"]})\nset(\"users/gv3\", {\"x.y\": array_remove([\"a\"])})\nget(\"users/gv3\")[\"x.y\"]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![]));
+}
+
+#[test]
+fn where_rejects_large_string_filter_values() {
+    // Firestore はクエリのフィルタ文字列値を 1,500 バイト未満に制限する
+    // (1,500 バイト以上はクエリ時にエラー。保存値に制限はない)。実機
+    // emulator の Firestore は 1,500 バイトのフィルタ値を
+    // `value for s is too large to be used in a query` で却下するため、
+    // in-memory も同じメッセージでエラーにする(1499 バイトのフィルタは
+    // 両バックエンドで評価できる)。emulator テスト
+    // emulator_where_rejects_large_string_filter_values と同じケース。
+    let p = "x".repeat(1500);
+    let err = run_script(&format!(
+        "set(\"users/gp1\", {{s: \"{p}a\"}})\ncol(\"users\").where(\"s\", \"==\", \"{p}\").get()"
+    ))
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("too large to be used in a query"),
+        "{err}"
+    );
+    let out = run_script(&format!(
+        "set(\"users/gp2\", {{s: \"{p}a\"}})\ncol(\"users\").where(\"s\", \"==\", \"{}x\").get().len()",
+        "x".repeat(1498)
+    ))
+    .unwrap();
+    assert_eq!(out, Value::Int(0));
+}

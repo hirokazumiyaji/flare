@@ -192,3 +192,131 @@ fn emulator_update_missing_fails() {
         "{err}"
     );
 }
+
+#[test]
+fn emulator_where_compare_matches_in_memory_semantics() {
+    // Same case as in-memory `where_comparison_supports_str_timestamp_and_bool`.
+    // Fixtures live in a per-run subcollection so the collection-scoped
+    // queries stay repeatable against a long-lived local emulator.
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let run = unique("cmp");
+    let script = format!(
+        r#"set("users/{run}/rows/{run}_1", {{name: "alice", created: timestamp(100), active: true}})
+set("users/{run}/rows/{run}_2", {{name: "bob", created: timestamp(200), active: false}})
+[
+  col("users/{run}/rows").where("name", ">", "a").get().len(),
+  col("users/{run}/rows").where("created", ">", timestamp(150)).get().len(),
+  col("users/{run}/rows").where("active", ">", false).get().len(),
+]"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(format!("{out:?}"), "Array([Int(2), Int(1), Int(1)])");
+}
+
+#[test]
+fn emulator_dotted_field_path_update_matches_in_memory() {
+    // Same case as in-memory `update_supports_dotted_field_path_like_firestore`.
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let p = unique("fp");
+    let path = format!("users/{p}");
+    let script = format!(
+        r#"set("{path}", {{profile: {{name: "a", age: 1}}, n: 5}})
+update("{path}", {{"profile.name": "b"}})
+set("{path}", {{"profile.age": 2}}, merge: true)
+get("{path}")"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    let s = format!("{out:?}");
+    assert!(s.contains("\"b\""), "{s}");
+    assert!(s.contains("Int(2)"), "{s}");
+    assert!(s.contains("Int(5)"), "{s}");
+    assert!(!s.contains("profile.name"), "{s}");
+}
+
+#[test]
+fn emulator_replacement_set_sentinel_with_dotted_key_matches_in_memory() {
+    // Same case as in-memory
+    // `replacement_set_resolves_sentinels_against_literal_dotted_keys`:
+    // a replacement `set` treats dotted keys as literal field names, so the
+    // transform must be sent with a backtick-escaped path.
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let run = unique("gv");
+    let script = format!(
+        r#"set("users/{run}/docs/d1", {{"a.b": array_union([1])}})
+set("users/{run}/docs/d2", {{"x.y": ["a"]}})
+set("users/{run}/docs/d2", {{"x.y": array_remove(["a"])}})
+[get("users/{run}/docs/d1")["a.b"], get("users/{run}/docs/d2")["x.y"]]"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(format!("{out:?}"), "Array([Array([Int(1)]), Array([])])");
+}
+
+#[test]
+fn emulator_where_rejects_large_string_filter_values() {
+    // Same case as in-memory `where_rejects_large_string_filter_values`.
+    // Firestore rejects string query filter values of 1,500 bytes or more
+    // (`value for s is too large to be used in a query`); a 1,499-byte filter
+    // evaluates normally on both backends.
+    let run = unique("gp");
+    let p = "x".repeat(1500);
+    let script = format!(
+        r#"set("users/{run}/docs/gp1", {{s: "{p}a"}})
+col("users/{run}/docs").where("s", "==", "{p}").get()"#
+    );
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let err = run_script_with_firestore(&script, fs).unwrap_err();
+    assert!(
+        format!("{err}").contains("too large to be used in a query"),
+        "{err}"
+    );
+    let script = format!(
+        r#"set("users/{run}/docs/gp2", {{s: "{p}a"}})
+col("users/{run}/docs").where("s", "==", "{}x").get().len()"#,
+        "x".repeat(1498)
+    );
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(format!("{out:?}"), "Int(0)");
+}
+
+#[test]
+fn emulator_update_field_paths_match_in_memory_validation() {
+    // Same case as in-memory `update_field_paths_require_simple_field_grammar`.
+    // Sentinel (transform) keys are validated too: Firestore's field_transforms
+    // accepts quoted paths, so the write is rejected before the RPC to keep the
+    // two backends consistent.
+    let run = unique("gvv");
+    for script in [
+        format!(r#"update("users/{run}/docs/d1", {{"`a.b`": 1}})"#),
+        format!(r#"update("users/{run}/docs/d1", {{"a..b": 1}})"#),
+        format!(r#"update("users/{run}/docs/d1", {{"`a.b`": array_union([1])}})"#),
+        format!(r#"update("users/{run}/docs/d1", {{"a..b": array_union([1])}})"#),
+        format!(r#"set("users/{run}/docs/d1", {{"`a.b`": array_union([1])}}, merge: true)"#),
+        format!(r#"set("users/{run}/docs/d1", {{"a..b": array_union([1])}}, merge: true)"#),
+    ] {
+        let Some(fs) = emulator() else {
+            eprintln!("skip: no emulator");
+            return;
+        };
+        let err = run_script_with_firestore(&script, fs).unwrap_err();
+        assert!(
+            format!("{err}").contains("invalid field path"),
+            "{script}: {err}"
+        );
+    }
+}
