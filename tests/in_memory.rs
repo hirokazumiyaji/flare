@@ -708,3 +708,29 @@ fn where_comparison_supports_str_timestamp_and_bool() {
         ])
     );
 }
+
+#[test]
+fn where_rejects_large_string_filter_values() {
+    // Firestore はクエリのフィルタ文字列値を 1,500 バイト未満に制限する
+    // (1,500 バイト以上はクエリ時にエラー。保存値に制限はない)。実機
+    // emulator の Firestore は 1,500 バイトのフィルタ値を
+    // `value for s is too large to be used in a query` で却下するため、
+    // in-memory も同じメッセージでエラーにする(1499 バイトのフィルタは
+    // 両バックエンドで評価できる)。emulator テスト
+    // emulator_where_rejects_large_string_filter_values と同じケース。
+    let p = "x".repeat(1500);
+    let err = run_script(&format!(
+        "set(\"users/gp1\", {{s: \"{p}a\"}})\ncol(\"users\").where(\"s\", \"==\", \"{p}\").get()"
+    ))
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("too large to be used in a query"),
+        "{err}"
+    );
+    let out = run_script(&format!(
+        "set(\"users/gp2\", {{s: \"{p}a\"}})\ncol(\"users\").where(\"s\", \"==\", \"{}x\").get().len()",
+        "x".repeat(1498)
+    ))
+    .unwrap();
+    assert_eq!(out, Value::Int(0));
+}

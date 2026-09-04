@@ -25,6 +25,7 @@ impl Firestore for InMemoryFirestore {
     }
 
     fn run_query(&self, query: &QueryRef) -> Result<Vec<Value>, Box<dyn Error>> {
+        validate_query_filter_values(&query.filters)?;
         match &query.source {
             QuerySource::Collection(path) => {
                 self.query_collection(path, &query.filters, query.limit)
@@ -183,6 +184,25 @@ fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bo
             QueryOp::Le => compare_values(actual, &f.value, |o| o.is_le()),
         }
     })
+}
+
+/// Firestore はクエリのフィルタ文字列値を 1,500 バイト未満に制限する
+/// (1,500 バイト以上のフィルタ値はクエリ時にエラーになる。実機 emulator:
+/// `value for {field} is too large to be used in a query`)。保存値に長さ
+/// 制限はない。有効なフィルタ(< 1,500 バイト)に対しては、最初の差異位置
+/// が常にフィルタ自身の長さ以内に収まるため、全文比較とインデックス接頭辞
+/// 比較は同じ結果になる。
+fn validate_query_filter_values(filters: &[QueryFilter]) -> Result<(), Box<dyn Error>> {
+    for f in filters {
+        if let Value::Str(s) = &f.value {
+            if s.len() >= 1500 {
+                return Err(
+                    format!("value for {} is too large to be used in a query", f.field).into(),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 大小比較は同型のみを規定する(Int / Str / Bool / Timestamp)。

@@ -215,3 +215,37 @@ set("users/{run}/rows/{run}_2", {{name: "bob", created: timestamp(200), active: 
     let out = run_script_with_firestore(&script, fs).unwrap();
     assert_eq!(format!("{out:?}"), "Array([Int(2), Int(1), Int(1)])");
 }
+
+#[test]
+fn emulator_where_rejects_large_string_filter_values() {
+    // Same case as in-memory `where_rejects_large_string_filter_values`.
+    // Firestore rejects string query filter values of 1,500 bytes or more
+    // (`value for s is too large to be used in a query`); a 1,499-byte filter
+    // evaluates normally.
+    let run = unique("gp");
+    let p = "x".repeat(1500);
+    let script = format!(
+        r#"set("users/{run}/docs/gp1", {{s: "{p}a"}})
+col("users/{run}/docs").where("s", "==", "{p}").get()"#
+    );
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let err = run_script_with_firestore(&script, fs).unwrap_err();
+    assert!(
+        format!("{err}").contains("too large to be used in a query"),
+        "{err}"
+    );
+    let script = format!(
+        r#"set("users/{run}/docs/gp2", {{s: "{p}a"}})
+col("users/{run}/docs").where("s", "==", "{}x").get().len()"#,
+        "x".repeat(1498)
+    );
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(format!("{out:?}"), "Int(0)");
+}
