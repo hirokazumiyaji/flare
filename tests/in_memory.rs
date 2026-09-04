@@ -689,3 +689,22 @@ fn valid_subcollection_paths_still_work() {
     let out = run_script("col(\"users\").doc(\"1\")").unwrap();
     assert!(matches!(out, Value::DocRef(_)));
 }
+
+#[test]
+fn where_comparison_supports_str_timestamp_and_bool() {
+    // emulator テスト(emulator_where_compare_matches_in_memory_semantics)と
+    // 同じケース。両バックエンドで同じ結果を返すことを契約とする。
+    let out = run_script(
+        "set(\"users/cmp1\", {name: \"alice\", created: timestamp(100), active: true})\nset(\"users/cmp2\", {name: \"bob\", created: timestamp(200), active: false})\n[\n  col(\"users\").where(\"name\", \">\", \"a\").get().len(),\n  col(\"users\").where(\"created\", \">\", timestamp(150)).get().len(),\n  col(\"users\").where(\"active\", \">\", false).get().len(),\n  col(\"users\").where(\"name\", \">\", 5).get().len(),\n]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(2),
+            Value::Int(1),
+            Value::Int(1),
+            Value::Int(0)
+        ])
+    );
+}

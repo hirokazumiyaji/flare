@@ -177,16 +177,25 @@ fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bo
         };
         match f.op {
             QueryOp::Eq => actual == &f.value,
-            QueryOp::Gt => compare_int(actual, &f.value, |a, b| a > b),
-            QueryOp::Ge => compare_int(actual, &f.value, |a, b| a >= b),
-            QueryOp::Lt => compare_int(actual, &f.value, |a, b| a < b),
-            QueryOp::Le => compare_int(actual, &f.value, |a, b| a <= b),
+            QueryOp::Gt => compare_values(actual, &f.value, |o| o.is_gt()),
+            QueryOp::Ge => compare_values(actual, &f.value, |o| o.is_ge()),
+            QueryOp::Lt => compare_values(actual, &f.value, |o| o.is_lt()),
+            QueryOp::Le => compare_values(actual, &f.value, |o| o.is_le()),
         }
     })
 }
 
-fn compare_int(a: &Value, b: &Value, pred: impl Fn(i64, i64) -> bool) -> bool {
-    matches!((a, b), (Value::Int(x), Value::Int(y)) if pred(*x, *y))
+/// 大小比較は同型のみを規定する(Int / Str / Bool / Timestamp)。
+/// 型が異なる・Nil は常にマッチしない(emulator の Firestore と実用上の
+/// 挙動を合わせる。異なる型同士の Firestore の型順序は未規定 = spec §13)。
+fn compare_values(a: &Value, b: &Value, pred: impl Fn(std::cmp::Ordering) -> bool) -> bool {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => pred(x.cmp(y)),
+        (Value::Str(x), Value::Str(y)) => pred(x.cmp(y)),
+        (Value::Bool(x), Value::Bool(y)) => pred(x.cmp(y)),
+        (Value::Timestamp(x), Value::Timestamp(y)) => pred(x.seconds.cmp(&y.seconds)),
+        _ => false,
+    }
 }
 
 fn apply_update_map(

@@ -192,3 +192,26 @@ fn emulator_update_missing_fails() {
         "{err}"
     );
 }
+
+#[test]
+fn emulator_where_compare_matches_in_memory_semantics() {
+    // Same case as in-memory `where_comparison_supports_str_timestamp_and_bool`.
+    // Fixtures live in a per-run subcollection so the collection-scoped
+    // queries stay repeatable against a long-lived local emulator.
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let run = unique("cmp");
+    let script = format!(
+        r#"set("users/{run}/rows/{run}_1", {{name: "alice", created: timestamp(100), active: true}})
+set("users/{run}/rows/{run}_2", {{name: "bob", created: timestamp(200), active: false}})
+[
+  col("users/{run}/rows").where("name", ">", "a").get().len(),
+  col("users/{run}/rows").where("created", ">", timestamp(150)).get().len(),
+  col("users/{run}/rows").where("active", ">", false).get().len(),
+]"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(format!("{out:?}"), "Array([Int(2), Int(1), Int(1)])");
+}
