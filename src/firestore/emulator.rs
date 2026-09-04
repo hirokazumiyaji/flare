@@ -405,15 +405,26 @@ fn build_write(fs: &FirestoreEmulator, op: &WriteOp) -> Result<Write, Box<dyn Er
     match op {
         WriteOp::Set { path, data, merge } => {
             let (plain, transforms) = split_fields_and_transforms(data);
-            let fields = encode_fields(&plain)?;
-            Ok(Write {
-                update_mask: if *merge {
+            // merge のキーは Firestore と同様にフィールドパス。update_mask の
+            // パスが payload から解決されるよう、payload をネスト構造に組む。
+            // merge でない set はキーをリテラルのフィールド名として保存する。
+            let (mask, payload, transforms) = if *merge {
+                // transform のキーも含めて全キーを検証する(上記参照)。
+                validated_field_paths(data)?;
+                (
                     Some(DocumentMask {
                         field_paths: plain.keys().cloned().collect(),
-                    })
-                } else {
-                    None
-                },
+                    }),
+                    nest_field_paths(plain)?,
+                    transforms,
+                )
+            } else {
+                // 置換 set: センチネル変換のパスはリテラルのフィールド名を指す。
+                (None, plain, escape_literal_transform_keys(transforms)?)
+            };
+            let fields = encode_fields(&payload)?;
+            Ok(Write {
+                update_mask: mask,
                 update_transforms: encode_field_transforms(&transforms)?,
                 current_document: None,
                 operation: Some(gcloud_sdk::google::firestore::v1::write::Operation::Update(
@@ -428,11 +439,12 @@ fn build_write(fs: &FirestoreEmulator, op: &WriteOp) -> Result<Write, Box<dyn Er
         }
         WriteOp::Update { path, data } => {
             let (plain, transforms) = split_fields_and_transforms(data);
-            let fields = encode_fields(&plain)?;
+            // transform のキーも含めて全キーを検証する(validated_field_paths 参照)。
+            validated_field_paths(data)?;
+            let field_paths: Vec<String> = plain.keys().cloned().collect();
+            let fields = encode_fields(&nest_field_paths(plain)?)?;
             Ok(Write {
-                update_mask: Some(DocumentMask {
-                    field_paths: plain.keys().cloned().collect(),
-                }),
+                update_mask: Some(DocumentMask { field_paths }),
                 update_transforms: encode_field_transforms(&transforms)?,
                 current_document: Some(Precondition {
                     condition_type: Some(precondition::ConditionType::Exists(true)),
@@ -456,6 +468,55 @@ fn build_write(fs: &FirestoreEmulator, op: &WriteOp) -> Result<Write, Box<dyn Er
             )),
         }),
     }
+}
+
+/// update / merge set のキー(ドット区切りフィールドパス)を検証する。
+/// plain(transform でない)キーと transform のキーの**両方**を検証する。
+/// Firestore の field_transforms は quoted パスを受け付けるため、transform
+/// キーを検証しないと in-memory(全キーを検証)と emulator で挙動が分かれる。
+/// in-memory と同じエラーを、RPC を送る前に出す。
+fn validated_field_paths(all: &BTreeMap<String, Value>) -> Result<(), Box<dyn Error>> {
+    for k in all.keys() {
+        super::validate_field_path(k)?;
+    }
+    Ok(())
+}
+
+/// フラットなフィールドパスマップをネストしたマップに組み替える。
+/// update_mask のパス("profile.name" など)が payload から解決されるように
+/// するための変換。
+fn nest_field_paths(
+    plain: BTreeMap<String, Value>,
+) -> Result<BTreeMap<String, Value>, Box<dyn Error>> {
+    let mut out = BTreeMap::new();
+    for (key, value) in plain {
+        let segments: Vec<&str> = key.split('.').collect();
+        super::insert_at_field_path(&mut out, &segments, value)?;
+    }
+    Ok(out)
+}
+
+/// 置換の `set` ではキーはリテラルのフィールド名として扱う(spec §6)。
+/// ドットを含むキーのセンチネル変換は、Firestore にネストパスと解釈されない
+/// ようバッククォートでエスケープして送る(in-memory のリテラルキーと一致)。
+fn escape_literal_transform_keys(
+    transforms: Vec<(String, Value)>,
+) -> Result<Vec<(String, Value)>, Box<dyn Error>> {
+    transforms
+        .into_iter()
+        .map(|(key, value)| {
+            if key.contains('`') {
+                return Err(
+                    format!("unsupported field name: {key} (backtick is not supported)").into(),
+                );
+            }
+            if key.contains('.') {
+                Ok((format!("`{key}`"), value))
+            } else {
+                Ok((key, value))
+            }
+        })
+        .collect()
 }
 
 fn split_fields_and_transforms(

@@ -242,9 +242,9 @@ while cond { ... }
 | `col(path)` | CollectionRef | コレクション参照。`"users"` や `"teams/t1/members"`(サブコレクション)が使える |
 | `col_group(id)` | CollectionGroupRef | 同名コレクション横断の参照 |
 | `get(target)` | Map / Nil | ドキュメント取得。**存在しなければ nil**(エラーにはならない) |
-| `set(target, data_map)` | Nil | ドキュメント全体を書き込み(置換) |
-| `set(target, data_map, merge_bool)` / `set(target, data_map, merge: true)` | Nil | merge=true ならフィールドマージ |
-| `update(target, data_map)` | Nil | フィールド更新。**ドキュメントが存在しなければエラー**(作成しない) |
+| `set(target, data_map)` | Nil | ドキュメント全体を書き込み(置換)。キーはリテラルのフィールド名(`.` を含むキーはそのまま保存される) |
+| `set(target, data_map, merge_bool)` / `set(target, data_map, merge: true)` | Nil | merge=true ならフィールドマージ。キーは `.` 区切りの**フィールドパス**として解釈(update と同じ) |
+| `update(target, data_map)` | Nil | フィールド更新。**ドキュメントが存在しなければエラー**(作成しない)。キーは `.` 区切りの**フィールドパス**として解釈し、ネストしたフィールドを更新する(中間 Map は必要なら作成、中間が Map でなければエラー)。パスの各セグメントは Firestore の単純フィールドパス(`[A-Za-z_][A-Za-z0-9_]*`)のみで、バッククォートによるエスケープは非対応 |
 | `delete(target)` | Nil | ドキュメント削除。存在しなくてもエラーにならない |
 | `array(...)` | Array | `[...]` リテラルと同等 |
 | `array_union(array)` | センチネル | 配列フィールドへの追加(重複は追加されない) |
@@ -259,7 +259,10 @@ while cond { ... }
 set(doc("users/1"), {name: "alice", age: 20})
 set("users/1", {age: 21}, true)                       # merge
 update("users/1", {tags: array_union(["a"])})
+update("users/1", {"profile.name": "b"})              # ドット区切りのフィールドパスでネスト更新
 ```
+
+update と merge `set` のキーはフィールドパスとして解釈されるため、`{"profile.name": "b"}` は `profile` マップ内の `name` を更新する(in-memory / emulator で同じ挙動)。キーの各セグメントは単純フィールドパス([A-Za-z_][A-Za-z0-9_]*)のみで、それ以外(`` `a.b` `` のようなバッククォート、空セグメント、記号)はエラー。この検証は**センチネル値(`array_union` 等)を置いたキーにも適用される**。置換の `set` では `{"a.b": 1}` のようなキーはそのままリテラルのフィールド名として保存され、センチネル(`array_union` 等)をドット付きキーに置いた場合もリテラルキーに対して解決される(両バックエンドで同じ)。
 
 ## 7. クエリ
 

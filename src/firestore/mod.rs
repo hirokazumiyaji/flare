@@ -11,6 +11,52 @@ use std::error::Error;
 
 use crate::value::{QueryRef, Value};
 
+/// update / merge set のキーは `.` 区切りのフィールドパス(Firestore 準拠)。
+/// 各セグメントは Firestore の単純フィールドパス文法
+/// (`[A-Za-z_][A-Za-z0-9_]*`)に従うこと。バッククォートによるエスケープは
+/// 非対応なので、バッククォートや空セグメントを含むキーはエラーにする。
+pub(crate) fn validate_field_path(key: &str) -> Result<(), Box<dyn Error>> {
+    for segment in key.split('.') {
+        let valid = match segment.chars().next() {
+            Some(c) => c.is_ascii_alphabetic() || c == '_',
+            None => false,
+        } && segment
+            .chars()
+            .skip(1)
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
+            return Err(format!(
+                "invalid field path: {key} (segment {segment:?} must match [A-Za-z_][A-Za-z0-9_]*)"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// フィールドパスに沿って `map` に値を挿入する。中間の Map は必要なら作成し、
+/// 中間が Map でなければエラーにする。
+pub(crate) fn insert_at_field_path(
+    map: &mut BTreeMap<String, Value>,
+    segments: &[&str],
+    value: Value,
+) -> Result<(), Box<dyn Error>> {
+    let Some((first, rest)) = segments.split_first() else {
+        return Err("empty field path".into());
+    };
+    if rest.is_empty() {
+        map.insert(first.to_string(), value);
+        return Ok(());
+    }
+    if !map.contains_key(*first) {
+        map.insert(first.to_string(), Value::Map(BTreeMap::new()));
+    }
+    match map.get_mut(*first).expect("just inserted") {
+        Value::Map(inner) => insert_at_field_path(inner, rest, value),
+        _ => Err(format!("cannot update field path: field {first:?} is not a map").into()),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum WriteOp {
     Set {

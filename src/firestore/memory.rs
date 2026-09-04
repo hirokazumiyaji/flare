@@ -208,6 +208,9 @@ fn validate_query_filter_values(filters: &[QueryFilter]) -> Result<(), Box<dyn E
 /// 大小比較は同型のみを規定する(Int / Str / Bool / Timestamp)。
 /// 型が異なる・Nil は常にマッチしない(emulator の Firestore と実用上の
 /// 挙動を合わせる。異なる型同士の Firestore の型順序は未規定 = spec §13)。
+/// フィルタの文字列値は 1,500 バイト未満に制限されており(emulator の
+/// Firestore と同じ)、有効なフィルタに対しては全文比較でよい(最初の差異
+/// 位置は常にフィルタ自身の長さ以内 = 1,500 バイト未満に収まる)。
 fn compare_values(a: &Value, b: &Value, pred: impl Fn(std::cmp::Ordering) -> bool) -> bool {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => pred(x.cmp(y)),
@@ -222,9 +225,13 @@ fn apply_update_map(
     current: &mut BTreeMap<String, Value>,
     updates: &mut BTreeMap<String, Value>,
 ) -> Result<(), Box<dyn Error>> {
+    for k in updates.keys() {
+        super::validate_field_path(k)?;
+    }
     resolve_sentinel_map(updates, Some(current))?;
     for (k, v) in updates.iter() {
-        current.insert(k.clone(), v.clone());
+        let segments: Vec<&str> = k.split('.').collect();
+        super::insert_at_field_path(current, &segments, v.clone())?;
     }
     Ok(())
 }
@@ -234,25 +241,27 @@ fn resolve_sentinel_map(
     current: Option<&BTreeMap<String, Value>>,
 ) -> Result<(), Box<dyn Error>> {
     for (k, v) in map.clone() {
+        let segments: Vec<&str> = k.split('.').collect();
+        let base = || lookup_field_path(current, &segments);
         let resolved = match v {
             Value::ArrayUnion(values) => {
-                let mut base = match current.and_then(|m| m.get(&k)) {
-                    Some(Value::Array(arr)) => arr.clone(),
+                let mut arr = match base() {
+                    Some(Value::Array(a)) => a.clone(),
                     _ => vec![],
                 };
                 for item in values {
-                    if !base.contains(&item) {
-                        base.push(item);
+                    if !arr.contains(&item) {
+                        arr.push(item);
                     }
                 }
-                Value::Array(base)
+                Value::Array(arr)
             }
             Value::ArrayRemove(values) => {
-                let base = match current.and_then(|m| m.get(&k)) {
-                    Some(Value::Array(arr)) => arr.clone(),
+                let arr = match base() {
+                    Some(Value::Array(a)) => a.clone(),
                     _ => vec![],
                 };
-                Value::Array(base.into_iter().filter(|v| !values.contains(v)).collect())
+                Value::Array(arr.into_iter().filter(|v| !values.contains(v)).collect())
             }
             Value::ServerTimestamp => Value::Timestamp(Timestamp {
                 seconds: Timestamp::now()?.seconds,
@@ -262,4 +271,23 @@ fn resolve_sentinel_map(
         map.insert(k, resolved);
     }
     Ok(())
+}
+
+/// フィールドパスでネストした値を参照する(中間が Map でなければ見つからない)。
+fn lookup_field_path<'a>(
+    map: Option<&'a BTreeMap<String, Value>>,
+    segments: &[&str],
+) -> Option<&'a Value> {
+    let mut cur = map?;
+    for (i, seg) in segments.iter().enumerate() {
+        let v = cur.get(*seg)?;
+        if i == segments.len() - 1 {
+            return Some(v);
+        }
+        match v {
+            Value::Map(m) => cur = m,
+            _ => return None,
+        }
+    }
+    None
 }

@@ -710,6 +710,103 @@ fn where_comparison_supports_str_timestamp_and_bool() {
 }
 
 #[test]
+fn update_supports_dotted_field_paths_like_firestore() {
+    // emulator テスト(emulator_dotted_field_path_update_matches_in_memory)と
+    // 同じケース。{"profile.name": ...} はネストしたフィールドを更新する。
+    let out = run_script(
+        "set(\"users/fp1\", {profile: {name: \"a\", age: 1}, n: 5})\nupdate(\"users/fp1\", {\"profile.name\": \"b\"})\nset(\"users/fp1\", {\"profile.age\": 2}, merge: true)\nget(\"users/fp1\")",
+    )
+    .unwrap();
+    let s = format!("{out:?}");
+    assert!(s.contains("\"b\""), "{s}");
+    assert!(s.contains("Int(2)"), "{s}");
+    assert!(s.contains("Int(5)"), "{s}");
+    assert!(!s.contains("profile.name"), "{s}");
+}
+
+#[test]
+fn dotted_update_creates_missing_intermediate_maps() {
+    let out = run_script(
+        "set(\"users/fp2\", {n: 1})\nupdate(\"users/fp2\", {\"outer.inner\": 42})\nget(\"users/fp2\")[\"outer\"][\"inner\"]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(42));
+}
+
+#[test]
+fn dotted_update_fails_when_intermediate_is_not_a_map() {
+    let err = run_script(
+        "set(\"users/fp3\", {profile: 1})\nupdate(\"users/fp3\", {\"profile.name\": \"b\"})",
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("not a map"), "{err}");
+}
+
+#[test]
+fn set_replace_keeps_dotted_keys_literal() {
+    let out = run_script("set(\"users/fp4\", {\"a.b\": 1})\nget(\"users/fp4\")[\"a.b\"]").unwrap();
+    assert_eq!(out, Value::Int(1));
+}
+
+#[test]
+fn dotted_update_supports_nested_array_union() {
+    let out = run_script(
+        "set(\"users/fp5\", {profile: {tags: [\"a\"]}})\nupdate(\"users/fp5\", {\"profile.tags\": array_union([\"b\"])})\nget(\"users/fp5\")[\"profile\"][\"tags\"]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string())
+        ])
+    );
+}
+
+#[test]
+fn update_field_paths_require_simple_field_grammar() {
+    // Firestore の単純フィールドパス([A-Za-z_][A-Za-z0-9_]*)のみ。
+    // バッククォートはエスケープとして解釈されないので、in-memory / emulator
+    // ともに検証エラーになる。センチネル値(transform)のキーも同じ検証を
+    // 受ける(emulator は Firestore が quoted transform パスを受け付けるため
+    // RPC 前に検証して挙動を揃える。emulator テスト
+    // emulator_update_field_paths_match_in_memory_validation と同じケース)。
+    let cases = [
+        "set(\"users/gv1\", {n: 1})\nupdate(\"users/gv1\", {\"`a.b`\": 1})",
+        "set(\"users/gv2\", {n: 1})\nupdate(\"users/gv2\", {\"a..b\": 1})",
+        "set(\"users/gv3\", {n: 1})\nupdate(\"users/gv3\", {\"a b\": 1})",
+        "set(\"users/gv4\", {n: 1})\nupdate(\"users/gv4\", {\"日本語\": 1})",
+        "set(\"users/gv5\", {\"a..b\": 1}, merge: true)",
+        "set(\"users/gv6\", {n: 1})\nupdate(\"users/gv6\", {\"`a.b`\": array_union([1])})",
+        "set(\"users/gv7\", {n: 1})\nset(\"users/gv7\", {\"`a.b`\": array_union([1])}, merge: true)",
+        "set(\"users/gv8\", {n: 1})\nupdate(\"users/gv8\", {\"a..b\": array_union([1])})",
+        "set(\"users/gv9\", {n: 1})\nset(\"users/gv9\", {\"a..b\": array_union([1])}, merge: true)",
+    ];
+    for src in cases {
+        let err = run_script(src).unwrap_err();
+        assert!(
+            format!("{err}").contains("invalid field path"),
+            "{src}: {err}"
+        );
+    }
+}
+
+#[test]
+fn replacement_set_resolves_sentinels_against_literal_dotted_keys() {
+    // emulator テスト(emulator_replacement_set_sentinel_with_dotted_key)と
+    // 同じケース。置換 set ではドット付きキーはリテラルのフィールド名。
+    let out =
+        run_script("set(\"users/gv2\", {\"a.b\": array_union([1])})\nget(\"users/gv2\")[\"a.b\"]")
+            .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1)]));
+    let out = run_script(
+        "set(\"users/gv3\", {\"x.y\": [\"a\"]})\nset(\"users/gv3\", {\"x.y\": array_remove([\"a\"])})\nget(\"users/gv3\")[\"x.y\"]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![]));
+}
+
+#[test]
 fn where_rejects_large_string_filter_values() {
     // Firestore はクエリのフィルタ文字列値を 1,500 バイト未満に制限する
     // (1,500 バイト以上はクエリ時にエラー。保存値に制限はない)。実機
