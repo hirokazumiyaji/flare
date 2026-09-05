@@ -13,6 +13,10 @@ pub enum Expr {
         op: BinOp,
         right: Box<Expr>,
     },
+    Unary {
+        op: UnOp,
+        expr: Box<Expr>,
+    },
     Call {
         receiver: Option<Box<Expr>>,
         name: String,
@@ -40,6 +44,13 @@ pub enum BinOp {
     Lt,
     Ge,
     Le,
+    And,
+    Or,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnOp {
+    Not,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -85,6 +96,17 @@ impl fmt::Display for BinOp {
             Self::Lt => "<",
             Self::Ge => ">=",
             Self::Le => "<=",
+            Self::And => "&&",
+            Self::Or => "||",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl fmt::Display for UnOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::Not => "!",
         };
         write!(f, "{s}")
     }

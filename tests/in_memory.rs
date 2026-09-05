@@ -831,3 +831,48 @@ fn where_rejects_large_string_filter_values() {
     .unwrap();
     assert_eq!(out, Value::Int(0));
 }
+
+#[test]
+fn logical_operators_return_operand_with_short_circuit() {
+    // `!` は Bool に正規化、`&&` / `||` は Ruby と同じくオペランドそのものを返す。
+    let out = run_script("[!true, !false, !nil, !0, !\"\", !!\"x\"]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(true),
+        ])
+    );
+    let out =
+        run_script("[1 && 2, nil && 2, false && 99, 1 || 2, nil || 2, false || nil]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(2),
+            Value::Nil,
+            Value::Bool(false),
+            Value::Int(1),
+            Value::Int(2),
+            Value::Nil,
+        ])
+    );
+    // 優先順位: `||` < `&&` < 比較 < `!`。
+    let out = run_script("true || false && false").unwrap();
+    assert_eq!(out, Value::Bool(true));
+    let out = run_script("1 + 1 == 2 && !false").unwrap();
+    assert_eq!(out, Value::Bool(true));
+    let out = run_script("if 20 >= 20 && true { 1 } else { 2 }").unwrap();
+    assert_eq!(out, Value::Int(1));
+    // 短絡評価: 右辺が評価されなければエラーにならない。
+    let out = run_script("false && undefined_var").unwrap();
+    assert_eq!(out, Value::Bool(false));
+    let out = run_script("true || undefined_var").unwrap();
+    assert_eq!(out, Value::Bool(true));
+    // 単体の `&` / `|` はエラー。
+    assert!(run_script("true & false").is_err());
+    assert!(run_script("true | false").is_err());
+}

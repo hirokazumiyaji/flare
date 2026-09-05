@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece};
+use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
 use crate::lexer::{self, StrPart, Token};
 
 type ParsedArgs = (Vec<Expr>, Vec<(String, Expr)>);
@@ -119,7 +119,33 @@ impl Parser {
         Ok(Stmt::While { cond, body })
     }
     fn parse_expr(&mut self) -> Result<Expr, Box<dyn Error>> {
-        self.parse_comparison()
+        self.parse_or()
+    }
+    fn parse_or(&mut self) -> Result<Expr, Box<dyn Error>> {
+        let mut left = self.parse_and()?;
+        while self.at(&Token::OrOr) {
+            self.bump();
+            let right = self.parse_and()?;
+            left = Expr::Binary {
+                left: Box::new(left),
+                op: BinOp::Or,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+    fn parse_and(&mut self) -> Result<Expr, Box<dyn Error>> {
+        let mut left = self.parse_comparison()?;
+        while self.at(&Token::AndAnd) {
+            self.bump();
+            let right = self.parse_comparison()?;
+            left = Expr::Binary {
+                left: Box::new(left),
+                op: BinOp::And,
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
     }
     fn parse_comparison(&mut self) -> Result<Expr, Box<dyn Error>> {
         let mut left = self.parse_add_sub()?;
@@ -160,7 +186,7 @@ impl Parser {
         Ok(left)
     }
     fn parse_mul_div(&mut self) -> Result<Expr, Box<dyn Error>> {
-        let mut left = self.parse_call()?;
+        let mut left = self.parse_unary()?;
         loop {
             let op = match self.peek() {
                 Token::Star => BinOp::Mul,
@@ -171,10 +197,21 @@ impl Parser {
             left = Expr::Binary {
                 left: Box::new(left),
                 op,
-                right: Box::new(self.parse_call()?),
+                right: Box::new(self.parse_unary()?),
             }
         }
         Ok(left)
+    }
+    fn parse_unary(&mut self) -> Result<Expr, Box<dyn Error>> {
+        if self.at(&Token::Bang) {
+            self.bump();
+            let expr = self.parse_unary()?;
+            return Ok(Expr::Unary {
+                op: UnOp::Not,
+                expr: Box::new(expr),
+            });
+        }
+        self.parse_call()
     }
     fn parse_call(&mut self) -> Result<Expr, Box<dyn Error>> {
         let mut expr = self.parse_primary()?;
@@ -481,6 +518,11 @@ impl Parser {
         Ok(Block { params, body })
     }
     fn parse_block_params(&mut self) -> Result<Vec<String>, Box<dyn Error>> {
+        // 空パラメータ `||` は lexer が OrOr 1 トークンにまとめるため、ここで吸収する。
+        if self.at(&Token::OrOr) {
+            self.bump();
+            return Ok(vec![]);
+        }
         if !self.at(&Token::Pipe) {
             return Ok(vec![]);
         }
@@ -517,6 +559,7 @@ impl Parser {
                 | Token::False
                 | Token::Nil
                 | Token::LParen
+                | Token::Bang
         )
     }
     /// 文の区切り(改行または `;`)をスキップする。ブロック本文・プログラム
