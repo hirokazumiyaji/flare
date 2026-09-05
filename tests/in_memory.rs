@@ -1050,6 +1050,21 @@ fn errors_carry_kind_and_line_col() {
 }
 
 #[test]
+fn interpolation_handles_braces_inside_nested_strings() {
+    // トークン単位で `#{...}` を切り出すため、中の文字列リテラル内の
+    // `{` `}` に惑わされない(旧実装の文字単位カウントでは壊れたケース)。
+    let out = run_script("\"#{\"}\" + \"}\"}\"").unwrap();
+    assert_eq!(out, Value::Str("}}".to_string()));
+    let out = run_script("\"#{{a: 1}[\"a\"]}\"").unwrap();
+    assert_eq!(out, Value::Str("1".to_string()));
+    let out = run_script("\"#{\"a{b}c\"}\"").unwrap();
+    assert_eq!(out, Value::Str("a{b}c".to_string()));
+    // 複数補間・式の組み合わせも従来どおり。
+    let out = run_script("m = {k: \"v\"}\n\"#{m[\"k\"]}-#{1 + 2}\"").unwrap();
+    assert_eq!(out, Value::Str("v-3".to_string()));
+}
+
+#[test]
 fn inspect_and_to_s_follow_ruby_style() {
     // inspect: Str はクォート付き、Map は "k" => v・キー昇順。
     let out = run_script("[1, \"x\", true, nil]").unwrap();
