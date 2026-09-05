@@ -229,6 +229,37 @@ fn apply_update_map(
     for k in updates.keys() {
         super::validate_field_path(k)?;
     }
+    // DeleteField / Increment は current への直接操作が必要なため、
+    // 他のセンチネル解決より先に処理する。
+    let mut deletes = vec![];
+    let mut increments = vec![];
+    for (k, v) in updates.iter() {
+        match v {
+            Value::DeleteField => deletes.push(k.clone()),
+            Value::Increment(n) => {
+                let segments: Vec<&str> = k.split('.').collect();
+                let next = match lookup_field_path(Some(current), &segments) {
+                    Some(Value::Int(cur)) => (*cur)
+                        .checked_add(*n)
+                        .ok_or_else(|| Box::<dyn Error>::from("integer overflow"))?,
+                    Some(_) => {
+                        return Err(format!("increment target must be an int: {k}").into());
+                    }
+                    None => *n,
+                };
+                increments.push((k.clone(), next));
+            }
+            _ => {}
+        }
+    }
+    for k in &deletes {
+        updates.remove(k);
+        let segments: Vec<&str> = k.split('.').collect();
+        remove_at_field_path(current, &segments)?;
+    }
+    for (k, next) in increments {
+        updates.insert(k, Value::Int(next));
+    }
     resolve_sentinel_map(updates, Some(current))?;
     for (k, v) in updates.iter() {
         let segments: Vec<&str> = k.split('.').collect();
@@ -267,11 +298,44 @@ fn resolve_sentinel_map(
             Value::ServerTimestamp => Value::Timestamp(Timestamp {
                 seconds: Timestamp::now()?.seconds,
             }),
+            Value::Increment(n) => match base() {
+                Some(Value::Int(cur)) => Value::Int(
+                    (*cur)
+                        .checked_add(n)
+                        .ok_or_else(|| Box::<dyn Error>::from("integer overflow"))?,
+                ),
+                _ => Value::Int(n),
+            },
+            // 置換 set(merge なし)でフィールド削除は意味を持たない。
+            // Firestore と同様にエラーにし、emulator と挙動を揃える。
+            Value::DeleteField => {
+                return Err("delete_field() cannot be used with set() without merge".into());
+            }
             other => other,
         };
         map.insert(k, resolved);
     }
     Ok(())
+}
+
+/// フィールドパスでネストした値を削除する。パスが存在しなければ何もしない。
+/// 中間が存在して Map でなければエラー(insert と同じ厳しさ)。
+fn remove_at_field_path(
+    map: &mut BTreeMap<String, Value>,
+    segments: &[&str],
+) -> Result<(), Box<dyn Error>> {
+    let Some((first, rest)) = segments.split_first() else {
+        return Err("empty field path".into());
+    };
+    if rest.is_empty() {
+        map.remove(*first);
+        return Ok(());
+    }
+    match map.get_mut(*first) {
+        None => Ok(()),
+        Some(Value::Map(inner)) => remove_at_field_path(inner, rest),
+        Some(_) => Err(format!("cannot update field path: field {first:?} is not a map").into()),
+    }
 }
 
 /// フィールドパスでネストした値を参照する(中間が Map でなければ見つからない)。

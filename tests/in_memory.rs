@@ -1024,3 +1024,64 @@ fn inspect_and_to_s_follow_ruby_style() {
     let out = run_script("\"v=#{[1, 2]}\"").unwrap();
     assert_eq!(out, Value::Str("v=[1, 2]".to_string()));
 }
+
+#[test]
+fn delete_field_removes_fields_via_update_and_merge_set() {
+    // emulator テスト(emulator_delete_field_and_increment_match_in_memory)と
+    // 同じケース。update / merge set でフィールドを削除できる。
+    let out = run_script(
+        "set(\"users/df1\", {name: \"a\", age: 1, extra: true})\nupdate(\"users/df1\", {age: delete_field()})\nget(\"users/df1\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"extra\" => true, \"name\" => \"a\"}");
+    let out = run_script(
+        "set(\"users/df2\", {name: \"a\", age: 1})\nset(\"users/df2\", {age: delete_field()}, merge: true)\nget(\"users/df2\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"name\" => \"a\"}");
+    // ドット区切りのネストパス・存在しないフィールド(no-op)。
+    let out = run_script(
+        "set(\"users/df3\", {profile: {name: \"a\", age: 1}})\nupdate(\"users/df3\", {\"profile.age\": delete_field(), missing: delete_field()})\nget(\"users/df3\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"profile\" => {\"name\" => \"a\"}}");
+    // 置換 set ではエラー。
+    let err = run_script("set(\"users/df4\", {age: delete_field()})").unwrap_err();
+    assert!(
+        format!("{err}").contains("delete_field() cannot be used with set() without merge"),
+        "{err}"
+    );
+}
+
+#[test]
+fn increment_adds_to_numeric_fields() {
+    // emulator テスト(emulator_delete_field_and_increment_match_in_memory)と
+    // 同じケース。なければ n、あれば加算。
+    let out = run_script(
+        "set(\"users/ic1\", {visits: 10})\nupdate(\"users/ic1\", {visits: increment(5), fresh: increment(3)})\nget(\"users/ic1\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"fresh\" => 3, \"visits\" => 15}");
+    // ドット区切りのネストパス・merge set でも使える。
+    let out = run_script(
+        "set(\"users/ic2\", {stats: {n: 1}})\nupdate(\"users/ic2\", {\"stats.n\": increment(2)})\nset(\"users/ic2\", {\"stats.m\": increment(4)}, merge: true)\nget(\"users/ic2\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"stats\" => {\"m\" => 4, \"n\" => 3}}");
+    // 引数なし・非 Int への加算・オーバーフローはエラー。
+    let err = run_script("increment()").unwrap_err();
+    assert!(format!("{err}").contains("expected int argument"), "{err}");
+    let err = run_script(
+        "set(\"users/ic3\", {name: \"a\"})\nupdate(\"users/ic3\", {name: increment(1)})",
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("increment target must be an int"),
+        "{err}"
+    );
+    let err = run_script(
+        "set(\"users/ic4\", {n: 9223372036854775807})\nupdate(\"users/ic4\", {n: increment(1)})",
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("integer overflow"), "{err}");
+}

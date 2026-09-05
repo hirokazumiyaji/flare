@@ -300,6 +300,8 @@ impl<F: Firestore> Runtime<F> {
             "server_timestamp" => Ok(Value::ServerTimestamp),
             "array_union" => Ok(Value::ArrayUnion(expect_array(args.first())?.clone())),
             "array_remove" => Ok(Value::ArrayRemove(expect_array(args.first())?.clone())),
+            "delete_field" => Ok(Value::DeleteField),
+            "increment" => Ok(Value::Increment(expect_int(args.first())?)),
             "get" => {
                 let path = expect_doc_path(args.first())?;
                 let v = match &self.exec {

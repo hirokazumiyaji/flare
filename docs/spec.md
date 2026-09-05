@@ -71,8 +71,10 @@ Firestore 操作のための特殊な値:
 | QueryRef | `col(..).where(..)` 等 | 構築中のクエリ |
 | ServerTimestamp | `server_timestamp()` | 書き込み時にサーバ時刻へ解決されるセンチネル |
 | ArrayUnion / ArrayRemove | `array_union([..])` / `array_remove([..])` | 配列フィールド変換センチネル |
+| DeleteField | `delete_field()` | フィールド削除センチネル(`update` / merge `set` のみ) |
+| Increment | `increment(n)` | 数値加算センチネル |
 
-センチネル 3 種(ServerTimestamp / ArrayUnion / ArrayRemove)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(emulator バックエンドではエラー)。
+センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(emulator バックエンドではエラー)。
 
 ### 真偽値判定(truthiness)
 
@@ -257,10 +259,14 @@ while cond { ... }
 | `array_union(array)` | センチネル | 配列フィールドへの追加(重複は追加されない) |
 | `array_remove(array)` | センチネル | 配列フィールドからの除去 |
 | `server_timestamp()` | センチネル | 書き込み時にサーバ時刻に解決 |
+| `delete_field()` | センチネル | `update` / merge `set` でフィールドを削除する。存在しないフィールドへの指定は no-op |
+| `increment(n)` | センチネル | 数値フィールドに `n`(Int)を加算する。フィールドがなければ `n` を設定。既存が Int でなければエラー。結果が範囲外なら `integer overflow` エラー |
 | `batch { ... }` | ブロックの値 | 8 章参照 |
 | `transaction { ... }` | ブロックの値 | 8 章参照 |
 
-`data_map` の値に使えるのは: Int / Str / Bool / Nil / Array / Map / Timestamp、および直下フィールドのセンチネル 3 種。
+`data_map` の値に使えるのは: Int / Str / Bool / Nil / Array / Map / Timestamp、および直下フィールドのセンチネル 5 種。
+
+センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(emulator バックエンドではエラー)。`delete_field()` は `update` と merge `set` でのみ使え、置換の `set` ではエラー(`delete_field() cannot be used with set() without merge`)。
 
 ```ruby
 set(doc("users/1"), {name: "alice", age: 20})
