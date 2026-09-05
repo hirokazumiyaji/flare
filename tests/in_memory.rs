@@ -1085,3 +1085,40 @@ fn increment_adds_to_numeric_fields() {
     .unwrap_err();
     assert!(format!("{err}").contains("integer overflow"), "{err}");
 }
+
+#[test]
+fn timestamp_comparison_diff_and_rfc3339() {
+    // 比較: Timestamp 同士は秒で比較できる。
+    let out = run_script(
+        "t1 = timestamp(100)\nt2 = timestamp(200)\n[t1 < t2, t1 > t2, t1 <= t1, t2 >= t1, t1 == timestamp(100), t1 != t2]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+        ])
+    );
+    // 差分: t2 - t1 は秒差の Int。
+    let out =
+        run_script("[timestamp(200) - timestamp(100), timestamp(100) - timestamp(200)]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(100), Value::Int(-100)]));
+    // 異型との比較・減算は従来どおりエラー。
+    let err = run_script("timestamp(1) > 2").unwrap_err();
+    assert!(format!("{err}").contains("unsupported > operands"), "{err}");
+    let err = run_script("timestamp(1) - 2").unwrap_err();
+    assert!(format!("{err}").contains("unsupported - operands"), "{err}");
+    // RFC3339 出力(UTC)。
+    let out = run_script("timestamp(0).to_rfc3339()").unwrap();
+    assert_eq!(out, Value::Str("1970-01-01T00:00:00+00:00".to_string()));
+    let out = run_script("timestamp(\"2026-02-01T00:00:00+09:00\").to_rfc3339()").unwrap();
+    assert_eq!(out, Value::Str("2026-01-31T15:00:00+00:00".to_string()));
+    // if 条件にも使える。
+    let out = run_script("if timestamp(200) > timestamp(100) { 1 } else { 2 }").unwrap();
+    assert_eq!(out, Value::Int(1));
+}
