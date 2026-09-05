@@ -54,6 +54,15 @@ impl<F: Firestore> Runtime<F> {
         Ok(last)
     }
 
+    /// ソースを字句解析・構文解析・評価する一連の処理。`lib.rs` の
+    /// エントリポイントとテストの共有ヘルパー。
+    pub fn run(&mut self, source: &str) -> Result<Value, Box<dyn Error>> {
+        let spanned = crate::lexer::lex_spanned(source)?;
+        let mut parser = crate::parser::Parser::from_spanned(spanned);
+        let (program, spans) = parser.parse_program_with_spans()?;
+        self.eval_program_with_spans(&program, &spans)
+    }
+
     fn eval_stmt(&mut self, stmt: &Stmt) -> Result<ExecFlow, Box<dyn Error>> {
         match stmt {
             Stmt::Expr(e) => Ok(ExecFlow::Value(self.eval_expr(e)?)),
