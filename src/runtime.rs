@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
 use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
+use crate::error::{FirelangError, Span};
 use crate::firestore::{Firestore, WriteOp};
 use crate::value::{
     CollectionGroupRef, CollectionRef, DocRef, QueryFilter, QueryOp, QueryRef, Timestamp, UserFunc,
@@ -35,6 +36,26 @@ impl<F: Firestore> Runtime<F> {
             match self.eval_stmt(stmt)? {
                 ExecFlow::Value(v) => last = v,
                 ExecFlow::Return(v) => return Ok(v),
+            }
+        }
+        Ok(last)
+    }
+
+    /// トップレベル文の開始位置付きで評価し、失敗した文の位置を
+    /// runtime/backend エラーに付与する。既に span を持つ lex/parse エラーは
+    /// そのまま通す。
+    pub fn eval_program_with_spans(
+        &mut self,
+        stmts: &[Stmt],
+        spans: &[Span],
+    ) -> Result<Value, Box<dyn Error>> {
+        let mut last = Value::Nil;
+        for (i, stmt) in stmts.iter().enumerate() {
+            let span = spans.get(i).copied();
+            match self.eval_stmt(stmt) {
+                Ok(ExecFlow::Value(v)) => last = v,
+                Ok(ExecFlow::Return(v)) => return Ok(v),
+                Err(e) => return Err(attach_span(e, span)),
             }
         }
         Ok(last)
@@ -114,7 +135,7 @@ impl<F: Firestore> Runtime<F> {
 
     fn dispatch_write(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
         match &mut self.exec {
-            ExecCtx::Normal => self.fs.apply(vec![op]),
+            ExecCtx::Normal => self.fs.apply(vec![op]).map_err(backend_err),
             ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => {
                 writes.push(op);
                 Ok(())
@@ -290,10 +311,16 @@ impl<F: Firestore> Runtime<F> {
                             "get is not allowed after the first write in a transaction".into()
                         );
                     }
-                    ExecCtx::Transaction { .. } => {
-                        self.fs.transaction_get(path)?.unwrap_or(Value::Nil)
-                    }
-                    ExecCtx::Normal => self.fs.get(path)?.unwrap_or(Value::Nil),
+                    ExecCtx::Transaction { .. } => self
+                        .fs
+                        .transaction_get(path)
+                        .map_err(backend_err)?
+                        .unwrap_or(Value::Nil),
+                    ExecCtx::Normal => self
+                        .fs
+                        .get(path)
+                        .map_err(backend_err)?
+                        .unwrap_or(Value::Nil),
                 };
                 Ok(v)
             }
@@ -340,7 +367,7 @@ impl<F: Firestore> Runtime<F> {
                     unreachable!("exec ctx changed inside batch");
                 };
                 let flow = flow?;
-                self.fs.apply(writes)?;
+                self.fs.apply(writes).map_err(backend_err)?;
                 Ok(flow.into_value())
             }
             "transaction" => {
@@ -353,7 +380,7 @@ impl<F: Firestore> Runtime<F> {
                 if !matches!(self.exec, ExecCtx::Normal) {
                     return Err("transaction cannot be nested inside batch/transaction".into());
                 }
-                self.fs.begin_transaction()?;
+                self.fs.begin_transaction().map_err(backend_err)?;
                 self.exec = ExecCtx::Transaction { writes: vec![] };
                 let flow = self.eval_block(&stmts.body);
                 let ExecCtx::Transaction { writes } =
@@ -363,7 +390,7 @@ impl<F: Firestore> Runtime<F> {
                 };
                 match flow {
                     Ok(flow) => {
-                        self.fs.commit_transaction(writes)?;
+                        self.fs.commit_transaction(writes).map_err(backend_err)?;
                         Ok(flow.into_value())
                     }
                     Err(e) => {
@@ -514,7 +541,9 @@ impl<F: Firestore> Runtime<F> {
             }
             "get" => {
                 self.forbid_query_in_batch_or_transaction()?;
-                Ok(Value::Array(self.fs.run_query(&query)?))
+                Ok(Value::Array(
+                    self.fs.run_query(&query).map_err(backend_err)?,
+                ))
             }
             _ => Err(format!("unknown query method: {name}").into()),
         }
@@ -748,6 +777,46 @@ fn int_binop(a: i64, b: i64, f: impl Fn(i64, i64) -> Option<i64>) -> Result<Valu
     f(a, b)
         .map(Value::Int)
         .ok_or_else(|| "integer overflow".into())
+}
+
+fn backend_err(e: Box<dyn Error>) -> Box<dyn Error> {
+    if e.downcast_ref::<FirelangError>().is_some() {
+        e
+    } else {
+        FirelangError::backend(e.to_string()).into()
+    }
+}
+
+/// eval 失敗時にトップレベル文の位置を付与する。既に span を持つ
+/// FirelangError (lex/parse/backendで付与済み)はそのまま通し、
+/// span なしの FirelangError と String 系エラーは Runtime として包む。
+fn attach_span(e: Box<dyn Error>, span: Option<Span>) -> Box<dyn Error> {
+    let Some(span) = span else {
+        return wrap_as_runtime(e);
+    };
+    match e.downcast::<FirelangError>() {
+        Ok(mut ferr) => {
+            if ferr.span.is_none() {
+                ferr.span = Some(span);
+            }
+            // `Box<FirelangError>` -> `Box<dyn Error>` は coerce する。
+            // `.into()` は `Box<FirelangError>` 自体を `Error` として
+            // 二重に Box 化してしまい downcast が効かなくなるため使わない。
+            ferr as Box<dyn Error>
+        }
+        Err(e) => {
+            // String 等の非 typed エラーは Runtime として包む。
+            FirelangError::runtime(e.to_string()).with_span(span).into()
+        }
+    }
+}
+
+fn wrap_as_runtime(e: Box<dyn Error>) -> Box<dyn Error> {
+    if e.downcast_ref::<FirelangError>().is_some() {
+        e
+    } else {
+        FirelangError::runtime(e.to_string()).into()
+    }
 }
 
 enum ExecFlow {

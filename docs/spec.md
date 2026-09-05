@@ -341,6 +341,7 @@ usage: fl [--backend in-memory|emulator] <script-file>
   - `FIRESTORE_EMULATOR_HOST` — **必須**。未設定なら即エラー。
   - `FIRESTORE_PROJECT_ID` — 省略時 `firelang-test`。
 - 実行結果は `=> <Debug表現>` で印字。
+- エラーは `error: <line>:<col>: <message>` を stderr に印字して exit 1。lex / parse エラーは該当トークンの位置、runtime / backend エラーは失敗したトップレベル文の開始位置。位置が付かない場合(補間内の単一式制約違反など)は `error: <message>`。
 
 ## 11. バックエンド
 

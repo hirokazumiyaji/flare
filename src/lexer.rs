@@ -1,5 +1,7 @@
 use std::error::Error;
 
+use crate::error::{FirelangError, Span};
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum StrPart {
     Lit(String),
@@ -49,57 +51,124 @@ pub enum Token {
     Eof,
 }
 
-pub fn lex(input: &str) -> Result<Vec<Token>, Box<dyn Error>> {
-    let mut chars = input.chars().peekable();
-    let mut tokens = Vec::new();
+/// Token with its start position (1-based line/col).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpannedToken {
+    pub token: Token,
+    pub span: Span,
+}
 
-    while let Some(&c) = chars.peek() {
+struct Lexer<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+    line: usize,
+    col: usize,
+}
+
+impl<'a> Lexer<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            chars: input.chars().peekable(),
+            line: 1,
+            col: 1,
+        }
+    }
+
+    fn span(&self) -> Span {
+        Span::new(self.line, self.col)
+    }
+
+    fn bump(&mut self) -> Option<char> {
+        let ch = self.chars.next()?;
+        if ch == '\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+        Some(ch)
+    }
+
+    fn peek(&mut self) -> Option<char> {
+        self.chars.peek().copied()
+    }
+}
+
+pub fn lex(input: &str) -> Result<Vec<Token>, Box<dyn Error>> {
+    Ok(lex_spanned(input)?.into_iter().map(|s| s.token).collect())
+}
+
+pub fn lex_spanned(input: &str) -> Result<Vec<SpannedToken>, Box<dyn Error>> {
+    let mut lx = Lexer::new(input);
+    let mut tokens = Vec::new();
+    let mut push = |token: Token, span: Span| {
+        tokens.push(SpannedToken { token, span });
+    };
+
+    while let Some(c) = lx.peek() {
         match c {
             ' ' | '\t' | '\r' => {
-                chars.next();
+                lx.bump();
             }
             '\n' => {
-                chars.next();
-                tokens.push(Token::Newline);
+                let span = lx.span();
+                lx.bump();
+                push(Token::Newline, span);
             }
             ';' => {
-                chars.next();
-                tokens.push(Token::Semicolon);
+                let span = lx.span();
+                lx.bump();
+                push(Token::Semicolon, span);
             }
             '#' => {
-                while let Some(&cc) = chars.peek() {
-                    chars.next();
+                while let Some(cc) = lx.peek() {
+                    // コメント終端の改行は Newline トークンとして残す。
                     if cc == '\n' {
-                        tokens.push(Token::Newline);
+                        let span = lx.span();
+                        lx.bump();
+                        push(Token::Newline, span);
                         break;
                     }
+                    lx.bump();
                 }
             }
             '0'..='9' => {
+                let span = lx.span();
                 let mut s = String::new();
-                while let Some(&d) = chars.peek() {
+                while let Some(d) = lx.peek() {
                     if d.is_ascii_digit() {
                         s.push(d);
-                        chars.next();
+                        lx.bump();
                     } else {
                         break;
                     }
                 }
-                tokens.push(Token::Int(
-                    s.parse::<i64>()
-                        .map_err(|_| format!("integer literal out of range: {s}"))?,
-                ));
+                match s.parse::<i64>() {
+                    Ok(v) => push(Token::Int(v), span),
+                    Err(_) => {
+                        return Err(FirelangError::lex(
+                            format!("integer literal out of range: {s}"),
+                            span.line,
+                            span.col,
+                        )
+                        .into());
+                    }
+                }
             }
             '"' => {
-                chars.next();
+                let span = lx.span();
+                lx.bump();
                 let mut parts: Vec<StrPart> = vec![];
                 let mut lit = String::new();
                 loop {
-                    let ch = chars.next().ok_or("unterminated string literal")?;
+                    let ch = lx.bump().ok_or_else(|| {
+                        FirelangError::lex("unterminated string literal", lx.line, lx.col)
+                    })?;
                     match ch {
                         '"' => break,
                         '\\' => {
-                            let esc = chars.next().ok_or("unterminated string literal")?;
+                            let esc = lx.bump().ok_or_else(|| {
+                                FirelangError::lex("unterminated string literal", lx.line, lx.col)
+                            })?;
                             lit.push(match esc {
                                 'n' => '\n',
                                 'r' => '\r',
@@ -110,15 +179,21 @@ pub fn lex(input: &str) -> Result<Vec<Token>, Box<dyn Error>> {
                                 other => other,
                             });
                         }
-                        '#' if chars.peek() == Some(&'{') => {
-                            chars.next();
+                        '#' if lx.peek() == Some('{') => {
+                            lx.bump();
                             if !lit.is_empty() {
                                 parts.push(StrPart::Lit(std::mem::take(&mut lit)));
                             }
                             let mut depth = 1;
                             let mut expr = String::new();
                             loop {
-                                let ch = chars.next().ok_or("unterminated string interpolation")?;
+                                let ch = lx.bump().ok_or_else(|| {
+                                    FirelangError::lex(
+                                        "unterminated string interpolation",
+                                        lx.line,
+                                        lx.col,
+                                    )
+                                })?;
                                 match ch {
                                     '{' => {
                                         depth += 1;
@@ -142,120 +217,142 @@ pub fn lex(input: &str) -> Result<Vec<Token>, Box<dyn Error>> {
                 if !lit.is_empty() || parts.is_empty() {
                     parts.push(StrPart::Lit(lit));
                 }
-                tokens.push(Token::Str(parts));
+                push(Token::Str(parts), span);
             }
             '(' => {
-                chars.next();
-                tokens.push(Token::LParen);
+                let span = lx.span();
+                lx.bump();
+                push(Token::LParen, span);
             }
             ')' => {
-                chars.next();
-                tokens.push(Token::RParen);
+                let span = lx.span();
+                lx.bump();
+                push(Token::RParen, span);
             }
             ',' => {
-                chars.next();
-                tokens.push(Token::Comma);
+                let span = lx.span();
+                lx.bump();
+                push(Token::Comma, span);
             }
             '{' => {
-                chars.next();
-                tokens.push(Token::LBrace);
+                let span = lx.span();
+                lx.bump();
+                push(Token::LBrace, span);
             }
             '}' => {
-                chars.next();
-                tokens.push(Token::RBrace);
+                let span = lx.span();
+                lx.bump();
+                push(Token::RBrace, span);
             }
             '[' => {
-                chars.next();
-                tokens.push(Token::LBracket);
+                let span = lx.span();
+                lx.bump();
+                push(Token::LBracket, span);
             }
             ']' => {
-                chars.next();
-                tokens.push(Token::RBracket);
+                let span = lx.span();
+                lx.bump();
+                push(Token::RBracket, span);
             }
             '.' => {
-                chars.next();
-                tokens.push(Token::Dot);
+                let span = lx.span();
+                lx.bump();
+                push(Token::Dot, span);
             }
             ':' => {
-                chars.next();
-                tokens.push(Token::Colon);
+                let span = lx.span();
+                lx.bump();
+                push(Token::Colon, span);
             }
             '+' => {
-                chars.next();
-                tokens.push(Token::Plus);
+                let span = lx.span();
+                lx.bump();
+                push(Token::Plus, span);
             }
             '-' => {
-                chars.next();
-                tokens.push(Token::Minus);
+                let span = lx.span();
+                lx.bump();
+                push(Token::Minus, span);
             }
             '*' => {
-                chars.next();
-                tokens.push(Token::Star);
+                let span = lx.span();
+                lx.bump();
+                push(Token::Star, span);
             }
             '/' => {
-                chars.next();
-                tokens.push(Token::Slash);
+                let span = lx.span();
+                lx.bump();
+                push(Token::Slash, span);
             }
             '=' => {
-                chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    tokens.push(Token::EqEq);
+                let span = lx.span();
+                lx.bump();
+                if lx.peek() == Some('=') {
+                    lx.bump();
+                    push(Token::EqEq, span);
                 } else {
-                    tokens.push(Token::Eq);
+                    push(Token::Eq, span);
                 }
             }
             '!' => {
-                chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    tokens.push(Token::Ne);
+                let span = lx.span();
+                lx.bump();
+                if lx.peek() == Some('=') {
+                    lx.bump();
+                    push(Token::Ne, span);
                 } else {
-                    tokens.push(Token::Bang);
+                    push(Token::Bang, span);
                 }
             }
             '&' => {
-                chars.next();
-                if chars.peek() == Some(&'&') {
-                    chars.next();
-                    tokens.push(Token::AndAnd);
+                let span = lx.span();
+                lx.bump();
+                if lx.peek() == Some('&') {
+                    lx.bump();
+                    push(Token::AndAnd, span);
                 } else {
-                    return Err("unexpected char: &".into());
+                    return Err(
+                        FirelangError::lex("unexpected char: &", span.line, span.col).into(),
+                    );
                 }
             }
             '|' => {
-                chars.next();
-                if chars.peek() == Some(&'|') {
-                    chars.next();
-                    tokens.push(Token::OrOr);
+                let span = lx.span();
+                lx.bump();
+                if lx.peek() == Some('|') {
+                    lx.bump();
+                    push(Token::OrOr, span);
                 } else {
-                    tokens.push(Token::Pipe);
+                    push(Token::Pipe, span);
                 }
             }
             '>' => {
-                chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    tokens.push(Token::Ge);
+                let span = lx.span();
+                lx.bump();
+                if lx.peek() == Some('=') {
+                    lx.bump();
+                    push(Token::Ge, span);
                 } else {
-                    tokens.push(Token::Gt);
+                    push(Token::Gt, span);
                 }
             }
             '<' => {
-                chars.next();
-                if chars.peek() == Some(&'=') {
-                    chars.next();
-                    tokens.push(Token::Le);
+                let span = lx.span();
+                lx.bump();
+                if lx.peek() == Some('=') {
+                    lx.bump();
+                    push(Token::Le, span);
                 } else {
-                    tokens.push(Token::Lt);
+                    push(Token::Lt, span);
                 }
             }
             _ if is_ident_start(c) => {
+                let span = lx.span();
                 let mut s = String::new();
-                while let Some(&ch) = chars.peek() {
+                while let Some(ch) = lx.peek() {
                     if is_ident_continue(ch) {
                         s.push(ch);
-                        chars.next();
+                        lx.bump();
                     } else {
                         break;
                     }
@@ -271,12 +368,21 @@ pub fn lex(input: &str) -> Result<Vec<Token>, Box<dyn Error>> {
                     "nil" => Token::Nil,
                     _ => Token::Ident(s),
                 };
-                tokens.push(t);
+                push(t, span);
             }
-            _ => return Err(format!("unexpected char: {c}").into()),
+            _ => {
+                let span = lx.span();
+                return Err(FirelangError::lex(
+                    format!("unexpected char: {c}"),
+                    span.line,
+                    span.col,
+                )
+                .into());
+            }
         }
     }
-    tokens.push(Token::Eof);
+    let span = lx.span();
+    push(Token::Eof, span);
     Ok(tokens)
 }
 
