@@ -97,6 +97,16 @@ impl<'a> Lexer<'a> {
         SpannedToken { token, span }
     }
 
+    /// `=` `!` `>` `<` の後に `=` が続けば 2 文字トークン。
+    fn suffixed_eq(&mut self, span: Span, doubled: Token, single: Token) -> SpannedToken {
+        if self.peek() == Some('=') {
+            self.bump();
+            self.spanned(doubled, span)
+        } else {
+            self.spanned(single, span)
+        }
+    }
+
     /// 入力からトークンを 1 つ読む。空白・コメントは読み飛ばす。
     /// EOF に達したら `None` を返す。
     fn next_token(&mut self) -> Result<Option<SpannedToken>, Box<dyn Error>> {
@@ -161,88 +171,33 @@ impl<'a> Lexer<'a> {
                     let token = self.lex_string_token()?;
                     return Ok(Some(self.spanned(token, span)));
                 }
-                '(' => {
+                '(' | ')' | ',' | '{' | '}' | '[' | ']' | '.' | ':' | '+' | '-' | '*' | '/' => {
                     let span = self.span();
                     self.bump();
-                    return Ok(Some(self.spanned(Token::LParen, span)));
-                }
-                ')' => {
-                    let span = self.span();
-                    self.bump();
-                    return Ok(Some(self.spanned(Token::RParen, span)));
-                }
-                ',' => {
-                    let span = self.span();
-                    self.bump();
-                    return Ok(Some(self.spanned(Token::Comma, span)));
-                }
-                '{' => {
-                    let span = self.span();
-                    self.bump();
-                    return Ok(Some(self.spanned(Token::LBrace, span)));
-                }
-                '}' => {
-                    let span = self.span();
-                    self.bump();
-                    return Ok(Some(self.spanned(Token::RBrace, span)));
-                }
-                '[' => {
-                    let span = self.span();
-                    self.bump();
-                    return Ok(Some(self.spanned(Token::LBracket, span)));
-                }
-                ']' => {
-                    let span = self.span();
-                    self.bump();
-                    return Ok(Some(self.spanned(Token::RBracket, span)));
-                }
-                '.' => {
-                    let span = self.span();
-                    self.bump();
-                    return Ok(Some(self.spanned(Token::Dot, span)));
-                }
-                ':' => {
-                    let span = self.span();
-                    self.bump();
-                    return Ok(Some(self.spanned(Token::Colon, span)));
-                }
-                '+' => {
-                    let span = self.span();
-                    self.bump();
-                    return Ok(Some(self.spanned(Token::Plus, span)));
-                }
-                '-' => {
-                    let span = self.span();
-                    self.bump();
-                    return Ok(Some(self.spanned(Token::Minus, span)));
-                }
-                '*' => {
-                    let span = self.span();
-                    self.bump();
-                    return Ok(Some(self.spanned(Token::Star, span)));
-                }
-                '/' => {
-                    let span = self.span();
-                    self.bump();
-                    return Ok(Some(self.spanned(Token::Slash, span)));
+                    // or-pattern が single_char_token の定義域と一致するため、
+                    // None は到達不能。 Producer/consumer を二重化しないため
+                    // テーブル側を正とし、万一のずれはエラーに落とす。
+                    match single_char_token(c) {
+                        Some(t) => return Ok(Some(self.spanned(t, span))),
+                        None => {
+                            return Err(FirelangError::lex(
+                                format!("unexpected char: {c}"),
+                                span.line,
+                                span.col,
+                            )
+                            .into());
+                        }
+                    }
                 }
                 '=' => {
                     let span = self.span();
                     self.bump();
-                    if self.peek() == Some('=') {
-                        self.bump();
-                        return Ok(Some(self.spanned(Token::EqEq, span)));
-                    }
-                    return Ok(Some(self.spanned(Token::Eq, span)));
+                    return Ok(Some(self.suffixed_eq(span, Token::EqEq, Token::Eq)));
                 }
                 '!' => {
                     let span = self.span();
                     self.bump();
-                    if self.peek() == Some('=') {
-                        self.bump();
-                        return Ok(Some(self.spanned(Token::Ne, span)));
-                    }
-                    return Ok(Some(self.spanned(Token::Bang, span)));
+                    return Ok(Some(self.suffixed_eq(span, Token::Ne, Token::Bang)));
                 }
                 '&' => {
                     let span = self.span();
@@ -267,20 +222,12 @@ impl<'a> Lexer<'a> {
                 '>' => {
                     let span = self.span();
                     self.bump();
-                    if self.peek() == Some('=') {
-                        self.bump();
-                        return Ok(Some(self.spanned(Token::Ge, span)));
-                    }
-                    return Ok(Some(self.spanned(Token::Gt, span)));
+                    return Ok(Some(self.suffixed_eq(span, Token::Ge, Token::Gt)));
                 }
                 '<' => {
                     let span = self.span();
                     self.bump();
-                    if self.peek() == Some('=') {
-                        self.bump();
-                        return Ok(Some(self.spanned(Token::Le, span)));
-                    }
-                    return Ok(Some(self.spanned(Token::Lt, span)));
+                    return Ok(Some(self.suffixed_eq(span, Token::Le, Token::Lt)));
                 }
                 _ if is_ident_start(c) => {
                     let span = self.span();
@@ -412,6 +359,25 @@ pub fn lex_spanned(input: &str) -> Result<Vec<SpannedToken>, Box<dyn Error>> {
         span,
     });
     Ok(tokens)
+}
+
+fn single_char_token(c: char) -> Option<Token> {
+    Some(match c {
+        '(' => Token::LParen,
+        ')' => Token::RParen,
+        ',' => Token::Comma,
+        '{' => Token::LBrace,
+        '}' => Token::RBrace,
+        '[' => Token::LBracket,
+        ']' => Token::RBracket,
+        '.' => Token::Dot,
+        ':' => Token::Colon,
+        '+' => Token::Plus,
+        '-' => Token::Minus,
+        '*' => Token::Star,
+        '/' => Token::Slash,
+        _ => return None,
+    })
 }
 
 fn is_ident_start(c: char) -> bool {
