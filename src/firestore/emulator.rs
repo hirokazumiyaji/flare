@@ -15,7 +15,9 @@ use prost_types::{NullValue, Timestamp as ProtoTimestamp};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 use super::{Firestore, WriteOp};
-use crate::value::{Direction, QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value};
+use crate::value::{
+    Direction, DocRef, QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value,
+};
 
 pub struct FirestoreEmulator {
     host: String,
@@ -754,6 +756,19 @@ fn decode_field_value(v: &SdkValue) -> Result<Value, Box<dyn Error>> {
             }
             Ok(Value::Map(out))
         }
+        // firelang が持たない型は読めることだけを目標にする。double・
+        // geo_point・bytes は表示専用の Opaque にし、reference は相対パス
+        // の DocRef にする。書き戻しは unsupported のまま(§3)。
+        value::ValueType::DoubleValue(f) => Ok(Value::Opaque(format!("Double({f})"))),
+        value::ValueType::BytesValue(b) => Ok(Value::Opaque(format!("Bytes({})", hex_bytes(b)))),
+        value::ValueType::GeoPointValue(p) => Ok(Value::Opaque(format!(
+            "GeoPoint({}, {})",
+            p.latitude, p.longitude
+        ))),
+        value::ValueType::ReferenceValue(name) => match relative_document_name(name) {
+            Ok(rel) => Ok(Value::DocRef(DocRef { path: rel })),
+            Err(_) => Ok(Value::Opaque(format!("Reference({name})"))),
+        },
         other => Err(format!("unsupported Firestore field value: {other:?}").into()),
     }
 }
@@ -763,6 +778,10 @@ fn relative_document_name(name: &str) -> Result<String, Box<dyn Error>> {
         .split_once("/documents/")
         .ok_or("invalid document name")?;
     Ok(rel.to_string())
+}
+
+fn hex_bytes(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 fn split_collection_path(path: &str) -> Result<(Option<String>, &str), Box<dyn Error>> {
@@ -1099,5 +1118,79 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(write.operation, Some(write::Operation::Delete(_))));
+    }
+
+    #[test]
+    fn decode_exotic_field_values_as_opaque_or_docref() {
+        let sdk = |t| SdkValue {
+            value_type: Some(t),
+        };
+        assert_eq!(
+            decode_field_value(&sdk(value::ValueType::DoubleValue(1.5))).unwrap(),
+            Value::Opaque("Double(1.5)".to_string())
+        );
+        assert_eq!(
+            decode_field_value(&sdk(value::ValueType::BytesValue(vec![0x00, 0xff]))).unwrap(),
+            Value::Opaque("Bytes(00ff)".to_string())
+        );
+        assert_eq!(
+            decode_field_value(&sdk(value::ValueType::GeoPointValue(
+                gcloud_sdk::google::r#type::LatLng {
+                    latitude: 35.7,
+                    longitude: 139.7,
+                },
+            )))
+            .unwrap(),
+            Value::Opaque("GeoPoint(35.7, 139.7)".to_string())
+        );
+        assert_eq!(
+            decode_field_value(&sdk(value::ValueType::ReferenceValue(
+                "projects/p/databases/(default)/documents/users/1".to_string(),
+            )))
+            .unwrap(),
+            Value::DocRef(DocRef {
+                path: "users/1".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn decode_document_with_exotic_fields_does_not_fail() {
+        let doc = Document {
+            name: "projects/p/databases/(default)/documents/users/x".to_string(),
+            fields: HashMap::from([
+                (
+                    "name".to_string(),
+                    SdkValue {
+                        value_type: Some(value::ValueType::StringValue("a".to_string())),
+                    },
+                ),
+                (
+                    "score".to_string(),
+                    SdkValue {
+                        value_type: Some(value::ValueType::DoubleValue(4.5)),
+                    },
+                ),
+            ]),
+            create_time: None,
+            update_time: None,
+        };
+        let Value::Map(m) = decode_document_for_get(&doc).unwrap() else {
+            panic!();
+        };
+        assert_eq!(m.get("name"), Some(&Value::Str("a".to_string())));
+        assert_eq!(
+            m.get("score"),
+            Some(&Value::Opaque("Double(4.5)".to_string()))
+        );
+    }
+
+    #[test]
+    fn encode_opaque_value_is_rejected_on_write() {
+        let err = encode_field_value(&Value::Opaque("Double(1.5)".to_string())).unwrap_err();
+        assert!(
+            format!("{err}").contains("unsupported value in emulator write"),
+            "{err}"
+        );
     }
 }

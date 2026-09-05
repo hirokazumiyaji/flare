@@ -73,8 +73,11 @@ Firestore 操作のための特殊な値:
 | ArrayUnion / ArrayRemove | `array_union([..])` / `array_remove([..])` | 配列フィールド変換センチネル |
 | DeleteField | `delete_field()` | フィールド削除センチネル(`update` / merge `set` のみ) |
 | Increment | `increment(n)` | 数値加算センチネル |
+| Opaque | (生成不可。emulator 読み取りのみ) | `double` / `geo_point` / `bytes` フィールドの表示専用値(`Double(1.5)` 等)。書き込みには使えない |
 
 センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(emulator バックエンドではエラー)。
+
+emulator バックエンドで firelang が持たない型のフィールドを含むドキュメントを読んだ場合、ドキュメント全体はエラーにせず次のように読み替える:`double` / `geo_point` / `bytes` は `Opaque` の表示専用値(例 `Double(1.5)`、`GeoPoint(35.7, 139.7)`、`Bytes(00ff)`)、`reference` は相対パスの `DocRef`。`Opaque` 値はクエリの `==` 等でマッチさせることはできず(スクリプトからは生成できない)、書き戻しはエラー(`unsupported value in emulator write`)。
 
 ### 真偽値判定(truthiness)
 
@@ -371,6 +374,7 @@ usage: fl [--backend in-memory|emulator] <script-file>
 - ランタイムは `Firestore` トレイトでバックエンドを抽象化する。デフォルトは `InMemoryFirestore`。
 - emulator バックエンドは Firestore Rust SDK(`firestore` crate)の gRPC クライアントで Firestore API を呼ぶ。database は `(default)` 固定。
 - 両バックエンドは同じ可視挙動(値の往復・クエリ順序・batch/transaction の原子性)を持たなければならない。
+- ただし emulator 側に firelang 外の型(`double` / `reference` / `geo_point` / `bytes`)で書かれたフィールドがある場合、emulator バックエンドは `Opaque` / `DocRef` に読み替えて返す(§3)。in-memory にはそのような値は存在しない。
 
 ## 12. スコープ外(MVP)
 

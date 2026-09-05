@@ -19,6 +19,9 @@ pub enum Value {
     ArrayRemove(Vec<Value>),
     DeleteField,
     Increment(i64),
+    /// emulator が読んだ firelang 外の型(double / geo_point / bytes)の
+    /// 表示専用値。スクリプトからは生成できず、書き戻しもできない。
+    Opaque(String),
     DocRef(DocRef),
     CollectionRef(CollectionRef),
     CollectionGroupRef(CollectionGroupRef),
@@ -206,6 +209,7 @@ impl Value {
             }
             Value::DeleteField => "DeleteField".to_string(),
             Value::Increment(n) => format!("Increment({n})"),
+            Value::Opaque(s) => s.clone(),
             Value::DocRef(d) => format!("#<DocRef path={}>", d.path),
             Value::CollectionRef(c) => format!("#<CollectionRef path={}>", c.path),
             Value::CollectionGroupRef(cg) => format!("#<CollectionGroupRef id={}>", cg.id),
