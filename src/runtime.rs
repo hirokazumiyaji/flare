@@ -431,9 +431,8 @@ impl<F: Firestore> Runtime<F> {
             }
             "get" => {
                 self.forbid_query_in_batch_or_transaction()?;
-                Ok(Value::Array(
-                    self.fs.run_query(&query).map_err(backend_err)?,
-                ))
+                let rows = self.fs.run_query(&query).map_err(backend_err)?;
+                Ok(Value::Array(apply_query_shape(rows, &query)))
             }
             _ => Err(format!("unknown query method: {name}").into()),
         }
@@ -905,6 +904,49 @@ fn check_block_arity(block: &Block, yielded: usize) -> Result<(), Box<dyn Error>
         .into());
     }
     Ok(())
+}
+
+/// バックエンドが返した候補(相対パス・フィールド)に `__name__` を付け、
+/// 順序・offset・limit を適用する。両バックエンド共通の決定性はここで
+/// 保証する(spec §7)。`order_by` 対象を持たないドキュメントは除外する。
+fn apply_query_shape(
+    mut rows: Vec<(String, BTreeMap<String, Value>)>,
+    query: &QueryRef,
+) -> Vec<Value> {
+    if query.order_by.is_empty() {
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+    } else {
+        rows.retain(|(_, doc)| query.order_by.iter().all(|(f, _)| doc.contains_key(f)));
+        rows.sort_by(|a, b| {
+            for (field, dir) in &query.order_by {
+                let ord = a.1[field].cmp_for_order(&b.1[field]);
+                let ord = match dir {
+                    Direction::Asc => ord,
+                    Direction::Desc => ord.reverse(),
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            a.0.cmp(&b.0)
+        });
+    }
+    let skip = query.offset.unwrap_or(0).min(rows.len());
+    let mut values: Vec<Value> = rows
+        .into_iter()
+        .skip(skip)
+        .map(|(path, doc)| wrap_doc(&path, &doc))
+        .collect();
+    if let Some(l) = query.limit {
+        values.truncate(l.min(values.len()));
+    }
+    values
+}
+
+fn wrap_doc(path: &str, doc: &BTreeMap<String, Value>) -> Value {
+    let mut out = doc.clone();
+    out.insert("__name__".to_string(), Value::Str(path.to_string()));
+    Value::Map(out)
 }
 
 fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {
