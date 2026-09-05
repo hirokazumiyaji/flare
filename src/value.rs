@@ -50,6 +50,8 @@ pub struct CollectionGroupRef {
 pub struct QueryRef {
     pub source: QuerySource,
     pub filters: Vec<QueryFilter>,
+    pub order_by: Vec<(String, Direction)>,
+    pub offset: Option<usize>,
     pub limit: Option<usize>,
 }
 
@@ -62,21 +64,52 @@ pub enum QuerySource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryOp {
     Eq,
+    Ne,
     Gt,
     Ge,
     Lt,
     Le,
+    In,
+    NotIn,
+    ArrayContains,
+    ArrayContainsAny,
 }
 
 impl QueryOp {
     pub fn parse(s: &str) -> Result<Self, Box<dyn Error>> {
         Ok(match s {
             "==" => Self::Eq,
+            "!=" => Self::Ne,
             ">" => Self::Gt,
             ">=" => Self::Ge,
             "<" => Self::Lt,
             "<=" => Self::Le,
+            "in" => Self::In,
+            "not-in" => Self::NotIn,
+            "array_contains" => Self::ArrayContains,
+            "array_contains_any" => Self::ArrayContainsAny,
             other => return Err(format!("unsupported query op: {other}").into()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Asc,
+    Desc,
+}
+
+impl Direction {
+    pub fn parse(s: &str) -> Result<Self, Box<dyn Error>> {
+        Ok(match s {
+            "asc" => Self::Asc,
+            "desc" => Self::Desc,
+            other => {
+                return Err(format!(
+                    "order_by direction must be \"asc\" or \"desc\", got {other:?}"
+                )
+                .into())
+            }
         })
     }
 }
@@ -122,6 +155,8 @@ impl CollectionRef {
         QueryRef {
             source: QuerySource::Collection(self.path.clone()),
             filters: vec![],
+            order_by: vec![],
+            offset: None,
             limit: None,
         }
     }
@@ -132,6 +167,8 @@ impl CollectionGroupRef {
         QueryRef {
             source: QuerySource::CollectionGroup(self.id.clone()),
             filters: vec![],
+            order_by: vec![],
+            offset: None,
             limit: None,
         }
     }

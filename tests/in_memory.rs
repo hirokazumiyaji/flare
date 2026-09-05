@@ -263,7 +263,7 @@ fn collection_limit_builds_query_inside_transaction() {
 
 #[test]
 fn where_rejects_unsupported_operator() {
-    let err = run_script("col(\"users\").where(\"a\", \"!=\", 1)").unwrap_err();
+    let err = run_script("col(\"users\").where(\"a\", \"=~\", 1)").unwrap_err();
     assert!(format!("{err}").contains("unsupported query op"), "{err}");
 }
 
@@ -1121,4 +1121,172 @@ fn timestamp_comparison_diff_and_rfc3339() {
     // if 条件にも使える。
     let out = run_script("if timestamp(200) > timestamp(100) { 1 } else { 2 }").unwrap();
     assert_eq!(out, Value::Int(1));
+}
+
+#[test]
+fn order_by_sorts_and_excludes_docs_missing_the_field() {
+    // emulator テスト(emulator_extended_query_matches_in_memory)と
+    // 同じケース。order_by 対象を持たない ob4 は除外、同値はパス辞書順。
+    let setup = "set(\"users/ob1\", {age: 30, name: \"c\"})\nset(\"users/ob2\", {age: 20, name: \"a\"})\nset(\"users/ob3\", {age: 20, name: \"b\"})\nset(\"users/ob4\", {other: 1})";
+    let out = run_script(&format!(
+        "{setup}\ncol(\"users\").order_by(\"age\", \"asc\").get().map {{ |r| r[\"__name__\"] }}"
+    ))
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("users/ob2".to_string()),
+            Value::Str("users/ob3".to_string()),
+            Value::Str("users/ob1".to_string()),
+        ])
+    );
+    let out = run_script(&format!(
+        "{setup}\ncol(\"users\").order_by(\"age\", \"desc\").get().map {{ |r| r[\"__name__\"] }}"
+    ))
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("users/ob1".to_string()),
+            Value::Str("users/ob2".to_string()),
+            Value::Str("users/ob3".to_string()),
+        ])
+    );
+    // 複数 order_by は順に適用される(name の降順で ob3 が先)。
+    let out = run_script(&format!(
+        "{setup}\ncol(\"users\").order_by(\"age\", \"asc\").order_by(\"name\", \"desc\").get().map {{ |r| r[\"__name__\"] }}"
+    ))
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("users/ob3".to_string()),
+            Value::Str("users/ob2".to_string()),
+            Value::Str("users/ob1".to_string()),
+        ])
+    );
+    // 不正な向きは呼び出し時にエラー。
+    let err = run_script("col(\"users\").order_by(\"age\", \"up\")").unwrap_err();
+    assert!(
+        format!("{err}").contains("order_by direction must be \"asc\" or \"desc\""),
+        "{err}"
+    );
+}
+
+#[test]
+fn where_supports_not_equal_and_membership_operators() {
+    // emulator テスト(emulator_extended_query_matches_in_memory)と
+    // 同じケース。`!=` は存在 + 不一致、欠損はマッチしない。
+    let setup = "set(\"users/mb1\", {age: 20, tag: \"x\"})\nset(\"users/mb2\", {age: 30})\nset(\"users/mb3\", {name: \"n\"})";
+    let out = run_script(&format!(
+        "{setup}\n[col(\"users\").where(\"age\", \"!=\", 20).get().len(), col(\"users\").where(\"tag\", \"!=\", 5).get().len(), col(\"users\").where(\"missing\", \"!=\", 1).get().len()]"
+    ))
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(1), Value::Int(1), Value::Int(0)])
+    );
+    // `in` / `not-in`。
+    let out = run_script(&format!(
+        "{setup}\n[col(\"users\").where(\"age\", \"in\", [20, 30]).get().len(), col(\"users\").where(\"age\", \"not-in\", [20]).get().len(), col(\"users\").where(\"age\", \"in\", []).get().len(), col(\"users\").where(\"age\", \"not-in\", []).get().len()]"
+    ))
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(2),
+            Value::Int(1),
+            Value::Int(0),
+            Value::Int(2)
+        ])
+    );
+    // 配列でなければ実行時エラー、11 要素以上もエラー。
+    let err = run_script("col(\"users\").where(\"age\", \"in\", 5).get()").unwrap_err();
+    assert!(
+        format!("{err}").contains("in filter requires an array value"),
+        "{err}"
+    );
+    let err = run_script("col(\"users\").where(\"age\", \"not-in\", \"x\").get()").unwrap_err();
+    assert!(
+        format!("{err}").contains("not-in filter requires an array value"),
+        "{err}"
+    );
+    let many = (0..11)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let err = run_script(&format!(
+        "col(\"users\").where(\"age\", \"in\", [{many}]).get()"
+    ))
+    .unwrap_err();
+    assert!(format!("{err}").contains("at most 10 elements"), "{err}");
+}
+
+#[test]
+fn where_supports_array_contains_operators() {
+    // emulator テスト(emulator_extended_query_matches_in_memory)と
+    // 同じケース。
+    let setup = "set(\"users/ac1\", {tags: [\"a\", \"b\"]})\nset(\"users/ac2\", {tags: [\"b\", \"c\"]})\nset(\"users/ac3\", {n: 1})";
+    let out = run_script(&format!(
+        "{setup}\n[col(\"users\").where(\"tags\", \"array_contains\", \"b\").get().len(), col(\"users\").where(\"tags\", \"array_contains\", \"z\").get().len(), col(\"users\").where(\"tags\", \"array_contains_any\", [\"a\", \"c\"]).get().len(), col(\"users\").where(\"tags\", \"array_contains_any\", []).get().len(), col(\"users\").where(\"n\", \"array_contains\", 1).get().len()]"
+    ))
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(2),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(0),
+            Value::Int(0)
+        ])
+    );
+    let err = run_script("col(\"users\").where(\"tags\", \"array_contains_any\", \"b\").get()")
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("array_contains_any filter requires an array value"),
+        "{err}"
+    );
+}
+
+#[test]
+fn offset_skips_after_sort_and_count_ignores_paging() {
+    // emulator テスト(emulator_extended_query_matches_in_memory)と
+    // 同じケース。sort → offset → limit の順に適用、count は全件。
+    let setup = "set(\"users/pg1\", {ord: 1})\nset(\"users/pg2\", {ord: 2})\nset(\"users/pg3\", {ord: 3})\nset(\"users/pg4\", {ord: 4})\nset(\"users/pg5\", {ord: 5})";
+    let out = run_script(&format!(
+        "{setup}\ncol(\"users\").order_by(\"ord\", \"asc\").offset(2).get().map {{ |r| r[\"ord\"] }}"
+    ))
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(3), Value::Int(4), Value::Int(5)])
+    );
+    let out = run_script(&format!(
+        "{setup}\ncol(\"users\").order_by(\"ord\", \"asc\").offset(1).limit(2).get().map {{ |r| r[\"ord\"] }}"
+    ))
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(2), Value::Int(3)]));
+    let out = run_script(&format!(
+        "{setup}\n[col(\"users\").order_by(\"ord\", \"asc\").offset(99).get().len(), col(\"users\").where(\"ord\", \">=\", 2).limit(1).count(), col(\"users\").order_by(\"ord\", \"desc\").offset(1).count()]"
+    ))
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(0), Value::Int(4), Value::Int(5)])
+    );
+    // count は batch/transaction 内で実行できない(get と同じ)。
+    let err = run_script("batch { col(\"users\").count() }").unwrap_err();
+    assert!(
+        format!("{err}").contains("not allowed inside batch"),
+        "{err}"
+    );
+    let err = run_script("transaction { col(\"users\").count() }").unwrap_err();
+    assert!(
+        format!("{err}").contains("not allowed inside transaction"),
+        "{err}"
+    );
+    // 負の offset はエラー。
+    let err = run_script("col(\"users\").offset(0 - 1).get()").unwrap_err();
+    assert!(format!("{err}").contains("offset must be >= 0"), "{err}");
 }

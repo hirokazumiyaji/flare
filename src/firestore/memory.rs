@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
 use super::{Firestore, WriteOp};
-use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value};
+use crate::value::{Direction, QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value};
 
 #[derive(Default)]
 pub struct InMemoryFirestore {
@@ -25,14 +25,22 @@ impl Firestore for InMemoryFirestore {
     }
 
     fn run_query(&self, query: &QueryRef) -> Result<Vec<Value>, Box<dyn Error>> {
-        validate_query_filter_values(&query.filters)?;
+        super::validate_query_filters(&query.filters)?;
         match &query.source {
-            QuerySource::Collection(path) => {
-                self.query_collection(path, &query.filters, query.limit)
-            }
-            QuerySource::CollectionGroup(id) => {
-                self.query_collection_group(id, &query.filters, query.limit)
-            }
+            QuerySource::Collection(path) => self.query_collection(
+                path,
+                &query.filters,
+                &query.order_by,
+                query.offset,
+                query.limit,
+            ),
+            QuerySource::CollectionGroup(id) => self.query_collection_group(
+                id,
+                &query.filters,
+                &query.order_by,
+                query.offset,
+                query.limit,
+            ),
         }
     }
 
@@ -71,6 +79,8 @@ impl InMemoryFirestore {
         &self,
         path: &str,
         filters: &[QueryFilter],
+        order_by: &[(String, Direction)],
+        offset: Option<usize>,
         limit: Option<usize>,
     ) -> Result<Vec<Value>, Box<dyn Error>> {
         let mut matches: Vec<(&String, &BTreeMap<String, Value>)> = vec![];
@@ -86,14 +96,16 @@ impl InMemoryFirestore {
                 matches.push((doc_path, doc));
             }
         }
-        matches.sort_by(|a, b| a.0.cmp(b.0));
-        Ok(take_matches(matches, limit))
+        sort_matches(&mut matches, order_by);
+        Ok(take_matches(matches, offset, limit))
     }
 
     fn query_collection_group(
         &self,
         id: &str,
         filters: &[QueryFilter],
+        order_by: &[(String, Direction)],
+        offset: Option<usize>,
         limit: Option<usize>,
     ) -> Result<Vec<Value>, Box<dyn Error>> {
         let mut matches: Vec<(&String, &BTreeMap<String, Value>)> = vec![];
@@ -116,8 +128,8 @@ impl InMemoryFirestore {
                 matches.push((doc_path, doc));
             }
         }
-        matches.sort_by(|a, b| a.0.cmp(b.0));
-        Ok(take_matches(matches, limit))
+        sort_matches(&mut matches, order_by);
+        Ok(take_matches(matches, offset, limit))
     }
 }
 
@@ -162,48 +174,81 @@ fn wrap_doc(path: &str, doc: &BTreeMap<String, Value>) -> Value {
 
 fn take_matches(
     sorted: Vec<(&String, &BTreeMap<String, Value>)>,
+    offset: Option<usize>,
     limit: Option<usize>,
 ) -> Vec<Value> {
-    let n = limit.map_or(sorted.len(), |l| l.min(sorted.len()));
-    sorted
+    let skip = offset.unwrap_or(0).min(sorted.len());
+    let mut values: Vec<Value> = sorted
         .into_iter()
-        .take(n)
+        .skip(skip)
         .map(|(p, d)| wrap_doc(p, d))
-        .collect()
+        .collect();
+    if let Some(l) = limit {
+        values.truncate(l.min(values.len()));
+    }
+    values
+}
+
+/// 結果の並べ替え。order_by が空なら従来どおりパス辞書順。指定時は
+/// フィールド値の順に並べ(同値はパス辞書順でタイブレーク)、対象フィールドを
+/// 持たないドキュメントは除外する。型が異なる値同士は型ランクで比べる
+/// (同型のみを規定する where と異なり、順序は全順序にする必要があるため)。
+fn sort_matches(
+    matches: &mut Vec<(&String, &BTreeMap<String, Value>)>,
+    order_by: &[(String, Direction)],
+) {
+    if order_by.is_empty() {
+        matches.sort_by(|a, b| a.0.cmp(b.0));
+        return;
+    }
+    matches.retain(|(_, doc)| order_by.iter().all(|(field, _)| doc.contains_key(field)));
+    matches.sort_by(|a, b| {
+        for (field, dir) in order_by {
+            let ord = super::compare_order_values(&a.1[field], &b.1[field]);
+            let ord = match dir {
+                Direction::Asc => ord,
+                Direction::Desc => ord.reverse(),
+            };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        a.0.cmp(b.0)
+    });
 }
 
 fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bool {
     filters.iter().all(|f| {
-        let Some(actual) = doc.get(&f.field) else {
-            return false;
-        };
+        // `!=` / `in` / `not-in` はフィールドの存在を要求する(存在しなければ
+        // マッチしない)。`order_by` 対象の存在チェックは sort 側で行う。
+        let actual = doc.get(&f.field);
         match f.op {
-            QueryOp::Eq => actual == &f.value,
+            QueryOp::Eq => actual == Some(&f.value),
+            QueryOp::Ne => actual.is_some_and(|v| v != &f.value),
             QueryOp::Gt => compare_values(actual, &f.value, |o| o.is_gt()),
             QueryOp::Ge => compare_values(actual, &f.value, |o| o.is_ge()),
             QueryOp::Lt => compare_values(actual, &f.value, |o| o.is_lt()),
             QueryOp::Le => compare_values(actual, &f.value, |o| o.is_le()),
+            QueryOp::In => match (&f.value, actual) {
+                (Value::Array(list), Some(v)) => list.contains(v),
+                _ => false,
+            },
+            QueryOp::NotIn => match (&f.value, actual) {
+                (Value::Array(list), Some(v)) => !list.contains(v),
+                _ => false,
+            },
+            QueryOp::ArrayContains => match actual {
+                Some(Value::Array(arr)) => arr.contains(&f.value),
+                _ => false,
+            },
+            QueryOp::ArrayContainsAny => match (&f.value, actual) {
+                (Value::Array(list), Some(Value::Array(arr))) => {
+                    arr.iter().any(|x| list.contains(x))
+                }
+                _ => false,
+            },
         }
     })
-}
-
-/// Firestore はクエリのフィルタ文字列値を 1,500 バイト未満に制限する
-/// (1,500 バイト以上のフィルタ値はクエリ時にエラーになる。実機 emulator:
-/// `value for {field} is too large to be used in a query`)。保存値に長さ
-/// 制限はない。有効なフィルタ(< 1,500 バイト)に対しては、最初の差異位置
-/// が常にフィルタ自身の長さ以内に収まるため、全文比較とインデックス接頭辞
-/// 比較は同じ結果になる。
-fn validate_query_filter_values(filters: &[QueryFilter]) -> Result<(), Box<dyn Error>> {
-    for f in filters {
-        if let Value::Str(s) = &f.value {
-            if s.len() >= 1500 {
-                return Err(
-                    format!("value for {} is too large to be used in a query", f.field).into(),
-                );
-            }
-        }
-    }
-    Ok(())
 }
 
 /// 大小比較は同型のみを規定する(Int / Str / Bool / Timestamp)。
@@ -212,12 +257,12 @@ fn validate_query_filter_values(filters: &[QueryFilter]) -> Result<(), Box<dyn E
 /// フィルタの文字列値は 1,500 バイト未満に制限されており(emulator の
 /// Firestore と同じ)、有効なフィルタに対しては全文比較でよい(最初の差異
 /// 位置は常にフィルタ自身の長さ以内 = 1,500 バイト未満に収まる)。
-fn compare_values(a: &Value, b: &Value, pred: impl Fn(std::cmp::Ordering) -> bool) -> bool {
+fn compare_values(a: Option<&Value>, b: &Value, pred: impl Fn(std::cmp::Ordering) -> bool) -> bool {
     match (a, b) {
-        (Value::Int(x), Value::Int(y)) => pred(x.cmp(y)),
-        (Value::Str(x), Value::Str(y)) => pred(x.cmp(y)),
-        (Value::Bool(x), Value::Bool(y)) => pred(x.cmp(y)),
-        (Value::Timestamp(x), Value::Timestamp(y)) => pred(x.seconds.cmp(&y.seconds)),
+        (Some(Value::Int(x)), Value::Int(y)) => pred(x.cmp(y)),
+        (Some(Value::Str(x)), Value::Str(y)) => pred(x.cmp(y)),
+        (Some(Value::Bool(x)), Value::Bool(y)) => pred(x.cmp(y)),
+        (Some(Value::Timestamp(x)), Value::Timestamp(y)) => pred(x.seconds.cmp(&y.seconds)),
         _ => false,
     }
 }

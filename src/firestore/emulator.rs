@@ -15,7 +15,7 @@ use prost_types::{NullValue, Timestamp as ProtoTimestamp};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 use super::{Firestore, WriteOp};
-use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value};
+use crate::value::{Direction, QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value};
 
 pub struct FirestoreEmulator {
     host: String,
@@ -210,15 +210,23 @@ impl Firestore for FirestoreEmulator {
     }
 
     fn run_query(&self, query: &QueryRef) -> Result<Vec<Value>, Box<dyn Error>> {
+        super::validate_query_filters(&query.filters)?;
         match &query.source {
             QuerySource::Collection(path) => {
                 let (parent, collection_id) = split_collection_path(path)?;
                 let sq = structured_query(collection_id, false, &query.filters)?;
-                run_query_sorted(self, parent.as_deref(), sq, query.limit)
+                run_query_sorted(
+                    self,
+                    parent.as_deref(),
+                    sq,
+                    &query.order_by,
+                    query.offset,
+                    query.limit,
+                )
             }
             QuerySource::CollectionGroup(id) => {
                 let sq = structured_query(id, true, &query.filters)?;
-                run_query_sorted(self, None, sq, query.limit)
+                run_query_sorted(self, None, sq, &query.order_by, query.offset, query.limit)
             }
         }
     }
@@ -307,6 +315,8 @@ fn run_query_sorted(
     fs: &FirestoreEmulator,
     parent: Option<&str>,
     query: StructuredQuery,
+    order_by: &[(String, Direction)],
+    offset: Option<usize>,
     limit: Option<usize>,
 ) -> Result<Vec<Value>, Box<dyn Error>> {
     let db = fs.sdk_db()?;
@@ -338,12 +348,45 @@ fn run_query_sorted(
         let value = decode_document_for_query(&doc)?;
         out.push((rel, value));
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut values: Vec<Value> = out.into_iter().map(|(_, v)| v).collect();
+    // 順序・offset・limit は取得後に適用する。サーバ側の order_by は使わず、
+    // in-memory と同じ比較器で並べることで両バックエンドの決定性を揃える
+    // (同値はパス辞書順でタイブレーク)。
+    sort_query_results(&mut out, order_by);
+    let skip = offset.unwrap_or(0).min(out.len());
+    let mut values: Vec<Value> = out.into_iter().skip(skip).map(|(_, v)| v).collect();
     if let Some(l) = limit {
-        values.truncate(l);
+        values.truncate(l.min(values.len()));
     }
     Ok(values)
+}
+
+/// order_by が空ならパス辞書順。指定時は対象フィールドを持たない
+/// ドキュメントを除外し、フィールド値の順に並べる(in-memory と同じ規則)。
+fn sort_query_results(out: &mut Vec<(String, Value)>, order_by: &[(String, Direction)]) {
+    if order_by.is_empty() {
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        return;
+    }
+    out.retain(|(_, v)| match v {
+        Value::Map(m) => order_by.iter().all(|(f, _)| m.contains_key(f)),
+        _ => false,
+    });
+    out.sort_by(|a, b| {
+        let (Value::Map(ma), Value::Map(mb)) = (&a.1, &b.1) else {
+            return a.0.cmp(&b.0);
+        };
+        for (field, dir) in order_by {
+            let ord = super::compare_order_values(&ma[field], &mb[field]);
+            let ord = match dir {
+                Direction::Asc => ord,
+                Direction::Desc => ord.reverse(),
+            };
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        a.0.cmp(&b.0)
+    });
 }
 
 fn structured_query(
@@ -374,10 +417,15 @@ fn build_where(
     for f in filters {
         let op = match f.op {
             QueryOp::Eq => structured_query::field_filter::Operator::Equal,
+            QueryOp::Ne => structured_query::field_filter::Operator::NotEqual,
             QueryOp::Gt => structured_query::field_filter::Operator::GreaterThan,
             QueryOp::Ge => structured_query::field_filter::Operator::GreaterThanOrEqual,
             QueryOp::Lt => structured_query::field_filter::Operator::LessThan,
             QueryOp::Le => structured_query::field_filter::Operator::LessThanOrEqual,
+            QueryOp::In => structured_query::field_filter::Operator::In,
+            QueryOp::NotIn => structured_query::field_filter::Operator::NotIn,
+            QueryOp::ArrayContains => structured_query::field_filter::Operator::ArrayContains,
+            QueryOp::ArrayContainsAny => structured_query::field_filter::Operator::ArrayContainsAny,
         };
         parts.push(structured_query::Filter {
             filter_type: Some(structured_query::filter::FilterType::FieldFilter(

@@ -5,8 +5,8 @@ use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
 use crate::error::{FirelangError, Span};
 use crate::firestore::{Firestore, WriteOp};
 use crate::value::{
-    CollectionGroupRef, CollectionRef, DocRef, QueryFilter, QueryOp, QueryRef, Timestamp, UserFunc,
-    Value,
+    CollectionGroupRef, CollectionRef, Direction, DocRef, QueryFilter, QueryOp, QueryRef,
+    Timestamp, UserFunc, Value,
 };
 
 enum ExecCtx {
@@ -544,6 +544,29 @@ impl<F: Firestore> Runtime<F> {
                 let n = usize::try_from(n).map_err(|_| "limit must be >= 0")?;
                 query.limit = Some(n);
                 Ok(Value::QueryRef(query))
+            }
+            "offset" => {
+                let n = expect_int(args.first())?;
+                let n = usize::try_from(n).map_err(|_| "offset must be >= 0")?;
+                query.offset = Some(n);
+                Ok(Value::QueryRef(query))
+            }
+            "order_by" => {
+                let field = expect_string(args.first())?.to_string();
+                let dir = Direction::parse(expect_string(args.get(1))?)?;
+                query.order_by.push((field, dir));
+                Ok(Value::QueryRef(query))
+            }
+            "count" => {
+                self.forbid_query_in_batch_or_transaction()?;
+                // 集計はフィルタ一致件数を数える。順序・offset・limit は無視する。
+                let mut unpaged = query.clone();
+                unpaged.order_by.clear();
+                unpaged.offset = None;
+                unpaged.limit = None;
+                Ok(Value::Int(
+                    self.fs.run_query(&unpaged).map_err(backend_err)?.len() as i64,
+                ))
             }
             "get" => {
                 self.forbid_query_in_batch_or_transaction()?;

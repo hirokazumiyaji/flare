@@ -280,25 +280,32 @@ update と merge `set` のキーはフィールドパスとして解釈される
 ## 7. クエリ
 
 ```ruby
-col("users").where("age", ">=", 20).where("active", "==", true).limit(10).get()
+col("users").where("age", ">=", 20).where("active", "==", true).order_by("age", "desc").limit(10).get()
 col_group("members").where("active", "==", true).get()
 col("users").get()          # 直下の全ドキュメント
-col("users").limit(10).get()
+col("users").limit(10).offset(5).get()
+col("users").where("age", ">=", 20).count()   # 一致件数
 col("users").doc("1")       # doc("users/1") と同等
 ```
 
-- `where(field, op, value)` — op は `"=="` `">"` `">="` `"<"` `"<="` の 5 種。複数 `where` は AND。
+- `where(field, op, value)` — op は `"=="` `"!="` `">"` `">="` `"<"` `"<="` `"in"` `"not-in"` `"array_contains"` `"array_contains_any"` の 10 種。複数 `where` は AND。
   - 未対応の op を渡すと `where()` 呼び出し時に即エラー(`unsupported query op: ...`)。
   - `==` は任意の値の構造比較。大小比較(`>` 等)は**同型のフィールド同士のみ**マッチ:Int は数値順、Str は辞書順、Bool は `false < true`、Timestamp は秒。型が異なる・Nil・存在しないフィールドはマッチしない。
-  - **文字列フィルタ値のサイズ制限**: Firestore と同様に、`where` の文字列フィルタ値は **1,500 UTF-8 バイト未満**であること(1,500 バイト以上のフィルタ値はクエリ実行時にエラー:`value for {field} is too large to be used in a query`)。**保存値には長さ制限がない**。有効なフィルタ(< 1,500 バイト)に対しては、保存値との最初の差異位置が常にフィルタ自身の長さ以内に収まるため、全文比較で Firestore と同じ結果になる。in-memory は emulator の Firestore と同じ検証をクエリ実行時に行う。
+  - `!=` はフィールドが存在し、値が構造比較で異なる場合にマッチ(存在しないフィールドはマッチしない。型が異なる値は不一致とみなす)。
+  - `in` / `not-in` — `value` は Array(要素は最大 10 個)。`in` はフィールド値がいずれかの要素と等しい場合、`not-in` はフィールドが存在し、どの要素とも等しくない場合にマッチ。空配列の `in` は何もマッチせず、空配列の `not-in` はフィールドを持つ全ドキュメントにマッチする。Array でない値を渡すとクエリ実行時にエラー。
+  - `array_contains` — フィールドが Array で `value` を要素に含む場合にマッチ。`array_contains_any` — `value` は Array(要素は最大 10 個)で、フィールドの Array と 1 つ以上共通の要素を持つ場合にマッチ(空配列は何もマッチしない)。Array でない値を渡すとクエリ実行時にエラー。
+  - **文字列フィルタ値のサイズ制限**: Firestore と同様に、`where` の文字列フィルタ値は **1,500 UTF-8 バイト未満**であること(`in` 等の配列要素・`array_contains` の要素を含む。1,500 バイト以上のフィルタ値はクエリ実行時にエラー:`value for {field} is too large to be used in a query`)。**保存値には長さ制限がない**。有効なフィルタ(< 1,500 バイト)に対しては、保存値との最初の差異位置が常にフィルタ自身の長さ以内に収まるため、全文比較で Firestore と同じ結果になる。in-memory / emulator は同じ検証をクエリ実行時に行う。
   - 異なる型同士の比較は未規定(§13)。in-memory ではマッチしない。
-  - フィールドが存在しないドキュメントはマッチしない。
+  - フィールドが存在しないドキュメントはマッチしない(`!=` / `not-in` を含む)。
+- `order_by(field, dir)` — `dir` は `"asc"` / `"desc"`(それ以外は呼び出し時にエラー)。複数回呼ぶと順に適用される。対象フィールドを持たないドキュメントは結果から除外される。同値は firelang 相対ドキュメントパス文字列の辞書順でタイブレークする。同型の値は where と同じ順序(Int 数値順 / Str 辞書順 / Bool `false < true` / Timestamp 秒)で比べ、型が異なる値同士は Nil < Bool < Int < Timestamp < Str < Array < Map の順に並べる(両バックエンド共通)。順序付けは取得後に両バックエンド共通の比較器で適用するため、サーバ側の複合インデックス制約は受けない。
 - `limit(n)` — 件数上限。後勝ち(複数回呼ぶと最後の値)。`n` は 0 以上で、負数はエラー(`limit must be >= 0`)。
+- `offset(n)` — 先頭から `n` 件を飛ばす。後勝ち。`n` は 0 以上で、負数はエラー(`offset must be >= 0`)。件数を超える offset は空結果になる。
 - `get()` — 実行して `Array<Map>` を返す。各 Map には `__name__` キーで**相対ドキュメントパス**(例 `"users/1"`)が入る。
-- **決定的順序**: 結果は firelang 相対ドキュメントパス文字列の辞書順でソートされ、`limit` はソート後に適用される。`users/a` < `users/b`、`teams/t1/members/a` < `teams/t2/members/a`。
+- `count()` — フィルタに一致する件数を Int で返す。順序・offset・limit は無視する。
+- **決定的順序**: `order_by` がなければ結果は firelang 相対ドキュメントパス文字列の辞書順(`users/a` < `users/b`)。`order_by` があれば上記の順序。`offset` → `limit` の順に適用される。
 - `col()` のクエリは**直下のドキュメントのみ**対象(サブコレクション内は含まない)。`col_group(id)` はパス中のいずれかの階層でコレクション名が `id` に一致するドキュメントすべてが対象。
-- クエリの**構築**(`.where()` / `.limit()`)は `batch` / `transaction` 内でも可。**実行**(`.get()`)のみ不可。
-- カーソル・オフセット・`order_by` は非対応(12 章)。
+- クエリの**構築**(`.where()` / `.order_by()` / `.offset()` / `.limit()`)は `batch` / `transaction` 内でも可。**実行**(`.get()` / `.count()`)のみ不可。
+- カーソル(`start_after` 等)は非対応(12 章)。ページネーションは `order_by` + `offset` + `limit` で行う。
 
 ## 8. batch / transaction
 
@@ -372,8 +379,8 @@ usage: fl [--backend in-memory|emulator] <script-file>
 - Float(数値は Int のみ)
 - 本番 Firestore への認証付きアクセス
 - transaction の自動リトライ
-- `limit` 以外のページネーション(カーソル・オフセット)
-- `order_by`・リスナー(リアルタイム購読)・インデックス依存機能
+- カーソルによるページネーション(`start_after` 等。`order_by` + `offset` + `limit` で代替)
+- リスナー(リアルタイム購読)・インデックス依存機能
 - ドキュメントに書かれたサブセットを超える mruby 互換
 
 ## 13. 既知の制限・実装メモ
