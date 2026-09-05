@@ -352,10 +352,15 @@ transaction {
 ## 10. CLI (`fl`)
 
 ```
-usage: fl [--backend in-memory|emulator] <script-file>
+usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 ```
 
-- スクリプトファイルはちょうど 1 つ。`--help` / `-h` で usage 表示。未知のオプション・未知のバックエンドはエラー終了。
+- スクリプトの指定はちょうど 1 つ:ファイルパス / `-`(stdin) / `-e <script>`(ワンライナー。複数回指定時は改行で連結)。引数なしで stdin がパイプ接続されている場合も stdin から読む(端末直結の引数なしは usage 表示で終了)。`-e` とファイル/`-` の併用はエラー。`--help` / `-h` で usage 表示。未知のオプション・未知のバックエンドはエラー終了。
+  ```sh
+  fl script.fl
+  echo 'get("users/1")' | fl --backend emulator -
+  fl -e 'col("users").get().len()'
+  ```
 - `--backend emulator` のとき:
   - `FIRESTORE_EMULATOR_HOST` — **必須**。未設定なら即エラー。
   - `FIRESTORE_PROJECT_ID` — 省略時 `firelang-test`。

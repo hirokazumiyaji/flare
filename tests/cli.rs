@@ -73,3 +73,80 @@ fn fl_error_goes_to_stderr_with_position() {
     );
     assert!(stderr.contains("undefined variable"), "{stderr:?}");
 }
+
+fn run_fl_with_piped_stdin(args: &[&str], stdin_text: &str) -> std::process::Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(FL_EXE)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fl");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(stdin_text.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait fl")
+}
+
+#[test]
+fn fl_inline_script_with_dash_e() {
+    let out = Command::new(FL_EXE)
+        .args(["-e", "1 + 2"])
+        .output()
+        .expect("spawn fl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "=> 3\n");
+    // -e のエラーも位置付きで stderr へ。
+    let out = Command::new(FL_EXE)
+        .args(["-e", "undefined_var_here"])
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.starts_with("error: 1:1: "), "{stderr:?}");
+}
+
+#[test]
+fn fl_dash_reads_script_from_stdin() {
+    let out = run_fl_with_piped_stdin(&["-"], "puts(\"hi\")\nputs(1 + 1)");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n2\n=> nil\n");
+}
+
+#[test]
+fn fl_no_args_with_piped_stdin_reads_stdin() {
+    let out = run_fl_with_piped_stdin(&[], "[1, 2].len()");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "=> 2\n");
+}
+
+#[test]
+fn fl_rejects_combined_script_sources() {
+    let path = std::env::temp_dir().join(format!("fl-test-{}-combo.fl", std::process::id()));
+    std::fs::write(&path, "1").expect("write temp script");
+    let out = Command::new(FL_EXE)
+        .args(["-e", "1", path.to_str().expect("utf8 path")])
+        .output()
+        .expect("spawn fl");
+    let _ = std::fs::remove_file(&path);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("-e cannot be combined"), "{stderr:?}");
+}
