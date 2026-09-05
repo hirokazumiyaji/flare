@@ -51,6 +51,7 @@ pub enum BinOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnOp {
     Not,
+    Neg,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -107,6 +108,7 @@ impl fmt::Display for UnOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             Self::Not => "!",
+            Self::Neg => "-",
         };
         write!(f, "{s}")
     }

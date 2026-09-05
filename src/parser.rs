@@ -211,6 +211,14 @@ impl Parser {
                 expr: Box::new(expr),
             });
         }
+        if self.at(&Token::Minus) {
+            self.bump();
+            let expr = self.parse_unary()?;
+            return Ok(Expr::Unary {
+                op: UnOp::Neg,
+                expr: Box::new(expr),
+            });
+        }
         self.parse_call()
     }
     fn parse_call(&mut self) -> Result<Expr, Box<dyn Error>> {

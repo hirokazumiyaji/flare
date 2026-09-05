@@ -171,6 +171,10 @@ impl<F: Firestore> Runtime<F> {
                 let v = self.eval_expr(expr)?;
                 Ok(match op {
                     UnOp::Not => Value::Bool(!v.truthy()),
+                    UnOp::Neg => match v {
+                        Value::Int(i) => Value::Int(i.checked_neg().ok_or("integer overflow")?),
+                        _ => return Err("unsupported unary - operand".into()),
+                    },
                 })
             }
             Expr::Call {

@@ -876,3 +876,47 @@ fn logical_operators_return_operand_with_short_circuit() {
     assert!(run_script("true & false").is_err());
     assert!(run_script("true | false").is_err());
 }
+
+#[test]
+fn unary_minus_negates_ints_with_highest_precedence() {
+    let out = run_script("[-5, -(1 + 2), --5, - -5, 0 - 5]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(-5),
+            Value::Int(-3),
+            Value::Int(5),
+            Value::Int(5),
+            Value::Int(-5),
+        ])
+    );
+    // 単項マイナスは `*` `/` より強く、`-1 * 2` は `(-1) * 2`。
+    let out = run_script("[-1 * 2, -(2 * 3), -2 * -3]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(-2), Value::Int(-6), Value::Int(6)])
+    );
+    let out = run_script("timestamp(-86400).to_unix()").unwrap();
+    assert_eq!(out, Value::Int(-86400));
+    let out = run_script("if -1 < 0 { 1 } else { 2 }").unwrap();
+    assert_eq!(out, Value::Int(1));
+    // `!` との組み合わせ(右結合)。
+    let out = run_script("!-5").unwrap();
+    assert_eq!(out, Value::Bool(false));
+    let err = run_script("-!false").unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported unary - operand"),
+        "{err}"
+    );
+    // 非 Int への単項マイナスはエラー。
+    let err = run_script("-\"a\"").unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported unary - operand"),
+        "{err}"
+    );
+    let err = run_script("-true").unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported unary - operand"),
+        "{err}"
+    );
+}
