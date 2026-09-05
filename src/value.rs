@@ -125,24 +125,68 @@ impl CollectionGroupRef {
     }
 }
 
+impl Value {
+    /// Ruby の `inspect` 風の開発者向け表現。`fl` の最終結果・複合値の
+    /// `to_s` に使う。Str はダブルクォート付き、それ以外は素直な文字列表現。
+    pub fn inspect(&self) -> String {
+        match self {
+            Value::Int(i) => i.to_string(),
+            Value::Str(s) => inspect_str(s),
+            Value::Bool(b) => b.to_string(),
+            Value::Nil => "nil".to_string(),
+            Value::Array(items) => {
+                let inner: Vec<String> = items.iter().map(|v| v.inspect()).collect();
+                format!("[{}]", inner.join(", "))
+            }
+            Value::Map(m) => {
+                let inner: Vec<String> = m
+                    .iter()
+                    .map(|(k, v)| format!("{} => {}", inspect_str(k), v.inspect()))
+                    .collect();
+                format!("{{{}}}", inner.join(", "))
+            }
+            Value::Timestamp(ts) => format!("Timestamp({})", ts.seconds),
+            Value::ServerTimestamp => "ServerTimestamp".to_string(),
+            Value::ArrayUnion(v) => {
+                let inner: Vec<String> = v.iter().map(|x| x.inspect()).collect();
+                format!("ArrayUnion([{}])", inner.join(", "))
+            }
+            Value::ArrayRemove(v) => {
+                let inner: Vec<String> = v.iter().map(|x| x.inspect()).collect();
+                format!("ArrayRemove([{}])", inner.join(", "))
+            }
+            Value::DocRef(d) => format!("#<DocRef path={}>", d.path),
+            Value::CollectionRef(c) => format!("#<CollectionRef path={}>", c.path),
+            Value::CollectionGroupRef(cg) => format!("#<CollectionGroupRef id={}>", cg.id),
+            Value::QueryRef(_) => "#<QueryRef>".to_string(),
+            Value::Func(_) => "<func>".to_string(),
+        }
+    }
+}
+
+fn inspect_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
 impl fmt::Display for Value {
+    /// Ruby の `to_s` 風: Str は素で出し、それ以外は `inspect` と同じ。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Value::Int(i) => write!(f, "{i}"),
             Value::Str(s) => write!(f, "{s}"),
-            Value::Bool(b) => write!(f, "{b}"),
-            Value::Nil => write!(f, "nil"),
-            Value::Array(a) => write!(f, "{a:?}"),
-            Value::Map(m) => write!(f, "{m:?}"),
-            Value::Timestamp(ts) => write!(f, "Timestamp({})", ts.seconds),
-            Value::ServerTimestamp => write!(f, "ServerTimestamp"),
-            Value::ArrayUnion(v) => write!(f, "ArrayUnion({v:?})"),
-            Value::ArrayRemove(v) => write!(f, "ArrayRemove({v:?})"),
-            Value::DocRef(d) => write!(f, "#<DocRef path={}>", d.path),
-            Value::CollectionRef(c) => write!(f, "#<CollectionRef path={}>", c.path),
-            Value::CollectionGroupRef(cg) => write!(f, "#<CollectionGroupRef id={}>", cg.id),
-            Value::QueryRef(_) => write!(f, "#<QueryRef>"),
-            Value::Func(_) => write!(f, "<func>"),
+            other => write!(f, "{}", other.inspect()),
         }
     }
 }
