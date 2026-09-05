@@ -60,8 +60,9 @@ impl Firestore for InMemoryFirestore {
         Ok(())
     }
 
-    fn abort_transaction(&mut self) {
+    fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
         self.tx_snapshot = None;
+        Ok(())
     }
 }
 
