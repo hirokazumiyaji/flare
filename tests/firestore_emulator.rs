@@ -8,7 +8,6 @@ use firelang::FirestoreEmulator;
 fn emulator() -> Option<FirestoreEmulator> {
     FirestoreEmulator::from_env()
 }
-
 fn unique(prefix: &str) -> String {
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -380,4 +379,37 @@ set("users/{run}/rows/r7", {{age: nil}})
         format!("{out:?}"),
         "Array([Array([Int(5), Int(4)]), Int(4), Int(3), Int(2), Int(3), Int(2), Int(5), Int(0), Int(6), Int(0), Int(2), Int(1), Int(2), Int(2), Int(5)])"
     );
+}
+
+fn run_on_shared_runtime(
+    rt: &mut firelang::runtime::Runtime<FirestoreEmulator>,
+    source: &str,
+) -> Result<firelang::Value, Box<dyn std::error::Error>> {
+    let tokens = firelang::lexer::lex(source)?;
+    let program = firelang::parser::Parser::new(tokens).parse_program()?;
+    rt.eval_program(&program)
+}
+
+#[test]
+fn emulator_failed_transaction_aborts_and_restarts() {
+    // 失敗した transaction は rollback RPC で中断され、同じ接続で
+    // 新しい transaction を開始できる("already in transaction" にならない)。
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let mut rt = firelang::runtime::Runtime::new(fs);
+    let run = unique("txab");
+    let failing = run_on_shared_runtime(
+        &mut rt,
+        &format!("transaction {{ set(\"users/{run}\", {{x: 1}})\nundefined_var }}"),
+    );
+    assert!(failing.is_err());
+    let out = run_on_shared_runtime(
+        &mut rt,
+        &format!("transaction {{ set(\"users/{run}\", {{x: 2}}) }}\nget(\"users/{run}\")"),
+    )
+    .unwrap();
+    let s = format!("{out:?}");
+    assert!(s.contains("Int(2)"), "{s}");
 }
