@@ -920,3 +920,26 @@ fn unary_minus_negates_ints_with_highest_precedence() {
         "{err}"
     );
 }
+
+#[test]
+fn else_if_chain_evaluates_first_matching_branch() {
+    let src = "if x > 10 { 1 } else if x > 3 { 2 } else { 3 }";
+    let out = run_script(&format!("x = 11\n{src}")).unwrap();
+    assert_eq!(out, Value::Int(1));
+    let out = run_script(&format!("x = 5\n{src}")).unwrap();
+    assert_eq!(out, Value::Int(2));
+    let out = run_script(&format!("x = 1\n{src}")).unwrap();
+    assert_eq!(out, Value::Int(3));
+    // 最後の else 省略可。
+    let out = run_script("x = 1\nif x > 10 { 1 } else if x > 0 { 2 }").unwrap();
+    assert_eq!(out, Value::Int(2));
+    let out = run_script("x = -1\nif x > 10 { 1 } else if x > 0 { 2 }").unwrap();
+    assert_eq!(out, Value::Nil);
+    // 3 段以上も可。従来の else { if ... } ネストと同値。
+    let out =
+        run_script("x = 2\nif x == 1 { 1 } else if x == 2 { 2 } else if x == 3 { 3 } else { 9 }")
+            .unwrap();
+    assert_eq!(out, Value::Int(2));
+    let out = run_script("x = 2\nif x == 1 { 1 } else { if x == 2 { 2 } else { 9 } }").unwrap();
+    assert_eq!(out, Value::Int(2));
+}

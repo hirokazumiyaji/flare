@@ -101,7 +101,13 @@ impl Parser {
         let mut else_body = vec![];
         if self.at(&Token::Else) {
             self.bump();
-            else_body = self.parse_brace_block()?;
+            // `else if ...` は else の直後が If なら再帰的にパースし、
+            // else_body に1文だけ入れる。`elsif` は増やさない。
+            if self.at(&Token::If) {
+                else_body = vec![self.parse_if()?];
+            } else {
+                else_body = self.parse_brace_block()?;
+            }
         }
         Ok(Stmt::If {
             cond,

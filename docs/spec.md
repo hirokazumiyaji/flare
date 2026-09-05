@@ -223,7 +223,7 @@ t2 = t1.add_seconds(10)   # t1 は 100 のまま
 ### 制御構文
 
 ```ruby
-if cond { ... } else { ... }   # else 省略可
+if cond { ... } else if cond { ... } else { ... }   # else / else if 省略可、else if は何段でも可
 while cond { ... }
 ```
 
