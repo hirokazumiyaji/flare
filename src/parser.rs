@@ -237,6 +237,9 @@ impl Parser {
         Ok(left)
     }
     fn parse_unary(&mut self) -> Result<Expr, Box<dyn Error>> {
+        if self.depth > 0 {
+            self.skip_newlines();
+        }
         if self.at(&Token::Bang) {
             self.bump();
             let expr = self.parse_unary()?;
