@@ -174,6 +174,7 @@ fn inspect_str(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            other if other.is_control() => out.push_str(&format!("\\u{{{:04x}}}", other as u32)),
             other => out.push(other),
         }
     }
