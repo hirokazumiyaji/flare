@@ -102,11 +102,11 @@ impl Timestamp {
 
     /// Unix 秒を RFC3339 (UTC, `+00:00`) に整形する。範囲外はエラー。
     pub fn to_rfc3339(&self) -> Result<String, Box<dyn Error>> {
-        use chrono::TimeZone;
+        use chrono::{Datelike, TimeZone};
         chrono::Utc
             .timestamp_opt(self.seconds, 0)
             .single()
-            .map(|dt| dt.to_rfc3339())
+            .and_then(|dt| (0..=9999).contains(&dt.year()).then(|| dt.to_rfc3339()))
             .ok_or_else(|| "timestamp out of range".into())
     }
 }
