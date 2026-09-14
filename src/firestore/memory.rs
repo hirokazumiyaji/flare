@@ -239,12 +239,10 @@ fn apply_update_map(
             Value::Increment(n) => {
                 let segments: Vec<&str> = k.split('.').collect();
                 let next = match lookup_field_path(Some(current), &segments) {
-                    Some(Value::Int(cur)) => (*cur)
-                        .checked_add(*n)
-                        .ok_or_else(|| Box::<dyn Error>::from("integer overflow"))?,
-                    Some(_) => {
-                        return Err(format!("increment target must be an int: {k}").into());
-                    }
+                    Some(Value::Int(cur)) => cur.checked_add(*n).unwrap_or_else(|| {
+                        if n.is_negative() { i64::MIN } else { i64::MAX }
+                    }),
+                    Some(_) => *n,
                     None => *n,
                 };
                 increments.push((k.clone(), next));
@@ -273,6 +271,7 @@ fn resolve_sentinel_map(
     current: Option<&BTreeMap<String, Value>>,
 ) -> Result<(), Box<dyn Error>> {
     for (k, v) in map.clone() {
+        reject_nested_sentinels(&v, false)?;
         let segments: Vec<&str> = k.split('.').collect();
         let base = || lookup_field_path(current, &segments);
         let resolved = match v {
@@ -299,11 +298,9 @@ fn resolve_sentinel_map(
                 seconds: Timestamp::now()?.seconds,
             }),
             Value::Increment(n) => match base() {
-                Some(Value::Int(cur)) => Value::Int(
-                    (*cur)
-                        .checked_add(n)
-                        .ok_or_else(|| Box::<dyn Error>::from("integer overflow"))?,
-                ),
+                Some(Value::Int(cur)) => Value::Int(cur.checked_add(n).unwrap_or_else(|| {
+                    if n.is_negative() { i64::MIN } else { i64::MAX }
+                })),
                 _ => Value::Int(n),
             },
             // 置換 set(merge なし)でフィールド削除は意味を持たない。
@@ -314,6 +311,35 @@ fn resolve_sentinel_map(
             other => other,
         };
         map.insert(k, resolved);
+    }
+    Ok(())
+}
+
+fn reject_nested_sentinels(value: &Value, nested: bool) -> Result<(), Box<dyn Error>> {
+    if nested
+        && matches!(
+            value,
+            Value::ArrayUnion(_)
+                | Value::ArrayRemove(_)
+                | Value::ServerTimestamp
+                | Value::Increment(_)
+                | Value::DeleteField
+        )
+    {
+        return Err("field transforms cannot be nested".into());
+    }
+    match value {
+        Value::Array(items) | Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
+            for item in items {
+                reject_nested_sentinels(item, true)?;
+            }
+        }
+        Value::Map(map) => {
+            for item in map.values() {
+                reject_nested_sentinels(item, true)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
