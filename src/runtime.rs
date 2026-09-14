@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
-use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece};
+use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
 use crate::firestore::{Firestore, WriteOp};
 use crate::value::{
     CollectionGroupRef, CollectionRef, DocRef, QueryFilter, QueryOp, QueryRef, Timestamp, UserFunc,
@@ -146,7 +146,36 @@ impl<F: Firestore> Runtime<F> {
                 .cloned()
                 .ok_or_else(|| format!("undefined variable: {name}").into()),
             Expr::Binary { left, op, right } => {
-                eval_binary(self.eval_expr(left)?, *op, self.eval_expr(right)?)
+                // `&&` / `||` は短絡評価し、Ruby と同じくオペランドそのものを返す。
+                match op {
+                    BinOp::And => {
+                        let l = self.eval_expr(left)?;
+                        if !l.truthy() {
+                            Ok(l)
+                        } else {
+                            self.eval_expr(right)
+                        }
+                    }
+                    BinOp::Or => {
+                        let l = self.eval_expr(left)?;
+                        if l.truthy() {
+                            Ok(l)
+                        } else {
+                            self.eval_expr(right)
+                        }
+                    }
+                    _ => eval_binary(self.eval_expr(left)?, *op, self.eval_expr(right)?),
+                }
+            }
+            Expr::Unary { op, expr } => {
+                let v = self.eval_expr(expr)?;
+                Ok(match op {
+                    UnOp::Not => Value::Bool(!v.truthy()),
+                    UnOp::Neg => match v {
+                        Value::Int(i) => Value::Int(i.checked_neg().ok_or("integer overflow")?),
+                        _ => return Err("unsupported unary - operand".into()),
+                    },
+                })
             }
             Expr::Call {
                 receiver,
@@ -696,6 +725,22 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a <= b),
             _ => return Err("unsupported <= operands".into()),
         },
+        // `eval_expr` 側で短絡評価するため、ここに来るのは両辺評価済みの場合のみ。
+        // Ruby と同じくオペランドそのものを返す。
+        BinOp::And => {
+            if !l.truthy() {
+                l
+            } else {
+                r
+            }
+        }
+        BinOp::Or => {
+            if l.truthy() {
+                l
+            } else {
+                r
+            }
+        }
     })
 }
 

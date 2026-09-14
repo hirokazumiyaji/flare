@@ -831,3 +831,115 @@ fn where_rejects_large_string_filter_values() {
     .unwrap();
     assert_eq!(out, Value::Int(0));
 }
+
+#[test]
+fn logical_operators_return_operand_with_short_circuit() {
+    // `!` は Bool に正規化、`&&` / `||` は Ruby と同じくオペランドそのものを返す。
+    let out = run_script("[!true, !false, !nil, !0, !\"\", !!\"x\"]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(true),
+        ])
+    );
+    let out =
+        run_script("[1 && 2, nil && 2, false && 99, 1 || 2, nil || 2, false || nil]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(2),
+            Value::Nil,
+            Value::Bool(false),
+            Value::Int(1),
+            Value::Int(2),
+            Value::Nil,
+        ])
+    );
+    // 優先順位: `||` < `&&` < 比較 < `!`。
+    let out = run_script("true || false && false").unwrap();
+    assert_eq!(out, Value::Bool(true));
+    let out = run_script("1 + 1 == 2 && !false").unwrap();
+    assert_eq!(out, Value::Bool(true));
+    let out = run_script("if 20 >= 20 && true { 1 } else { 2 }").unwrap();
+    assert_eq!(out, Value::Int(1));
+    // 短絡評価: 右辺が評価されなければエラーにならない。
+    let out = run_script("false && undefined_var").unwrap();
+    assert_eq!(out, Value::Bool(false));
+    let out = run_script("true || undefined_var").unwrap();
+    assert_eq!(out, Value::Bool(true));
+    // 単体の `&` / `|` はエラー。
+    assert!(run_script("true & false").is_err());
+    assert!(run_script("true | false").is_err());
+}
+
+#[test]
+fn unary_minus_negates_ints_with_highest_precedence() {
+    let out = run_script("[-5, -(1 + 2), --5, - -5, 0 - 5]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(-5),
+            Value::Int(-3),
+            Value::Int(5),
+            Value::Int(5),
+            Value::Int(-5),
+        ])
+    );
+    // 単項マイナスは `*` `/` より強く、`-1 * 2` は `(-1) * 2`。
+    let out = run_script("[-1 * 2, -(2 * 3), -2 * -3]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(-2), Value::Int(-6), Value::Int(6)])
+    );
+    let out = run_script("timestamp(-86400).to_unix()").unwrap();
+    assert_eq!(out, Value::Int(-86400));
+    let out = run_script("if -1 < 0 { 1 } else { 2 }").unwrap();
+    assert_eq!(out, Value::Int(1));
+    // `!` との組み合わせ(右結合)。
+    let out = run_script("!-5").unwrap();
+    assert_eq!(out, Value::Bool(false));
+    let err = run_script("-!false").unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported unary - operand"),
+        "{err}"
+    );
+    // 非 Int への単項マイナスはエラー。
+    let err = run_script("-\"a\"").unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported unary - operand"),
+        "{err}"
+    );
+    let err = run_script("-true").unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported unary - operand"),
+        "{err}"
+    );
+}
+
+#[test]
+fn else_if_chain_evaluates_first_matching_branch() {
+    let src = "if x > 10 { 1 } else if x > 3 { 2 } else { 3 }";
+    let out = run_script(&format!("x = 11\n{src}")).unwrap();
+    assert_eq!(out, Value::Int(1));
+    let out = run_script(&format!("x = 5\n{src}")).unwrap();
+    assert_eq!(out, Value::Int(2));
+    let out = run_script(&format!("x = 1\n{src}")).unwrap();
+    assert_eq!(out, Value::Int(3));
+    // 最後の else 省略可。
+    let out = run_script("x = 1\nif x > 10 { 1 } else if x > 0 { 2 }").unwrap();
+    assert_eq!(out, Value::Int(2));
+    let out = run_script("x = -1\nif x > 10 { 1 } else if x > 0 { 2 }").unwrap();
+    assert_eq!(out, Value::Nil);
+    // 3 段以上も可。従来の else { if ... } ネストと同値。
+    let out =
+        run_script("x = 2\nif x == 1 { 1 } else if x == 2 { 2 } else if x == 3 { 3 } else { 9 }")
+            .unwrap();
+    assert_eq!(out, Value::Int(2));
+    let out = run_script("x = 2\nif x == 1 { 1 } else { if x == 2 { 2 } else { 9 } }").unwrap();
+    assert_eq!(out, Value::Int(2));
+}

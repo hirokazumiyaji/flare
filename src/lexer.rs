@@ -31,6 +31,9 @@ pub enum Token {
     Lt,
     Ge,
     Le,
+    AndAnd,
+    OrOr,
+    Bang,
     LParen,
     RParen,
     Comma,
@@ -169,10 +172,6 @@ pub fn lex(input: &str) -> Result<Vec<Token>, Box<dyn Error>> {
                 chars.next();
                 tokens.push(Token::RBracket);
             }
-            '|' => {
-                chars.next();
-                tokens.push(Token::Pipe);
-            }
             '.' => {
                 chars.next();
                 tokens.push(Token::Dot);
@@ -212,7 +211,25 @@ pub fn lex(input: &str) -> Result<Vec<Token>, Box<dyn Error>> {
                     chars.next();
                     tokens.push(Token::Ne);
                 } else {
-                    return Err("unexpected !".into());
+                    tokens.push(Token::Bang);
+                }
+            }
+            '&' => {
+                chars.next();
+                if chars.peek() == Some(&'&') {
+                    chars.next();
+                    tokens.push(Token::AndAnd);
+                } else {
+                    return Err("unexpected char: &".into());
+                }
+            }
+            '|' => {
+                chars.next();
+                if chars.peek() == Some(&'|') {
+                    chars.next();
+                    tokens.push(Token::OrOr);
+                } else {
+                    tokens.push(Token::Pipe);
                 }
             }
             '>' => {
