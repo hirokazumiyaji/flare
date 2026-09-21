@@ -338,3 +338,46 @@ fn emulator_delete_field_and_increment_match_in_memory() {
     assert!(s.contains("\"visits\": Int(15)"), "{s}");
     assert!(!s.contains("age"), "{s}");
 }
+
+#[test]
+fn emulator_extended_query_matches_in_memory() {
+    // Same cases as the in-memory order_by/where-offset-count tests.
+    // Fixtures live in a per-run subcollection so the collection-scoped
+    // queries stay repeatable against a long-lived local emulator.
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let run = unique("xq");
+    let script = format!(
+        r#"set("users/{run}/rows/r1", {{ord: 1, age: 20, tags: ["a", "b"]}})
+set("users/{run}/rows/r2", {{ord: 2, age: 30, tags: ["b", "c"]}})
+set("users/{run}/rows/r3", {{ord: 3, age: 20, tags: ["c"]}})
+set("users/{run}/rows/r4", {{ord: 4, age: 40}})
+set("users/{run}/rows/r5", {{ord: 5, age: 50, tags: []}})
+set("users/{run}/rows/r6", {{other: 1}})
+set("users/{run}/rows/r7", {{age: nil}})
+[
+  col("users/{run}/rows").order_by("ord", "desc").limit(2).get().map {{ |r| r["ord"] }},
+  col("users/{run}/rows").where("age", "!=", 20).get().len(),
+  col("users/{run}/rows").where("age", "in", [20, 30]).get().len(),
+  col("users/{run}/rows").where("tags", "array_contains", "b").get().len(),
+  col("users/{run}/rows").where("tags", "array_contains_any", ["a", "c"]).get().len(),
+  col("users/{run}/rows").order_by("ord", "asc").offset(3).get().len(),
+  col("users/{run}/rows").where("age", ">=", 20).count(),
+  col("users/{run}/rows").where("age", "in", []).get().len(),
+  col("users/{run}/rows").where("age", "not-in", []).get().len(),
+  col("users/{run}/rows").where("age", "not-in", [20, nil]).get().len(),
+  col("users/{run}/rows").where("age", "!=", 20).where("age", "!=", 30).get().len(),
+  col("users/{run}/rows").where("age", "not-in", [20]).where("age", "in", [30]).get().len(),
+  col("users/{run}/rows").where("tags", "array_contains_any", ["a", "b"]).where("tags", "array_contains_any", ["b", "c"]).get().len(),
+  col("users/{run}/rows").where("tags", "array_contains", "b").where("tags", "array_contains_any", ["b", "c"]).get().len(),
+  col("users/{run}/rows").where("age", "!=", nil).get().len(),
+]"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(
+        format!("{out:?}"),
+        "Array([Array([Int(5), Int(4)]), Int(4), Int(3), Int(2), Int(3), Int(2), Int(5), Int(0), Int(6), Int(0), Int(2), Int(1), Int(2), Int(2), Int(5)])"
+    );
+}

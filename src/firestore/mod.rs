@@ -9,7 +9,82 @@ pub use memory::InMemoryFirestore;
 use std::collections::BTreeMap;
 use std::error::Error;
 
-use crate::value::{QueryRef, Value};
+use crate::value::{QueryFilter, QueryOp, QueryRef, Value};
+
+/// クエリフィルタ値の共有検証。in-memory / emulator のクエリ実行前に
+/// 両バックエンドが呼び、同じエラーを同じメッセージで返す。
+/// - 文字列フィルタ値は 1,500 UTF-8 バイト未満(Firestore 準拠。`in` 等の
+///   配列要素・`array_contains` の要素も含む)
+/// - `in` / `not-in` / `array_contains_any` の値は Array で要素は最大 10 個
+pub(crate) fn validate_query_filters(filters: &[QueryFilter]) -> Result<(), Box<dyn Error>> {
+    for f in filters {
+        if let Value::Str(s) = &f.value {
+            if s.len() >= 1500 {
+                return Err(
+                    format!("value for {} is too large to be used in a query", f.field).into(),
+                );
+            }
+        }
+        match f.op {
+            QueryOp::In | QueryOp::NotIn | QueryOp::ArrayContainsAny => {
+                let op_name = match f.op {
+                    QueryOp::In => "in",
+                    QueryOp::NotIn => "not-in",
+                    _ => "array_contains_any",
+                };
+                let Value::Array(items) = &f.value else {
+                    return Err(format!("{op_name} filter requires an array value").into());
+                };
+                if items.len() > 10 {
+                    return Err(format!("{op_name} filters support at most 10 elements").into());
+                }
+                for item in items {
+                    check_element_size(&f.field, item)?;
+                }
+            }
+            QueryOp::ArrayContains => {
+                check_element_size(&f.field, &f.value)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn check_element_size(field: &str, v: &Value) -> Result<(), Box<dyn Error>> {
+    match v {
+        Value::Str(s) if s.len() >= 1500 => {
+            Err(format!("value for {field} is too large to be used in a query").into())
+        }
+        Value::Array(items) => items.iter().try_for_each(|x| check_element_size(field, x)),
+        _ => Ok(()),
+    }
+}
+
+/// 順序付けの値比較。同型は自然順、異型は型ランク(両バックエンド共通の
+/// 全順序。spec §7)。欠損は呼び出し側で除外済みのため扱わない。
+pub(crate) fn compare_order_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Timestamp(x), Value::Timestamp(y)) => x.seconds.cmp(&y.seconds),
+        _ => type_rank(a).cmp(&type_rank(b)),
+    }
+}
+
+fn type_rank(v: &Value) -> u8 {
+    match v {
+        Value::Nil => 0,
+        Value::Bool(_) => 1,
+        Value::Int(_) => 2,
+        Value::Timestamp(_) => 3,
+        Value::Str(_) => 4,
+        Value::Array(_) => 5,
+        Value::Map(_) => 6,
+        _ => 7,
+    }
+}
 
 pub(crate) fn is_simple_field_name(segment: &str) -> bool {
     let mut chars = segment.chars();
