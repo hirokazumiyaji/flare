@@ -459,7 +459,6 @@ fn build_where(
     filters: &[QueryFilter],
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
     let mut parts = vec![];
-    let mut has_inequality = false;
     let mut has_membership = false;
     let mut has_array_contains = false;
     for f in filters {
@@ -469,21 +468,17 @@ fn build_where(
             // 乖離するため、サーバには送らずクライアント側(matches_filters)で評価する。
             continue;
         }
-        if f.op == QueryOp::Ne && f.value == Value::Nil {
-            // Firestore は != nil に UnaryFilter(IS_NOT_NULL) を要求するため、
-            // FieldFilter で送らずクライアント側で評価する。
+        if f.op == QueryOp::Ne {
+            // Firestore の NOT_EQUAL はサーバ側で Double と Int を数値等価として評価して
+            // firelang の Opaque 読み替え後の構造的不一致判定と乖離する(また != nil の
+            // IS_NOT_NULL 要求や複数 != の制限もある)ため、サーバには送らず
+            // クライアント側(matches_filters)で評価する。
             continue;
         }
-        let is_inequality = matches!(f.op, QueryOp::Ne);
         let is_membership = matches!(f.op, QueryOp::In | QueryOp::ArrayContainsAny);
         let is_array_contains =
             matches!(f.op, QueryOp::ArrayContains | QueryOp::ArrayContainsAny);
 
-        if is_inequality && has_inequality {
-            // Firestore はクエリ全体で NOT_EQUAL を 1 つのみ許可するため、
-            // 2 つ目以降はサーバに送らずクライアント側(matches_filters)で評価する。
-            continue;
-        }
         if is_membership && has_membership {
             // Firestore は in, array_contains_any をクエリ全体で最大 1 つのみ許可するため、
             // 2 つ目以降はサーバに送らずクライアント側(matches_filters)で評価する。
@@ -504,9 +499,6 @@ fn build_where(
             }
             _ => {}
         }
-        if is_inequality {
-            has_inequality = true;
-        }
         if is_membership {
             has_membership = true;
         }
@@ -515,15 +507,14 @@ fn build_where(
         }
         let op = match f.op {
             QueryOp::Eq => structured_query::field_filter::Operator::Equal,
-            QueryOp::Ne => structured_query::field_filter::Operator::NotEqual,
             QueryOp::Gt => structured_query::field_filter::Operator::GreaterThan,
             QueryOp::Ge => structured_query::field_filter::Operator::GreaterThanOrEqual,
             QueryOp::Lt => structured_query::field_filter::Operator::LessThan,
             QueryOp::Le => structured_query::field_filter::Operator::LessThanOrEqual,
             QueryOp::In => structured_query::field_filter::Operator::In,
-            QueryOp::NotIn => structured_query::field_filter::Operator::NotIn,
             QueryOp::ArrayContains => structured_query::field_filter::Operator::ArrayContains,
             QueryOp::ArrayContainsAny => structured_query::field_filter::Operator::ArrayContainsAny,
+            QueryOp::Ne | QueryOp::NotIn => unreachable!(),
         };
         parts.push(structured_query::Filter {
             filter_type: Some(structured_query::filter::FilterType::FieldFilter(
@@ -1439,6 +1430,20 @@ mod tests {
                 "projects/my-project/databases/(default)/documents/users/1".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn build_where_keeps_not_equal_client_side() {
+        let filter = build_where(
+            "p",
+            &[QueryFilter {
+                field: "x".to_string(),
+                op: QueryOp::Ne,
+                value: Value::Int(1),
+            }],
+        )
+        .unwrap();
+        assert!(filter.is_none());
     }
 
     #[test]
