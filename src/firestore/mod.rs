@@ -11,20 +11,22 @@ use std::error::Error;
 
 use crate::value::{QueryRef, Value};
 
+pub(crate) fn is_simple_field_name(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// update / merge set のキーは `.` 区切りのフィールドパス(Firestore 準拠)。
 /// 各セグメントは Firestore の単純フィールドパス文法
 /// (`[A-Za-z_][A-Za-z0-9_]*`)に従うこと。バッククォートによるエスケープは
 /// 非対応なので、バッククォートや空セグメントを含むキーはエラーにする。
 pub(crate) fn validate_field_path(key: &str) -> Result<(), Box<dyn Error>> {
     for segment in key.split('.') {
-        let valid = match segment.chars().next() {
-            Some(c) => c.is_ascii_alphabetic() || c == '_',
-            None => false,
-        } && segment
-            .chars()
-            .skip(1)
-            .all(|c| c.is_ascii_alphanumeric() || c == '_');
-        if !valid {
+        if !is_simple_field_name(segment) {
             return Err(format!(
                 "invalid field path: {key} (segment {segment:?} must match [A-Za-z_][A-Za-z0-9_]*)"
             )

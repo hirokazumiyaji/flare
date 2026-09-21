@@ -320,3 +320,21 @@ fn emulator_update_field_paths_match_in_memory_validation() {
         );
     }
 }
+
+#[test]
+fn emulator_delete_field_and_increment_match_in_memory() {
+    // Same cases as in-memory `delete_field_removes_fields_via_update_and_merge_set`
+    // and `increment_adds_to_numeric_fields`.
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let run = unique("sent");
+    let script = format!(
+        "set(\"users/{run}\", {{name: \"a\", age: 1, visits: 10}})\nupdate(\"users/{run}\", {{age: delete_field(), visits: increment(5)}})\nget(\"users/{run}\")"
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    let s = format!("{out:?}");
+    assert!(s.contains("\"visits\": Int(15)"), "{s}");
+    assert!(!s.contains("age"), "{s}");
+}

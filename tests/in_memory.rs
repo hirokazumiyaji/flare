@@ -1078,3 +1078,127 @@ fn inspect_and_to_s_follow_ruby_style() {
     let out = run_script("col_group(\"items\")").unwrap();
     assert_eq!(out.inspect(), "#<CollectionGroupRef id=\"items\">");
 }
+
+#[test]
+fn delete_field_removes_fields_via_update_and_merge_set() {
+    // emulator テスト(emulator_delete_field_and_increment_match_in_memory)と
+    // 同じケース。update / merge set でフィールドを削除できる。
+    let out = run_script(
+        "set(\"users/df1\", {name: \"a\", age: 1, extra: true})\nupdate(\"users/df1\", {age: delete_field()})\nget(\"users/df1\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"extra\" => true, \"name\" => \"a\"}");
+    let out = run_script(
+        "set(\"users/df2\", {name: \"a\", age: 1})\nset(\"users/df2\", {age: delete_field()}, merge: true)\nget(\"users/df2\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"name\" => \"a\"}");
+    // ドット区切りのネストパス・存在しないフィールド(no-op)。
+    let out = run_script(
+        "set(\"users/df3\", {profile: {name: \"a\", age: 1}})\nupdate(\"users/df3\", {\"profile.age\": delete_field(), missing: delete_field()})\nget(\"users/df3\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"profile\" => {\"name\" => \"a\"}}");
+    // 置換 set ではエラー。
+    let err = run_script("set(\"users/df4\", {age: delete_field()})").unwrap_err();
+    assert!(
+        format!("{err}").contains("delete_field() cannot be used with set() without merge"),
+        "{err}"
+    );
+}
+
+#[test]
+fn increment_adds_to_numeric_fields() {
+    // emulator テスト(emulator_delete_field_and_increment_match_in_memory)と
+    // 同じケース。なければ n、あれば加算。
+    let out = run_script(
+        "set(\"users/ic1\", {visits: 10})\nupdate(\"users/ic1\", {visits: increment(5), fresh: increment(3)})\nget(\"users/ic1\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"fresh\" => 3, \"visits\" => 15}");
+    // ドット区切りのネストパス・merge set でも使える。
+    let out = run_script(
+        "set(\"users/ic2\", {stats: {n: 1}})\nupdate(\"users/ic2\", {\"stats.n\": increment(2)})\nset(\"users/ic2\", {\"stats.m\": increment(4)}, merge: true)\nget(\"users/ic2\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"stats\" => {\"m\" => 4, \"n\" => 3}}");
+    // 引数なしはエラー。非 Int やオーバーフローは Firestore と同様に上書き・飽和する。
+    let err = run_script("increment()").unwrap_err();
+    assert!(format!("{err}").contains("expected int argument"), "{err}");
+    let out = run_script(
+        "set(\"users/ic3\", {name: \"a\"})\nupdate(\"users/ic3\", {name: increment(1)})\nget(\"users/ic3\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"name\" => 1}");
+    let out = run_script(
+        "set(\"users/ic4\", {n: 9223372036854775807})\nupdate(\"users/ic4\", {n: increment(1)})\nget(\"users/ic4\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"n\" => 9223372036854775807}");
+    let out = run_script(
+        "set(\"users/ic5\", {n: -9223372036854775807 - 1})\nupdate(\"users/ic5\", {n: increment(-1)})\nget(\"users/ic5\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"n\" => -9223372036854775808}");
+}
+
+#[test]
+fn nested_sentinels_are_rejected() {
+    let err = run_script("set(\"users/ns1\", {nested: {n: increment(1)}})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
+    let err = run_script("set(\"users/ns2\", {arr: [increment(1)]})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
+    let err = run_script("set(\"users/ns3\", {nested: {df: delete_field()}})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
+    let err = run_script("set(\"users/ns4\", {arr: [delete_field()]})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
+    let err = run_script("set(\"users/ns5\", {})\nupdate(\"users/ns5\", {nested: {n: increment(1)}})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
+    let err = run_script("set(\"users/ns6\", {})\nupdate(\"users/ns6\", {nested: {df: delete_field()}})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
+}
+
+#[test]
+fn update_deletes_ancestor_before_descendant_increment() {
+    let out = run_script(
+        "set(\"users/del_inc\", {a: {b: 10}})\nupdate(\"users/del_inc\", {a: delete_field(), \"a.b\": increment(1)})\nget(\"users/del_inc\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"a\" => {\"b\" => 1}}");
+}
+
+#[test]
+fn replacement_set_resolves_increment_under_literal_hyphen_key() {
+    let out = run_script(
+        "set(\"users/lit_hyphen\", {\"a-b\": increment(1)})\nget(\"users/lit_hyphen\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"a-b\" => 1}");
+}
+
+#[test]
+fn update_applies_plain_before_descendant_increment() {
+    let out = run_script(
+        "set(\"users/plain_inc\", {a: {b: 10}})\nupdate(\"users/plain_inc\", {a: {b: 100}, \"a.b\": increment(1)})\nget(\"users/plain_inc\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"a\" => {\"b\" => 101}}");
+}

@@ -428,21 +428,30 @@ fn write_ops_to_sdk_writes(
 fn build_write(fs: &FirestoreEmulator, op: &WriteOp) -> Result<Write, Box<dyn Error>> {
     match op {
         WriteOp::Set { path, data, merge } => {
-            let (plain, transforms) = split_fields_and_transforms(data);
+            let split = split_fields_and_transforms(data);
+            let plain = split.plain;
+            let transforms = split.transforms;
+            let deletes = split.deletes;
             // merge のキーは Firestore と同様にフィールドパス。update_mask の
             // パスが payload から解決されるよう、payload をネスト構造に組む。
             // merge でない set はキーをリテラルのフィールド名として保存する。
             let (mask, payload, transforms) = if *merge {
-                // transform のキーも含めて全キーを検証する(上記参照)。
+                // transform / delete のキーも含めて全キーを検証する(上記参照)。
                 validated_field_paths(data)?;
+                let mut mask_paths: Vec<String> = plain.keys().cloned().collect();
+                // DeleteField は update_mask に含めつつ fields から除外する。
+                mask_paths.extend(deletes);
                 (
                     Some(DocumentMask {
-                        field_paths: plain.keys().cloned().collect(),
+                        field_paths: mask_paths,
                     }),
                     nest_field_paths(plain)?,
                     transforms,
                 )
             } else {
+                if !deletes.is_empty() {
+                    return Err("delete_field() cannot be used with set() without merge".into());
+                }
                 // 置換 set: センチネル変換のパスはリテラルのフィールド名を指す。
                 (None, plain, escape_literal_transform_keys(transforms)?)
             };
@@ -462,10 +471,15 @@ fn build_write(fs: &FirestoreEmulator, op: &WriteOp) -> Result<Write, Box<dyn Er
             })
         }
         WriteOp::Update { path, data } => {
-            let (plain, transforms) = split_fields_and_transforms(data);
-            // transform のキーも含めて全キーを検証する(validated_field_paths 参照)。
+            let split = split_fields_and_transforms(data);
+            let plain = split.plain;
+            let transforms = split.transforms;
+            let deletes = split.deletes;
+            // transform / delete のキーも含めて全キーを検証する(validated_field_paths 参照)。
             validated_field_paths(data)?;
-            let field_paths: Vec<String> = plain.keys().cloned().collect();
+            // DeleteField は update_mask に含めつつ fields から除外する。
+            let mut field_paths: Vec<String> = plain.keys().cloned().collect();
+            field_paths.extend(deletes);
             let fields = encode_fields(&nest_field_paths(plain)?)?;
             Ok(Write {
                 update_mask: Some(DocumentMask { field_paths }),
@@ -521,8 +535,8 @@ fn nest_field_paths(
 }
 
 /// 置換の `set` ではキーはリテラルのフィールド名として扱う(spec §6)。
-/// ドットを含むキーのセンチネル変換は、Firestore にネストパスと解釈されない
-/// ようバッククォートでエスケープして送る(in-memory のリテラルキーと一致)。
+/// Firestore の単純フィールド名([A-Za-z_][A-Za-z0-9_]*)でないキーのセンチネル変換は、
+/// バッククォートでエスケープして送る(ドットやハイフンなどを含むリテラルキーに対応)。
 fn escape_literal_transform_keys(
     transforms: Vec<(String, Value)>,
 ) -> Result<Vec<(String, Value)>, Box<dyn Error>> {
@@ -534,7 +548,7 @@ fn escape_literal_transform_keys(
                     format!("unsupported field name: {key} (backtick is not supported)").into(),
                 );
             }
-            if key.contains('.') {
+            if !super::is_simple_field_name(&key) {
                 Ok((format!("`{key}`"), value))
             } else {
                 Ok((key, value))
@@ -543,22 +557,35 @@ fn escape_literal_transform_keys(
         .collect()
 }
 
-fn split_fields_and_transforms(
-    data: &BTreeMap<String, Value>,
-) -> (BTreeMap<String, Value>, Vec<(String, Value)>) {
+fn split_fields_and_transforms(data: &BTreeMap<String, Value>) -> SplitFields {
     let mut plain = BTreeMap::new();
     let mut transforms = vec![];
+    let mut deletes = vec![];
     for (k, v) in data {
         match v {
-            Value::ArrayUnion(_) | Value::ArrayRemove(_) | Value::ServerTimestamp => {
+            Value::ArrayUnion(_)
+            | Value::ArrayRemove(_)
+            | Value::ServerTimestamp
+            | Value::Increment(_) => {
                 transforms.push((k.clone(), v.clone()));
             }
+            Value::DeleteField => deletes.push(k.clone()),
             _ => {
                 plain.insert(k.clone(), v.clone());
             }
         }
     }
-    (plain, transforms)
+    SplitFields {
+        plain,
+        transforms,
+        deletes,
+    }
+}
+
+struct SplitFields {
+    plain: BTreeMap<String, Value>,
+    transforms: Vec<(String, Value)>,
+    deletes: Vec<String>,
 }
 
 fn encode_field_transforms(
@@ -589,6 +616,11 @@ fn encode_field_transform(
         Value::ArrayRemove(items) => {
             document_transform::field_transform::TransformType::RemoveAllFromArray(ArrayValue {
                 values: encode_array_items(items)?,
+            })
+        }
+        Value::Increment(n) => {
+            document_transform::field_transform::TransformType::Increment(SdkValue {
+                value_type: Some(value::ValueType::IntegerValue(*n)),
             })
         }
         _ => return Err("not a transform value".into()),
@@ -799,6 +831,99 @@ mod tests {
     }
 
     #[test]
+    fn build_write_update_treats_delete_field_as_mask_only() {
+        let fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
+        let writes = write_ops_to_sdk_writes(
+            &fs,
+            &[WriteOp::Update {
+                path: "users/d1".to_string(),
+                data: BTreeMap::from([
+                    ("gone".to_string(), Value::DeleteField),
+                    ("kept".to_string(), Value::Int(1)),
+                ]),
+            }],
+        )
+        .unwrap();
+        let mut mask = writes[0]
+            .update_mask
+            .clone()
+            .expect("update mask")
+            .field_paths;
+        mask.sort();
+        assert_eq!(mask, vec!["gone".to_string(), "kept".to_string()]);
+        let write::Operation::Update(doc) = writes[0].operation.as_ref().expect("update op") else {
+            panic!("expected update operation");
+        };
+        assert!(!doc.fields.contains_key("gone"));
+        assert!(doc.fields.contains_key("kept"));
+    }
+
+    #[test]
+    fn build_write_merge_set_masks_deleted_fields() {
+        let fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
+        let writes = write_ops_to_sdk_writes(
+            &fs,
+            &[WriteOp::Set {
+                path: "users/d2".to_string(),
+                data: BTreeMap::from([("gone".to_string(), Value::DeleteField)]),
+                merge: true,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            writes[0].update_mask.clone().expect("mask").field_paths,
+            vec!["gone".to_string()]
+        );
+        let write::Operation::Update(doc) = writes[0].operation.as_ref().expect("update op") else {
+            panic!("expected update operation");
+        };
+        assert!(doc.fields.is_empty());
+    }
+
+    #[test]
+    fn build_write_replacement_set_rejects_delete_field() {
+        let fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
+        let err = write_ops_to_sdk_writes(
+            &fs,
+            &[WriteOp::Set {
+                path: "users/d3".to_string(),
+                data: BTreeMap::from([("gone".to_string(), Value::DeleteField)]),
+                merge: false,
+            }],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("delete_field() cannot be used with set() without merge"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn build_write_encodes_increment_as_field_transform() {
+        let fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
+        let writes = write_ops_to_sdk_writes(
+            &fs,
+            &[WriteOp::Update {
+                path: "users/i1".to_string(),
+                data: BTreeMap::from([("count".to_string(), Value::Increment(5))]),
+            }],
+        )
+        .unwrap();
+        assert_eq!(writes[0].update_transforms.len(), 1);
+        assert_eq!(writes[0].update_transforms[0].field_path, "count");
+        match writes[0].update_transforms[0]
+            .transform_type
+            .as_ref()
+            .expect("transform type")
+        {
+            document_transform::field_transform::TransformType::Increment(v) => {
+                assert_eq!(v.value_type, Some(value::ValueType::IntegerValue(5)));
+            }
+            other => panic!("expected increment transform, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_write_update_includes_exists_precondition() {
         let fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
         let writes = write_ops_to_sdk_writes(
@@ -935,5 +1060,20 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(write.operation, Some(write::Operation::Delete(_))));
+    }
+
+    #[test]
+    fn escape_literal_transform_keys_quotes_non_simple_keys() {
+        let inputs = vec![
+            ("normal_field".to_string(), Value::Increment(1)),
+            ("a.b".to_string(), Value::Increment(2)),
+            ("a-b".to_string(), Value::Increment(3)),
+            ("1start_digit".to_string(), Value::Increment(4)),
+        ];
+        let escaped = escape_literal_transform_keys(inputs).unwrap();
+        assert_eq!(escaped[0].0, "normal_field");
+        assert_eq!(escaped[1].0, "`a.b`");
+        assert_eq!(escaped[2].0, "`a-b`");
+        assert_eq!(escaped[3].0, "`1start_digit`");
     }
 }

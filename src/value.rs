@@ -17,6 +17,8 @@ pub enum Value {
     ServerTimestamp,
     ArrayUnion(Vec<Value>),
     ArrayRemove(Vec<Value>),
+    DeleteField,
+    Increment(i64),
     DocRef(DocRef),
     CollectionRef(CollectionRef),
     CollectionGroupRef(CollectionGroupRef),
@@ -155,6 +157,8 @@ impl Value {
                 let inner: Vec<String> = v.iter().map(|x| x.inspect()).collect();
                 format!("ArrayRemove([{}])", inner.join(", "))
             }
+            Value::DeleteField => "DeleteField".to_string(),
+            Value::Increment(n) => format!("Increment({n})"),
             Value::DocRef(d) => format!("#<DocRef path={}>", inspect_str(&d.path)),
             Value::CollectionRef(c) => format!("#<CollectionRef path={}>", inspect_str(&c.path)),
             Value::CollectionGroupRef(cg) => format!("#<CollectionGroupRef id={}>", inspect_str(&cg.id)),
