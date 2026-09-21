@@ -4,7 +4,14 @@ use std::fs;
 
 use firelang::{run_script, run_script_with_firestore, FirestoreEmulator};
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
         print_usage();

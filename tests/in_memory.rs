@@ -943,3 +943,71 @@ fn else_if_chain_evaluates_first_matching_branch() {
     let out = run_script("x = 2\nif x == 1 { 1 } else { if x == 2 { 2 } else { 9 } }").unwrap();
     assert_eq!(out, Value::Int(2));
 }
+
+#[test]
+fn errors_carry_kind_and_line_col() {
+    use firelang::{ErrorKind, FirelangError, Span};
+
+    // lex エラー: 行・桁付き。
+    let err = firelang::lexer::lex("a = 1\nb = 2 &").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("lex error should be FirelangError");
+    assert_eq!(ferr.kind, ErrorKind::Lex);
+    assert_eq!(ferr.span, Some(Span::new(2, 7)));
+    assert!(format!("{ferr}").contains("unexpected char"), "{ferr}");
+
+    // parse エラー: 行・桁付き。
+    let err = run_script("a = 1\nb = }").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("parse error should be FirelangError");
+    assert_eq!(ferr.kind, ErrorKind::Parse);
+    assert_eq!(ferr.span, Some(Span::new(2, 5)));
+    assert!(format!("{ferr}").starts_with("2:5: "), "{ferr}");
+
+    // runtime エラー: 失敗したトップレベル文の開始位置。
+    let err = run_script("a = 1\nb = 2\nc = undefined_var").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("runtime error should be FirelangError");
+    assert_eq!(ferr.kind, ErrorKind::Runtime);
+    assert_eq!(ferr.span, Some(Span::new(3, 1)));
+    assert!(format!("{ferr}").contains("undefined variable"), "{ferr}");
+
+    // backend エラー(in-memory の document not found)は Backend 種別。
+    let err = run_script("update(\"users/nope\", {x: 1})").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("backend error should be FirelangError");
+    assert_eq!(ferr.kind, ErrorKind::Backend);
+    assert_eq!(ferr.span, Some(Span::new(1, 1)));
+
+    // 文字列補間内のエラー位置: 式の先頭からの相対位置が正しく反映される
+    let err = run_script("\"#{@}\"").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("lex error in interpolation should be FirelangError");
+    assert_eq!(ferr.span, Some(Span::new(1, 4)));
+
+    let err = run_script("\"#{1 + }\"").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("parse error in interpolation should be FirelangError");
+    assert_eq!(ferr.span, Some(Span::new(1, 8)));
+
+    // マップキーでの文字列補間禁止エラーの位置: 拒否されたキートークン自体の位置を指す
+    let err = run_script("{\"#{x}\": 1}").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("parse error in map key should be FirelangError");
+    assert_eq!(ferr.span, Some(Span::new(1, 2)));
+
+    // 補間内の単一式制約違反: 仕様(docs/spec.md §10)通り位置が付かない (None)
+    let err = run_script("\"#{1; 2}\"").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("parse error in interpolation should be FirelangError");
+    assert_eq!(ferr.span, None);
+    assert_eq!(format!("{ferr}"), "interpolation must contain a single expression");
+}

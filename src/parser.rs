@@ -1,12 +1,14 @@
 use std::error::Error;
 
 use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
-use crate::lexer::{self, StrPart, Token};
+use crate::error::{FirelangError, Span};
+use crate::lexer::{self, SpannedToken, StrPart, Token};
 
 type ParsedArgs = (Vec<Expr>, Vec<(String, Expr)>);
 
 pub struct Parser {
     tokens: Vec<Token>,
+    spans: Vec<Option<Span>>,
     pos: usize,
     /// if / while の条件式パース中に 1 以上。条件式内ではメソッド呼び出しの
     /// 省略可能ブロック(`obj.method { ... }`)を消費しない(制御構文の本体
@@ -19,21 +21,47 @@ pub struct Parser {
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
+        let spans = vec![None; tokens.len()];
         Self {
             tokens,
+            spans,
+            pos: 0,
+            suppress_block_calls: 0,
+            depth: 0,
+        }
+    }
+
+    pub fn from_spanned(spanned: Vec<SpannedToken>) -> Self {
+        let mut tokens = Vec::with_capacity(spanned.len());
+        let mut spans = Vec::with_capacity(spanned.len());
+        for s in spanned {
+            tokens.push(s.token);
+            spans.push(Some(s.span));
+        }
+        Self {
+            tokens,
+            spans,
             pos: 0,
             suppress_block_calls: 0,
             depth: 0,
         }
     }
     pub fn parse_program(&mut self) -> Result<Vec<Stmt>, Box<dyn Error>> {
+        Ok(self.parse_program_with_spans()?.0)
+    }
+
+    /// トップレベル文と各文の開始位置を返す。runtime のエラーに文単位の
+    /// 位置を付与するために使う。
+    pub fn parse_program_with_spans(&mut self) -> Result<(Vec<Stmt>, Vec<Span>), Box<dyn Error>> {
         let mut out = Vec::new();
+        let mut spans = Vec::new();
         self.skip_separators();
         while !self.at(&Token::Eof) {
+            spans.push(self.peek_span().unwrap_or(Span::new(1, 1)));
             out.push(self.parse_stmt()?);
             self.skip_separators();
         }
-        Ok(out)
+        Ok((out, spans))
     }
     fn parse_stmt(&mut self) -> Result<Stmt, Box<dyn Error>> {
         match self.peek() {
@@ -325,7 +353,7 @@ impl Parser {
                 self.bump();
                 self.parse_primary()
             }
-            t => Err(format!("unexpected token: {t:?}").into()),
+            t => Err(self.parse_err(format!("unexpected token: {t:?}"))),
         }
     }
     fn parse_map_literal(&mut self) -> Result<Expr, Box<dyn Error>> {
@@ -344,10 +372,17 @@ impl Parser {
             loop {
                 let key = match self.peek().clone() {
                     Token::Str(parts) => {
+                        let span = self.peek_span();
                         self.bump();
                         match parts.as_slice() {
                             [lexer::StrPart::Lit(s)] => s.clone(),
-                            _ => return Err("interpolation is not allowed in map keys".into()),
+                            _ => {
+                                return Err(FirelangError::parse(
+                                    "interpolation is not allowed in map keys",
+                                    span,
+                                )
+                                .into())
+                            }
                         }
                     }
                     Token::Ident(s) => {
@@ -355,9 +390,9 @@ impl Parser {
                         s
                     }
                     t => {
-                        return Err(
-                            format!("object key must be string or identifier, got {t:?}").into(),
-                        )
+                        return Err(self.parse_err(format!(
+                            "object key must be string or identifier, got {t:?}"
+                        )))
                     }
                 };
                 self.expect(Token::Colon)?;
@@ -475,21 +510,49 @@ impl Parser {
         for part in parts {
             match part {
                 StrPart::Lit(s) => pieces.push(StrPiece::Lit(s)),
-                StrPart::Interp(src) => {
-                    pieces.push(StrPiece::Expr(Self::parse_embedded_expr(&src)?))
+                StrPart::Interp { src, span } => {
+                    pieces.push(StrPiece::Expr(Self::parse_embedded_expr(&src, span)?))
                 }
             }
         }
         Ok(Expr::StrInterp(pieces))
     }
 
-    fn parse_embedded_expr(src: &str) -> Result<Expr, Box<dyn Error>> {
-        let tokens = lexer::lex(src)?;
-        let program = Parser::new(tokens).parse_program()?;
+    fn parse_embedded_expr(src: &str, base: Span) -> Result<Expr, Box<dyn Error>> {
+        let tokens = lexer::lex_spanned(src)
+            .map_err(|e| Self::offset_error(e, base))?
+            .into_iter()
+            .map(|mut token| {
+                token.span = Self::offset_span(token.span, base);
+                token
+            })
+            .collect();
+        let program = Parser::from_spanned(tokens).parse_program()?;
         match program.as_slice() {
             [Stmt::Expr(e)] => Ok(e.clone()),
-            _ => Err("interpolation must contain a single expression".into()),
+            _ => Err(
+                FirelangError::parse("interpolation must contain a single expression", None).into(),
+            ),
         }
+    }
+
+    fn offset_span(span: Span, base: Span) -> Span {
+        if span.line == 1 {
+            Span::new(base.line, base.col + span.col - 1)
+        } else {
+            Span::new(base.line + span.line - 1, span.col)
+        }
+    }
+
+    fn offset_error(error: Box<dyn Error>, base: Span) -> Box<dyn Error> {
+        if let Some(error) = error.downcast_ref::<FirelangError>() {
+            let mut error = error.clone();
+            if let Some(span) = error.span {
+                error.span = Some(Self::offset_span(span, base));
+            }
+            return error.into();
+        }
+        error
     }
 
     fn parse_kwarg(&mut self) -> Result<Option<(String, Expr)>, Box<dyn Error>> {
@@ -507,19 +570,25 @@ impl Parser {
         if !self.at(&Token::LBrace) || self.suppress_block_calls > 0 {
             return Ok(None);
         }
-        Ok(Some(self.parse_brace_block_with_params()?))
+        let (block, _) = self.parse_brace_block_with_params()?;
+        Ok(Some(block))
     }
     fn parse_brace_block(&mut self) -> Result<Vec<Stmt>, Box<dyn Error>> {
-        let block = self.parse_brace_block_with_params()?;
+        let (block, param_span) = self.parse_brace_block_with_params()?;
         if !block.params.is_empty() {
-            return Err("block parameters are not allowed here".into());
+            return Err(FirelangError::parse(
+                "block parameters are not allowed here",
+                param_span,
+            )
+            .into());
         }
         Ok(block.body)
     }
-    fn parse_brace_block_with_params(&mut self) -> Result<Block, Box<dyn Error>> {
+    fn parse_brace_block_with_params(&mut self) -> Result<(Block, Option<Span>), Box<dyn Error>> {
         self.expect(Token::LBrace)?;
         // `{\n|x| ... }` のようにパラメータリストの直前に改行が置けるようにする。
         self.skip_newlines();
+        let param_span = self.at(&Token::Pipe).then(|| self.peek_span()).flatten();
         let params = self.parse_block_params()?;
         // 本文は「文の並び」なので `;` も文の区切りとして扱う。
         self.skip_separators();
@@ -529,7 +598,7 @@ impl Parser {
             self.skip_separators();
         }
         self.expect(Token::RBrace)?;
-        Ok(Block { params, body })
+        Ok((Block { params, body }, param_span))
     }
     fn parse_block_params(&mut self) -> Result<Vec<String>, Box<dyn Error>> {
         // 空パラメータ `||` は lexer が OrOr 1 トークンにまとめるため、ここで吸収する。
@@ -596,6 +665,12 @@ impl Parser {
     fn peek(&self) -> &Token {
         self.tokens.get(self.pos).unwrap_or(&Token::Eof)
     }
+    fn peek_span(&self) -> Option<Span> {
+        self.spans.get(self.pos).and_then(|s| *s)
+    }
+    fn parse_err(&self, message: impl Into<String>) -> Box<dyn Error> {
+        FirelangError::parse(message, self.peek_span()).into()
+    }
     fn peek_n(&self, n: usize) -> Option<&Token> {
         self.tokens.get(self.pos + n)
     }
@@ -607,7 +682,7 @@ impl Parser {
             self.bump();
             Ok(())
         } else {
-            Err(format!("expected {token:?}, got {:?}", self.peek()).into())
+            Err(self.parse_err(format!("expected {token:?}, got {:?}", self.peek())))
         }
     }
     fn expect_ident(&mut self) -> Result<String, Box<dyn Error>> {
@@ -616,7 +691,7 @@ impl Parser {
                 self.bump();
                 Ok(s)
             }
-            t => Err(format!("expected ident, got {t:?}").into()),
+            t => Err(self.parse_err(format!("expected ident, got {t:?}"))),
         }
     }
 }
