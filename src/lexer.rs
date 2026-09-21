@@ -6,7 +6,7 @@ use crate::error::{FirelangError, Span};
 pub enum StrPart {
     Lit(String),
     /// `#{ ... }` の中身の生ソース。パースは parser が行う。
-    Interp(String),
+    Interp { src: String, span: Span },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,6 +181,7 @@ pub fn lex_spanned(input: &str) -> Result<Vec<SpannedToken>, Box<dyn Error>> {
                         }
                         '#' if lx.peek() == Some('{') => {
                             lx.bump();
+                            let interp_span = lx.span();
                             if !lit.is_empty() {
                                 parts.push(StrPart::Lit(std::mem::take(&mut lit)));
                             }
@@ -209,7 +210,10 @@ pub fn lex_spanned(input: &str) -> Result<Vec<SpannedToken>, Box<dyn Error>> {
                                     other => expr.push(other),
                                 }
                             }
-                            parts.push(StrPart::Interp(expr));
+                            parts.push(StrPart::Interp {
+                                src: expr,
+                                span: interp_span,
+                            });
                         }
                         other => lit.push(other),
                     }

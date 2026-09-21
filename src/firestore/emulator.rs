@@ -286,8 +286,17 @@ impl Firestore for FirestoreEmulator {
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        if self.transaction_id.is_none() {
+            return Err("not in transaction".into());
+        }
+        let sdk_writes = match write_ops_to_sdk_writes(self, &writes) {
+            Ok(writes) => writes,
+            Err(e) => {
+                let _ = self.abort_transaction();
+                return Err(e);
+            }
+        };
         let tid = self.transaction_id.take().ok_or("not in transaction")?;
-        let sdk_writes = write_ops_to_sdk_writes(self, &writes)?;
         self.commit_writes(sdk_writes, tid)
     }
 
@@ -480,6 +489,7 @@ fn build_write(fs: &FirestoreEmulator, op: &WriteOp) -> Result<Write, Box<dyn Er
                 let mut mask_paths: Vec<String> = plain.keys().cloned().collect();
                 // DeleteField は update_mask に含めつつ fields から除外する。
                 mask_paths.extend(deletes);
+                super::validate_no_overlapping_paths(mask_paths.iter().map(String::as_str))?;
                 (
                     Some(DocumentMask {
                         field_paths: mask_paths,
@@ -519,6 +529,7 @@ fn build_write(fs: &FirestoreEmulator, op: &WriteOp) -> Result<Write, Box<dyn Er
             // DeleteField は update_mask に含めつつ fields から除外する。
             let mut field_paths: Vec<String> = plain.keys().cloned().collect();
             field_paths.extend(deletes);
+            super::validate_no_overlapping_paths(field_paths.iter().map(String::as_str))?;
             let fields = encode_fields(&nest_field_paths(plain)?)?;
             Ok(Write {
                 update_mask: Some(DocumentMask { field_paths }),
@@ -574,8 +585,8 @@ fn nest_field_paths(
 }
 
 /// 置換の `set` ではキーはリテラルのフィールド名として扱う(spec §6)。
-/// ドットを含むキーのセンチネル変換は、Firestore にネストパスと解釈されない
-/// ようバッククォートでエスケープして送る(in-memory のリテラルキーと一致)。
+/// Firestore の単純フィールド名([A-Za-z_][A-Za-z0-9_]*)でないキーのセンチネル変換は、
+/// バッククォートでエスケープして送る(ドットやハイフンなどを含むリテラルキーに対応)。
 fn escape_literal_transform_keys(
     transforms: Vec<(String, Value)>,
 ) -> Result<Vec<(String, Value)>, Box<dyn Error>> {
@@ -587,7 +598,7 @@ fn escape_literal_transform_keys(
                     format!("unsupported field name: {key} (backtick is not supported)").into(),
                 );
             }
-            if key.contains('.') {
+            if !super::is_simple_field_name(&key) {
                 Ok((format!("`{key}`"), value))
             } else {
                 Ok((key, value))
@@ -1099,5 +1110,51 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(write.operation, Some(write::Operation::Delete(_))));
+    }
+
+    #[test]
+    fn escape_literal_transform_keys_quotes_non_simple_keys() {
+        let inputs = vec![
+            ("normal_field".to_string(), Value::Increment(1)),
+            ("a.b".to_string(), Value::Increment(2)),
+            ("a-b".to_string(), Value::Increment(3)),
+            ("1start_digit".to_string(), Value::Increment(4)),
+        ];
+        let escaped = escape_literal_transform_keys(inputs).unwrap();
+        assert_eq!(escaped[0].0, "normal_field");
+        assert_eq!(escaped[1].0, "`a.b`");
+        assert_eq!(escaped[2].0, "`a-b`");
+        assert_eq!(escaped[3].0, "`1start_digit`");
+    }
+
+    #[test]
+    fn rejects_overlapping_update_and_delete_paths() {
+        let fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
+        let err = build_write(
+            &fs,
+            &WriteOp::Update {
+                path: "c/d".to_string(),
+                data: BTreeMap::from([
+                    ("a".to_string(), Value::DeleteField),
+                    ("a.b".to_string(), Value::Int(1)),
+                ]),
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("overlapping field paths: a and a.b"));
+
+        let err = build_write(
+            &fs,
+            &WriteOp::Set {
+                path: "c/d".to_string(),
+                merge: true,
+                data: BTreeMap::from([
+                    ("a".to_string(), Value::Int(1)),
+                    ("a.b".to_string(), Value::Int(2)),
+                ]),
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("overlapping field paths: a and a.b"));
     }
 }

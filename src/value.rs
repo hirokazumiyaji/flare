@@ -135,11 +135,11 @@ impl Timestamp {
 
     /// Unix 秒を RFC3339 (UTC, `+00:00`) に整形する。範囲外はエラー。
     pub fn to_rfc3339(&self) -> Result<String, Box<dyn Error>> {
-        use chrono::TimeZone;
+        use chrono::{Datelike, TimeZone};
         chrono::Utc
             .timestamp_opt(self.seconds, 0)
             .single()
-            .map(|dt| dt.to_rfc3339())
+            .and_then(|dt| (0..=9999).contains(&dt.year()).then(|| dt.to_rfc3339()))
             .ok_or_else(|| "timestamp out of range".into())
     }
 }
@@ -206,9 +206,9 @@ impl Value {
             }
             Value::DeleteField => "DeleteField".to_string(),
             Value::Increment(n) => format!("Increment({n})"),
-            Value::DocRef(d) => format!("#<DocRef path={}>", d.path),
-            Value::CollectionRef(c) => format!("#<CollectionRef path={}>", c.path),
-            Value::CollectionGroupRef(cg) => format!("#<CollectionGroupRef id={}>", cg.id),
+            Value::DocRef(d) => format!("#<DocRef path={}>", inspect_str(&d.path)),
+            Value::CollectionRef(c) => format!("#<CollectionRef path={}>", inspect_str(&c.path)),
+            Value::CollectionGroupRef(cg) => format!("#<CollectionGroupRef id={}>", inspect_str(&cg.id)),
             Value::QueryRef(_) => "#<QueryRef>".to_string(),
             Value::Func(_) => "<func>".to_string(),
         }
@@ -218,13 +218,16 @@ impl Value {
 fn inspect_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
-    for ch in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '#' if chars.peek() == Some(&'{') => out.push_str("\\#"),
+            other if other.is_control() => out.push_str(&format!("\\u{{{:04x}}}", other as u32)),
             other => out.push(other),
         }
     }
