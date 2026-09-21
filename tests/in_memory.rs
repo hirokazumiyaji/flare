@@ -225,6 +225,22 @@ fn transaction_can_restart_after_abort_clears_state() {
 }
 
 #[test]
+fn transaction_can_restart_after_commit_failure_clears_state() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let failing = run_in(
+        &mut runtime,
+        "transaction { update(\"users/nonexistent\", {x: 1}) }",
+    );
+    assert!(failing.is_err());
+    let out = run_in(
+        &mut runtime,
+        "transaction { set(\"users/tx_commit_err\", {x: 2}) }\nget(\"users/tx_commit_err\")",
+    )
+    .unwrap();
+    assert!(format!("{out:?}").contains("Int(2)"), "{out:?}");
+}
+
+#[test]
 fn transaction_rolls_back_on_runtime_error() {
     let mut runtime = Runtime::new(InMemoryFirestore::default());
     let failing = run_in(
@@ -1000,6 +1016,34 @@ fn errors_carry_kind_and_line_col() {
         .expect("backend error should be FirelangError");
     assert_eq!(ferr.kind, ErrorKind::Backend);
     assert_eq!(ferr.span, Some(Span::new(1, 1)));
+
+    // 文字列補間内のエラー位置: 式の先頭からの相対位置が正しく反映される
+    let err = run_script("\"#{@}\"").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("lex error in interpolation should be FirelangError");
+    assert_eq!(ferr.span, Some(Span::new(1, 4)));
+
+    let err = run_script("\"#{1 + }\"").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("parse error in interpolation should be FirelangError");
+    assert_eq!(ferr.span, Some(Span::new(1, 8)));
+
+    // マップキーでの文字列補間禁止エラーの位置: 拒否されたキートークン自体の位置を指す
+    let err = run_script("{\"#{x}\": 1}").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("parse error in map key should be FirelangError");
+    assert_eq!(ferr.span, Some(Span::new(1, 2)));
+
+    // 補間内の単一式制約違反: 仕様(docs/spec.md §10)通り位置が付かない (None)
+    let err = run_script("\"#{1; 2}\"").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("parse error in interpolation should be FirelangError");
+    assert_eq!(ferr.span, None);
+    assert_eq!(format!("{ferr}"), "interpolation must contain a single expression");
 }
 
 #[test]
