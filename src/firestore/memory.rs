@@ -147,7 +147,7 @@ fn apply_write_to_docs(
                 let current = docs.entry(path).or_default();
                 apply_update_map(current, &mut data)?;
             } else {
-                resolve_sentinel_map(&mut data, None)?;
+                resolve_sentinel_map(&mut data)?;
                 docs.insert(path, data);
             }
             Ok(())
@@ -189,6 +189,19 @@ fn take_matches(
     values
 }
 
+pub(crate) fn get_field_value(
+    path: &str,
+    doc: &BTreeMap<String, Value>,
+    field: &str,
+) -> Option<Value> {
+    if field == "__name__" {
+        Some(Value::Str(path.to_string()))
+    } else {
+        let segments: Vec<&str> = field.split('.').collect();
+        lookup_field_path(Some(doc), &segments).cloned()
+    }
+}
+
 /// 結果の並べ替え。order_by が空なら従来どおりパス辞書順。指定時は
 /// フィールド値の順に並べ(同値はパス辞書順でタイブレーク)、対象フィールドを
 /// 持たないドキュメントは除外する。型が異なる値同士は型ランクで比べる
@@ -201,10 +214,16 @@ fn sort_matches(
         matches.sort_by(|a, b| a.0.cmp(b.0));
         return;
     }
-    matches.retain(|(_, doc)| order_by.iter().all(|(field, _)| doc.contains_key(field)));
+    matches.retain(|(p, doc)| {
+        order_by
+            .iter()
+            .all(|(field, _)| get_field_value(p, doc, field).is_some())
+    });
     matches.sort_by(|a, b| {
         for (field, dir) in order_by {
-            let ord = super::compare_order_values(&a.1[field], &b.1[field]);
+            let val_a = get_field_value(a.0, a.1, field).unwrap();
+            let val_b = get_field_value(b.0, b.1, field).unwrap();
+            let ord = super::compare_order_values(&val_a, &val_b);
             let ord = match dir {
                 Direction::Asc => ord,
                 Direction::Desc => ord.reverse(),
@@ -217,11 +236,12 @@ fn sort_matches(
     });
 }
 
-fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bool {
+pub(crate) fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bool {
     filters.iter().all(|f| {
         // `!=` / `in` / `not-in` はフィールドの存在を要求する(存在しなければ
         // マッチしない)。`order_by` 対象の存在チェックは sort 側で行う。
-        let actual = doc.get(&f.field);
+        let segments: Vec<&str> = f.field.split('.').collect();
+        let actual = lookup_field_path(Some(doc), &segments);
         match f.op {
             QueryOp::Eq => actual == Some(&f.value),
             QueryOp::Ne => actual.is_some_and(|v| v != &f.value),
@@ -234,7 +254,13 @@ fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bo
                 _ => false,
             },
             QueryOp::NotIn => match (&f.value, actual) {
-                (Value::Array(list), Some(v)) => !list.contains(v),
+                (Value::Array(list), Some(v)) => {
+                    if list.contains(&Value::Nil) {
+                        false
+                    } else {
+                        !list.contains(v)
+                    }
+                }
                 _ => false,
             },
             QueryOp::ArrayContains => match actual {
@@ -271,58 +297,45 @@ fn apply_update_map(
     current: &mut BTreeMap<String, Value>,
     updates: &mut BTreeMap<String, Value>,
 ) -> Result<(), Box<dyn Error>> {
-    for k in updates.keys() {
+    for (k, v) in updates.iter() {
         super::validate_field_path(k)?;
+        reject_nested_sentinels(v, false)?;
     }
-    // DeleteField / Increment は current への直接操作が必要なため、
-    // 他のセンチネル解決より先に処理する。
+    // Firestore の挙動に合わせ、1) 削除 2) 通常フィールド更新 3) フィールド変換(increment等)
+    // の順序で適用する。
     let mut deletes = vec![];
-    let mut increments = vec![];
+    let mut plain = vec![];
+    let mut transforms = vec![];
     for (k, v) in updates.iter() {
         match v {
             Value::DeleteField => deletes.push(k.clone()),
-            Value::Increment(n) => {
-                let segments: Vec<&str> = k.split('.').collect();
-                let next = match lookup_field_path(Some(current), &segments) {
-                    Some(Value::Int(cur)) => (*cur)
-                        .checked_add(*n)
-                        .ok_or_else(|| Box::<dyn Error>::from("integer overflow"))?,
-                    Some(_) => {
-                        return Err(format!("increment target must be an int: {k}").into());
-                    }
-                    None => *n,
-                };
-                increments.push((k.clone(), next));
-            }
-            _ => {}
+            Value::ArrayUnion(_)
+            | Value::ArrayRemove(_)
+            | Value::ServerTimestamp
+            | Value::Increment(_) => transforms.push((k.clone(), v.clone())),
+            _ => plain.push((k.clone(), v.clone())),
         }
     }
+    super::validate_no_overlapping_paths(
+        deletes
+            .iter()
+            .map(String::as_str)
+            .chain(plain.iter().map(|(k, _)| k.as_str())),
+    )?;
     for k in &deletes {
-        updates.remove(k);
         let segments: Vec<&str> = k.split('.').collect();
         remove_at_field_path(current, &segments)?;
     }
-    for (k, next) in increments {
-        updates.insert(k, Value::Int(next));
-    }
-    resolve_sentinel_map(updates, Some(current))?;
-    for (k, v) in updates.iter() {
+    for (k, v) in plain {
         let segments: Vec<&str> = k.split('.').collect();
-        super::insert_at_field_path(current, &segments, v.clone())?;
+        super::insert_at_field_path(current, &segments, v)?;
     }
-    Ok(())
-}
-
-fn resolve_sentinel_map(
-    map: &mut BTreeMap<String, Value>,
-    current: Option<&BTreeMap<String, Value>>,
-) -> Result<(), Box<dyn Error>> {
-    for (k, v) in map.clone() {
+    for (k, v) in transforms {
         let segments: Vec<&str> = k.split('.').collect();
-        let base = || lookup_field_path(current, &segments);
+        let base = lookup_field_path(Some(current), &segments);
         let resolved = match v {
             Value::ArrayUnion(values) => {
-                let mut arr = match base() {
+                let mut arr = match base {
                     Some(Value::Array(a)) => a.clone(),
                     _ => vec![],
                 };
@@ -334,7 +347,7 @@ fn resolve_sentinel_map(
                 Value::Array(arr)
             }
             Value::ArrayRemove(values) => {
-                let arr = match base() {
+                let arr = match base {
                     Some(Value::Array(a)) => a.clone(),
                     _ => vec![],
                 };
@@ -343,14 +356,38 @@ fn resolve_sentinel_map(
             Value::ServerTimestamp => Value::Timestamp(Timestamp {
                 seconds: Timestamp::now()?.seconds,
             }),
-            Value::Increment(n) => match base() {
-                Some(Value::Int(cur)) => Value::Int(
-                    (*cur)
-                        .checked_add(n)
-                        .ok_or_else(|| Box::<dyn Error>::from("integer overflow"))?,
-                ),
+            Value::Increment(n) => match base {
+                Some(Value::Int(cur)) => Value::Int(cur.checked_add(n).unwrap_or_else(|| {
+                    if n.is_negative() { i64::MIN } else { i64::MAX }
+                })),
                 _ => Value::Int(n),
             },
+            Value::DeleteField => unreachable!(),
+            other => other,
+        };
+        super::insert_at_field_path(current, &segments, resolved)?;
+    }
+    Ok(())
+}
+
+fn resolve_sentinel_map(map: &mut BTreeMap<String, Value>) -> Result<(), Box<dyn Error>> {
+    for (k, v) in map.clone() {
+        reject_nested_sentinels(&v, false)?;
+        let resolved = match v {
+            Value::ArrayUnion(values) => {
+                let mut arr = vec![];
+                for item in values {
+                    if !arr.contains(&item) {
+                        arr.push(item);
+                    }
+                }
+                Value::Array(arr)
+            }
+            Value::ArrayRemove(_) => Value::Array(vec![]),
+            Value::ServerTimestamp => Value::Timestamp(Timestamp {
+                seconds: Timestamp::now()?.seconds,
+            }),
+            Value::Increment(n) => Value::Int(n),
             // 置換 set(merge なし)でフィールド削除は意味を持たない。
             // Firestore と同様にエラーにし、emulator と挙動を揃える。
             Value::DeleteField => {
@@ -359,6 +396,35 @@ fn resolve_sentinel_map(
             other => other,
         };
         map.insert(k, resolved);
+    }
+    Ok(())
+}
+
+fn reject_nested_sentinels(value: &Value, nested: bool) -> Result<(), Box<dyn Error>> {
+    if nested
+        && matches!(
+            value,
+            Value::ArrayUnion(_)
+                | Value::ArrayRemove(_)
+                | Value::ServerTimestamp
+                | Value::Increment(_)
+                | Value::DeleteField
+        )
+    {
+        return Err("field transforms cannot be nested".into());
+    }
+    match value {
+        Value::Array(items) | Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
+            for item in items {
+                reject_nested_sentinels(item, true)?;
+            }
+        }
+        Value::Map(map) => {
+            for item in map.values() {
+                reject_nested_sentinels(item, true)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -384,7 +450,7 @@ fn remove_at_field_path(
 }
 
 /// フィールドパスでネストした値を参照する(中間が Map でなければ見つからない)。
-fn lookup_field_path<'a>(
+pub(crate) fn lookup_field_path<'a>(
     map: Option<&'a BTreeMap<String, Value>>,
     segments: &[&str],
 ) -> Option<&'a Value> {

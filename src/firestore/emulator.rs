@@ -213,6 +213,18 @@ impl Firestore for FirestoreEmulator {
 
     fn run_query(&self, query: &QueryRef) -> Result<Vec<Value>, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
+        // in: [] や array_contains_any: []、not-in: [..., nil, ...] は 0 件確定
+        for f in &query.filters {
+            match (&f.op, &f.value) {
+                (QueryOp::In | QueryOp::ArrayContainsAny, Value::Array(a)) if a.is_empty() => {
+                    return Ok(vec![]);
+                }
+                (QueryOp::NotIn, Value::Array(a)) if a.contains(&Value::Nil) => {
+                    return Ok(vec![]);
+                }
+                _ => {}
+            }
+        }
         match &query.source {
             QuerySource::Collection(path) => {
                 let (parent, collection_id) = split_collection_path(path)?;
@@ -221,6 +233,7 @@ impl Firestore for FirestoreEmulator {
                     self,
                     parent.as_deref(),
                     sq,
+                    &query.filters,
                     &query.order_by,
                     query.offset,
                     query.limit,
@@ -228,7 +241,15 @@ impl Firestore for FirestoreEmulator {
             }
             QuerySource::CollectionGroup(id) => {
                 let sq = structured_query(id, true, &query.filters)?;
-                run_query_sorted(self, None, sq, &query.order_by, query.offset, query.limit)
+                run_query_sorted(
+                    self,
+                    None,
+                    sq,
+                    &query.filters,
+                    &query.order_by,
+                    query.offset,
+                    query.limit,
+                )
             }
         }
     }
@@ -288,8 +309,17 @@ impl Firestore for FirestoreEmulator {
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        if self.transaction_id.is_none() {
+            return Err("not in transaction".into());
+        }
+        let sdk_writes = match write_ops_to_sdk_writes(self, &writes) {
+            Ok(writes) => writes,
+            Err(e) => {
+                let _ = self.abort_transaction();
+                return Err(e);
+            }
+        };
         let tid = self.transaction_id.take().ok_or("not in transaction")?;
-        let sdk_writes = write_ops_to_sdk_writes(self, &writes)?;
         self.commit_writes(sdk_writes, tid)
     }
 
@@ -317,6 +347,7 @@ fn run_query_sorted(
     fs: &FirestoreEmulator,
     parent: Option<&str>,
     query: StructuredQuery,
+    filters: &[QueryFilter],
     order_by: &[(String, Direction)],
     offset: Option<usize>,
     limit: Option<usize>,
@@ -350,6 +381,12 @@ fn run_query_sorted(
         let value = decode_document_for_query(&doc)?;
         out.push((rel, value));
     }
+    // サーバ側の複合フィルタ制約(複数の != や not-in、空配列など)を吸収するため、
+    // in-memory と同一のフィルタ判定をクライアント側でも適用する。
+    out.retain(|(_, v)| match v {
+        Value::Map(m) => super::memory::matches_filters(m, filters),
+        _ => false,
+    });
     // 順序・offset・limit は取得後に適用する。サーバ側の order_by は使わず、
     // in-memory と同じ比較器で並べることで両バックエンドの決定性を揃える
     // (同値はパス辞書順でタイブレーク)。
@@ -369,8 +406,10 @@ fn sort_query_results(out: &mut Vec<(String, Value)>, order_by: &[(String, Direc
         out.sort_by(|a, b| a.0.cmp(&b.0));
         return;
     }
-    out.retain(|(_, v)| match v {
-        Value::Map(m) => order_by.iter().all(|(f, _)| m.contains_key(f)),
+    out.retain(|(path, v)| match v {
+        Value::Map(m) => order_by
+            .iter()
+            .all(|(f, _)| super::memory::get_field_value(path, m, f).is_some()),
         _ => false,
     });
     out.sort_by(|a, b| {
@@ -378,7 +417,9 @@ fn sort_query_results(out: &mut Vec<(String, Value)>, order_by: &[(String, Direc
             return a.0.cmp(&b.0);
         };
         for (field, dir) in order_by {
-            let ord = super::compare_order_values(&ma[field], &mb[field]);
+            let val_a = super::memory::get_field_value(&a.0, ma, field).unwrap();
+            let val_b = super::memory::get_field_value(&b.0, mb, field).unwrap();
+            let ord = super::compare_order_values(&val_a, &val_b);
             let ord = match dir {
                 Direction::Asc => ord,
                 Direction::Desc => ord.reverse(),
@@ -416,7 +457,60 @@ fn build_where(
     filters: &[QueryFilter],
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
     let mut parts = vec![];
+    let mut has_inequality = false;
+    let mut has_membership = false;
+    let mut has_array_contains = false;
     for f in filters {
+        if f.op == QueryOp::NotIn {
+            // Firestore の NOT_IN はサーバ側で null 値フィールドを除外してしまい
+            // firelang の構造的セマンティクス(not-in: [1] は {x: nil} にマッチ)と
+            // 乖離するため、サーバには送らずクライアント側(matches_filters)で評価する。
+            continue;
+        }
+        if f.op == QueryOp::Ne && f.value == Value::Nil {
+            // Firestore は != nil に UnaryFilter(IS_NOT_NULL) を要求するため、
+            // FieldFilter で送らずクライアント側で評価する。
+            continue;
+        }
+        let is_inequality = matches!(f.op, QueryOp::Ne);
+        let is_membership = matches!(f.op, QueryOp::In | QueryOp::ArrayContainsAny);
+        let is_array_contains =
+            matches!(f.op, QueryOp::ArrayContains | QueryOp::ArrayContainsAny);
+
+        if is_inequality && has_inequality {
+            // Firestore はクエリ全体で NOT_EQUAL を 1 つのみ許可するため、
+            // 2 つ目以降はサーバに送らずクライアント側(matches_filters)で評価する。
+            continue;
+        }
+        if is_membership && has_membership {
+            // Firestore は in, array_contains_any をクエリ全体で最大 1 つのみ許可するため、
+            // 2 つ目以降はサーバに送らずクライアント側(matches_filters)で評価する。
+            continue;
+        }
+        if is_array_contains && has_array_contains {
+            // Firestore は array_contains と array_contains_any をクエリ全体で最大 1 つのみ許可するため、
+            // 2 つ目以降はサーバに送らずクライアント側(matches_filters)で評価する。
+            continue;
+        }
+        match f.op {
+            QueryOp::In | QueryOp::ArrayContainsAny => {
+                if let Value::Array(list) = &f.value {
+                    if list.is_empty() {
+                        continue;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if is_inequality {
+            has_inequality = true;
+        }
+        if is_membership {
+            has_membership = true;
+        }
+        if is_array_contains {
+            has_array_contains = true;
+        }
         let op = match f.op {
             QueryOp::Eq => structured_query::field_filter::Operator::Equal,
             QueryOp::Ne => structured_query::field_filter::Operator::NotEqual,
@@ -482,6 +576,7 @@ fn build_write(fs: &FirestoreEmulator, op: &WriteOp) -> Result<Write, Box<dyn Er
                 let mut mask_paths: Vec<String> = plain.keys().cloned().collect();
                 // DeleteField は update_mask に含めつつ fields から除外する。
                 mask_paths.extend(deletes);
+                super::validate_no_overlapping_paths(mask_paths.iter().map(String::as_str))?;
                 (
                     Some(DocumentMask {
                         field_paths: mask_paths,
@@ -521,6 +616,7 @@ fn build_write(fs: &FirestoreEmulator, op: &WriteOp) -> Result<Write, Box<dyn Er
             // DeleteField は update_mask に含めつつ fields から除外する。
             let mut field_paths: Vec<String> = plain.keys().cloned().collect();
             field_paths.extend(deletes);
+            super::validate_no_overlapping_paths(field_paths.iter().map(String::as_str))?;
             let fields = encode_fields(&nest_field_paths(plain)?)?;
             Ok(Write {
                 update_mask: Some(DocumentMask { field_paths }),
@@ -576,8 +672,8 @@ fn nest_field_paths(
 }
 
 /// 置換の `set` ではキーはリテラルのフィールド名として扱う(spec §6)。
-/// ドットを含むキーのセンチネル変換は、Firestore にネストパスと解釈されない
-/// ようバッククォートでエスケープして送る(in-memory のリテラルキーと一致)。
+/// Firestore の単純フィールド名([A-Za-z_][A-Za-z0-9_]*)でないキーのセンチネル変換は、
+/// バッククォートでエスケープして送る(ドットやハイフンなどを含むリテラルキーに対応)。
 fn escape_literal_transform_keys(
     transforms: Vec<(String, Value)>,
 ) -> Result<Vec<(String, Value)>, Box<dyn Error>> {
@@ -589,7 +685,7 @@ fn escape_literal_transform_keys(
                     format!("unsupported field name: {key} (backtick is not supported)").into(),
                 );
             }
-            if key.contains('.') {
+            if !super::is_simple_field_name(&key) {
                 Ok((format!("`{key}`"), value))
             } else {
                 Ok((key, value))
@@ -1192,5 +1288,51 @@ mod tests {
             format!("{err}").contains("unsupported value in emulator write"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn escape_literal_transform_keys_quotes_non_simple_keys() {
+        let inputs = vec![
+            ("normal_field".to_string(), Value::Increment(1)),
+            ("a.b".to_string(), Value::Increment(2)),
+            ("a-b".to_string(), Value::Increment(3)),
+            ("1start_digit".to_string(), Value::Increment(4)),
+        ];
+        let escaped = escape_literal_transform_keys(inputs).unwrap();
+        assert_eq!(escaped[0].0, "normal_field");
+        assert_eq!(escaped[1].0, "`a.b`");
+        assert_eq!(escaped[2].0, "`a-b`");
+        assert_eq!(escaped[3].0, "`1start_digit`");
+    }
+
+    #[test]
+    fn rejects_overlapping_update_and_delete_paths() {
+        let fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
+        let err = build_write(
+            &fs,
+            &WriteOp::Update {
+                path: "c/d".to_string(),
+                data: BTreeMap::from([
+                    ("a".to_string(), Value::DeleteField),
+                    ("a.b".to_string(), Value::Int(1)),
+                ]),
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("overlapping field paths: a and a.b"));
+
+        let err = build_write(
+            &fs,
+            &WriteOp::Set {
+                path: "c/d".to_string(),
+                merge: true,
+                data: BTreeMap::from([
+                    ("a".to_string(), Value::Int(1)),
+                    ("a.b".to_string(), Value::Int(2)),
+                ]),
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("overlapping field paths: a and a.b"));
     }
 }
