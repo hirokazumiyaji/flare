@@ -201,10 +201,24 @@ fn sort_matches(
         matches.sort_by(|a, b| a.0.cmp(b.0));
         return;
     }
-    matches.retain(|(_, doc)| order_by.iter().all(|(field, _)| doc.contains_key(field)));
+    matches.retain(|(p, doc)| {
+        order_by
+            .iter()
+            .all(|(field, _)| field == "__name__" || doc.contains_key(field))
+    });
     matches.sort_by(|a, b| {
         for (field, dir) in order_by {
-            let ord = super::compare_order_values(&a.1[field], &b.1[field]);
+            let val_a = if field == "__name__" {
+                Value::Str((*a.0).clone())
+            } else {
+                a.1[field].clone()
+            };
+            let val_b = if field == "__name__" {
+                Value::Str((*b.0).clone())
+            } else {
+                b.1[field].clone()
+            };
+            let ord = super::compare_order_values(&val_a, &val_b);
             let ord = match dir {
                 Direction::Asc => ord,
                 Direction::Desc => ord.reverse(),

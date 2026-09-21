@@ -455,19 +455,29 @@ fn build_where(
     let mut has_membership = false;
     let mut has_array_contains = false;
     for f in filters {
-        let is_inequality = matches!(f.op, QueryOp::Ne | QueryOp::NotIn);
-        let is_membership =
-            matches!(f.op, QueryOp::In | QueryOp::NotIn | QueryOp::ArrayContainsAny);
+        if f.op == QueryOp::NotIn {
+            // Firestore の NOT_IN はサーバ側で null 値フィールドを除外してしまい
+            // firelang の構造的セマンティクス(not-in: [1] は {x: nil} にマッチ)と
+            // 乖離するため、サーバには送らずクライアント側(matches_filters)で評価する。
+            continue;
+        }
+        if f.op == QueryOp::Ne && f.value == Value::Nil {
+            // Firestore は != nil に UnaryFilter(IS_NOT_NULL) を要求するため、
+            // FieldFilter で送らずクライアント側で評価する。
+            continue;
+        }
+        let is_inequality = matches!(f.op, QueryOp::Ne);
+        let is_membership = matches!(f.op, QueryOp::In | QueryOp::ArrayContainsAny);
         let is_array_contains =
             matches!(f.op, QueryOp::ArrayContains | QueryOp::ArrayContainsAny);
 
         if is_inequality && has_inequality {
-            // Firestore はクエリ全体で NOT_EQUAL / NOT_IN を 1 つのみ許可するため、
+            // Firestore はクエリ全体で NOT_EQUAL を 1 つのみ許可するため、
             // 2 つ目以降はサーバに送らずクライアント側(matches_filters)で評価する。
             continue;
         }
         if is_membership && has_membership {
-            // Firestore は in, not-in, array_contains_any をクエリ全体で最大 1 つのみ許可するため、
+            // Firestore は in, array_contains_any をクエリ全体で最大 1 つのみ許可するため、
             // 2 つ目以降はサーバに送らずクライアント側(matches_filters)で評価する。
             continue;
         }
@@ -476,22 +486,10 @@ fn build_where(
             // 2 つ目以降はサーバに送らずクライアント側(matches_filters)で評価する。
             continue;
         }
-        if f.op == QueryOp::Ne && f.value == Value::Nil {
-            // Firestore は != nil に UnaryFilter(IS_NOT_NULL) を要求するため、
-            // FieldFilter で送らずクライアント側で評価する。
-            continue;
-        }
         match f.op {
             QueryOp::In | QueryOp::ArrayContainsAny => {
                 if let Value::Array(list) = &f.value {
                     if list.is_empty() {
-                        continue;
-                    }
-                }
-            }
-            QueryOp::NotIn => {
-                if let Value::Array(list) = &f.value {
-                    if list.is_empty() || list.contains(&Value::Nil) {
                         continue;
                     }
                 }

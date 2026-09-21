@@ -1285,6 +1285,20 @@ fn order_by_sorts_and_excludes_docs_missing_the_field() {
             Value::Str("users/ob1".to_string()),
         ])
     );
+    // __name__ によるソートは全ドキュメントを対象にし、パス順で並ぶ。
+    let out = run_script(&format!(
+        "{setup}\ncol(\"users\").order_by(\"__name__\", \"desc\").get().map {{ |r| r[\"__name__\"] }}"
+    ))
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("users/ob4".to_string()),
+            Value::Str("users/ob3".to_string()),
+            Value::Str("users/ob2".to_string()),
+            Value::Str("users/ob1".to_string()),
+        ])
+    );
     // 不正な向きは呼び出し時にエラー。
     let err = run_script("col(\"users\").order_by(\"age\", \"up\")").unwrap_err();
     assert!(
