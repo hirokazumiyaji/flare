@@ -1,6 +1,7 @@
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::io::{IsTerminal, Read};
 
 use firelang::{run_script, run_script_with_firestore, FirestoreEmulator};
 
@@ -13,26 +14,36 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() {
-        print_usage();
-        std::process::exit(1);
-    }
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_usage();
-        return Ok(());
-    }
 
     let mut backend = "in-memory";
     let mut paths: Vec<String> = vec![];
+    let mut inline: Vec<String> = vec![];
+    let mut use_stdin = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--help" | "-h" => {
+                print_usage();
+                return Ok(());
+            }
             "--backend" => {
                 let b = args
                     .get(i + 1)
                     .ok_or("--backend requires in-memory or emulator")?;
                 backend = b.as_str();
                 i += 2;
+            }
+            "-e" => {
+                let script = args.get(i + 1).ok_or("-e requires a script argument")?;
+                inline.push(script.clone());
+                i += 2;
+            }
+            "-" => {
+                if use_stdin {
+                    return Err("stdin script given more than once".into());
+                }
+                use_stdin = true;
+                i += 1;
             }
             s if s.starts_with('-') => {
                 return Err(format!("unknown option: {s}").into());
@@ -44,25 +55,54 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    if paths.len() != 1 {
-        eprintln!("error: expected exactly one script file");
-        print_usage();
-        std::process::exit(1);
-    }
-    let script_path = &paths[0];
-    let src = fs::read_to_string(script_path)?;
-
-    let out = match backend {
-        "in-memory" => run_script(&src)?,
+    let backend_config = match backend {
+        "in-memory" => None,
         "emulator" => {
             let host = env::var("FIRESTORE_EMULATOR_HOST")
                 .map_err(|_| "FIRESTORE_EMULATOR_HOST must be set when using --backend emulator")?;
             let project_id =
                 env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".to_string());
-            run_script_with_firestore(&src, FirestoreEmulator::new(host, project_id))?
+            Some((host, project_id))
         }
         other => {
-            return Err(format!("unknown backend: {other} (use in-memory or emulator)").into())
+            return Err(format!("unknown backend: {other} (use in-memory or emulator)").into());
+        }
+    };
+
+    let src = if !inline.is_empty() {
+        if !paths.is_empty() || use_stdin {
+            eprintln!("error: -e cannot be combined with a script file or stdin");
+            print_usage();
+            std::process::exit(1);
+        }
+        // 複数の -e は改行で連結する(Ruby 互換)。
+        inline.join("\n")
+    } else if use_stdin {
+        if !paths.is_empty() {
+            eprintln!("error: cannot read from both a script file and stdin");
+            print_usage();
+            std::process::exit(1);
+        }
+        read_stdin()?
+    } else if paths.len() == 1 {
+        fs::read_to_string(&paths[0])?
+    } else if paths.is_empty() && !std::io::stdin().is_terminal() {
+        // 引数なし + パイプ時は stdin から読む。端末直結の引数なしは usage エラー。
+        read_stdin()?
+    } else {
+        if paths.is_empty() {
+            print_usage();
+        } else {
+            eprintln!("error: expected exactly one script file");
+            print_usage();
+        }
+        std::process::exit(1);
+    };
+
+    let out = match backend_config {
+        None => run_script(&src)?,
+        Some((host, project_id)) => {
+            run_script_with_firestore(&src, FirestoreEmulator::new(host, project_id))?
         }
     };
 
@@ -71,9 +111,21 @@ fn run() -> Result<(), Box<dyn Error>> {
 }
 
 fn print_usage() {
-    eprintln!("usage: fl [--backend in-memory|emulator] <script-file>");
+    eprintln!("usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)");
+    eprintln!();
+    eprintln!("  Script source (exactly one):");
+    eprintln!("    <script-file>  run a script file");
+    eprintln!("    -             read a script from stdin");
+    eprintln!("    -e <script>   run an inline script (repeatable, joined by newlines)");
+    eprintln!("    (no args)     read from stdin when piped, otherwise show this usage");
     eprintln!();
     eprintln!("  Backends:");
     eprintln!("    in-memory   (default) use the in-memory Firestore stub");
     eprintln!("    emulator    use FIRESTORE_EMULATOR_HOST and optional FIRESTORE_PROJECT_ID");
+}
+
+fn read_stdin() -> Result<String, Box<dyn Error>> {
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    Ok(buf)
 }
