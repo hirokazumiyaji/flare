@@ -1064,6 +1064,9 @@ fn inspect_and_to_s_follow_ruby_style() {
     // エスケープ。
     let out = run_script("\"a\\\"b\\nc\"").unwrap();
     assert_eq!(out.inspect(), "\"a\\\"b\\nc\"");
+    // 補間マーカー \#{ は inspect でもエスケープを保持する。
+    let out = run_script("\"\\#{1}\"").unwrap();
+    assert_eq!(out.inspect(), "\"\\#{1}\"");
     // 補間は to_s 形式。
     let out = run_script("\"v=#{[1, 2]}\"").unwrap();
     assert_eq!(out, Value::Str("v=[1, 2]".to_string()));
