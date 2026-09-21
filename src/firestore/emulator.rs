@@ -812,10 +812,16 @@ fn decode_document_for_query(doc: &Document) -> Result<Value, Box<dyn Error>> {
     decode_document_inner(doc, true)
 }
 
+fn document_root_prefix(doc_name: &str) -> Option<&str> {
+    let idx = doc_name.find("/documents/")?;
+    Some(&doc_name[..idx + "/documents/".len()])
+}
+
 fn decode_document_inner(doc: &Document, include_doc_path: bool) -> Result<Value, Box<dyn Error>> {
+    let root_prefix = document_root_prefix(&doc.name);
     let mut out = BTreeMap::new();
     for (k, fv) in &doc.fields {
-        out.insert(k.clone(), decode_field_value(fv)?);
+        out.insert(k.clone(), decode_field_value(fv, root_prefix)?);
     }
     if include_doc_path {
         if let Ok(rel) = relative_document_name(&doc.name) {
@@ -825,7 +831,7 @@ fn decode_document_inner(doc: &Document, include_doc_path: bool) -> Result<Value
     Ok(Value::Map(out))
 }
 
-fn decode_field_value(v: &SdkValue) -> Result<Value, Box<dyn Error>> {
+fn decode_field_value(v: &SdkValue, root_prefix: Option<&str>) -> Result<Value, Box<dyn Error>> {
     match v
         .value_type
         .as_ref()
@@ -841,29 +847,37 @@ fn decode_field_value(v: &SdkValue) -> Result<Value, Box<dyn Error>> {
         value::ValueType::ArrayValue(arr) => {
             let mut out = vec![];
             for x in &arr.values {
-                out.push(decode_field_value(x)?);
+                out.push(decode_field_value(x, root_prefix)?);
             }
             Ok(Value::Array(out))
         }
         value::ValueType::MapValue(map) => {
             let mut out = BTreeMap::new();
             for (k, fv) in &map.fields {
-                out.insert(k.clone(), decode_field_value(fv)?);
+                out.insert(k.clone(), decode_field_value(fv, root_prefix)?);
             }
             Ok(Value::Map(out))
         }
         // firelang が持たない型は読めることだけを目標にする。double・
-        // geo_point・bytes は表示専用の Opaque にし、reference は相対パス
-        // の DocRef にする。書き戻しは unsupported のまま(§3)。
+        // geo_point・bytes は表示専用の Opaque にし、同一 DB の reference は相対パス
+        // の DocRef にする(別 DB や別プロジェクトの reference は Opaque に保持)。書き戻しは unsupported のまま(§3)。
         value::ValueType::DoubleValue(f) => Ok(Value::Opaque(format!("Double({f})"))),
         value::ValueType::BytesValue(b) => Ok(Value::Opaque(format!("Bytes({})", hex_bytes(b)))),
         value::ValueType::GeoPointValue(p) => Ok(Value::Opaque(format!(
             "GeoPoint({}, {})",
             p.latitude, p.longitude
         ))),
-        value::ValueType::ReferenceValue(name) => match relative_document_name(name) {
-            Ok(rel) => Ok(Value::DocRef(DocRef { path: rel })),
-            Err(_) => Ok(Value::Opaque(format!("Reference({name})"))),
+        value::ValueType::ReferenceValue(name) => {
+            let local_rel = match root_prefix {
+                Some(prefix) => name.strip_prefix(prefix),
+                None => None,
+            };
+            match local_rel {
+                Some(rel) => Ok(Value::DocRef(DocRef {
+                    path: rel.to_string(),
+                })),
+                None => Ok(Value::Opaque(format!("Reference({name})"))),
+            }
         },
         other => Err(format!("unsupported Firestore field value: {other:?}").into()),
     }
@@ -1221,32 +1235,51 @@ mod tests {
         let sdk = |t| SdkValue {
             value_type: Some(t),
         };
+        let root = Some("projects/p/databases/(default)/documents/");
         assert_eq!(
-            decode_field_value(&sdk(value::ValueType::DoubleValue(1.5))).unwrap(),
+            decode_field_value(&sdk(value::ValueType::DoubleValue(1.5)), root).unwrap(),
             Value::Opaque("Double(1.5)".to_string())
         );
         assert_eq!(
-            decode_field_value(&sdk(value::ValueType::BytesValue(vec![0x00, 0xff]))).unwrap(),
+            decode_field_value(&sdk(value::ValueType::BytesValue(vec![0x00, 0xff])), root).unwrap(),
             Value::Opaque("Bytes(00ff)".to_string())
         );
         assert_eq!(
-            decode_field_value(&sdk(value::ValueType::GeoPointValue(
-                gcloud_sdk::google::r#type::LatLng {
-                    latitude: 35.7,
-                    longitude: 139.7,
-                },
-            )))
+            decode_field_value(
+                &sdk(value::ValueType::GeoPointValue(
+                    gcloud_sdk::google::r#type::LatLng {
+                        latitude: 35.7,
+                        longitude: 139.7,
+                    },
+                )),
+                root,
+            )
             .unwrap(),
             Value::Opaque("GeoPoint(35.7, 139.7)".to_string())
         );
         assert_eq!(
-            decode_field_value(&sdk(value::ValueType::ReferenceValue(
-                "projects/p/databases/(default)/documents/users/1".to_string(),
-            )))
+            decode_field_value(
+                &sdk(value::ValueType::ReferenceValue(
+                    "projects/p/databases/(default)/documents/users/1".to_string(),
+                )),
+                root,
+            )
             .unwrap(),
             Value::DocRef(DocRef {
                 path: "users/1".to_string()
             })
+        );
+        assert_eq!(
+            decode_field_value(
+                &sdk(value::ValueType::ReferenceValue(
+                    "projects/other-proj/databases/(default)/documents/users/1".to_string(),
+                )),
+                root,
+            )
+            .unwrap(),
+            Value::Opaque(
+                "Reference(projects/other-proj/databases/(default)/documents/users/1)".to_string()
+            )
         );
     }
 

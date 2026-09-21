@@ -77,7 +77,7 @@ Firestore 操作のための特殊な値:
 
 センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(emulator バックエンドではエラー)。
 
-emulator バックエンドで firelang が持たない型のフィールドを含むドキュメントを読んだ場合、ドキュメント全体はエラーにせず次のように読み替える:`double` / `geo_point` / `bytes` は `Opaque` の表示専用値(例 `Double(1.5)`、`GeoPoint(35.7, 139.7)`、`Bytes(00ff)`)、`reference` は相対パスの `DocRef`。`Opaque` 値はクエリの `==` 等でマッチさせることはできず(スクリプトからは生成できない)、書き戻しはエラー(`unsupported value in emulator write`)。
+emulator バックエンドで firelang が持たない型のフィールドを含むドキュメントを読んだ場合、ドキュメント全体はエラーにせず次のように読み替える:`double` / `geo_point` / `bytes` は `Opaque` の表示専用値(例 `Double(1.5)`、`GeoPoint(35.7, 139.7)`、`Bytes(00ff)`)、`reference` は同一データベース内であれば相対パスの `DocRef`(別プロジェクトや別データベースの参照は `Reference(...)` の `Opaque` 値)。`Opaque` 値はクエリの `==` 等でマッチさせることはできず(スクリプトからは生成できない)、書き戻しはエラー(`unsupported value in emulator write`)。
 
 ### 真偽値判定(truthiness)
 
