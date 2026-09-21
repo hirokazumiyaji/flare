@@ -236,17 +236,7 @@ fn apply_update_map(
     for (k, v) in updates.iter() {
         match v {
             Value::DeleteField => deletes.push(k.clone()),
-            Value::Increment(n) => {
-                let segments: Vec<&str> = k.split('.').collect();
-                let next = match lookup_field_path(Some(current), &segments) {
-                    Some(Value::Int(cur)) => cur.checked_add(*n).unwrap_or_else(|| {
-                        if n.is_negative() { i64::MIN } else { i64::MAX }
-                    }),
-                    Some(_) => *n,
-                    None => *n,
-                };
-                increments.push((k.clone(), next));
-            }
+            Value::Increment(n) => increments.push((k.clone(), *n)),
             _ => {}
         }
     }
@@ -255,7 +245,15 @@ fn apply_update_map(
         let segments: Vec<&str> = k.split('.').collect();
         remove_at_field_path(current, &segments)?;
     }
-    for (k, next) in increments {
+    for (k, n) in increments {
+        let segments: Vec<&str> = k.split('.').collect();
+        let next = match lookup_field_path(Some(current), &segments) {
+            Some(Value::Int(cur)) => cur.checked_add(n).unwrap_or_else(|| {
+                if n.is_negative() { i64::MIN } else { i64::MAX }
+            }),
+            Some(_) => n,
+            None => n,
+        };
         updates.insert(k, Value::Int(next));
     }
     resolve_sentinel_map(updates, Some(current))?;

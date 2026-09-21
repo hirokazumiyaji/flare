@@ -1175,3 +1175,21 @@ fn nested_sentinels_are_rejected() {
         "{err}"
     );
 }
+
+#[test]
+fn update_deletes_ancestor_before_descendant_increment() {
+    let out = run_script(
+        "set(\"users/del_inc\", {a: {b: 10}})\nupdate(\"users/del_inc\", {a: delete_field(), \"a.b\": increment(1)})\nget(\"users/del_inc\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"a\" => {\"b\" => 1}}");
+}
+
+#[test]
+fn replacement_set_resolves_increment_under_literal_hyphen_key() {
+    let out = run_script(
+        "set(\"users/lit_hyphen\", {\"a-b\": increment(1)})\nget(\"users/lit_hyphen\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"a-b\" => 1}");
+}

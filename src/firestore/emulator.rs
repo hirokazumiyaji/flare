@@ -535,8 +535,8 @@ fn nest_field_paths(
 }
 
 /// 置換の `set` ではキーはリテラルのフィールド名として扱う(spec §6)。
-/// ドットを含むキーのセンチネル変換は、Firestore にネストパスと解釈されない
-/// ようバッククォートでエスケープして送る(in-memory のリテラルキーと一致)。
+/// Firestore の単純フィールド名([A-Za-z_][A-Za-z0-9_]*)でないキーのセンチネル変換は、
+/// バッククォートでエスケープして送る(ドットやハイフンなどを含むリテラルキーに対応)。
 fn escape_literal_transform_keys(
     transforms: Vec<(String, Value)>,
 ) -> Result<Vec<(String, Value)>, Box<dyn Error>> {
@@ -548,7 +548,7 @@ fn escape_literal_transform_keys(
                     format!("unsupported field name: {key} (backtick is not supported)").into(),
                 );
             }
-            if key.contains('.') {
+            if !super::is_simple_field_name(&key) {
                 Ok((format!("`{key}`"), value))
             } else {
                 Ok((key, value))
@@ -1060,5 +1060,20 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(write.operation, Some(write::Operation::Delete(_))));
+    }
+
+    #[test]
+    fn escape_literal_transform_keys_quotes_non_simple_keys() {
+        let inputs = vec![
+            ("normal_field".to_string(), Value::Increment(1)),
+            ("a.b".to_string(), Value::Increment(2)),
+            ("a-b".to_string(), Value::Increment(3)),
+            ("1start_digit".to_string(), Value::Increment(4)),
+        ];
+        let escaped = escape_literal_transform_keys(inputs).unwrap();
+        assert_eq!(escaped[0].0, "normal_field");
+        assert_eq!(escaped[1].0, "`a.b`");
+        assert_eq!(escaped[2].0, "`a-b`");
+        assert_eq!(escaped[3].0, "`1start_digit`");
     }
 }
