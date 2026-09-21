@@ -368,11 +368,13 @@ set("users/{run}/rows/r6", {{other: 1}})
   col("users/{run}/rows").where("age", "not-in", []).get().len(),
   col("users/{run}/rows").where("age", "not-in", [20, nil]).get().len(),
   col("users/{run}/rows").where("age", "!=", 20).where("age", "!=", 30).get().len(),
+  col("users/{run}/rows").where("age", "not-in", [20]).where("age", "in", [30]).get().len(),
+  col("users/{run}/rows").where("tags", "array_contains_any", ["a", "b"]).where("tags", "array_contains_any", ["b", "c"]).get().len(),
 ]"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
     assert_eq!(
         format!("{out:?}"),
-        "Array([Array([Int(5), Int(4)]), Int(3), Int(3), Int(2), Int(3), Int(2), Int(5), Int(0), Int(5), Int(0), Int(2)])"
+        "Array([Array([Int(5), Int(4)]), Int(3), Int(3), Int(2), Int(3), Int(2), Int(5), Int(0), Int(5), Int(0), Int(2), Int(2), Int(2)])"
     );
 }

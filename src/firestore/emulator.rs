@@ -452,10 +452,26 @@ fn build_where(
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
     let mut parts = vec![];
     let mut has_inequality = false;
+    let mut has_membership = false;
+    let mut has_array_contains = false;
     for f in filters {
         let is_inequality = matches!(f.op, QueryOp::Ne | QueryOp::NotIn);
+        let is_membership =
+            matches!(f.op, QueryOp::In | QueryOp::NotIn | QueryOp::ArrayContainsAny);
+        let is_array_contains = matches!(f.op, QueryOp::ArrayContains);
+
         if is_inequality && has_inequality {
             // Firestore はクエリ全体で NOT_EQUAL / NOT_IN を 1 つのみ許可するため、
+            // 2 つ目以降はサーバに送らずクライアント側(matches_filters)で評価する。
+            continue;
+        }
+        if is_membership && has_membership {
+            // Firestore は in, not-in, array_contains_any をクエリ全体で最大 1 つのみ許可するため、
+            // 2 つ目以降はサーバに送らずクライアント側(matches_filters)で評価する。
+            continue;
+        }
+        if is_array_contains && has_array_contains {
+            // Firestore は array_contains をクエリ全体で最大 1 つのみ許可するため、
             // 2 つ目以降はサーバに送らずクライアント側(matches_filters)で評価する。
             continue;
         }
@@ -478,6 +494,12 @@ fn build_where(
         }
         if is_inequality {
             has_inequality = true;
+        }
+        if is_membership {
+            has_membership = true;
+        }
+        if is_array_contains {
+            has_array_contains = true;
         }
         let op = match f.op {
             QueryOp::Eq => structured_query::field_filter::Operator::Equal,
