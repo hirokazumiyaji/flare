@@ -1067,4 +1067,11 @@ fn inspect_and_to_s_follow_ruby_style() {
     // 補間は to_s 形式。
     let out = run_script("\"v=#{[1, 2]}\"").unwrap();
     assert_eq!(out, Value::Str("v=[1, 2]".to_string()));
+    // 参照型は path / id をエスケープ・クォートする。
+    let out = run_script("doc(\"users/1\")").unwrap();
+    assert_eq!(out.inspect(), "#<DocRef path=\"users/1\">");
+    let out = run_script("col(\"users\")").unwrap();
+    assert_eq!(out.inspect(), "#<CollectionRef path=\"users\">");
+    let out = run_script("col_group(\"items\")").unwrap();
+    assert_eq!(out.inspect(), "#<CollectionGroupRef id=\"items\">");
 }

@@ -155,9 +155,9 @@ impl Value {
                 let inner: Vec<String> = v.iter().map(|x| x.inspect()).collect();
                 format!("ArrayRemove([{}])", inner.join(", "))
             }
-            Value::DocRef(d) => format!("#<DocRef path={}>", d.path),
-            Value::CollectionRef(c) => format!("#<CollectionRef path={}>", c.path),
-            Value::CollectionGroupRef(cg) => format!("#<CollectionGroupRef id={}>", cg.id),
+            Value::DocRef(d) => format!("#<DocRef path={}>", inspect_str(&d.path)),
+            Value::CollectionRef(c) => format!("#<CollectionRef path={}>", inspect_str(&c.path)),
+            Value::CollectionGroupRef(cg) => format!("#<CollectionGroupRef id={}>", inspect_str(&cg.id)),
             Value::QueryRef(_) => "#<QueryRef>".to_string(),
             Value::Func(_) => "<func>".to_string(),
         }
