@@ -77,7 +77,7 @@ Firestore 操作のための特殊な値:
 
 センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(emulator バックエンドではエラー)。
 
-emulator バックエンドで firelang が持たない型のフィールドを含むドキュメントを読んだ場合、ドキュメント全体はエラーにせず次のように読み替える:`double` / `geo_point` / `bytes` は `Opaque` の表示専用値(例 `Double(1.5)`、`GeoPoint(35.7, 139.7)`、`Bytes(00ff)`)、`reference` は相対パスの `DocRef`。`Opaque` 値はクエリの `==` 等でマッチさせることはできず(スクリプトからは生成できない)、書き戻しはエラー(`unsupported value in emulator write`)。
+emulator バックエンドで firelang が持たない型のフィールドを含むドキュメントを読んだ場合、ドキュメント全体はエラーにせず次のように読み替える:`double` / `geo_point` / `bytes` は `Opaque` の表示専用値(例 `Double(1.5)`、`GeoPoint(35.7, 139.7)`、`Bytes(00ff)`)、`reference` は同一データベース内であれば相対パスの `DocRef`(別プロジェクトや別データベースの参照は `Reference(...)` の `Opaque` 値)。`Opaque` 値はクエリの `==` 等でマッチさせることはできず(スクリプトからは生成できない)、書き戻しはエラー(`unsupported value in emulator write`)。
 
 ### 真偽値判定(truthiness)
 
@@ -263,13 +263,13 @@ while cond { ... }
 | `array_remove(array)` | センチネル | 配列フィールドからの除去 |
 | `server_timestamp()` | センチネル | 書き込み時にサーバ時刻に解決 |
 | `delete_field()` | センチネル | `update` / merge `set` でフィールドを削除する。存在しないフィールドへの指定は no-op |
-| `increment(n)` | センチネル | 数値フィールドに `n`(Int)を加算する。フィールドがなければ `n` を設定。既存が Int でなければエラー。結果が範囲外なら `integer overflow` エラー |
+| `increment(n)` | センチネル | 数値フィールドに `n`(Int)を加算する。フィールドが存在しないか数値以外の場合は `n` を設定。正負のオーバーフロー時は `i64::MAX` / `i64::MIN` に飽和する(Firestore 仕様準拠) |
 | `batch { ... }` | ブロックの値 | 8 章参照 |
 | `transaction { ... }` | ブロックの値 | 8 章参照 |
 
 `data_map` の値に使えるのは: Int / Str / Bool / Nil / Array / Map / Timestamp、および直下フィールドのセンチネル 5 種。
 
-センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(emulator バックエンドではエラー)。`delete_field()` は `update` と merge `set` でのみ使え、置換の `set` ではエラー(`delete_field() cannot be used with set() without merge`)。
+センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(エラー: `field transforms cannot be nested`)。`delete_field()` は `update` と merge `set` でのみ使え、置換の `set` ではエラー(`delete_field() cannot be used with set() without merge`)。
 
 ```ruby
 set(doc("users/1"), {name: "alice", age: 20})
@@ -294,13 +294,14 @@ col("users").doc("1")       # doc("users/1") と同等
 - `where(field, op, value)` — op は `"=="` `"!="` `">"` `">="` `"<"` `"<="` `"in"` `"not-in"` `"array_contains"` `"array_contains_any"` の 10 種。複数 `where` は AND。
   - 未対応の op を渡すと `where()` 呼び出し時に即エラー(`unsupported query op: ...`)。
   - `==` は任意の値の構造比較。大小比較(`>` 等)は**同型のフィールド同士のみ**マッチ:Int は数値順、Str は辞書順、Bool は `false < true`、Timestamp は秒。型が異なる・Nil・存在しないフィールドはマッチしない。
-  - `!=` はフィールドが存在し、値が構造比較で異なる場合にマッチ(存在しないフィールドはマッチしない。型が異なる値は不一致とみなす)。
-  - `in` / `not-in` — `value` は Array(要素は最大 10 個)。`in` はフィールド値がいずれかの要素と等しい場合、`not-in` はフィールドが存在し、どの要素とも等しくない場合にマッチ。空配列の `in` は何もマッチせず、空配列の `not-in` はフィールドを持つ全ドキュメントにマッチする。Array でない値を渡すとクエリ実行時にエラー。
+  - `!=` はフィールドが存在し、値が構造比較で異なる場合にマッチ(存在しないフィールドはマッチしない。型が異なる値は不一致とみなす。emulator バックエンドでは Double と Int の数値比較や Opaque 値の扱いとの整合のため、`!=` はサーバ RPC では絞り込まずクライアント側で評価される)。
+  - `in` / `not-in` — `value` は Array(要素は最大 10 個)。`in` はフィールド値がいずれかの要素と等しい場合、`not-in` はフィールドが存在し、どの要素とも等しくない場合にマッチ(ただし Firestore 仕様に準拠し、比較配列に `nil` が含まれる `not-in` は何もマッチしない)。空配列の `in` は何もマッチせず、空配列の `not-in` はフィールドを持つ全ドキュメントにマッチする。Array でない値を渡すとクエリ実行時にエラー。
   - `array_contains` — フィールドが Array で `value` を要素に含む場合にマッチ。`array_contains_any` — `value` は Array(要素は最大 10 個)で、フィールドの Array と 1 つ以上共通の要素を持つ場合にマッチ(空配列は何もマッチしない)。Array でない値を渡すとクエリ実行時にエラー。
   - **文字列フィルタ値のサイズ制限**: Firestore と同様に、`where` の文字列フィルタ値は **1,500 UTF-8 バイト未満**であること(`in` 等の配列要素・`array_contains` の要素を含む。1,500 バイト以上のフィルタ値はクエリ実行時にエラー:`value for {field} is too large to be used in a query`)。**保存値には長さ制限がない**。有効なフィルタ(< 1,500 バイト)に対しては、保存値との最初の差異位置が常にフィルタ自身の長さ以内に収まるため、全文比較で Firestore と同じ結果になる。in-memory / emulator は同じ検証をクエリ実行時に行う。
+  - `where` の値には `doc("users/1")` などの `DocRef` も指定可能(同一データベース内の参照型フィールドに対する `==` や `in`、`array_contains` 等のクエリ。emulator バックエンドでは同一プロジェクト・同一データベースの完全リソース名へエンコードされて実行される)。
   - 異なる型同士の比較は未規定(§13)。in-memory ではマッチしない。
   - フィールドが存在しないドキュメントはマッチしない(`!=` / `not-in` を含む)。
-- `order_by(field, dir)` — `dir` は `"asc"` / `"desc"`(それ以外は呼び出し時にエラー)。複数回呼ぶと順に適用される。対象フィールドを持たないドキュメントは結果から除外される。同値は firelang 相対ドキュメントパス文字列の辞書順でタイブレークする。同型の値は where と同じ順序(Int 数値順 / Str 辞書順 / Bool `false < true` / Timestamp 秒)で比べ、型が異なる値同士は Nil < Bool < Int < Timestamp < Str < Array < Map の順に並べる(両バックエンド共通)。順序付けは取得後に両バックエンド共通の比較器で適用するため、サーバ側の複合インデックス制約は受けない。
+- `order_by(field, dir)` — `dir` は `"asc"` / `"desc"`(それ以外は呼び出し時にエラー)。複数回呼ぶと順に適用される。対象フィールドを持たないドキュメントは結果から除外される(`__name__` は全ドキュメントが持つ)。同値は firelang 相対ドキュメントパス文字列の辞書順でタイブレークする。同型の値は where と同じ順序(Int 数値順 / Str 辞書順 / Bool `false < true` / Timestamp 秒)で比べ、型が異なる値同士は Nil < Bool < Int < Timestamp < Str < Array < Map の順に並べる(両バックエンド共通)。順序付けは取得後に両バックエンド共通の比較器で適用するため、サーバ側の複合インデックス制約は受けない。
 - `limit(n)` — 件数上限。後勝ち(複数回呼ぶと最後の値)。`n` は 0 以上で、負数はエラー(`limit must be >= 0`)。
 - `offset(n)` — 先頭から `n` 件を飛ばす。後勝ち。`n` は 0 以上で、負数はエラー(`offset must be >= 0`)。件数を超える offset は空結果になる。
 - `get()` — 実行して `Array<Map>` を返す。各 Map には `__name__` キーで**相対ドキュメントパス**(例 `"users/1"`)が入る。

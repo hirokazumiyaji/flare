@@ -225,6 +225,22 @@ fn transaction_can_restart_after_abort_clears_state() {
 }
 
 #[test]
+fn transaction_can_restart_after_commit_failure_clears_state() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let failing = run_in(
+        &mut runtime,
+        "transaction { update(\"users/nonexistent\", {x: 1}) }",
+    );
+    assert!(failing.is_err());
+    let out = run_in(
+        &mut runtime,
+        "transaction { set(\"users/tx_commit_err\", {x: 2}) }\nget(\"users/tx_commit_err\")",
+    )
+    .unwrap();
+    assert!(format!("{out:?}").contains("Int(2)"), "{out:?}");
+}
+
+#[test]
 fn transaction_rolls_back_on_runtime_error() {
     let mut runtime = Runtime::new(InMemoryFirestore::default());
     let failing = run_in(
@@ -1000,6 +1016,34 @@ fn errors_carry_kind_and_line_col() {
         .expect("backend error should be FirelangError");
     assert_eq!(ferr.kind, ErrorKind::Backend);
     assert_eq!(ferr.span, Some(Span::new(1, 1)));
+
+    // 文字列補間内のエラー位置: 式の先頭からの相対位置が正しく反映される
+    let err = run_script("\"#{@}\"").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("lex error in interpolation should be FirelangError");
+    assert_eq!(ferr.span, Some(Span::new(1, 4)));
+
+    let err = run_script("\"#{1 + }\"").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("parse error in interpolation should be FirelangError");
+    assert_eq!(ferr.span, Some(Span::new(1, 8)));
+
+    // マップキーでの文字列補間禁止エラーの位置: 拒否されたキートークン自体の位置を指す
+    let err = run_script("{\"#{x}\": 1}").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("parse error in map key should be FirelangError");
+    assert_eq!(ferr.span, Some(Span::new(1, 2)));
+
+    // 補間内の単一式制約違反: 仕様(docs/spec.md §10)通り位置が付かない (None)
+    let err = run_script("\"#{1; 2}\"").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("parse error in interpolation should be FirelangError");
+    assert_eq!(ferr.span, None);
+    assert_eq!(format!("{ferr}"), "interpolation must contain a single expression");
 }
 
 #[test]
@@ -1020,9 +1064,19 @@ fn inspect_and_to_s_follow_ruby_style() {
     // エスケープ。
     let out = run_script("\"a\\\"b\\nc\"").unwrap();
     assert_eq!(out.inspect(), "\"a\\\"b\\nc\"");
+    // 補間マーカー \#{ は inspect でもエスケープを保持する。
+    let out = run_script("\"\\#{1}\"").unwrap();
+    assert_eq!(out.inspect(), "\"\\#{1}\"");
     // 補間は to_s 形式。
     let out = run_script("\"v=#{[1, 2]}\"").unwrap();
     assert_eq!(out, Value::Str("v=[1, 2]".to_string()));
+    // 参照型は path / id をエスケープ・クォートする。
+    let out = run_script("doc(\"users/1\")").unwrap();
+    assert_eq!(out.inspect(), "#<DocRef path=\"users/1\">");
+    let out = run_script("col(\"users\")").unwrap();
+    assert_eq!(out.inspect(), "#<CollectionRef path=\"users\">");
+    let out = run_script("col_group(\"items\")").unwrap();
+    assert_eq!(out.inspect(), "#<CollectionGroupRef id=\"items\">");
 }
 
 #[test]
@@ -1068,22 +1122,85 @@ fn increment_adds_to_numeric_fields() {
     )
     .unwrap();
     assert_eq!(out.inspect(), "{\"stats\" => {\"m\" => 4, \"n\" => 3}}");
-    // 引数なし・非 Int への加算・オーバーフローはエラー。
+    // 引数なしはエラー。非 Int やオーバーフローは Firestore と同様に上書き・飽和する。
     let err = run_script("increment()").unwrap_err();
     assert!(format!("{err}").contains("expected int argument"), "{err}");
-    let err = run_script(
-        "set(\"users/ic3\", {name: \"a\"})\nupdate(\"users/ic3\", {name: increment(1)})",
+    let out = run_script(
+        "set(\"users/ic3\", {name: \"a\"})\nupdate(\"users/ic3\", {name: increment(1)})\nget(\"users/ic3\")",
     )
-    .unwrap_err();
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"name\" => 1}");
+    let out = run_script(
+        "set(\"users/ic4\", {n: 9223372036854775807})\nupdate(\"users/ic4\", {n: increment(1)})\nget(\"users/ic4\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"n\" => 9223372036854775807}");
+    let out = run_script(
+        "set(\"users/ic5\", {n: -9223372036854775807 - 1})\nupdate(\"users/ic5\", {n: increment(-1)})\nget(\"users/ic5\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"n\" => -9223372036854775808}");
+}
+
+#[test]
+fn nested_sentinels_are_rejected() {
+    let err = run_script("set(\"users/ns1\", {nested: {n: increment(1)}})").unwrap_err();
     assert!(
-        format!("{err}").contains("increment target must be an int"),
+        format!("{err}").contains("field transforms cannot be nested"),
         "{err}"
     );
-    let err = run_script(
-        "set(\"users/ic4\", {n: 9223372036854775807})\nupdate(\"users/ic4\", {n: increment(1)})",
+    let err = run_script("set(\"users/ns2\", {arr: [increment(1)]})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
+    let err = run_script("set(\"users/ns3\", {nested: {df: delete_field()}})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
+    let err = run_script("set(\"users/ns4\", {arr: [delete_field()]})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
+    let err = run_script("set(\"users/ns5\", {})\nupdate(\"users/ns5\", {nested: {n: increment(1)}})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
+    let err = run_script("set(\"users/ns6\", {})\nupdate(\"users/ns6\", {nested: {df: delete_field()}})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
+}
+
+#[test]
+fn update_deletes_ancestor_before_descendant_increment() {
+    let out = run_script(
+        "set(\"users/del_inc\", {a: {b: 10}})\nupdate(\"users/del_inc\", {a: delete_field(), \"a.b\": increment(1)})\nget(\"users/del_inc\")",
     )
-    .unwrap_err();
-    assert!(format!("{err}").contains("integer overflow"), "{err}");
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"a\" => {\"b\" => 1}}");
+}
+
+#[test]
+fn replacement_set_resolves_increment_under_literal_hyphen_key() {
+    let out = run_script(
+        "set(\"users/lit_hyphen\", {\"a-b\": increment(1)})\nget(\"users/lit_hyphen\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"a-b\" => 1}");
+}
+
+#[test]
+fn update_applies_plain_before_descendant_increment() {
+    let out = run_script(
+        "set(\"users/plain_inc\", {a: {b: 10}})\nupdate(\"users/plain_inc\", {a: {b: 100}, \"a.b\": increment(1)})\nget(\"users/plain_inc\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"a\" => {\"b\" => 101}}");
 }
 
 #[test]
@@ -1118,6 +1235,9 @@ fn timestamp_comparison_diff_and_rfc3339() {
     assert_eq!(out, Value::Str("1970-01-01T00:00:00+00:00".to_string()));
     let out = run_script("timestamp(\"2026-02-01T00:00:00+09:00\").to_rfc3339()").unwrap();
     assert_eq!(out, Value::Str("2026-01-31T15:00:00+00:00".to_string()));
+    // RFC3339 の 4 桁年(0000..=9999)の範囲外はエラー。
+    let err = run_script("timestamp(253402300800).to_rfc3339()").unwrap_err();
+    assert!(format!("{err}").contains("timestamp out of range"), "{err}");
     // if 条件にも使える。
     let out = run_script("if timestamp(200) > timestamp(100) { 1 } else { 2 }").unwrap();
     assert_eq!(out, Value::Int(1));
@@ -1165,6 +1285,38 @@ fn order_by_sorts_and_excludes_docs_missing_the_field() {
             Value::Str("users/ob1".to_string()),
         ])
     );
+    // __name__ によるソートは全ドキュメントを対象にし、パス順で並ぶ。
+    let out = run_script(&format!(
+        "{setup}\ncol(\"users\").order_by(\"__name__\", \"desc\").get().map {{ |r| r[\"__name__\"] }}"
+    ))
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("users/ob4".to_string()),
+            Value::Str("users/ob3".to_string()),
+            Value::Str("users/ob2".to_string()),
+            Value::Str("users/ob1".to_string()),
+        ])
+    );
+    // ドット区切りのネストしたフィールドパスでのソートと where
+    let setup_nested = "set(\"nested/n1\", {profile: {age: 30}})\nset(\"nested/n2\", {profile: {age: 10}})\nset(\"nested/n3\", {profile: 1})";
+    let out = run_script(&format!(
+        "{setup_nested}\ncol(\"nested\").order_by(\"profile.age\", \"asc\").get().map {{ |r| r[\"__name__\"] }}"
+    ))
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("nested/n2".to_string()),
+            Value::Str("nested/n1".to_string()),
+        ])
+    );
+    let out = run_script(&format!(
+        "{setup_nested}\ncol(\"nested\").where(\"profile.age\", \">=\", 20).get().map {{ |r| r[\"__name__\"] }}"
+    ))
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Str("nested/n1".to_string())]));
     // 不正な向きは呼び出し時にエラー。
     let err = run_script("col(\"users\").order_by(\"age\", \"up\")").unwrap_err();
     assert!(
@@ -1186,9 +1338,9 @@ fn where_supports_not_equal_and_membership_operators() {
         out,
         Value::Array(vec![Value::Int(1), Value::Int(1), Value::Int(0)])
     );
-    // `in` / `not-in`。
+    // `in` / `not-in`。not-in に nil を含む場合は常に 0 件。
     let out = run_script(&format!(
-        "{setup}\n[col(\"users\").where(\"age\", \"in\", [20, 30]).get().len(), col(\"users\").where(\"age\", \"not-in\", [20]).get().len(), col(\"users\").where(\"age\", \"in\", []).get().len(), col(\"users\").where(\"age\", \"not-in\", []).get().len()]"
+        "{setup}\n[col(\"users\").where(\"age\", \"in\", [20, 30]).get().len(), col(\"users\").where(\"age\", \"not-in\", [20]).get().len(), col(\"users\").where(\"age\", \"in\", []).get().len(), col(\"users\").where(\"age\", \"not-in\", []).get().len(), col(\"users\").where(\"age\", \"not-in\", [20, nil]).get().len(), col(\"users\").where(\"age\", \"!=\", 20).where(\"age\", \"!=\", 30).get().len()]"
     ))
     .unwrap();
     assert_eq!(
@@ -1197,10 +1349,21 @@ fn where_supports_not_equal_and_membership_operators() {
             Value::Int(2),
             Value::Int(1),
             Value::Int(0),
-            Value::Int(2)
+            Value::Int(2),
+            Value::Int(0),
+            Value::Int(0),
         ])
     );
     // 配列でなければ実行時エラー、11 要素以上もエラー。
+    let setup_nil = "set(\"items/1\", {val: nil})\nset(\"items/2\", {val: 10})";
+    let out = run_script(&format!(
+        "{setup_nil}\n[col(\"items\").where(\"val\", \"not-in\", []).get().len(), col(\"items\").where(\"val\", \"!=\", nil).get().len(), col(\"items\").where(\"val\", \"not-in\", [nil]).get().len()]"
+    ))
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(2), Value::Int(1), Value::Int(0)])
+    );
     let err = run_script("col(\"users\").where(\"age\", \"in\", 5).get()").unwrap_err();
     assert!(
         format!("{err}").contains("in filter requires an array value"),
@@ -1289,4 +1452,18 @@ fn offset_skips_after_sort_and_count_ignores_paging() {
     // 負の offset はエラー。
     let err = run_script("col(\"users\").offset(0 - 1).get()").unwrap_err();
     assert!(format!("{err}").contains("offset must be >= 0"), "{err}");
+}
+
+#[test]
+fn overlapping_update_and_delete_paths_are_rejected() {
+    let err = run_script("set(\"users/ov1\", {})\nupdate(\"users/ov1\", {a: delete_field(), \"a.b\": 1})")
+        .unwrap_err();
+    assert!(format!("{err}").contains("overlapping field paths"), "{err}");
+
+    let err = run_script("set(\"users/ov2\", {a: 1, \"a.b\": 2}, merge: true)").unwrap_err();
+    assert!(format!("{err}").contains("overlapping field paths"), "{err}");
+
+    let err = run_script("set(\"users/ov3\", {})\nupdate(\"users/ov3\", {\"a.b\": delete_field(), a: 1})")
+        .unwrap_err();
+    assert!(format!("{err}").contains("overlapping field paths"), "{err}");
 }
