@@ -441,6 +441,7 @@ fn build_write(fs: &FirestoreEmulator, op: &WriteOp) -> Result<Write, Box<dyn Er
                 let mut mask_paths: Vec<String> = plain.keys().cloned().collect();
                 // DeleteField は update_mask に含めつつ fields から除外する。
                 mask_paths.extend(deletes);
+                super::validate_no_overlapping_paths(mask_paths.iter().map(String::as_str))?;
                 (
                     Some(DocumentMask {
                         field_paths: mask_paths,
@@ -480,6 +481,7 @@ fn build_write(fs: &FirestoreEmulator, op: &WriteOp) -> Result<Write, Box<dyn Er
             // DeleteField は update_mask に含めつつ fields から除外する。
             let mut field_paths: Vec<String> = plain.keys().cloned().collect();
             field_paths.extend(deletes);
+            super::validate_no_overlapping_paths(field_paths.iter().map(String::as_str))?;
             let fields = encode_fields(&nest_field_paths(plain)?)?;
             Ok(Write {
                 update_mask: Some(DocumentMask { field_paths }),
@@ -1075,5 +1077,36 @@ mod tests {
         assert_eq!(escaped[1].0, "`a.b`");
         assert_eq!(escaped[2].0, "`a-b`");
         assert_eq!(escaped[3].0, "`1start_digit`");
+    }
+
+    #[test]
+    fn rejects_overlapping_update_and_delete_paths() {
+        let fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
+        let err = build_write(
+            &fs,
+            &WriteOp::Update {
+                path: "c/d".to_string(),
+                data: BTreeMap::from([
+                    ("a".to_string(), Value::DeleteField),
+                    ("a.b".to_string(), Value::Int(1)),
+                ]),
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("overlapping field paths: a and a.b"));
+
+        let err = build_write(
+            &fs,
+            &WriteOp::Set {
+                path: "c/d".to_string(),
+                merge: true,
+                data: BTreeMap::from([
+                    ("a".to_string(), Value::Int(1)),
+                    ("a.b".to_string(), Value::Int(2)),
+                ]),
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("overlapping field paths: a and a.b"));
     }
 }

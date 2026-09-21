@@ -245,6 +245,12 @@ fn apply_update_map(
             _ => plain.push((k.clone(), v.clone())),
         }
     }
+    super::validate_no_overlapping_paths(
+        deletes
+            .iter()
+            .map(String::as_str)
+            .chain(plain.iter().map(|(k, _)| k.as_str())),
+    )?;
     for k in &deletes {
         let segments: Vec<&str> = k.split('.').collect();
         remove_at_field_path(current, &segments)?;
