@@ -1122,20 +1122,56 @@ fn increment_adds_to_numeric_fields() {
     )
     .unwrap();
     assert_eq!(out.inspect(), "{\"stats\" => {\"m\" => 4, \"n\" => 3}}");
-    // 引数なし・非 Int への加算・オーバーフローはエラー。
+    // 引数なしはエラー。非 Int やオーバーフローは Firestore と同様に上書き・飽和する。
     let err = run_script("increment()").unwrap_err();
     assert!(format!("{err}").contains("expected int argument"), "{err}");
-    let err = run_script(
-        "set(\"users/ic3\", {name: \"a\"})\nupdate(\"users/ic3\", {name: increment(1)})",
+    let out = run_script(
+        "set(\"users/ic3\", {name: \"a\"})\nupdate(\"users/ic3\", {name: increment(1)})\nget(\"users/ic3\")",
     )
-    .unwrap_err();
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"name\" => 1}");
+    let out = run_script(
+        "set(\"users/ic4\", {n: 9223372036854775807})\nupdate(\"users/ic4\", {n: increment(1)})\nget(\"users/ic4\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"n\" => 9223372036854775807}");
+    let out = run_script(
+        "set(\"users/ic5\", {n: -9223372036854775807 - 1})\nupdate(\"users/ic5\", {n: increment(-1)})\nget(\"users/ic5\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"n\" => -9223372036854775808}");
+}
+
+#[test]
+fn nested_sentinels_are_rejected() {
+    let err = run_script("set(\"users/ns1\", {nested: {n: increment(1)}})").unwrap_err();
     assert!(
-        format!("{err}").contains("increment target must be an int"),
+        format!("{err}").contains("field transforms cannot be nested"),
         "{err}"
     );
-    let err = run_script(
-        "set(\"users/ic4\", {n: 9223372036854775807})\nupdate(\"users/ic4\", {n: increment(1)})",
-    )
-    .unwrap_err();
-    assert!(format!("{err}").contains("integer overflow"), "{err}");
+    let err = run_script("set(\"users/ns2\", {arr: [increment(1)]})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
+    let err = run_script("set(\"users/ns3\", {nested: {df: delete_field()}})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
+    let err = run_script("set(\"users/ns4\", {arr: [delete_field()]})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
+    let err = run_script("set(\"users/ns5\", {})\nupdate(\"users/ns5\", {nested: {n: increment(1)}})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
+    let err = run_script("set(\"users/ns6\", {})\nupdate(\"users/ns6\", {nested: {df: delete_field()}})").unwrap_err();
+    assert!(
+        format!("{err}").contains("field transforms cannot be nested"),
+        "{err}"
+    );
 }
