@@ -169,9 +169,9 @@ impl Value {
             }
             Value::DeleteField => "DeleteField".to_string(),
             Value::Increment(n) => format!("Increment({n})"),
-            Value::DocRef(d) => format!("#<DocRef path={}>", d.path),
-            Value::CollectionRef(c) => format!("#<CollectionRef path={}>", c.path),
-            Value::CollectionGroupRef(cg) => format!("#<CollectionGroupRef id={}>", cg.id),
+            Value::DocRef(d) => format!("#<DocRef path={}>", inspect_str(&d.path)),
+            Value::CollectionRef(c) => format!("#<CollectionRef path={}>", inspect_str(&c.path)),
+            Value::CollectionGroupRef(cg) => format!("#<CollectionGroupRef id={}>", inspect_str(&cg.id)),
             Value::QueryRef(_) => "#<QueryRef>".to_string(),
             Value::Func(_) => "<func>".to_string(),
         }
@@ -181,13 +181,16 @@ impl Value {
 fn inspect_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
-    for ch in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            '#' if chars.peek() == Some(&'{') => out.push_str("\\#"),
+            other if other.is_control() => out.push_str(&format!("\\u{{{:04x}}}", other as u32)),
             other => out.push(other),
         }
     }

@@ -135,7 +135,7 @@ fn apply_write_to_docs(
                 let current = docs.entry(path).or_default();
                 apply_update_map(current, &mut data)?;
             } else {
-                resolve_sentinel_map(&mut data, None)?;
+                resolve_sentinel_map(&mut data)?;
                 docs.insert(path, data);
             }
             Ok(())
@@ -226,57 +226,39 @@ fn apply_update_map(
     current: &mut BTreeMap<String, Value>,
     updates: &mut BTreeMap<String, Value>,
 ) -> Result<(), Box<dyn Error>> {
-    for k in updates.keys() {
+    for (k, v) in updates.iter() {
         super::validate_field_path(k)?;
+        reject_nested_sentinels(v, false)?;
     }
-    // DeleteField / Increment は current への直接操作が必要なため、
-    // 他のセンチネル解決より先に処理する。
+    // Firestore の挙動に合わせ、1) 削除 2) 通常フィールド更新 3) フィールド変換(increment等)
+    // の順序で適用する。
     let mut deletes = vec![];
-    let mut increments = vec![];
+    let mut plain = vec![];
+    let mut transforms = vec![];
     for (k, v) in updates.iter() {
         match v {
             Value::DeleteField => deletes.push(k.clone()),
-            Value::Increment(n) => {
-                let segments: Vec<&str> = k.split('.').collect();
-                let next = match lookup_field_path(Some(current), &segments) {
-                    Some(Value::Int(cur)) => cur.checked_add(*n).unwrap_or_else(|| {
-                        if n.is_negative() { i64::MIN } else { i64::MAX }
-                    }),
-                    Some(_) => *n,
-                    None => *n,
-                };
-                increments.push((k.clone(), next));
-            }
-            _ => {}
+            Value::ArrayUnion(_)
+            | Value::ArrayRemove(_)
+            | Value::ServerTimestamp
+            | Value::Increment(_) => transforms.push((k.clone(), v.clone())),
+            _ => plain.push((k.clone(), v.clone())),
         }
     }
     for k in &deletes {
-        updates.remove(k);
         let segments: Vec<&str> = k.split('.').collect();
         remove_at_field_path(current, &segments)?;
     }
-    for (k, next) in increments {
-        updates.insert(k, Value::Int(next));
-    }
-    resolve_sentinel_map(updates, Some(current))?;
-    for (k, v) in updates.iter() {
+    for (k, v) in plain {
         let segments: Vec<&str> = k.split('.').collect();
-        super::insert_at_field_path(current, &segments, v.clone())?;
+        super::insert_at_field_path(current, &segments, v)?;
     }
-    Ok(())
-}
-
-fn resolve_sentinel_map(
-    map: &mut BTreeMap<String, Value>,
-    current: Option<&BTreeMap<String, Value>>,
-) -> Result<(), Box<dyn Error>> {
-    for (k, v) in map.clone() {
-        reject_nested_sentinels(&v, false)?;
+    for (k, v) in transforms {
         let segments: Vec<&str> = k.split('.').collect();
-        let base = || lookup_field_path(current, &segments);
+        let base = lookup_field_path(Some(current), &segments);
         let resolved = match v {
             Value::ArrayUnion(values) => {
-                let mut arr = match base() {
+                let mut arr = match base {
                     Some(Value::Array(a)) => a.clone(),
                     _ => vec![],
                 };
@@ -288,7 +270,7 @@ fn resolve_sentinel_map(
                 Value::Array(arr)
             }
             Value::ArrayRemove(values) => {
-                let arr = match base() {
+                let arr = match base {
                     Some(Value::Array(a)) => a.clone(),
                     _ => vec![],
                 };
@@ -297,12 +279,38 @@ fn resolve_sentinel_map(
             Value::ServerTimestamp => Value::Timestamp(Timestamp {
                 seconds: Timestamp::now()?.seconds,
             }),
-            Value::Increment(n) => match base() {
+            Value::Increment(n) => match base {
                 Some(Value::Int(cur)) => Value::Int(cur.checked_add(n).unwrap_or_else(|| {
                     if n.is_negative() { i64::MIN } else { i64::MAX }
                 })),
                 _ => Value::Int(n),
             },
+            Value::DeleteField => unreachable!(),
+            other => other,
+        };
+        super::insert_at_field_path(current, &segments, resolved)?;
+    }
+    Ok(())
+}
+
+fn resolve_sentinel_map(map: &mut BTreeMap<String, Value>) -> Result<(), Box<dyn Error>> {
+    for (k, v) in map.clone() {
+        reject_nested_sentinels(&v, false)?;
+        let resolved = match v {
+            Value::ArrayUnion(values) => {
+                let mut arr = vec![];
+                for item in values {
+                    if !arr.contains(&item) {
+                        arr.push(item);
+                    }
+                }
+                Value::Array(arr)
+            }
+            Value::ArrayRemove(_) => Value::Array(vec![]),
+            Value::ServerTimestamp => Value::Timestamp(Timestamp {
+                seconds: Timestamp::now()?.seconds,
+            }),
+            Value::Increment(n) => Value::Int(n),
             // 置換 set(merge なし)でフィールド削除は意味を持たない。
             // Firestore と同様にエラーにし、emulator と挙動を揃える。
             Value::DeleteField => {
