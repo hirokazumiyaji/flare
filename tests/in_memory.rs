@@ -1193,3 +1193,12 @@ fn replacement_set_resolves_increment_under_literal_hyphen_key() {
     .unwrap();
     assert_eq!(out.inspect(), "{\"a-b\" => 1}");
 }
+
+#[test]
+fn update_applies_plain_before_descendant_increment() {
+    let out = run_script(
+        "set(\"users/plain_inc\", {a: {b: 10}})\nupdate(\"users/plain_inc\", {a: {b: 100}, \"a.b\": increment(1)})\nget(\"users/plain_inc\")",
+    )
+    .unwrap();
+    assert_eq!(out.inspect(), "{\"a\" => {\"b\" => 101}}");
+}
