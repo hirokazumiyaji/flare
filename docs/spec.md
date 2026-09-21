@@ -46,7 +46,7 @@ puts "found #{rows}"
   ただし `fn` / `if` / `while` / ブロック付きメソッドの `{ ... }`(文の並び)では改行は文の区切りのまま。delimiter の内側では `;` は改行と同じにはならない(要素の区切りは `,` のみ。`[;1]` 等はエラー)。
 - `#` から行末まではコメント(文字列リテラル内を除く)。
 - プログラムの評価結果は、最後に評価された文の値。`return` がトップレベルで実行された場合はその値。
-- `fl` CLI は評価結果を `=> <Debug表現>` 形式で標準出力に印字する。
+- `fl` CLI は評価結果を `=> <inspect表現>` 形式で標準出力に印字する。
 
 ## 3. 値と型
 
@@ -233,7 +233,7 @@ while cond { ... }
 
 ### 組み込み出力
 
-`puts(v, ...)` — 各値を 1 行ずつ印字して nil を返す。スカラー以外(Array / Map 等)は Debug 形式で印字される。
+`puts(v, ...)` — 各値を `to_s` 形式で 1 行ずつ印字して nil を返す。`to_s` は Str を素(クォートなし)で出し、それ以外は `inspect` 形式。`inspect` 形式は Ruby 風: `[1, "x"]` / `{"a" => 1}` / `nil` / `"str"`(Str はダブルクォート付き、キー昇順)。`fl` の最終結果は `=> <inspect>` で印字される(トップレベルの Str もクォート付き)。文字列補間 `#{式}` の埋め込みは `to_s` 形式。
 
 ## 6. Firestore API
 
@@ -340,7 +340,7 @@ usage: fl [--backend in-memory|emulator] <script-file>
 - `--backend emulator` のとき:
   - `FIRESTORE_EMULATOR_HOST` — **必須**。未設定なら即エラー。
   - `FIRESTORE_PROJECT_ID` — 省略時 `firelang-test`。
-- 実行結果は `=> <Debug表現>` で印字。
+- 実行結果は `=> <inspect表現>` で印字。
 - エラーは `error: <line>:<col>: <message>` を stderr に印字して exit 1。lex / parse エラーは該当トークンの位置、runtime / backend エラーは失敗したトップレベル文の開始位置。位置が付かない場合(補間内の単一式制約違反など)は `error: <message>`。
 
 ## 11. バックエンド
@@ -374,4 +374,3 @@ usage: fl [--backend in-memory|emulator] <script-file>
 | 項目 | 現状の挙動 | 予定 |
 |------|-----------|------|
 | `where` の異なる型同士の大小比較 | in-memory ではマッチしない。emulator では Firestore の型順序で比較される(§7 は同型のみを規定) | backlog |
-| `puts` / `fl` の複合値出力 | Rust の Debug 形式(`Map({"a": Int(1)})`) | backlog |

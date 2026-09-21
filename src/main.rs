@@ -66,7 +66,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    println!("=> {out:?}");
+    println!("=> {}", out.inspect());
     Ok(())
 }
 

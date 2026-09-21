@@ -1045,3 +1045,36 @@ fn errors_carry_kind_and_line_col() {
     assert_eq!(ferr.span, None);
     assert_eq!(format!("{ferr}"), "interpolation must contain a single expression");
 }
+
+#[test]
+fn inspect_and_to_s_follow_ruby_style() {
+    // inspect: Str はクォート付き、Map は "k" => v・キー昇順。
+    let out = run_script("[1, \"x\", true, nil]").unwrap();
+    assert_eq!(out.inspect(), "[1, \"x\", true, nil]");
+    let out = run_script("{name: \"alice\", age: 20}").unwrap();
+    assert_eq!(out.inspect(), "{\"age\" => 20, \"name\" => \"alice\"}");
+    let out = run_script("{tags: [\"a\", 1]}").unwrap();
+    assert_eq!(out.inspect(), "{\"tags\" => [\"a\", 1]}");
+    // to_s (Display): Str は素、それ以外は inspect と同じ。
+    let out = run_script("\"hi\"").unwrap();
+    assert_eq!(out.to_string(), "hi");
+    assert_eq!(out.inspect(), "\"hi\"");
+    let out = run_script("[1, \"x\"]").unwrap();
+    assert_eq!(out.to_string(), "[1, \"x\"]");
+    // エスケープ。
+    let out = run_script("\"a\\\"b\\nc\"").unwrap();
+    assert_eq!(out.inspect(), "\"a\\\"b\\nc\"");
+    // 補間マーカー \#{ は inspect でもエスケープを保持する。
+    let out = run_script("\"\\#{1}\"").unwrap();
+    assert_eq!(out.inspect(), "\"\\#{1}\"");
+    // 補間は to_s 形式。
+    let out = run_script("\"v=#{[1, 2]}\"").unwrap();
+    assert_eq!(out, Value::Str("v=[1, 2]".to_string()));
+    // 参照型は path / id をエスケープ・クォートする。
+    let out = run_script("doc(\"users/1\")").unwrap();
+    assert_eq!(out.inspect(), "#<DocRef path=\"users/1\">");
+    let out = run_script("col(\"users\")").unwrap();
+    assert_eq!(out.inspect(), "#<CollectionRef path=\"users\">");
+    let out = run_script("col_group(\"items\")").unwrap();
+    assert_eq!(out.inspect(), "#<CollectionGroupRef id=\"items\">");
+}
