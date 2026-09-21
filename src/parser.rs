@@ -372,13 +372,16 @@ impl Parser {
             loop {
                 let key = match self.peek().clone() {
                     Token::Str(parts) => {
+                        let span = self.peek_span();
                         self.bump();
                         match parts.as_slice() {
                             [lexer::StrPart::Lit(s)] => s.clone(),
                             _ => {
-                                return Err(
-                                    self.parse_err("interpolation is not allowed in map keys")
+                                return Err(FirelangError::parse(
+                                    "interpolation is not allowed in map keys",
+                                    span,
                                 )
+                                .into())
                             }
                         }
                     }

@@ -982,4 +982,24 @@ fn errors_carry_kind_and_line_col() {
         .expect("backend error should be FirelangError");
     assert_eq!(ferr.kind, ErrorKind::Backend);
     assert_eq!(ferr.span, Some(Span::new(1, 1)));
+
+    // 文字列補間内のエラー位置: 式の先頭からの相対位置が正しく反映される
+    let err = run_script("\"#{@}\"").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("lex error in interpolation should be FirelangError");
+    assert_eq!(ferr.span, Some(Span::new(1, 4)));
+
+    let err = run_script("\"#{1 + }\"").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("parse error in interpolation should be FirelangError");
+    assert_eq!(ferr.span, Some(Span::new(1, 8)));
+
+    // マップキーでの文字列補間禁止エラーの位置: 拒否されたキートークン自体の位置を指す
+    let err = run_script("{\"#{x}\": 1}").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("parse error in map key should be FirelangError");
+    assert_eq!(ferr.span, Some(Span::new(1, 2)));
 }
