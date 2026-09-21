@@ -228,7 +228,7 @@ impl Firestore for FirestoreEmulator {
         match &query.source {
             QuerySource::Collection(path) => {
                 let (parent, collection_id) = split_collection_path(path)?;
-                let sq = structured_query(collection_id, false, &query.filters)?;
+                let sq = structured_query(&self.project_id, collection_id, false, &query.filters)?;
                 run_query_sorted(
                     self,
                     parent.as_deref(),
@@ -240,7 +240,7 @@ impl Firestore for FirestoreEmulator {
                 )
             }
             QuerySource::CollectionGroup(id) => {
-                let sq = structured_query(id, true, &query.filters)?;
+                let sq = structured_query(&self.project_id, id, true, &query.filters)?;
                 run_query_sorted(
                     self,
                     None,
@@ -433,6 +433,7 @@ fn sort_query_results(out: &mut Vec<(String, Value)>, order_by: &[(String, Direc
 }
 
 fn structured_query(
+    project_id: &str,
     collection_id: &str,
     all_descendants: bool,
     filters: &[QueryFilter],
@@ -443,7 +444,7 @@ fn structured_query(
             collection_id: collection_id.to_string(),
             all_descendants,
         }],
-        r#where: build_where(filters)?,
+        r#where: build_where(project_id, filters)?,
         order_by: vec![],
         start_at: None,
         end_at: None,
@@ -454,6 +455,7 @@ fn structured_query(
 }
 
 fn build_where(
+    project_id: &str,
     filters: &[QueryFilter],
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
     let mut parts = vec![];
@@ -530,7 +532,7 @@ fn build_where(
                         field_path: f.field.clone(),
                     }),
                     op: op.into(),
-                    value: Some(encode_field_value(&f.value)?),
+                    value: Some(encode_query_value(project_id, &f.value)?),
                 },
             )),
         });
@@ -800,6 +802,40 @@ fn encode_field_value(v: &Value) -> Result<SdkValue, Box<dyn Error>> {
                 fields: encode_fields(m)?,
             }),
             _ => return Err(format!("unsupported value in emulator write: {v:?}").into()),
+        }),
+    })
+}
+
+fn encode_query_value(project_id: &str, v: &Value) -> Result<SdkValue, Box<dyn Error>> {
+    Ok(SdkValue {
+        value_type: Some(match v {
+            Value::Str(s) => value::ValueType::StringValue(s.clone()),
+            Value::Int(i) => value::ValueType::IntegerValue(*i),
+            Value::Bool(b) => value::ValueType::BooleanValue(*b),
+            Value::Nil => value::ValueType::NullValue(NullValue::NullValue.into()),
+            Value::Timestamp(ts) => value::ValueType::TimestampValue(ProtoTimestamp {
+                seconds: ts.seconds,
+                nanos: 0,
+            }),
+            Value::DocRef(d) => value::ValueType::ReferenceValue(format!(
+                "projects/{project_id}/databases/(default)/documents/{}",
+                d.path.trim_start_matches('/')
+            )),
+            Value::Array(items) => {
+                let mut out = vec![];
+                for item in items {
+                    out.push(encode_query_value(project_id, item)?);
+                }
+                value::ValueType::ArrayValue(ArrayValue { values: out })
+            }
+            Value::Map(m) => {
+                let mut out = HashMap::new();
+                for (k, val) in m {
+                    out.insert(k.clone(), encode_query_value(project_id, val)?);
+                }
+                value::ValueType::MapValue(MapValue { fields: out })
+            }
+            _ => return Err(format!("unsupported value in emulator query: {v:?}").into()),
         }),
     })
 }
@@ -1336,6 +1372,73 @@ mod tests {
         assert_eq!(escaped[1].0, "`a.b`");
         assert_eq!(escaped[2].0, "`a-b`");
         assert_eq!(escaped[3].0, "`1start_digit`");
+    }
+
+    #[test]
+    fn encode_doc_ref_in_query_filter_encodes_reference_value() {
+        let val = encode_query_value("my-project", &Value::DocRef(DocRef {
+            path: "users/1".to_string(),
+        }))
+        .unwrap();
+        assert_eq!(
+            val.value_type,
+            Some(value::ValueType::ReferenceValue(
+                "projects/my-project/databases/(default)/documents/users/1".to_string()
+            ))
+        );
+
+        // 配列内の DocRef も正しくエンコードされること
+        let arr_val = encode_query_value(
+            "my-project",
+            &Value::Array(vec![Value::DocRef(DocRef {
+                path: "users/1".to_string(),
+            })]),
+        )
+        .unwrap();
+        let Some(value::ValueType::ArrayValue(arr)) = arr_val.value_type else {
+            panic!("expected ArrayValue");
+        };
+        assert_eq!(arr.values.len(), 1);
+        assert_eq!(
+            arr.values[0].value_type,
+            Some(value::ValueType::ReferenceValue(
+                "projects/my-project/databases/(default)/documents/users/1".to_string()
+            ))
+        );
+
+        // write 側は引き続き DocRef を拒否すること
+        let err = encode_field_value(&Value::DocRef(DocRef {
+            path: "users/1".to_string(),
+        }))
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("unsupported value in emulator write"),
+            "{err}"
+        );
+
+        // build_where に渡したフィルタも正しく組み立てられること
+        let filter = build_where(
+            "my-project",
+            &[QueryFilter {
+                field: "owner".to_string(),
+                op: QueryOp::Eq,
+                value: Value::DocRef(DocRef {
+                    path: "users/1".to_string(),
+                }),
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        let Some(structured_query::filter::FilterType::FieldFilter(ff)) = filter.filter_type else {
+            panic!("expected FieldFilter");
+        };
+        assert_eq!(ff.field.unwrap().field_path, "owner");
+        assert_eq!(
+            ff.value.unwrap().value_type,
+            Some(value::ValueType::ReferenceValue(
+                "projects/my-project/databases/(default)/documents/users/1".to_string()
+            ))
+        );
     }
 
     #[test]
