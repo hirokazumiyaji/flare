@@ -235,7 +235,7 @@ pub(crate) fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFil
             },
             QueryOp::NotIn => match (&f.value, actual) {
                 (Value::Array(list), Some(v)) => {
-                    if list.contains(&Value::Nil) || v == &Value::Nil {
+                    if list.contains(&Value::Nil) {
                         false
                     } else {
                         !list.contains(v)

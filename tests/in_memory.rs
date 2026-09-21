@@ -1323,6 +1323,15 @@ fn where_supports_not_equal_and_membership_operators() {
         ])
     );
     // 配列でなければ実行時エラー、11 要素以上もエラー。
+    let setup_nil = "set(\"items/1\", {val: nil})\nset(\"items/2\", {val: 10})";
+    let out = run_script(&format!(
+        "{setup_nil}\n[col(\"items\").where(\"val\", \"not-in\", []).get().len(), col(\"items\").where(\"val\", \"!=\", nil).get().len(), col(\"items\").where(\"val\", \"not-in\", [nil]).get().len()]"
+    ))
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(2), Value::Int(1), Value::Int(0)])
+    );
     let err = run_script("col(\"users\").where(\"age\", \"in\", 5).get()").unwrap_err();
     assert!(
         format!("{err}").contains("in filter requires an array value"),

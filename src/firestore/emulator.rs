@@ -458,7 +458,8 @@ fn build_where(
         let is_inequality = matches!(f.op, QueryOp::Ne | QueryOp::NotIn);
         let is_membership =
             matches!(f.op, QueryOp::In | QueryOp::NotIn | QueryOp::ArrayContainsAny);
-        let is_array_contains = matches!(f.op, QueryOp::ArrayContains);
+        let is_array_contains =
+            matches!(f.op, QueryOp::ArrayContains | QueryOp::ArrayContainsAny);
 
         if is_inequality && has_inequality {
             // Firestore はクエリ全体で NOT_EQUAL / NOT_IN を 1 つのみ許可するため、
@@ -471,8 +472,13 @@ fn build_where(
             continue;
         }
         if is_array_contains && has_array_contains {
-            // Firestore は array_contains をクエリ全体で最大 1 つのみ許可するため、
+            // Firestore は array_contains と array_contains_any をクエリ全体で最大 1 つのみ許可するため、
             // 2 つ目以降はサーバに送らずクライアント側(matches_filters)で評価する。
+            continue;
+        }
+        if f.op == QueryOp::Ne && f.value == Value::Nil {
+            // Firestore は != nil に UnaryFilter(IS_NOT_NULL) を要求するため、
+            // FieldFilter で送らずクライアント側で評価する。
             continue;
         }
         match f.op {
