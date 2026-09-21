@@ -1244,7 +1244,6 @@ fn timestamp_comparison_diff_and_rfc3339() {
 }
 
 #[test]
-<<<<<<< HEAD
 fn order_by_sorts_and_excludes_docs_missing_the_field() {
     // emulator テスト(emulator_extended_query_matches_in_memory)と
     // 同じケース。order_by 対象を持たない ob4 は除外、同値はパス辞書順。
@@ -1307,9 +1306,9 @@ fn where_supports_not_equal_and_membership_operators() {
         out,
         Value::Array(vec![Value::Int(1), Value::Int(1), Value::Int(0)])
     );
-    // `in` / `not-in`。
+    // `in` / `not-in`。not-in に nil を含む場合は常に 0 件。
     let out = run_script(&format!(
-        "{setup}\n[col(\"users\").where(\"age\", \"in\", [20, 30]).get().len(), col(\"users\").where(\"age\", \"not-in\", [20]).get().len(), col(\"users\").where(\"age\", \"in\", []).get().len(), col(\"users\").where(\"age\", \"not-in\", []).get().len()]"
+        "{setup}\n[col(\"users\").where(\"age\", \"in\", [20, 30]).get().len(), col(\"users\").where(\"age\", \"not-in\", [20]).get().len(), col(\"users\").where(\"age\", \"in\", []).get().len(), col(\"users\").where(\"age\", \"not-in\", []).get().len(), col(\"users\").where(\"age\", \"not-in\", [20, nil]).get().len(), col(\"users\").where(\"age\", \"!=\", 20).where(\"age\", \"!=\", 30).get().len()]"
     ))
     .unwrap();
     assert_eq!(
@@ -1318,7 +1317,9 @@ fn where_supports_not_equal_and_membership_operators() {
             Value::Int(2),
             Value::Int(1),
             Value::Int(0),
-            Value::Int(2)
+            Value::Int(2),
+            Value::Int(0),
+            Value::Int(0),
         ])
     );
     // 配列でなければ実行時エラー、11 要素以上もエラー。

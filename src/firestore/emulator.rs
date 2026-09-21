@@ -211,6 +211,18 @@ impl Firestore for FirestoreEmulator {
 
     fn run_query(&self, query: &QueryRef) -> Result<Vec<Value>, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
+        // in: [] や array_contains_any: []、not-in: [..., nil, ...] は 0 件確定
+        for f in &query.filters {
+            match (&f.op, &f.value) {
+                (QueryOp::In | QueryOp::ArrayContainsAny, Value::Array(a)) if a.is_empty() => {
+                    return Ok(vec![]);
+                }
+                (QueryOp::NotIn, Value::Array(a)) if a.contains(&Value::Nil) => {
+                    return Ok(vec![]);
+                }
+                _ => {}
+            }
+        }
         match &query.source {
             QuerySource::Collection(path) => {
                 let (parent, collection_id) = split_collection_path(path)?;
@@ -219,6 +231,7 @@ impl Firestore for FirestoreEmulator {
                     self,
                     parent.as_deref(),
                     sq,
+                    &query.filters,
                     &query.order_by,
                     query.offset,
                     query.limit,
@@ -226,7 +239,15 @@ impl Firestore for FirestoreEmulator {
             }
             QuerySource::CollectionGroup(id) => {
                 let sq = structured_query(id, true, &query.filters)?;
-                run_query_sorted(self, None, sq, &query.order_by, query.offset, query.limit)
+                run_query_sorted(
+                    self,
+                    None,
+                    sq,
+                    &query.filters,
+                    &query.order_by,
+                    query.offset,
+                    query.limit,
+                )
             }
         }
     }
@@ -324,6 +345,7 @@ fn run_query_sorted(
     fs: &FirestoreEmulator,
     parent: Option<&str>,
     query: StructuredQuery,
+    filters: &[QueryFilter],
     order_by: &[(String, Direction)],
     offset: Option<usize>,
     limit: Option<usize>,
@@ -357,6 +379,12 @@ fn run_query_sorted(
         let value = decode_document_for_query(&doc)?;
         out.push((rel, value));
     }
+    // サーバ側の複合フィルタ制約(複数の != や not-in、空配列など)を吸収するため、
+    // in-memory と同一のフィルタ判定をクライアント側でも適用する。
+    out.retain(|(_, v)| match v {
+        Value::Map(m) => super::memory::matches_filters(m, filters),
+        _ => false,
+    });
     // 順序・offset・limit は取得後に適用する。サーバ側の order_by は使わず、
     // in-memory と同じ比較器で並べることで両バックエンドの決定性を揃える
     // (同値はパス辞書順でタイブレーク)。
@@ -423,7 +451,34 @@ fn build_where(
     filters: &[QueryFilter],
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
     let mut parts = vec![];
+    let mut has_inequality = false;
     for f in filters {
+        let is_inequality = matches!(f.op, QueryOp::Ne | QueryOp::NotIn);
+        if is_inequality && has_inequality {
+            // Firestore はクエリ全体で NOT_EQUAL / NOT_IN を 1 つのみ許可するため、
+            // 2 つ目以降はサーバに送らずクライアント側(matches_filters)で評価する。
+            continue;
+        }
+        match f.op {
+            QueryOp::In | QueryOp::ArrayContainsAny => {
+                if let Value::Array(list) = &f.value {
+                    if list.is_empty() {
+                        continue;
+                    }
+                }
+            }
+            QueryOp::NotIn => {
+                if let Value::Array(list) = &f.value {
+                    if list.is_empty() || list.contains(&Value::Nil) {
+                        continue;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if is_inequality {
+            has_inequality = true;
+        }
         let op = match f.op {
             QueryOp::Eq => structured_query::field_filter::Operator::Equal,
             QueryOp::Ne => structured_query::field_filter::Operator::NotEqual,

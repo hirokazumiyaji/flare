@@ -217,7 +217,7 @@ fn sort_matches(
     });
 }
 
-fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bool {
+pub(crate) fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bool {
     filters.iter().all(|f| {
         // `!=` / `in` / `not-in` はフィールドの存在を要求する(存在しなければ
         // マッチしない)。`order_by` 対象の存在チェックは sort 側で行う。
@@ -234,7 +234,13 @@ fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bo
                 _ => false,
             },
             QueryOp::NotIn => match (&f.value, actual) {
-                (Value::Array(list), Some(v)) => !list.contains(v),
+                (Value::Array(list), Some(v)) => {
+                    if list.contains(&Value::Nil) || v == &Value::Nil {
+                        false
+                    } else {
+                        !list.contains(v)
+                    }
+                }
                 _ => false,
             },
             QueryOp::ArrayContains => match actual {

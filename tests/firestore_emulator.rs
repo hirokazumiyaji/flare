@@ -364,11 +364,15 @@ set("users/{run}/rows/r6", {{other: 1}})
   col("users/{run}/rows").where("tags", "array_contains_any", ["a", "c"]).get().len(),
   col("users/{run}/rows").order_by("ord", "asc").offset(3).get().len(),
   col("users/{run}/rows").where("age", ">=", 20).count(),
+  col("users/{run}/rows").where("age", "in", []).get().len(),
+  col("users/{run}/rows").where("age", "not-in", []).get().len(),
+  col("users/{run}/rows").where("age", "not-in", [20, nil]).get().len(),
+  col("users/{run}/rows").where("age", "!=", 20).where("age", "!=", 30).get().len(),
 ]"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
     assert_eq!(
         format!("{out:?}"),
-        "Array([Array([Int(5), Int(4)]), Int(3), Int(3), Int(2), Int(3), Int(2), Int(5)])"
+        "Array([Array([Int(5), Int(4)]), Int(3), Int(3), Int(2), Int(3), Int(2), Int(5), Int(0), Int(5), Int(0), Int(2)])"
     );
 }
