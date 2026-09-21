@@ -278,8 +278,17 @@ impl Firestore for FirestoreEmulator {
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        if self.transaction_id.is_none() {
+            return Err("not in transaction".into());
+        }
+        let sdk_writes = match write_ops_to_sdk_writes(self, &writes) {
+            Ok(writes) => writes,
+            Err(e) => {
+                let _ = self.abort_transaction();
+                return Err(e);
+            }
+        };
         let tid = self.transaction_id.take().ok_or("not in transaction")?;
-        let sdk_writes = write_ops_to_sdk_writes(self, &writes)?;
         self.commit_writes(sdk_writes, tid)
     }
 

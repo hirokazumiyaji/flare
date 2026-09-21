@@ -225,6 +225,22 @@ fn transaction_can_restart_after_abort_clears_state() {
 }
 
 #[test]
+fn transaction_can_restart_after_commit_failure_clears_state() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let failing = run_in(
+        &mut runtime,
+        "transaction { update(\"users/nonexistent\", {x: 1}) }",
+    );
+    assert!(failing.is_err());
+    let out = run_in(
+        &mut runtime,
+        "transaction { set(\"users/tx_commit_err\", {x: 2}) }\nget(\"users/tx_commit_err\")",
+    )
+    .unwrap();
+    assert!(format!("{out:?}").contains("Int(2)"), "{out:?}");
+}
+
+#[test]
 fn transaction_rolls_back_on_runtime_error() {
     let mut runtime = Runtime::new(InMemoryFirestore::default());
     let failing = run_in(
