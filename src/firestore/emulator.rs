@@ -8,7 +8,7 @@ use gcloud_sdk::google::firestore::v1::{
     batch_get_documents_request, batch_get_documents_response, document_transform, precondition,
     run_query_request, structured_query, value, write, ArrayValue, BatchGetDocumentsRequest,
     BeginTransactionRequest, CommitRequest, Document, DocumentMask, GetDocumentRequest, MapValue,
-    Precondition, RunQueryRequest, StructuredQuery, Value as SdkValue, Write,
+    Precondition, RollbackRequest, RunQueryRequest, StructuredQuery, Value as SdkValue, Write,
 };
 use gcloud_sdk::tonic::{Code, Request, Status};
 use prost_types::{NullValue, Timestamp as ProtoTimestamp};
@@ -278,13 +278,37 @@ impl Firestore for FirestoreEmulator {
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        if self.transaction_id.is_none() {
+            return Err("not in transaction".into());
+        }
+        let sdk_writes = match write_ops_to_sdk_writes(self, &writes) {
+            Ok(writes) => writes,
+            Err(e) => {
+                let _ = self.abort_transaction();
+                return Err(e);
+            }
+        };
         let tid = self.transaction_id.take().ok_or("not in transaction")?;
-        let sdk_writes = write_ops_to_sdk_writes(self, &writes)?;
         self.commit_writes(sdk_writes, tid)
     }
 
-    fn abort_transaction(&mut self) {
-        self.transaction_id = None;
+    fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+        let Some(tid) = self.transaction_id.take() else {
+            return Ok(());
+        };
+        let db = self.sdk_db()?;
+        let database = db.get_database_path().clone();
+        self.runtime.block_on(async move {
+            db.client()
+                .get()
+                .rollback(Request::new(RollbackRequest {
+                    database,
+                    transaction: tid,
+                }))
+                .await?;
+            Ok::<_, gcloud_sdk::tonic::Status>(())
+        })?;
+        Ok(())
     }
 }
 
@@ -764,6 +788,14 @@ mod tests {
             m.get("__name__"),
             Some(&Value::Str("teams/t1/documents/x".to_string()))
         );
+    }
+
+    #[test]
+    fn abort_without_open_transaction_is_ok() {
+        // Rollback RPC を送らず成功する(接続不要の冪等パス)。
+        let mut fs = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
+        fs.abort_transaction().unwrap();
+        fs.abort_transaction().unwrap();
     }
 
     #[test]

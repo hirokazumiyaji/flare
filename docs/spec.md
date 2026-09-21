@@ -374,5 +374,4 @@ usage: fl [--backend in-memory|emulator] <script-file>
 | 項目 | 現状の挙動 | 予定 |
 |------|-----------|------|
 | `where` の異なる型同士の大小比較 | in-memory ではマッチしない。emulator では Firestore の型順序で比較される(§7 は同型のみを規定) | backlog |
-| emulator の transaction 中断 | ロールバック RPC を送らない(サーバ側タイムアウト任せ) | backlog |
 | `puts` / `fl` の複合値出力 | Rust の Debug 形式(`Map({"a": Int(1)})`) | backlog |

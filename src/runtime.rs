@@ -390,11 +390,17 @@ impl<F: Firestore> Runtime<F> {
                 };
                 match flow {
                     Ok(flow) => {
-                        self.fs.commit_transaction(writes).map_err(backend_err)?;
+                        if let Err(e) = self.fs.commit_transaction(writes) {
+                            let _ = self.fs.abort_transaction();
+                            return Err(backend_err(e));
+                        }
                         Ok(flow.into_value())
                     }
                     Err(e) => {
-                        self.fs.abort_transaction();
+                        // Rollback は best-effort: 元のブロックエラーを優先し、
+                        // rollback 自体の失敗は無視する(サーバ側タイムアウトが
+                        // 最終的な後ろ盾になる)。
+                        let _ = self.fs.abort_transaction();
                         Err(e)
                     }
                 }

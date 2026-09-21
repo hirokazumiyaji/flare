@@ -207,6 +207,40 @@ fn transaction_get_reads_snapshot_and_commit_applies_writes() {
 }
 
 #[test]
+fn transaction_can_restart_after_abort_clears_state() {
+    // 失敗した transaction の後は abort で状態が戻り、新しい transaction を
+    // 開始できる(abort 前の write は残らない)。
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let failing = run_in(
+        &mut runtime,
+        "transaction { set(\"users/tx_re\", {x: 1})\nundefined_var }",
+    );
+    assert!(failing.is_err());
+    let out = run_in(
+        &mut runtime,
+        "transaction { set(\"users/tx_re\", {x: 2}) }\nget(\"users/tx_re\")",
+    )
+    .unwrap();
+    assert!(format!("{out:?}").contains("Int(2)"), "{out:?}");
+}
+
+#[test]
+fn transaction_can_restart_after_commit_failure_clears_state() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let failing = run_in(
+        &mut runtime,
+        "transaction { update(\"users/nonexistent\", {x: 1}) }",
+    );
+    assert!(failing.is_err());
+    let out = run_in(
+        &mut runtime,
+        "transaction { set(\"users/tx_commit_err\", {x: 2}) }\nget(\"users/tx_commit_err\")",
+    )
+    .unwrap();
+    assert!(format!("{out:?}").contains("Int(2)"), "{out:?}");
+}
+
+#[test]
 fn transaction_rolls_back_on_runtime_error() {
     let mut runtime = Runtime::new(InMemoryFirestore::default());
     let failing = run_in(

@@ -82,5 +82,8 @@ pub trait Firestore {
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>>;
     fn transaction_get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>>;
-    fn abort_transaction(&mut self);
+    /// Rollback an open transaction. Idempotent: succeeds when no
+    /// transaction is open. Failures are returned so callers can decide;
+    /// `Runtime` ignores them to preserve the original block error.
+    fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>>;
 }
