@@ -14,10 +14,6 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_usage();
-        return Ok(());
-    }
 
     let mut backend = "in-memory";
     let mut paths: Vec<String> = vec![];
@@ -26,6 +22,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--help" | "-h" => {
+                print_usage();
+                return Ok(());
+            }
             "--backend" => {
                 let b = args
                     .get(i + 1)

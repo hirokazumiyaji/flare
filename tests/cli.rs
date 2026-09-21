@@ -150,3 +150,28 @@ fn fl_rejects_combined_script_sources() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("-e cannot be combined"), "{stderr:?}");
 }
+
+#[test]
+fn fl_inline_script_accepts_help_argument_without_triggering_usage() {
+    // -e の値が "-h" の場合、Usage 表示ではなくスクリプトとして実行され、
+    // 未定義変数 h の評価エラーになること(exit 1)。
+    let out = Command::new(FL_EXE)
+        .args(["-e", "-h"])
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("undefined variable: h"),
+        "expected undefined variable error, got {stderr:?}"
+    );
+
+    // 有効なスクリプトで -h を含む場合、正常に評価されること
+    let out = Command::new(FL_EXE)
+        .args(["-e", "h = 5; -h"])
+        .output()
+        .expect("spawn fl");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "=> -5\n");
+}
+
