@@ -1202,3 +1202,57 @@ fn update_applies_plain_before_descendant_increment() {
     .unwrap();
     assert_eq!(out.inspect(), "{\"a\" => {\"b\" => 101}}");
 }
+
+#[test]
+fn timestamp_comparison_diff_and_rfc3339() {
+    // 比較: Timestamp 同士は秒で比較できる。
+    let out = run_script(
+        "t1 = timestamp(100)\nt2 = timestamp(200)\n[t1 < t2, t1 > t2, t1 <= t1, t2 >= t1, t1 == timestamp(100), t1 != t2]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+        ])
+    );
+    // 差分: t2 - t1 は秒差の Int。
+    let out =
+        run_script("[timestamp(200) - timestamp(100), timestamp(100) - timestamp(200)]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(100), Value::Int(-100)]));
+    // 異型との比較・減算は従来どおりエラー。
+    let err = run_script("timestamp(1) > 2").unwrap_err();
+    assert!(format!("{err}").contains("unsupported > operands"), "{err}");
+    let err = run_script("timestamp(1) - 2").unwrap_err();
+    assert!(format!("{err}").contains("unsupported - operands"), "{err}");
+    // RFC3339 出力(UTC)。
+    let out = run_script("timestamp(0).to_rfc3339()").unwrap();
+    assert_eq!(out, Value::Str("1970-01-01T00:00:00+00:00".to_string()));
+    let out = run_script("timestamp(\"2026-02-01T00:00:00+09:00\").to_rfc3339()").unwrap();
+    assert_eq!(out, Value::Str("2026-01-31T15:00:00+00:00".to_string()));
+    // RFC3339 の 4 桁年(0000..=9999)の範囲外はエラー。
+    let err = run_script("timestamp(253402300800).to_rfc3339()").unwrap_err();
+    assert!(format!("{err}").contains("timestamp out of range"), "{err}");
+    // if 条件にも使える。
+    let out = run_script("if timestamp(200) > timestamp(100) { 1 } else { 2 }").unwrap();
+    assert_eq!(out, Value::Int(1));
+}
+
+#[test]
+fn overlapping_update_and_delete_paths_are_rejected() {
+    let err = run_script("set(\"users/ov1\", {})\nupdate(\"users/ov1\", {a: delete_field(), \"a.b\": 1})")
+        .unwrap_err();
+    assert!(format!("{err}").contains("overlapping field paths"), "{err}");
+
+    let err = run_script("set(\"users/ov2\", {a: 1, \"a.b\": 2}, merge: true)").unwrap_err();
+    assert!(format!("{err}").contains("overlapping field paths"), "{err}");
+
+    let err = run_script("set(\"users/ov3\", {})\nupdate(\"users/ov3\", {\"a.b\": delete_field(), a: 1})")
+        .unwrap_err();
+    assert!(format!("{err}").contains("overlapping field paths"), "{err}");
+}

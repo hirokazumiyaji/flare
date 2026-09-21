@@ -459,6 +459,7 @@ impl<F: Firestore> Runtime<F> {
             Value::Array(items) => self.eval_array_method(items, name, args, block),
             Value::Timestamp(ts) => match name {
                 "to_unix" => Ok(Value::Int(ts.seconds)),
+                "to_rfc3339" => Ok(Value::Str(ts.to_rfc3339()?)),
                 "add_seconds" => Ok(Value::Timestamp(Timestamp {
                     seconds: ts.seconds + expect_int(args.first())?,
                 })),
@@ -729,6 +730,9 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
         },
         BinOp::Sub => match (l, r) {
             (Value::Int(a), Value::Int(b)) => int_binop(a, b, |a, b| a.checked_sub(b))?,
+            (Value::Timestamp(a), Value::Timestamp(b)) => {
+                int_binop(a.seconds, b.seconds, |a, b| a.checked_sub(b))?
+            }
             _ => return Err("unsupported - operands".into()),
         },
         BinOp::Mul => match (l, r) {
@@ -748,18 +752,22 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
         BinOp::Ne => Value::Bool(l != r),
         BinOp::Gt => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a > b),
+            (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds > b.seconds),
             _ => return Err("unsupported > operands".into()),
         },
         BinOp::Lt => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a < b),
+            (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds < b.seconds),
             _ => return Err("unsupported < operands".into()),
         },
         BinOp::Ge => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a >= b),
+            (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds >= b.seconds),
             _ => return Err("unsupported >= operands".into()),
         },
         BinOp::Le => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a <= b),
+            (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds <= b.seconds),
             _ => return Err("unsupported <= operands".into()),
         },
         // `eval_expr` 側で短絡評価するため、ここに来るのは両辺評価済みの場合のみ。

@@ -20,6 +20,42 @@ pub(crate) fn is_simple_field_name(segment: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+pub(crate) fn paths_overlap(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    if let Some(rest) = b.strip_prefix(a) {
+        if rest.starts_with('.') {
+            return true;
+        }
+    }
+    if let Some(rest) = a.strip_prefix(b) {
+        if rest.starts_with('.') {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn validate_no_overlapping_paths<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<(), Box<dyn Error>> {
+    let mut vec: Vec<&str> = paths.into_iter().collect();
+    vec.sort();
+    for i in 0..vec.len() {
+        for j in (i + 1)..vec.len() {
+            if paths_overlap(vec[i], vec[j]) {
+                return Err(format!(
+                    "overlapping field paths: {} and {}",
+                    vec[i], vec[j]
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// update / merge set のキーは `.` 区切りのフィールドパス(Firestore 準拠)。
 /// 各セグメントは Firestore の単純フィールドパス文法
 /// (`[A-Za-z_][A-Za-z0-9_]*`)に従うこと。バッククォートによるエスケープは
