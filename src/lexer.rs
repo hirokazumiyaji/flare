@@ -180,7 +180,6 @@ pub fn lex_spanned(input: &str) -> Result<Vec<SpannedToken>, Box<dyn Error>> {
                             });
                         }
                         '#' if lx.peek() == Some('{') => {
-                            let interp_span = Span::new(lx.line, lx.col + 2);
                             lx.bump();
                             let interp_span = lx.span();
                             if !lit.is_empty() {
