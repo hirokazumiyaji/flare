@@ -1299,6 +1299,24 @@ fn order_by_sorts_and_excludes_docs_missing_the_field() {
             Value::Str("users/ob1".to_string()),
         ])
     );
+    // ドット区切りのネストしたフィールドパスでのソートと where
+    let setup_nested = "set(\"nested/n1\", {profile: {age: 30}})\nset(\"nested/n2\", {profile: {age: 10}})\nset(\"nested/n3\", {profile: 1})";
+    let out = run_script(&format!(
+        "{setup_nested}\ncol(\"nested\").order_by(\"profile.age\", \"asc\").get().map {{ |r| r[\"__name__\"] }}"
+    ))
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("nested/n2".to_string()),
+            Value::Str("nested/n1".to_string()),
+        ])
+    );
+    let out = run_script(&format!(
+        "{setup_nested}\ncol(\"nested\").where(\"profile.age\", \">=\", 20).get().map {{ |r| r[\"__name__\"] }}"
+    ))
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Str("nested/n1".to_string())]));
     // 不正な向きは呼び出し時にエラー。
     let err = run_script("col(\"users\").order_by(\"age\", \"up\")").unwrap_err();
     assert!(

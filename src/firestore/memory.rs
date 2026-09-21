@@ -189,6 +189,19 @@ fn take_matches(
     values
 }
 
+pub(crate) fn get_field_value(
+    path: &str,
+    doc: &BTreeMap<String, Value>,
+    field: &str,
+) -> Option<Value> {
+    if field == "__name__" {
+        Some(Value::Str(path.to_string()))
+    } else {
+        let segments: Vec<&str> = field.split('.').collect();
+        lookup_field_path(Some(doc), &segments).cloned()
+    }
+}
+
 /// 結果の並べ替え。order_by が空なら従来どおりパス辞書順。指定時は
 /// フィールド値の順に並べ(同値はパス辞書順でタイブレーク)、対象フィールドを
 /// 持たないドキュメントは除外する。型が異なる値同士は型ランクで比べる
@@ -204,20 +217,12 @@ fn sort_matches(
     matches.retain(|(p, doc)| {
         order_by
             .iter()
-            .all(|(field, _)| field == "__name__" || doc.contains_key(field))
+            .all(|(field, _)| get_field_value(p, doc, field).is_some())
     });
     matches.sort_by(|a, b| {
         for (field, dir) in order_by {
-            let val_a = if field == "__name__" {
-                Value::Str((*a.0).clone())
-            } else {
-                a.1[field].clone()
-            };
-            let val_b = if field == "__name__" {
-                Value::Str((*b.0).clone())
-            } else {
-                b.1[field].clone()
-            };
+            let val_a = get_field_value(a.0, a.1, field).unwrap();
+            let val_b = get_field_value(b.0, b.1, field).unwrap();
             let ord = super::compare_order_values(&val_a, &val_b);
             let ord = match dir {
                 Direction::Asc => ord,
@@ -235,7 +240,8 @@ pub(crate) fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFil
     filters.iter().all(|f| {
         // `!=` / `in` / `not-in` はフィールドの存在を要求する(存在しなければ
         // マッチしない)。`order_by` 対象の存在チェックは sort 側で行う。
-        let actual = doc.get(&f.field);
+        let segments: Vec<&str> = f.field.split('.').collect();
+        let actual = lookup_field_path(Some(doc), &segments);
         match f.op {
             QueryOp::Eq => actual == Some(&f.value),
             QueryOp::Ne => actual.is_some_and(|v| v != &f.value),
@@ -444,7 +450,7 @@ fn remove_at_field_path(
 }
 
 /// フィールドパスでネストした値を参照する(中間が Map でなければ見つからない)。
-fn lookup_field_path<'a>(
+pub(crate) fn lookup_field_path<'a>(
     map: Option<&'a BTreeMap<String, Value>>,
     segments: &[&str],
 ) -> Option<&'a Value> {

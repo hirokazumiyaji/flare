@@ -15,7 +15,9 @@ use prost_types::{NullValue, Timestamp as ProtoTimestamp};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 use super::{Firestore, WriteOp};
-use crate::value::{Direction, QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value};
+use crate::value::{
+    Direction, DocRef, QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value,
+};
 
 pub struct FirestoreEmulator {
     host: String,
@@ -226,7 +228,7 @@ impl Firestore for FirestoreEmulator {
         match &query.source {
             QuerySource::Collection(path) => {
                 let (parent, collection_id) = split_collection_path(path)?;
-                let sq = structured_query(collection_id, false, &query.filters)?;
+                let sq = structured_query(&self.project_id, collection_id, false, &query.filters)?;
                 run_query_sorted(
                     self,
                     parent.as_deref(),
@@ -238,7 +240,7 @@ impl Firestore for FirestoreEmulator {
                 )
             }
             QuerySource::CollectionGroup(id) => {
-                let sq = structured_query(id, true, &query.filters)?;
+                let sq = structured_query(&self.project_id, id, true, &query.filters)?;
                 run_query_sorted(
                     self,
                     None,
@@ -404,8 +406,10 @@ fn sort_query_results(out: &mut Vec<(String, Value)>, order_by: &[(String, Direc
         out.sort_by(|a, b| a.0.cmp(&b.0));
         return;
     }
-    out.retain(|(_, v)| match v {
-        Value::Map(m) => order_by.iter().all(|(f, _)| m.contains_key(f)),
+    out.retain(|(path, v)| match v {
+        Value::Map(m) => order_by
+            .iter()
+            .all(|(f, _)| super::memory::get_field_value(path, m, f).is_some()),
         _ => false,
     });
     out.sort_by(|a, b| {
@@ -413,7 +417,9 @@ fn sort_query_results(out: &mut Vec<(String, Value)>, order_by: &[(String, Direc
             return a.0.cmp(&b.0);
         };
         for (field, dir) in order_by {
-            let ord = super::compare_order_values(&ma[field], &mb[field]);
+            let val_a = super::memory::get_field_value(&a.0, ma, field).unwrap();
+            let val_b = super::memory::get_field_value(&b.0, mb, field).unwrap();
+            let ord = super::compare_order_values(&val_a, &val_b);
             let ord = match dir {
                 Direction::Asc => ord,
                 Direction::Desc => ord.reverse(),
@@ -427,6 +433,7 @@ fn sort_query_results(out: &mut Vec<(String, Value)>, order_by: &[(String, Direc
 }
 
 fn structured_query(
+    project_id: &str,
     collection_id: &str,
     all_descendants: bool,
     filters: &[QueryFilter],
@@ -437,7 +444,7 @@ fn structured_query(
             collection_id: collection_id.to_string(),
             all_descendants,
         }],
-        r#where: build_where(filters)?,
+        r#where: build_where(project_id, filters)?,
         order_by: vec![],
         start_at: None,
         end_at: None,
@@ -448,10 +455,10 @@ fn structured_query(
 }
 
 fn build_where(
+    project_id: &str,
     filters: &[QueryFilter],
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
     let mut parts = vec![];
-    let mut has_inequality = false;
     let mut has_membership = false;
     let mut has_array_contains = false;
     for f in filters {
@@ -461,21 +468,17 @@ fn build_where(
             // 乖離するため、サーバには送らずクライアント側(matches_filters)で評価する。
             continue;
         }
-        if f.op == QueryOp::Ne && f.value == Value::Nil {
-            // Firestore は != nil に UnaryFilter(IS_NOT_NULL) を要求するため、
-            // FieldFilter で送らずクライアント側で評価する。
+        if f.op == QueryOp::Ne {
+            // Firestore の NOT_EQUAL はサーバ側で Double と Int を数値等価として評価して
+            // firelang の Opaque 読み替え後の構造的不一致判定と乖離する(また != nil の
+            // IS_NOT_NULL 要求や複数 != の制限もある)ため、サーバには送らず
+            // クライアント側(matches_filters)で評価する。
             continue;
         }
-        let is_inequality = matches!(f.op, QueryOp::Ne);
         let is_membership = matches!(f.op, QueryOp::In | QueryOp::ArrayContainsAny);
         let is_array_contains =
             matches!(f.op, QueryOp::ArrayContains | QueryOp::ArrayContainsAny);
 
-        if is_inequality && has_inequality {
-            // Firestore はクエリ全体で NOT_EQUAL を 1 つのみ許可するため、
-            // 2 つ目以降はサーバに送らずクライアント側(matches_filters)で評価する。
-            continue;
-        }
         if is_membership && has_membership {
             // Firestore は in, array_contains_any をクエリ全体で最大 1 つのみ許可するため、
             // 2 つ目以降はサーバに送らずクライアント側(matches_filters)で評価する。
@@ -496,9 +499,6 @@ fn build_where(
             }
             _ => {}
         }
-        if is_inequality {
-            has_inequality = true;
-        }
         if is_membership {
             has_membership = true;
         }
@@ -507,15 +507,14 @@ fn build_where(
         }
         let op = match f.op {
             QueryOp::Eq => structured_query::field_filter::Operator::Equal,
-            QueryOp::Ne => structured_query::field_filter::Operator::NotEqual,
             QueryOp::Gt => structured_query::field_filter::Operator::GreaterThan,
             QueryOp::Ge => structured_query::field_filter::Operator::GreaterThanOrEqual,
             QueryOp::Lt => structured_query::field_filter::Operator::LessThan,
             QueryOp::Le => structured_query::field_filter::Operator::LessThanOrEqual,
             QueryOp::In => structured_query::field_filter::Operator::In,
-            QueryOp::NotIn => structured_query::field_filter::Operator::NotIn,
             QueryOp::ArrayContains => structured_query::field_filter::Operator::ArrayContains,
             QueryOp::ArrayContainsAny => structured_query::field_filter::Operator::ArrayContainsAny,
+            QueryOp::Ne | QueryOp::NotIn => unreachable!(),
         };
         parts.push(structured_query::Filter {
             filter_type: Some(structured_query::filter::FilterType::FieldFilter(
@@ -524,7 +523,7 @@ fn build_where(
                         field_path: f.field.clone(),
                     }),
                     op: op.into(),
-                    value: Some(encode_field_value(&f.value)?),
+                    value: Some(encode_query_value(project_id, &f.value)?),
                 },
             )),
         });
@@ -798,6 +797,40 @@ fn encode_field_value(v: &Value) -> Result<SdkValue, Box<dyn Error>> {
     })
 }
 
+fn encode_query_value(project_id: &str, v: &Value) -> Result<SdkValue, Box<dyn Error>> {
+    Ok(SdkValue {
+        value_type: Some(match v {
+            Value::Str(s) => value::ValueType::StringValue(s.clone()),
+            Value::Int(i) => value::ValueType::IntegerValue(*i),
+            Value::Bool(b) => value::ValueType::BooleanValue(*b),
+            Value::Nil => value::ValueType::NullValue(NullValue::NullValue.into()),
+            Value::Timestamp(ts) => value::ValueType::TimestampValue(ProtoTimestamp {
+                seconds: ts.seconds,
+                nanos: 0,
+            }),
+            Value::DocRef(d) => value::ValueType::ReferenceValue(format!(
+                "projects/{project_id}/databases/(default)/documents/{}",
+                d.path.trim_start_matches('/')
+            )),
+            Value::Array(items) => {
+                let mut out = vec![];
+                for item in items {
+                    out.push(encode_query_value(project_id, item)?);
+                }
+                value::ValueType::ArrayValue(ArrayValue { values: out })
+            }
+            Value::Map(m) => {
+                let mut out = HashMap::new();
+                for (k, val) in m {
+                    out.insert(k.clone(), encode_query_value(project_id, val)?);
+                }
+                value::ValueType::MapValue(MapValue { fields: out })
+            }
+            _ => return Err(format!("unsupported value in emulator query: {v:?}").into()),
+        }),
+    })
+}
+
 fn decode_document_for_get(doc: &Document) -> Result<Value, Box<dyn Error>> {
     decode_document_inner(doc, false)
 }
@@ -806,10 +839,16 @@ fn decode_document_for_query(doc: &Document) -> Result<Value, Box<dyn Error>> {
     decode_document_inner(doc, true)
 }
 
+fn document_root_prefix(doc_name: &str) -> Option<&str> {
+    let idx = doc_name.find("/documents/")?;
+    Some(&doc_name[..idx + "/documents/".len()])
+}
+
 fn decode_document_inner(doc: &Document, include_doc_path: bool) -> Result<Value, Box<dyn Error>> {
+    let root_prefix = document_root_prefix(&doc.name);
     let mut out = BTreeMap::new();
     for (k, fv) in &doc.fields {
-        out.insert(k.clone(), decode_field_value(fv)?);
+        out.insert(k.clone(), decode_field_value(fv, root_prefix)?);
     }
     if include_doc_path {
         if let Ok(rel) = relative_document_name(&doc.name) {
@@ -819,7 +858,7 @@ fn decode_document_inner(doc: &Document, include_doc_path: bool) -> Result<Value
     Ok(Value::Map(out))
 }
 
-fn decode_field_value(v: &SdkValue) -> Result<Value, Box<dyn Error>> {
+fn decode_field_value(v: &SdkValue, root_prefix: Option<&str>) -> Result<Value, Box<dyn Error>> {
     match v
         .value_type
         .as_ref()
@@ -835,17 +874,38 @@ fn decode_field_value(v: &SdkValue) -> Result<Value, Box<dyn Error>> {
         value::ValueType::ArrayValue(arr) => {
             let mut out = vec![];
             for x in &arr.values {
-                out.push(decode_field_value(x)?);
+                out.push(decode_field_value(x, root_prefix)?);
             }
             Ok(Value::Array(out))
         }
         value::ValueType::MapValue(map) => {
             let mut out = BTreeMap::new();
             for (k, fv) in &map.fields {
-                out.insert(k.clone(), decode_field_value(fv)?);
+                out.insert(k.clone(), decode_field_value(fv, root_prefix)?);
             }
             Ok(Value::Map(out))
         }
+        // firelang が持たない型は読めることだけを目標にする。double・
+        // geo_point・bytes は表示専用の Opaque にし、同一 DB の reference は相対パス
+        // の DocRef にする(別 DB や別プロジェクトの reference は Opaque に保持)。書き戻しは unsupported のまま(§3)。
+        value::ValueType::DoubleValue(f) => Ok(Value::Opaque(format!("Double({f})"))),
+        value::ValueType::BytesValue(b) => Ok(Value::Opaque(format!("Bytes({})", hex_bytes(b)))),
+        value::ValueType::GeoPointValue(p) => Ok(Value::Opaque(format!(
+            "GeoPoint({}, {})",
+            p.latitude, p.longitude
+        ))),
+        value::ValueType::ReferenceValue(name) => {
+            let local_rel = match root_prefix {
+                Some(prefix) => name.strip_prefix(prefix),
+                None => None,
+            };
+            match local_rel {
+                Some(rel) => Ok(Value::DocRef(DocRef {
+                    path: rel.to_string(),
+                })),
+                None => Ok(Value::Opaque(format!("Reference({name})"))),
+            }
+        },
         other => Err(format!("unsupported Firestore field value: {other:?}").into()),
     }
 }
@@ -855,6 +915,10 @@ fn relative_document_name(name: &str) -> Result<String, Box<dyn Error>> {
         .split_once("/documents/")
         .ok_or("invalid document name")?;
     Ok(rel.to_string())
+}
+
+fn hex_bytes(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 fn split_collection_path(path: &str) -> Result<(Option<String>, &str), Box<dyn Error>> {
@@ -1194,6 +1258,99 @@ mod tests {
     }
 
     #[test]
+    fn decode_exotic_field_values_as_opaque_or_docref() {
+        let sdk = |t| SdkValue {
+            value_type: Some(t),
+        };
+        let root = Some("projects/p/databases/(default)/documents/");
+        assert_eq!(
+            decode_field_value(&sdk(value::ValueType::DoubleValue(1.5)), root).unwrap(),
+            Value::Opaque("Double(1.5)".to_string())
+        );
+        assert_eq!(
+            decode_field_value(&sdk(value::ValueType::BytesValue(vec![0x00, 0xff])), root).unwrap(),
+            Value::Opaque("Bytes(00ff)".to_string())
+        );
+        assert_eq!(
+            decode_field_value(
+                &sdk(value::ValueType::GeoPointValue(
+                    gcloud_sdk::google::r#type::LatLng {
+                        latitude: 35.7,
+                        longitude: 139.7,
+                    },
+                )),
+                root,
+            )
+            .unwrap(),
+            Value::Opaque("GeoPoint(35.7, 139.7)".to_string())
+        );
+        assert_eq!(
+            decode_field_value(
+                &sdk(value::ValueType::ReferenceValue(
+                    "projects/p/databases/(default)/documents/users/1".to_string(),
+                )),
+                root,
+            )
+            .unwrap(),
+            Value::DocRef(DocRef {
+                path: "users/1".to_string()
+            })
+        );
+        assert_eq!(
+            decode_field_value(
+                &sdk(value::ValueType::ReferenceValue(
+                    "projects/other-proj/databases/(default)/documents/users/1".to_string(),
+                )),
+                root,
+            )
+            .unwrap(),
+            Value::Opaque(
+                "Reference(projects/other-proj/databases/(default)/documents/users/1)".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn decode_document_with_exotic_fields_does_not_fail() {
+        let doc = Document {
+            name: "projects/p/databases/(default)/documents/users/x".to_string(),
+            fields: HashMap::from([
+                (
+                    "name".to_string(),
+                    SdkValue {
+                        value_type: Some(value::ValueType::StringValue("a".to_string())),
+                    },
+                ),
+                (
+                    "score".to_string(),
+                    SdkValue {
+                        value_type: Some(value::ValueType::DoubleValue(4.5)),
+                    },
+                ),
+            ]),
+            create_time: None,
+            update_time: None,
+        };
+        let Value::Map(m) = decode_document_for_get(&doc).unwrap() else {
+            panic!();
+        };
+        assert_eq!(m.get("name"), Some(&Value::Str("a".to_string())));
+        assert_eq!(
+            m.get("score"),
+            Some(&Value::Opaque("Double(4.5)".to_string()))
+        );
+    }
+
+    #[test]
+    fn encode_opaque_value_is_rejected_on_write() {
+        let err = encode_field_value(&Value::Opaque("Double(1.5)".to_string())).unwrap_err();
+        assert!(
+            format!("{err}").contains("unsupported value in emulator write"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn escape_literal_transform_keys_quotes_non_simple_keys() {
         let inputs = vec![
             ("normal_field".to_string(), Value::Increment(1)),
@@ -1206,6 +1363,87 @@ mod tests {
         assert_eq!(escaped[1].0, "`a.b`");
         assert_eq!(escaped[2].0, "`a-b`");
         assert_eq!(escaped[3].0, "`1start_digit`");
+    }
+
+    #[test]
+    fn encode_doc_ref_in_query_filter_encodes_reference_value() {
+        let val = encode_query_value("my-project", &Value::DocRef(DocRef {
+            path: "users/1".to_string(),
+        }))
+        .unwrap();
+        assert_eq!(
+            val.value_type,
+            Some(value::ValueType::ReferenceValue(
+                "projects/my-project/databases/(default)/documents/users/1".to_string()
+            ))
+        );
+
+        // 配列内の DocRef も正しくエンコードされること
+        let arr_val = encode_query_value(
+            "my-project",
+            &Value::Array(vec![Value::DocRef(DocRef {
+                path: "users/1".to_string(),
+            })]),
+        )
+        .unwrap();
+        let Some(value::ValueType::ArrayValue(arr)) = arr_val.value_type else {
+            panic!("expected ArrayValue");
+        };
+        assert_eq!(arr.values.len(), 1);
+        assert_eq!(
+            arr.values[0].value_type,
+            Some(value::ValueType::ReferenceValue(
+                "projects/my-project/databases/(default)/documents/users/1".to_string()
+            ))
+        );
+
+        // write 側は引き続き DocRef を拒否すること
+        let err = encode_field_value(&Value::DocRef(DocRef {
+            path: "users/1".to_string(),
+        }))
+        .unwrap_err();
+        assert!(
+            format!("{err}").contains("unsupported value in emulator write"),
+            "{err}"
+        );
+
+        // build_where に渡したフィルタも正しく組み立てられること
+        let filter = build_where(
+            "my-project",
+            &[QueryFilter {
+                field: "owner".to_string(),
+                op: QueryOp::Eq,
+                value: Value::DocRef(DocRef {
+                    path: "users/1".to_string(),
+                }),
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        let Some(structured_query::filter::FilterType::FieldFilter(ff)) = filter.filter_type else {
+            panic!("expected FieldFilter");
+        };
+        assert_eq!(ff.field.unwrap().field_path, "owner");
+        assert_eq!(
+            ff.value.unwrap().value_type,
+            Some(value::ValueType::ReferenceValue(
+                "projects/my-project/databases/(default)/documents/users/1".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn build_where_keeps_not_equal_client_side() {
+        let filter = build_where(
+            "p",
+            &[QueryFilter {
+                field: "x".to_string(),
+                op: QueryOp::Ne,
+                value: Value::Int(1),
+            }],
+        )
+        .unwrap();
+        assert!(filter.is_none());
     }
 
     #[test]
