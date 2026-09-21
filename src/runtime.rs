@@ -392,7 +392,10 @@ impl<F: Firestore> Runtime<F> {
                 };
                 match flow {
                     Ok(flow) => {
-                        self.fs.commit_transaction(writes).map_err(backend_err)?;
+                        if let Err(e) = self.fs.commit_transaction(writes) {
+                            let _ = self.fs.abort_transaction();
+                            return Err(backend_err(e));
+                        }
                         Ok(flow.into_value())
                     }
                     Err(e) => {
