@@ -531,11 +531,7 @@ impl Parser {
         match program.as_slice() {
             [Stmt::Expr(e)] => Ok(e.clone()),
             _ => Err(
-                FirelangError::parse(
-                    "interpolation must contain a single expression",
-                    Some(base),
-                )
-                .into(),
+                FirelangError::parse("interpolation must contain a single expression", None).into(),
             ),
         }
     }

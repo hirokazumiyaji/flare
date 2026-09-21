@@ -1002,4 +1002,12 @@ fn errors_carry_kind_and_line_col() {
         .downcast_ref::<FirelangError>()
         .expect("parse error in map key should be FirelangError");
     assert_eq!(ferr.span, Some(Span::new(1, 2)));
+
+    // 補間内の単一式制約違反: 仕様(docs/spec.md §10)通り位置が付かない (None)
+    let err = run_script("\"#{1; 2}\"").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("parse error in interpolation should be FirelangError");
+    assert_eq!(ferr.span, None);
+    assert_eq!(format!("{ferr}"), "interpolation must contain a single expression");
 }
