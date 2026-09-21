@@ -175,3 +175,32 @@ fn fl_inline_script_accepts_help_argument_without_triggering_usage() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "=> -5\n");
 }
 
+#[test]
+fn fl_validates_backend_before_reading_stdin() {
+    // 未知のバックエンド指定で stdin を要求した場合、stdin を読み取ることなく即時失敗すること
+    let out = Command::new(FL_EXE)
+        .args(["--backend", "unknown-backend", "-"])
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown backend: unknown-backend"),
+        "{stderr:?}"
+    );
+
+    // FIRESTORE_EMULATOR_HOST 未設定で emulator バックエンド + stdin の場合も即時失敗すること
+    let out = Command::new(FL_EXE)
+        .args(["--backend", "emulator", "-"])
+        .env_remove("FIRESTORE_EMULATOR_HOST")
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("FIRESTORE_EMULATOR_HOST must be set"),
+        "{stderr:?}"
+    );
+}
+
+

@@ -55,6 +55,20 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    let backend_config = match backend {
+        "in-memory" => None,
+        "emulator" => {
+            let host = env::var("FIRESTORE_EMULATOR_HOST")
+                .map_err(|_| "FIRESTORE_EMULATOR_HOST must be set when using --backend emulator")?;
+            let project_id =
+                env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".to_string());
+            Some((host, project_id))
+        }
+        other => {
+            return Err(format!("unknown backend: {other} (use in-memory or emulator)").into());
+        }
+    };
+
     let src = if !inline.is_empty() {
         if !paths.is_empty() || use_stdin {
             eprintln!("error: -e cannot be combined with a script file or stdin");
@@ -85,17 +99,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     };
 
-    let out = match backend {
-        "in-memory" => run_script(&src)?,
-        "emulator" => {
-            let host = env::var("FIRESTORE_EMULATOR_HOST")
-                .map_err(|_| "FIRESTORE_EMULATOR_HOST must be set when using --backend emulator")?;
-            let project_id =
-                env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".to_string());
+    let out = match backend_config {
+        None => run_script(&src)?,
+        Some((host, project_id)) => {
             run_script_with_firestore(&src, FirestoreEmulator::new(host, project_id))?
-        }
-        other => {
-            return Err(format!("unknown backend: {other} (use in-memory or emulator)").into())
         }
     };
 
