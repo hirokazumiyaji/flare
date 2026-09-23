@@ -120,11 +120,7 @@ pub(crate) fn validate_no_overlapping_paths<'a>(
     for i in 0..vec.len() {
         for j in (i + 1)..vec.len() {
             if paths_overlap(vec[i], vec[j]) {
-                return Err(format!(
-                    "overlapping field paths: {} and {}",
-                    vec[i], vec[j]
-                )
-                .into());
+                return Err(format!("overlapping field paths: {} and {}", vec[i], vec[j]).into());
             }
         }
     }

@@ -476,8 +476,7 @@ fn build_where(
             continue;
         }
         let is_membership = matches!(f.op, QueryOp::In | QueryOp::ArrayContainsAny);
-        let is_array_contains =
-            matches!(f.op, QueryOp::ArrayContains | QueryOp::ArrayContainsAny);
+        let is_array_contains = matches!(f.op, QueryOp::ArrayContains | QueryOp::ArrayContainsAny);
 
         if is_membership && has_membership {
             // Firestore は in, array_contains_any をクエリ全体で最大 1 つのみ許可するため、
@@ -905,7 +904,7 @@ fn decode_field_value(v: &SdkValue, root_prefix: Option<&str>) -> Result<Value, 
                 })),
                 None => Ok(Value::Opaque(format!("Reference({name})"))),
             }
-        },
+        }
         other => Err(format!("unsupported Firestore field value: {other:?}").into()),
     }
 }
@@ -1367,9 +1366,12 @@ mod tests {
 
     #[test]
     fn encode_doc_ref_in_query_filter_encodes_reference_value() {
-        let val = encode_query_value("my-project", &Value::DocRef(DocRef {
-            path: "users/1".to_string(),
-        }))
+        let val = encode_query_value(
+            "my-project",
+            &Value::DocRef(DocRef {
+                path: "users/1".to_string(),
+            }),
+        )
         .unwrap();
         assert_eq!(
             val.value_type,

@@ -358,7 +358,11 @@ fn apply_update_map(
             }),
             Value::Increment(n) => match base {
                 Some(Value::Int(cur)) => Value::Int(cur.checked_add(n).unwrap_or_else(|| {
-                    if n.is_negative() { i64::MIN } else { i64::MAX }
+                    if n.is_negative() {
+                        i64::MIN
+                    } else {
+                        i64::MAX
+                    }
                 })),
                 _ => Value::Int(n),
             },

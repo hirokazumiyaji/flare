@@ -31,14 +31,7 @@ impl<F: Firestore> Runtime<F> {
     }
 
     pub fn eval_program(&mut self, stmts: &[Stmt]) -> Result<Value, Box<dyn Error>> {
-        let mut last = Value::Nil;
-        for stmt in stmts {
-            match self.eval_stmt(stmt)? {
-                ExecFlow::Value(v) => last = v,
-                ExecFlow::Return(v) => return Ok(v),
-            }
-        }
-        Ok(last)
+        self.eval_block(stmts).map(ExecFlow::into_value)
     }
 
     /// トップレベル文の開始位置付きで評価し、失敗した文の位置を
@@ -126,6 +119,22 @@ impl<F: Firestore> Runtime<F> {
             }
         }
         Ok(ExecFlow::Value(last))
+    }
+
+    /// `exec` をステージング用 ctx に差し替えてブロックを評価し、元の ctx に
+    /// 戻してステージされた writes を返す。ブロックの成否にかかわらず復元する。
+    fn run_staged_block(
+        &mut self,
+        ctx: ExecCtx,
+        body: &[Stmt],
+    ) -> (Result<ExecFlow, Box<dyn Error>>, Vec<WriteOp>) {
+        let prev = std::mem::replace(&mut self.exec, ctx);
+        let flow = self.eval_block(body);
+        let writes = match std::mem::replace(&mut self.exec, prev) {
+            ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => writes,
+            ExecCtx::Normal => unreachable!("exec ctx changed inside batch/transaction"),
+        };
+        (flow, writes)
     }
 
     fn forbid_query_in_batch_or_transaction(&self) -> Result<(), Box<dyn Error>> {
@@ -702,10 +711,10 @@ fn builtin_get<F: Firestore>(
         }
         ExecCtx::Transaction { .. } => rt
             .fs
-            .transaction_get(path)
+            .transaction_get(&path)
             .map_err(backend_err)?
             .unwrap_or(Value::Nil),
-        ExecCtx::Normal => rt.fs.get(path).map_err(backend_err)?.unwrap_or(Value::Nil),
+        ExecCtx::Normal => rt.fs.get(&path).map_err(backend_err)?.unwrap_or(Value::Nil),
     };
     Ok(v)
 }
@@ -724,7 +733,6 @@ fn builtin_set<F: Firestore>(
         (None, None) => false,
         _ => return Err("set merge must be bool".into()),
     };
-    let path = path.to_string();
     rt.dispatch_write(WriteOp::Set { path, data, merge })?;
     Ok(Value::Nil)
 }
@@ -737,7 +745,6 @@ fn builtin_update<F: Firestore>(
 ) -> Result<Value, Box<dyn Error>> {
     let path = expect_doc_path(args.first())?;
     let data = expect_map(args.get(1))?.clone();
-    let path = path.to_string();
     rt.dispatch_write(WriteOp::Update { path, data })?;
     Ok(Value::Nil)
 }
@@ -749,7 +756,6 @@ fn builtin_delete<F: Firestore>(
     _block: Option<&Block>,
 ) -> Result<Value, Box<dyn Error>> {
     let path = expect_doc_path(args.first())?;
-    let path = path.to_string();
     rt.dispatch_write(WriteOp::Delete { path })?;
     Ok(Value::Nil)
 }
@@ -769,11 +775,7 @@ fn builtin_batch<F: Firestore>(
     if !matches!(rt.exec, ExecCtx::Normal) {
         return Err("batch cannot be nested inside batch/transaction".into());
     }
-    rt.exec = ExecCtx::Batch { writes: vec![] };
-    let flow = rt.eval_block(&stmts.body);
-    let ExecCtx::Batch { writes } = std::mem::replace(&mut rt.exec, ExecCtx::Normal) else {
-        unreachable!("exec ctx changed inside batch");
-    };
+    let (flow, writes) = rt.run_staged_block(ExecCtx::Batch { writes: vec![] }, &stmts.body);
     let flow = flow?;
     rt.fs.apply(writes).map_err(backend_err)?;
     Ok(flow.into_value())
@@ -795,11 +797,7 @@ fn builtin_transaction<F: Firestore>(
         return Err("transaction cannot be nested inside batch/transaction".into());
     }
     rt.fs.begin_transaction().map_err(backend_err)?;
-    rt.exec = ExecCtx::Transaction { writes: vec![] };
-    let flow = rt.eval_block(&stmts.body);
-    let ExecCtx::Transaction { writes } = std::mem::replace(&mut rt.exec, ExecCtx::Normal) else {
-        unreachable!("exec ctx changed inside transaction");
-    };
+    let (flow, writes) = rt.run_staged_block(ExecCtx::Transaction { writes: vec![] }, &stmts.body);
     match flow {
         Ok(flow) => {
             rt.fs.commit_transaction(writes).map_err(backend_err)?;
@@ -857,13 +855,13 @@ fn expect_array(v: Option<&Value>) -> Result<&Vec<Value>, Box<dyn Error>> {
     }
 }
 
-fn expect_doc_path(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
+fn expect_doc_path(v: Option<&Value>) -> Result<String, Box<dyn Error>> {
     match v {
         Some(Value::Str(s)) => {
             validate_doc_path(s)?;
-            Ok(s)
+            Ok(s.clone())
         }
-        Some(Value::DocRef(d)) => Ok(&d.path),
+        Some(Value::DocRef(d)) => Ok(d.path.clone()),
         _ => Err("expected document path string or doc object".into()),
     }
 }
