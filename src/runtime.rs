@@ -800,7 +800,10 @@ fn builtin_transaction<F: Firestore>(
     let (flow, writes) = rt.run_staged_block(ExecCtx::Transaction { writes: vec![] }, &stmts.body);
     match flow {
         Ok(flow) => {
-            rt.fs.commit_transaction(writes).map_err(backend_err)?;
+            if let Err(e) = rt.fs.commit_transaction(writes) {
+                let _ = rt.fs.abort_transaction();
+                return Err(backend_err(e));
+            }
             Ok(flow.into_value())
         }
         Err(e) => {
@@ -1070,5 +1073,62 @@ mod tests {
         }
         assert!(!is_builtin_name("undefined_fn"));
         assert!(lookup_builtin::<InMemoryFirestore>("undefined_fn").is_none());
+    }
+
+    struct FailingCommitFirestore {
+        in_tx: bool,
+        aborted: bool,
+    }
+
+    impl Firestore for FailingCommitFirestore {
+        fn get(&self, _path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+            Ok(None)
+        }
+        fn apply(&mut self, _writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+        fn run_query(&self, _query: &QueryRef) -> Result<Vec<Value>, Box<dyn Error>> {
+            Ok(vec![])
+        }
+        fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+            if self.in_tx {
+                return Err("already in transaction".into());
+            }
+            self.in_tx = true;
+            Ok(())
+        }
+        fn transaction_get(&self, _path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+            Ok(None)
+        }
+        fn commit_transaction(&mut self, _writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+            Err("commit failed".into())
+        }
+        fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+            self.in_tx = false;
+            self.aborted = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn transaction_aborts_on_commit_failure() {
+        let fs = FailingCommitFirestore {
+            in_tx: false,
+            aborted: false,
+        };
+        let mut runtime = Runtime::new(fs);
+        let res = runtime.eval_program(&[Stmt::Expr(Expr::Call {
+            receiver: None,
+            name: "transaction".into(),
+            args: vec![],
+            kwargs: vec![],
+            block: Some(Block {
+                params: vec![],
+                body: vec![],
+            }),
+        })]);
+        assert!(res.is_err());
+        assert!(runtime.fs.aborted);
+        assert!(!runtime.fs.in_tx);
     }
 }
