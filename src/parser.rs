@@ -6,6 +6,21 @@ use crate::lexer::{SpannedToken, StrPart, Token};
 
 type ParsedArgs = (Vec<Expr>, Vec<(String, Expr)>);
 
+/// 二項演算子の優先順位表(弱い順)。`parse_or` / `parse_and` より強く、
+/// 単項より弱い 3 段。和・積の各段は左結合。
+const BINARY_LEVELS: &[&[(Token, BinOp)]] = &[
+    &[
+        (Token::EqEq, BinOp::Eq),
+        (Token::Ne, BinOp::Ne),
+        (Token::Gt, BinOp::Gt),
+        (Token::Lt, BinOp::Lt),
+        (Token::Ge, BinOp::Ge),
+        (Token::Le, BinOp::Le),
+    ],
+    &[(Token::Plus, BinOp::Add), (Token::Minus, BinOp::Sub)],
+    &[(Token::Star, BinOp::Mul), (Token::Slash, BinOp::Div)],
+];
+
 pub struct Parser {
     tokens: Vec<Token>,
     spans: Vec<Option<Span>>,
@@ -87,22 +102,8 @@ impl Parser {
         let mut params = vec![];
         if self.at(&Token::LParen) {
             self.bump();
-            self.skip_newlines();
-            if !self.at(&Token::RParen) {
-                loop {
-                    params.push(self.expect_ident()?);
-                    self.skip_newlines();
-                    if self.at(&Token::Comma) {
-                        self.bump();
-                        self.skip_newlines();
-                        if self.at(&Token::RParen) {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-            }
+            let parsed = self.parse_comma_separated(Token::RParen, |p| p.expect_ident());
+            params = parsed?;
             self.expect(Token::RParen)?;
         }
         let body = self.parse_brace_block()?;
@@ -182,56 +183,31 @@ impl Parser {
         Ok(left)
     }
     fn parse_comparison(&mut self) -> Result<Expr, Box<dyn Error>> {
-        let mut left = self.parse_add_sub()?;
-        loop {
-            let op = match self.peek() {
-                Token::EqEq => BinOp::Eq,
-                Token::Ne => BinOp::Ne,
-                Token::Gt => BinOp::Gt,
-                Token::Lt => BinOp::Lt,
-                Token::Ge => BinOp::Ge,
-                Token::Le => BinOp::Le,
-                _ => break,
-            };
-            self.bump();
-            left = Expr::Binary {
-                left: Box::new(left),
-                op,
-                right: Box::new(self.parse_add_sub()?),
-            }
-        }
-        Ok(left)
+        self.parse_binary_level(0)
     }
-    fn parse_add_sub(&mut self) -> Result<Expr, Box<dyn Error>> {
-        let mut left = self.parse_mul_div()?;
-        loop {
-            let op = match self.peek() {
-                Token::Plus => BinOp::Add,
-                Token::Minus => BinOp::Sub,
-                _ => break,
-            };
+    /// 二項演算子を優先順位テーブルで一段ずつ読む。深い level ほど強い。
+    /// 各 level は左結合のループで、次の level(または単項)へ再帰する。
+    fn parse_binary_level(&mut self, level: usize) -> Result<Expr, Box<dyn Error>> {
+        let mut left = if level + 1 < BINARY_LEVELS.len() {
+            self.parse_binary_level(level + 1)?
+        } else {
+            self.parse_unary()?
+        };
+        while let Some(op) = BINARY_LEVELS[level]
+            .iter()
+            .find(|(t, _)| self.at(t))
+            .map(|(_, op)| *op)
+        {
             self.bump();
+            let right = if level + 1 < BINARY_LEVELS.len() {
+                self.parse_binary_level(level + 1)?
+            } else {
+                self.parse_unary()?
+            };
             left = Expr::Binary {
                 left: Box::new(left),
                 op,
-                right: Box::new(self.parse_mul_div()?),
-            }
-        }
-        Ok(left)
-    }
-    fn parse_mul_div(&mut self) -> Result<Expr, Box<dyn Error>> {
-        let mut left = self.parse_unary()?;
-        loop {
-            let op = match self.peek() {
-                Token::Star => BinOp::Mul,
-                Token::Slash => BinOp::Div,
-                _ => break,
-            };
-            self.bump();
-            left = Expr::Binary {
-                left: Box::new(left),
-                op,
-                right: Box::new(self.parse_unary()?),
+                right: Box::new(right),
             }
         }
         Ok(left)
@@ -312,8 +288,12 @@ impl Parser {
             }
             Token::Ident(name) => {
                 self.bump();
+                // `(` 付き・引数開始トークン・`{` ブロックのいずれかが続けば
+                // 呼び出し。`parse_args` は空の引数列を返すので `LBrace` の
+                // 分岐は不要(ブロックは `parse_optional_brace_block` が読む)。
                 if self.at(&Token::LParen)
                     || (self.is_arg_start() && self.suppress_block_calls == 0)
+                    || (self.at(&Token::LBrace) && self.suppress_block_calls == 0)
                 {
                     let (args, kwargs) = self.parse_args()?;
                     Ok(Expr::Call {
@@ -321,14 +301,6 @@ impl Parser {
                         name,
                         args,
                         kwargs,
-                        block: self.parse_optional_brace_block()?,
-                    })
-                } else if self.at(&Token::LBrace) && self.suppress_block_calls == 0 {
-                    Ok(Expr::Call {
-                        receiver: None,
-                        name,
-                        args: vec![],
-                        kwargs: vec![],
                         block: self.parse_optional_brace_block()?,
                     })
                 } else {
@@ -366,48 +338,29 @@ impl Parser {
         Ok(Expr::Map(entries))
     }
     fn parse_map_entries(&mut self) -> Result<Vec<(String, Expr)>, Box<dyn Error>> {
-        self.skip_newlines();
-        let mut entries = vec![];
-        if !self.at(&Token::RBrace) {
-            loop {
-                let key = match self.peek().clone() {
-                    Token::Str(parts) => {
-                        self.bump();
-                        match parts.as_slice() {
-                            [StrPart::Lit(s)] => s.clone(),
-                            _ => {
-                                return Err(
-                                    self.parse_err("interpolation is not allowed in map keys")
-                                )
-                            }
-                        }
+        self.parse_comma_separated(Token::RBrace, |p| {
+            let key = match p.peek().clone() {
+                Token::Str(parts) => {
+                    p.bump();
+                    match parts.as_slice() {
+                        [StrPart::Lit(s)] => s.clone(),
+                        _ => return Err(p.parse_err("interpolation is not allowed in map keys")),
                     }
-                    Token::Ident(s) => {
-                        self.bump();
-                        s
-                    }
-                    t => {
-                        return Err(self.parse_err(format!(
-                            "object key must be string or identifier, got {t:?}"
-                        )))
-                    }
-                };
-                self.expect(Token::Colon)?;
-                let value = self.parse_expr()?;
-                entries.push((key, value));
-                self.skip_newlines();
-                if self.at(&Token::Comma) {
-                    self.bump();
-                    self.skip_newlines();
-                    if self.at(&Token::RBrace) {
-                        break;
-                    }
-                } else {
-                    break;
                 }
-            }
-        }
-        Ok(entries)
+                Token::Ident(s) => {
+                    p.bump();
+                    s
+                }
+                t => {
+                    return Err(p.parse_err(format!(
+                        "object key must be string or identifier, got {t:?}"
+                    )))
+                }
+            };
+            p.expect(Token::Colon)?;
+            let value = p.parse_expr()?;
+            Ok((key, value))
+        })
     }
     fn parse_array_literal(&mut self) -> Result<Expr, Box<dyn Error>> {
         self.expect(Token::LBracket)?;
@@ -418,17 +371,23 @@ impl Parser {
         self.expect(Token::RBracket)?;
         Ok(Expr::Array(items))
     }
-    fn parse_array_items(&mut self) -> Result<Vec<Expr>, Box<dyn Error>> {
+    /// delimiter 内のカンマ区切り列を読む。要素前後の改行を無視し、
+    /// 末尾カンマを許す。`end` 自体の消費は呼び出し側が行う。
+    fn parse_comma_separated<T>(
+        &mut self,
+        end: Token,
+        mut item: impl FnMut(&mut Self) -> Result<T, Box<dyn Error>>,
+    ) -> Result<Vec<T>, Box<dyn Error>> {
         self.skip_newlines();
-        let mut items = vec![];
-        if !self.at(&Token::RBracket) {
+        let mut out = vec![];
+        if !self.at(&end) {
             loop {
-                items.push(self.parse_expr()?);
+                out.push(item(self)?);
                 self.skip_newlines();
                 if self.at(&Token::Comma) {
                     self.bump();
                     self.skip_newlines();
-                    if self.at(&Token::RBracket) {
+                    if self.at(&end) {
                         break;
                     }
                 } else {
@@ -436,7 +395,10 @@ impl Parser {
                 }
             }
         }
-        Ok(items)
+        Ok(out)
+    }
+    fn parse_array_items(&mut self) -> Result<Vec<Expr>, Box<dyn Error>> {
+        self.parse_comma_separated(Token::RBracket, |p| p.parse_expr())
     }
     fn parse_arg_into(
         &mut self,
@@ -481,22 +443,14 @@ impl Parser {
         args: &mut Vec<Expr>,
         kwargs: &mut Vec<(String, Expr)>,
     ) -> Result<(), Box<dyn Error>> {
-        self.skip_newlines();
-        if !self.at(&Token::RParen) {
-            loop {
-                self.parse_arg_into(args, kwargs)?;
-                self.skip_newlines();
-                if self.at(&Token::Comma) {
-                    self.bump();
-                    self.skip_newlines();
-                    if self.at(&Token::RParen) {
-                        break;
-                    }
-                } else {
-                    break;
-                }
+        self.parse_comma_separated(Token::RParen, |p| {
+            if let Some(kw) = p.parse_kwarg()? {
+                kwargs.push(kw);
+            } else {
+                args.push(p.parse_expr()?);
             }
-        }
+            Ok(())
+        })?;
         Ok(())
     }
     fn expr_from_string_parts(parts: Vec<StrPart>) -> Result<Expr, Box<dyn Error>> {
