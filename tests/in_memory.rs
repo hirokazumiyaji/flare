@@ -1043,7 +1043,10 @@ fn errors_carry_kind_and_line_col() {
         .downcast_ref::<FirelangError>()
         .expect("parse error in interpolation should be FirelangError");
     assert_eq!(ferr.span, None);
-    assert_eq!(format!("{ferr}"), "interpolation must contain a single expression");
+    assert_eq!(
+        format!("{ferr}"),
+        "interpolation must contain a single expression"
+    );
 }
 
 #[test]
@@ -1164,12 +1167,16 @@ fn nested_sentinels_are_rejected() {
         format!("{err}").contains("field transforms cannot be nested"),
         "{err}"
     );
-    let err = run_script("set(\"users/ns5\", {})\nupdate(\"users/ns5\", {nested: {n: increment(1)}})").unwrap_err();
+    let err =
+        run_script("set(\"users/ns5\", {})\nupdate(\"users/ns5\", {nested: {n: increment(1)}})")
+            .unwrap_err();
     assert!(
         format!("{err}").contains("field transforms cannot be nested"),
         "{err}"
     );
-    let err = run_script("set(\"users/ns6\", {})\nupdate(\"users/ns6\", {nested: {df: delete_field()}})").unwrap_err();
+    let err =
+        run_script("set(\"users/ns6\", {})\nupdate(\"users/ns6\", {nested: {df: delete_field()}})")
+            .unwrap_err();
     assert!(
         format!("{err}").contains("field transforms cannot be nested"),
         "{err}"
@@ -1187,10 +1194,9 @@ fn update_deletes_ancestor_before_descendant_increment() {
 
 #[test]
 fn replacement_set_resolves_increment_under_literal_hyphen_key() {
-    let out = run_script(
-        "set(\"users/lit_hyphen\", {\"a-b\": increment(1)})\nget(\"users/lit_hyphen\")",
-    )
-    .unwrap();
+    let out =
+        run_script("set(\"users/lit_hyphen\", {\"a-b\": increment(1)})\nget(\"users/lit_hyphen\")")
+            .unwrap();
     assert_eq!(out.inspect(), "{\"a-b\" => 1}");
 }
 
@@ -1456,14 +1462,27 @@ fn offset_skips_after_sort_and_count_ignores_paging() {
 
 #[test]
 fn overlapping_update_and_delete_paths_are_rejected() {
-    let err = run_script("set(\"users/ov1\", {})\nupdate(\"users/ov1\", {a: delete_field(), \"a.b\": 1})")
-        .unwrap_err();
-    assert!(format!("{err}").contains("overlapping field paths"), "{err}");
+    let err = run_script(
+        "set(\"users/ov1\", {})\nupdate(\"users/ov1\", {a: delete_field(), \"a.b\": 1})",
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("overlapping field paths"),
+        "{err}"
+    );
 
     let err = run_script("set(\"users/ov2\", {a: 1, \"a.b\": 2}, merge: true)").unwrap_err();
-    assert!(format!("{err}").contains("overlapping field paths"), "{err}");
+    assert!(
+        format!("{err}").contains("overlapping field paths"),
+        "{err}"
+    );
 
-    let err = run_script("set(\"users/ov3\", {})\nupdate(\"users/ov3\", {\"a.b\": delete_field(), a: 1})")
-        .unwrap_err();
-    assert!(format!("{err}").contains("overlapping field paths"), "{err}");
+    let err = run_script(
+        "set(\"users/ov3\", {})\nupdate(\"users/ov3\", {\"a.b\": delete_field(), a: 1})",
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("overlapping field paths"),
+        "{err}"
+    );
 }

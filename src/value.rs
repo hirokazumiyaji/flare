@@ -212,7 +212,9 @@ impl Value {
             Value::Opaque(s) => s.clone(),
             Value::DocRef(d) => format!("#<DocRef path={}>", inspect_str(&d.path)),
             Value::CollectionRef(c) => format!("#<CollectionRef path={}>", inspect_str(&c.path)),
-            Value::CollectionGroupRef(cg) => format!("#<CollectionGroupRef id={}>", inspect_str(&cg.id)),
+            Value::CollectionGroupRef(cg) => {
+                format!("#<CollectionGroupRef id={}>", inspect_str(&cg.id))
+            }
             Value::QueryRef(_) => "#<QueryRef>".to_string(),
             Value::Func(_) => "<func>".to_string(),
         }
