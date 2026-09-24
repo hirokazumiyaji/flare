@@ -14,7 +14,7 @@ use gcloud_sdk::tonic::{Code, Request, Status};
 use prost_types::{NullValue, Timestamp as ProtoTimestamp};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
-use super::{Firestore, InMemoryFirestore, WriteOp};
+use super::{Firestore, WriteOp};
 use crate::value::{DocRef, QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value};
 
 pub struct FirestoreEmulator {
@@ -205,12 +205,6 @@ impl Firestore for FirestoreEmulator {
     }
 
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
-        let reads = writes
-            .iter()
-            .map(|write| write_path(write).to_string())
-            .map(|path| Ok::<_, Box<dyn Error>>((path.clone(), self.get(&path)?)))
-            .collect::<Result<Vec<_>, _>>()?;
-        validate_writes(reads, &writes)?;
         let sdk_writes = write_ops_to_sdk_writes(self, &writes)?;
         self.commit_writes(sdk_writes, vec![])
     }
@@ -285,15 +279,6 @@ impl Firestore for FirestoreEmulator {
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
-        let reads = writes
-            .iter()
-            .map(|write| write_path(write).to_string())
-            .map(|path| Ok::<_, Box<dyn Error>>((path.clone(), self.transaction_get(&path)?)))
-            .collect::<Result<Vec<_>, _>>()?;
-        if let Err(err) = validate_writes(reads, &writes) {
-            let _ = self.abort_transaction();
-            return Err(err);
-        }
         let tid = self.transaction_id.take().ok_or("not in transaction")?;
         let sdk_writes = write_ops_to_sdk_writes(self, &writes)?;
         self.commit_writes(sdk_writes, tid)
@@ -317,29 +302,6 @@ impl Firestore for FirestoreEmulator {
         })?;
         Ok(())
     }
-}
-
-fn write_path(write: &WriteOp) -> &str {
-    match write {
-        WriteOp::Set { path, .. } | WriteOp::Update { path, .. } | WriteOp::Delete { path } => path,
-    }
-}
-
-fn validate_writes(
-    reads: impl IntoIterator<Item = (String, Option<Value>)>,
-    writes: &[WriteOp],
-) -> Result<(), Box<dyn Error>> {
-    let mut memory = InMemoryFirestore::default();
-    for (path, value) in reads {
-        if let Some(Value::Map(data)) = value {
-            memory.apply(vec![WriteOp::Set {
-                path,
-                data,
-                merge: false,
-            }])?;
-        }
-    }
-    memory.apply(writes.to_vec())
 }
 
 fn run_query_candidates(
@@ -782,45 +744,6 @@ fn split_collection_path(path: &str) -> Result<(Option<String>, &str), Box<dyn E
 mod tests {
     use super::*;
 
-    #[test]
-    fn validate_writes_rejects_non_integer_increment_targets() {
-        let reads = [(
-            "users/u".to_string(),
-            Some(Value::Map(BTreeMap::from([(
-                "name".to_string(),
-                Value::Str("a".to_string()),
-            )]))),
-        )];
-        let err = validate_writes(
-            reads,
-            &[WriteOp::Update {
-                path: "users/u".to_string(),
-                data: BTreeMap::from([("name".to_string(), Value::Increment(1))]),
-            }],
-        )
-        .unwrap_err();
-        assert!(format!("{err}").contains("increment target must be an int"));
-    }
-
-    #[test]
-    fn validate_writes_rejects_integer_increment_overflow() {
-        let reads = [(
-            "users/u".to_string(),
-            Some(Value::Map(BTreeMap::from([(
-                "n".to_string(),
-                Value::Int(i64::MAX),
-            )]))),
-        )];
-        let err = validate_writes(
-            reads,
-            &[WriteOp::Update {
-                path: "users/u".to_string(),
-                data: BTreeMap::from([("n".to_string(), Value::Increment(1))]),
-            }],
-        )
-        .unwrap_err();
-        assert!(format!("{err}").contains("integer overflow"));
-    }
     use gcloud_sdk::google::firestore::v1::write;
 
     #[test]

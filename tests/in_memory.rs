@@ -88,7 +88,15 @@ fn supports_server_timestamp_sentinel() {
 fn parses_timestamp_from_rfc3339_string() {
     let out = run_script("timestamp(\"2026-02-01T00:00:00+09:00\").to_unix()").unwrap();
     assert_eq!(out, Value::Int(1769871600));
-    for value in ["2026-02-01T00:00:00.000Z", "2026-02-01T00:00:00.999Z"] {
+    let out = run_script("timestamp(\"2026-02-01t00:00:00Z\").to_unix()").unwrap();
+    assert_eq!(out, Value::Int(1769904000));
+    let out = run_script("timestamp(\"2026-02-01t00:00:00z\").to_unix()").unwrap();
+    assert_eq!(out, Value::Int(1769904000));
+    for value in [
+        "2026-02-01T00:00:00.000Z",
+        "2026-02-01T00:00:00.999Z",
+        "2026-02-01t00:00:00.123z",
+    ] {
         let err = run_script(&format!("timestamp(\"{value}\")")).unwrap_err();
         assert!(format!("{err}").contains("fractional seconds are not supported"));
     }
