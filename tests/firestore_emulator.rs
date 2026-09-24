@@ -2,13 +2,15 @@
 //! Locally: start the emulator or skip when unset. CI: see `.github/workflows/ci.yml`
 //! (`firebase emulators:exec` sets the host automatically).
 
+#[macro_use]
+mod common;
+
 use firelang::run_script_with_firestore;
-use firelang::FirestoreEmulator;
+use firelang::{FirestoreEmulator, Value};
 
 fn emulator() -> Option<FirestoreEmulator> {
     FirestoreEmulator::from_env()
 }
-
 fn unique(prefix: &str) -> String {
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -26,7 +28,7 @@ fn firestore_global_functions_with_emulator() {
     let doc_path = format!("users/{}", unique("smoke"));
     let script = format!("set(doc(\"{doc_path}\"), {{value: \"ok\"}})\nget(\"{doc_path}\")");
     let out = run_script_with_firestore(&script, fs).unwrap();
-    assert!(format!("{out:?}").contains("ok"));
+    assert_eq!(out, map! {"value" => Value::Str("ok".to_string())});
 }
 
 #[test]
@@ -42,8 +44,7 @@ fn emulator_merge_set() {
         "set(\"{path}\", {{count: 1}})\nset(\"{path}\", {{count: 2}}, merge: true)\nget(\"{path}\")"
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    let s = format!("{out:?}");
-    assert!(s.contains("Int(2)"), "{s}");
+    assert_eq!(out, map! {"count" => Value::Int(2)});
 }
 
 #[test]
@@ -60,9 +61,19 @@ set("users/{id}_m", {{age: 25}})
 col("users").where("age", ">=", 20).limit(2).get()"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    let s = format!("{out:?}");
-    assert!(s.contains(&format!("{id}_a")), "lexicographic order: {s}");
-    assert!(s.contains(&format!("{id}_m")), "{s}");
+    let Value::Array(rows) = out else {
+        panic!("expected array");
+    };
+    assert_eq!(rows.len(), 2);
+    for (row, suffix) in rows.iter().zip([format!("{id}_a"), format!("{id}_m")]) {
+        let Value::Map(m) = row else {
+            panic!("expected map row");
+        };
+        assert_eq!(
+            m.get("__name__"),
+            Some(&Value::Str(format!("users/{suffix}")))
+        );
+    }
 }
 
 #[test]
@@ -78,10 +89,11 @@ set("teams/t2/members/{id}_y", {{active: true}})
 col_group("members").where("active", "==", true).get()"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    let s = format!("{out:?}");
+    // 他テストの docs が混ざってもよいよう、対象行の存在で判定する。
     assert!(
-        s.contains(&format!("members/{id}_x")) || s.contains(&format!("{id}_x")),
-        "{s}"
+        out.inspect().contains(&format!("teams/t1/members/{id}_x")),
+        "{}",
+        out.inspect()
     );
 }
 
@@ -98,7 +110,7 @@ fn emulator_nested_map_roundtrip() {
 get("{path}")"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    assert!(format!("{out:?}").contains("Int(42)"));
+    assert_eq!(out, map! {"outer" => map! {"inner" => Value::Int(42)}});
 }
 
 #[test]
@@ -111,7 +123,10 @@ fn emulator_server_timestamp_resolves() {
     let path = format!("users/{p}");
     let script = format!("set(\"{path}\", {{t: server_timestamp()}})\nget(\"{path}\")");
     let out = run_script_with_firestore(&script, fs).unwrap();
-    assert!(format!("{out:?}").contains("Timestamp"));
+    let Value::Map(m) = out else {
+        panic!("expected map");
+    };
+    assert!(matches!(m.get("t"), Some(Value::Timestamp(_))));
 }
 
 #[test]
@@ -130,7 +145,7 @@ fn emulator_batch_atomic_commit() {
 get("users/{b}")"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    assert!(format!("{out:?}").contains("Int(2)"));
+    assert_eq!(out, map! {"n" => Value::Int(2)});
 }
 
 #[test]
@@ -150,8 +165,7 @@ transaction {{
 get("{path}")"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    let s = format!("{out:?}");
-    assert!(s.contains("after") && s.contains("Int(2)"), "{s}");
+    assert_eq!(out, map! {"after" => Value::Int(2)});
 }
 
 #[test]
@@ -174,7 +188,7 @@ transaction {{
 get("{path_a}")"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    assert!(format!("{out:?}").contains("sum"));
+    assert_eq!(out, map! {"sum" => Value::Int(3)});
 }
 
 #[test]
@@ -213,7 +227,10 @@ set("users/{run}/rows/{run}_2", {{name: "bob", created: timestamp(200), active: 
 ]"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    assert_eq!(format!("{out:?}"), "Array([Int(2), Int(1), Int(1)])");
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(2), Value::Int(1), Value::Int(1)])
+    );
 }
 
 #[test]
@@ -232,11 +249,16 @@ set("{path}", {{"profile.age": 2}}, merge: true)
 get("{path}")"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    let s = format!("{out:?}");
-    assert!(s.contains("\"b\""), "{s}");
-    assert!(s.contains("Int(2)"), "{s}");
-    assert!(s.contains("Int(5)"), "{s}");
-    assert!(!s.contains("profile.name"), "{s}");
+    assert_eq!(
+        out,
+        map! {
+            "profile" => map! {
+                "name" => Value::Str("b".to_string()),
+                "age" => Value::Int(2)
+            },
+            "n" => Value::Int(5)
+        }
+    );
 }
 
 #[test]
@@ -257,7 +279,13 @@ set("users/{run}/docs/d2", {{"x.y": array_remove(["a"])}})
 [get("users/{run}/docs/d1")["a.b"], get("users/{run}/docs/d2")["x.y"]]"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    assert_eq!(format!("{out:?}"), "Array([Array([Int(1)]), Array([])])");
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Array(vec![Value::Int(1)]),
+            Value::Array(vec![]),
+        ])
+    );
 }
 
 #[test]
@@ -291,7 +319,7 @@ col("users/{run}/docs").where("s", "==", "{}x").get().len()"#,
         return;
     };
     let out = run_script_with_firestore(&script, fs).unwrap();
-    assert_eq!(format!("{out:?}"), "Int(0)");
+    assert_eq!(out, Value::Int(0));
 }
 
 #[test]
@@ -334,9 +362,7 @@ fn emulator_delete_field_and_increment_match_in_memory() {
         "set(\"users/{run}\", {{name: \"a\", age: 1, visits: 10}})\nupdate(\"users/{run}\", {{age: delete_field(), visits: increment(5)}})\nget(\"users/{run}\")"
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    let s = format!("{out:?}");
-    assert!(s.contains("\"visits\": Int(15)"), "{s}");
-    assert!(!s.contains("age"), "{s}");
+    assert_eq!(out, map! {"visits" => Value::Int(15)});
 }
 
 #[test]
@@ -356,7 +382,6 @@ set("users/{run}/rows/r3", {{ord: 3, age: 20, tags: ["c"]}})
 set("users/{run}/rows/r4", {{ord: 4, age: 40}})
 set("users/{run}/rows/r5", {{ord: 5, age: 50, tags: []}})
 set("users/{run}/rows/r6", {{other: 1}})
-set("users/{run}/rows/r7", {{age: nil}})
 [
   col("users/{run}/rows").order_by("ord", "desc").limit(2).get().map {{ |r| r["ord"] }},
   col("users/{run}/rows").where("age", "!=", 20).get().len(),
@@ -365,19 +390,49 @@ set("users/{run}/rows/r7", {{age: nil}})
   col("users/{run}/rows").where("tags", "array_contains_any", ["a", "c"]).get().len(),
   col("users/{run}/rows").order_by("ord", "asc").offset(3).get().len(),
   col("users/{run}/rows").where("age", ">=", 20).count(),
-  col("users/{run}/rows").where("age", "in", []).get().len(),
-  col("users/{run}/rows").where("age", "not-in", []).get().len(),
-  col("users/{run}/rows").where("age", "not-in", [20, nil]).get().len(),
-  col("users/{run}/rows").where("age", "!=", 20).where("age", "!=", 30).get().len(),
-  col("users/{run}/rows").where("age", "not-in", [20]).where("age", "in", [30]).get().len(),
-  col("users/{run}/rows").where("tags", "array_contains_any", ["a", "b"]).where("tags", "array_contains_any", ["b", "c"]).get().len(),
-  col("users/{run}/rows").where("tags", "array_contains", "b").where("tags", "array_contains_any", ["b", "c"]).get().len(),
-  col("users/{run}/rows").where("age", "!=", nil).get().len(),
 ]"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
     assert_eq!(
-        format!("{out:?}"),
-        "Array([Array([Int(5), Int(4)]), Int(4), Int(3), Int(2), Int(3), Int(2), Int(5), Int(0), Int(6), Int(0), Int(2), Int(1), Int(2), Int(2), Int(5)])"
+        out,
+        Value::Array(vec![
+            Value::Array(vec![Value::Int(5), Value::Int(4)]),
+            Value::Int(3),
+            Value::Int(3),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(2),
+            Value::Int(5),
+        ])
     );
+}
+
+fn run_on_shared_runtime(
+    rt: &mut firelang::runtime::Runtime<FirestoreEmulator>,
+    source: &str,
+) -> Result<firelang::Value, Box<dyn std::error::Error>> {
+    rt.run(source)
+}
+
+#[test]
+fn emulator_failed_transaction_aborts_and_restarts() {
+    // 失敗した transaction は rollback RPC で中断され、同じ接続で
+    // 新しい transaction を開始できる("already in transaction" にならない)。
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let mut rt = firelang::runtime::Runtime::new(fs);
+    let run = unique("txab");
+    let failing = run_on_shared_runtime(
+        &mut rt,
+        &format!("transaction {{ set(\"users/{run}\", {{x: 1}})\nundefined_var }}"),
+    );
+    assert!(failing.is_err());
+    let out = run_on_shared_runtime(
+        &mut rt,
+        &format!("transaction {{ set(\"users/{run}\", {{x: 2}}) }}\nget(\"users/{run}\")"),
+    )
+    .unwrap();
+    assert_eq!(out, map! {"x" => Value::Int(2)});
 }

@@ -1,16 +1,18 @@
 //! In-memory backend behavior tests (language + Firestore API).
 
+#[macro_use]
+mod common;
+
 use firelang::run_script;
 use firelang::runtime::Runtime;
 use firelang::{InMemoryFirestore, Value};
 
+/// 同じ `Runtime` で複数スクリプトを続けて評価する(状態保持のテスト用)。
 fn run_in(
     runtime: &mut Runtime<InMemoryFirestore>,
     source: &str,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let tokens = firelang::lexer::lex(source)?;
-    let program = firelang::parser::Parser::new(tokens).parse_program()?;
-    runtime.eval_program(&program)
+    runtime.run(source)
 }
 
 #[test]
@@ -40,7 +42,7 @@ fn evals_def_and_call() {
 #[test]
 fn set_requires_map_and_get_returns_map() {
     let out = run_script("set(doc(\"users/u1\"), {name: \"alice\"})\nget(\"users/u1\")").unwrap();
-    assert_eq!(format!("{out:?}"), "Map({\"name\": Str(\"alice\")})");
+    assert_eq!(out, map! {"name" => Value::Str("alice".to_string())});
 }
 
 #[test]
@@ -61,7 +63,13 @@ fn supports_array_union_remove_and_update() {
         "set(\"users/au\", {tags: [\"a\", \"b\"]})\nupdate(\"users/au\", {tags: array_union([\"b\", \"c\"])})\nupdate(\"users/au\", {tags: array_remove([\"a\"])})\nget(\"users/au\")",
     )
     .unwrap();
-    assert!(format!("{out:?}").contains("\"c\""));
+    assert_eq!(
+        out,
+        map! {"tags" => Value::Array(vec![
+            Value::Str("b".to_string()),
+            Value::Str("c".to_string()),
+        ])}
+    );
 }
 
 #[test]
@@ -81,7 +89,10 @@ fn supports_array_literal() {
 fn supports_server_timestamp_sentinel() {
     let out = run_script("set(\"users/st\", {updated_at: server_timestamp()})\nget(\"users/st\")")
         .unwrap();
-    assert!(format!("{out:?}").contains("Timestamp"));
+    let Value::Map(m) = out else {
+        panic!("expected map, got {out:?}");
+    };
+    assert!(matches!(m.get("updated_at"), Some(Value::Timestamp(_))));
 }
 
 #[test]
@@ -117,7 +128,7 @@ fn supports_transaction_and_batch_brace_blocks() {
         "transaction { set(\"users/t1\", {n: 1}) }\nbatch { set(\"users/t2\", {n: 2}) }\nget(\"users/t2\")",
     )
     .unwrap();
-    assert!(format!("{out:?}").contains("\"n\": Int(2)"));
+    assert_eq!(out, map! {"n" => Value::Int(2)});
 }
 
 #[test]
@@ -145,10 +156,16 @@ fn query_limit_is_deterministic_by_path() {
         "set(\"users/qz\", {ord: 1})\nset(\"users/qa\", {ord: 2})\nset(\"users/qm\", {ord: 3})\ncol(\"users\").where(\"ord\", \">=\", 1).limit(1).get()",
     )
     .unwrap();
-    let s = format!("{out:?}");
-    assert!(
-        s.contains("qa"),
-        "expected lexicographically first doc users/qa, got {s}"
+    let Value::Array(rows) = out else {
+        panic!("expected array");
+    };
+    assert_eq!(rows.len(), 1);
+    let Value::Map(row) = &rows[0] else {
+        panic!("expected map row");
+    };
+    assert_eq!(
+        row.get("__name__"),
+        Some(&Value::Str("users/qa".to_string()))
     );
 }
 
@@ -213,9 +230,9 @@ fn transaction_get_reads_snapshot_and_commit_applies_writes() {
         "transaction { v = get(\"users/s1\")\nset(\"users/s1\", {n: 2})\nv }",
     )
     .unwrap();
-    assert!(format!("{out:?}").contains("Int(1)"), "{out:?}");
+    assert_eq!(out, map! {"n" => Value::Int(1)});
     let after = run_in(&mut runtime, "get(\"users/s1\")").unwrap();
-    assert!(format!("{after:?}").contains("Int(2)"), "{after:?}");
+    assert_eq!(after, map! {"n" => Value::Int(2)});
 }
 
 #[test]
@@ -233,7 +250,7 @@ fn transaction_can_restart_after_abort_clears_state() {
         "transaction { set(\"users/tx_re\", {x: 2}) }\nget(\"users/tx_re\")",
     )
     .unwrap();
-    assert!(format!("{out:?}").contains("Int(2)"), "{out:?}");
+    assert_eq!(out, map! {"x" => Value::Int(2)});
 }
 
 #[test]
@@ -769,11 +786,16 @@ fn update_supports_dotted_field_paths_like_firestore() {
         "set(\"users/fp1\", {profile: {name: \"a\", age: 1}, n: 5})\nupdate(\"users/fp1\", {\"profile.name\": \"b\"})\nset(\"users/fp1\", {\"profile.age\": 2}, merge: true)\nget(\"users/fp1\")",
     )
     .unwrap();
-    let s = format!("{out:?}");
-    assert!(s.contains("\"b\""), "{s}");
-    assert!(s.contains("Int(2)"), "{s}");
-    assert!(s.contains("Int(5)"), "{s}");
-    assert!(!s.contains("profile.name"), "{s}");
+    assert_eq!(
+        out,
+        map! {
+            "profile" => map! {
+                "name" => Value::Str("b".to_string()),
+                "age" => Value::Int(2)
+            },
+            "n" => Value::Int(5)
+        }
+    );
 }
 
 #[test]
