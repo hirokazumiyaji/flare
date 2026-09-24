@@ -58,6 +58,11 @@ impl<F: Firestore> Runtime<F> {
         match stmt {
             Stmt::Expr(e) => Ok(ExecFlow::Value(self.eval_expr(e)?)),
             Stmt::Assign { name, value } => {
+                // ビルトイン関数名と同じ名前の変数定義(例: set = 5)は許可する。
+                // 呼び出し時(Expr::Call)はビルトインディスパッチが常に優先され、
+                // 変数参照時(Expr::Var)は変数テーブルから読み出されるため構文上区別できる。
+                // 一方で fn 定義(Stmt::Def)は定義してもビルトインに隠されて呼び出せないため
+                // 禁止している。
                 if self.var_exists(name) {
                     return Err(format!("reassignment is not allowed: {name}").into());
                 }
@@ -523,9 +528,9 @@ type Builtin<F> = fn(
     Option<&Block>,
 ) -> Result<Value, Box<dyn Error>>;
 
-/// ビルトインのテーブル。名前と実装の対応はここだけにある。
-fn lookup_builtin<F: Firestore>(name: &str) -> Option<Builtin<F>> {
-    let table: [(&str, Builtin<F>); 19] = [
+/// ビルトインの対応テーブル。
+fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 19] {
+    [
         ("puts", builtin_puts),
         ("doc", builtin_doc),
         ("col", builtin_col),
@@ -545,8 +550,15 @@ fn lookup_builtin<F: Firestore>(name: &str) -> Option<Builtin<F>> {
         ("delete", builtin_delete),
         ("batch", builtin_batch),
         ("transaction", builtin_transaction),
-    ];
-    table.iter().find(|(n, _)| *n == name).map(|(_, f)| *f)
+    ]
+}
+
+/// ビルトインのテーブル引き。
+fn lookup_builtin<F: Firestore>(name: &str) -> Option<Builtin<F>> {
+    builtin_entries::<F>()
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, f)| f)
 }
 
 fn is_builtin_name(name: &str) -> bool {
@@ -710,10 +722,10 @@ fn builtin_get<F: Firestore>(
         }
         ExecCtx::Transaction { .. } => rt
             .fs
-            .transaction_get(&path)
+            .transaction_get(path)
             .map_err(backend_err)?
             .unwrap_or(Value::Nil),
-        ExecCtx::Normal => rt.fs.get(&path).map_err(backend_err)?.unwrap_or(Value::Nil),
+        ExecCtx::Normal => rt.fs.get(path).map_err(backend_err)?.unwrap_or(Value::Nil),
     };
     Ok(v)
 }
@@ -724,7 +736,7 @@ fn builtin_set<F: Firestore>(
     kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
 ) -> Result<Value, Box<dyn Error>> {
-    let path = expect_doc_path(args.first())?;
+    let path = expect_doc_path(args.first())?.to_string();
     let data = expect_map(args.get(1))?.clone();
     let merge = match (args.get(2), kwargs.get("merge")) {
         (_, Some(Value::Bool(v))) => *v,
@@ -742,7 +754,7 @@ fn builtin_update<F: Firestore>(
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
 ) -> Result<Value, Box<dyn Error>> {
-    let path = expect_doc_path(args.first())?;
+    let path = expect_doc_path(args.first())?.to_string();
     let data = expect_map(args.get(1))?.clone();
     rt.dispatch_write(WriteOp::Update { path, data })?;
     Ok(Value::Nil)
@@ -754,7 +766,7 @@ fn builtin_delete<F: Firestore>(
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
 ) -> Result<Value, Box<dyn Error>> {
-    let path = expect_doc_path(args.first())?;
+    let path = expect_doc_path(args.first())?.to_string();
     rt.dispatch_write(WriteOp::Delete { path })?;
     Ok(Value::Nil)
 }
@@ -799,7 +811,10 @@ fn builtin_transaction<F: Firestore>(
     let (flow, writes) = rt.run_staged_block(ExecCtx::Transaction { writes: vec![] }, &stmts.body);
     match flow {
         Ok(flow) => {
-            rt.fs.commit_transaction(writes).map_err(backend_err)?;
+            if let Err(e) = rt.fs.commit_transaction(writes) {
+                let _ = rt.fs.abort_transaction();
+                return Err(backend_err(e));
+            }
             Ok(flow.into_value())
         }
         Err(e) => {
@@ -866,13 +881,13 @@ fn expect_array(v: Option<&Value>) -> Result<&Vec<Value>, Box<dyn Error>> {
     }
 }
 
-fn expect_doc_path(v: Option<&Value>) -> Result<String, Box<dyn Error>> {
+fn expect_doc_path(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
     match v {
         Some(Value::Str(s)) => {
             validate_doc_path(s)?;
-            Ok(s.clone())
+            Ok(s)
         }
-        Some(Value::DocRef(d)) => Ok(d.path.clone()),
+        Some(Value::DocRef(d)) => Ok(&d.path),
         _ => Err("expected document path string or doc object".into()),
     }
 }
@@ -1149,6 +1164,12 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), BUILTIN_NAMES.len(), "duplicate builtin names");
+        for (name, _) in builtin_entries::<InMemoryFirestore>() {
+            assert!(
+                is_builtin_name(name),
+                "{name} is implemented but missing from BUILTIN_NAMES"
+            );
+        }
         for name in BUILTIN_NAMES {
             assert!(
                 lookup_builtin::<InMemoryFirestore>(name).is_some(),
@@ -1158,5 +1179,62 @@ mod tests {
         }
         assert!(!is_builtin_name("undefined_fn"));
         assert!(lookup_builtin::<InMemoryFirestore>("undefined_fn").is_none());
+    }
+
+    struct FailingCommitFirestore {
+        in_tx: bool,
+        aborted: bool,
+    }
+
+    impl Firestore for FailingCommitFirestore {
+        fn get(&self, _path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+            Ok(None)
+        }
+        fn apply(&mut self, _writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+        fn run_query(&self, _query: &QueryRef) -> Result<crate::firestore::QueryCandidates, Box<dyn Error>> {
+            Ok(vec![])
+        }
+        fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+            if self.in_tx {
+                return Err("already in transaction".into());
+            }
+            self.in_tx = true;
+            Ok(())
+        }
+        fn transaction_get(&self, _path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+            Ok(None)
+        }
+        fn commit_transaction(&mut self, _writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+            Err("commit failed".into())
+        }
+        fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+            self.in_tx = false;
+            self.aborted = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn transaction_aborts_on_commit_failure() {
+        let fs = FailingCommitFirestore {
+            in_tx: false,
+            aborted: false,
+        };
+        let mut runtime = Runtime::new(fs);
+        let res = runtime.eval_program(&[Stmt::Expr(Expr::Call {
+            receiver: None,
+            name: "transaction".into(),
+            args: vec![],
+            kwargs: vec![],
+            block: Some(Block {
+                params: vec![],
+                body: vec![],
+            }),
+        })]);
+        assert!(res.is_err());
+        assert!(runtime.fs.aborted);
+        assert!(!runtime.fs.in_tx);
     }
 }

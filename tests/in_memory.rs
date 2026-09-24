@@ -1065,7 +1065,6 @@ fn errors_carry_kind_and_line_col() {
         format!("{ferr}"),
         "interpolation must contain a single expression"
     );
-
     let err = run_script("if true { |x| x }").unwrap_err();
     let ferr = err
         .downcast_ref::<FirelangError>()
