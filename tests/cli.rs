@@ -171,7 +171,11 @@ fn fl_inline_script_accepts_help_argument_without_triggering_usage() {
         .args(["-e", "h = 5; -h"])
         .output()
         .expect("spawn fl");
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "=> -5\n");
 }
 
@@ -202,5 +206,3 @@ fn fl_validates_backend_before_reading_stdin() {
         "{stderr:?}"
     );
 }
-
-

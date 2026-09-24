@@ -579,11 +579,9 @@ impl Parser {
     fn parse_brace_block(&mut self) -> Result<Vec<Stmt>, Box<dyn Error>> {
         let (block, param_span) = self.parse_brace_block_with_params()?;
         if !block.params.is_empty() {
-            return Err(FirelangError::parse(
-                "block parameters are not allowed here",
-                param_span,
-            )
-            .into());
+            return Err(
+                FirelangError::parse("block parameters are not allowed here", param_span).into(),
+            );
         }
         Ok(block.body)
     }

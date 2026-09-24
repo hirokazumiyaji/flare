@@ -6,7 +6,10 @@ use crate::error::{FirelangError, Span};
 pub enum StrPart {
     Lit(String),
     /// `#{ ... }` の中身の生ソース。パースは parser が行う。
-    Interp { src: String, span: Span },
+    Interp {
+        src: String,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
