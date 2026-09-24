@@ -821,6 +821,18 @@ fn parse_timestamp_arg(v: Option<&Value>) -> Result<i64, Box<dyn Error>> {
 }
 
 fn parse_rfc3339_to_unix(s: &str) -> Result<i64, Box<dyn Error>> {
+    let time = s
+        .split_once('T')
+        .map(|(_, time)| time)
+        .ok_or("invalid RFC3339 timestamp")?;
+    let time_without_zone = time
+        .trim_end_matches('Z')
+        .split(['+', '-'])
+        .next()
+        .unwrap_or(time);
+    if time_without_zone.contains('.') {
+        return Err("fractional seconds are not supported".into());
+    }
     Ok(chrono::DateTime::parse_from_rfc3339(s)
         .map_err(|e| format!("invalid RFC3339 timestamp: {e}"))?
         .timestamp())
