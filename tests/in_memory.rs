@@ -88,6 +88,18 @@ fn supports_server_timestamp_sentinel() {
 fn parses_timestamp_from_rfc3339_string() {
     let out = run_script("timestamp(\"2026-02-01T00:00:00+09:00\").to_unix()").unwrap();
     assert_eq!(out, Value::Int(1769871600));
+    let out = run_script("timestamp(\"2026-02-01t00:00:00Z\").to_unix()").unwrap();
+    assert_eq!(out, Value::Int(1769904000));
+    let out = run_script("timestamp(\"2026-02-01t00:00:00z\").to_unix()").unwrap();
+    assert_eq!(out, Value::Int(1769904000));
+    for value in [
+        "2026-02-01T00:00:00.000Z",
+        "2026-02-01T00:00:00.999Z",
+        "2026-02-01t00:00:00.123z",
+    ] {
+        let err = run_script(&format!("timestamp(\"{value}\")")).unwrap_err();
+        assert!(format!("{err}").contains("fractional seconds are not supported"));
+    }
 }
 
 #[test]
@@ -576,6 +588,12 @@ fn newlines_inside_contained_expressions_are_ignored() {
     assert_eq!(out, Value::Int(3));
     let out = run_script("m = [1, 2]\nm[1 +\n0]").unwrap();
     assert_eq!(out, Value::Int(2));
+    let out = run_script("(1 +\n -2)").unwrap();
+    assert_eq!(out, Value::Int(-1));
+    let out = run_script("[1 +\n -0]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1)]));
+    let out = run_script("[\n !false]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Bool(true)]));
 }
 
 #[test]
@@ -1047,6 +1065,26 @@ fn errors_carry_kind_and_line_col() {
         format!("{ferr}"),
         "interpolation must contain a single expression"
     );
+    let err = run_script("if true { |x| x }").unwrap_err();
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("block parameter error should be FirelangError");
+    assert_eq!(ferr.span, Some(Span::new(1, 11)));
+}
+
+#[test]
+fn interpolation_handles_braces_inside_nested_strings() {
+    // トークン単位で `#{...}` を切り出すため、中の文字列リテラル内の
+    // `{` `}` に惑わされない(旧実装の文字単位カウントでは壊れたケース)。
+    let out = run_script("\"#{\"}\" + \"}\"}\"").unwrap();
+    assert_eq!(out, Value::Str("}}".to_string()));
+    let out = run_script("\"#{{a: 1}[\"a\"]}\"").unwrap();
+    assert_eq!(out, Value::Str("1".to_string()));
+    let out = run_script("\"#{\"a{b}c\"}\"").unwrap();
+    assert_eq!(out, Value::Str("a{b}c".to_string()));
+    // 複数補間・式の組み合わせも従来どおり。
+    let out = run_script("m = {k: \"v\"}\n\"#{m[\"k\"]}-#{1 + 2}\"").unwrap();
+    assert_eq!(out, Value::Str("v-3".to_string()));
 }
 
 #[test]
