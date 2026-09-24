@@ -61,40 +61,6 @@ fn check_element_size(field: &str, v: &Value) -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// 順序付けの値比較。同型は自然順、異型は型ランク(両バックエンド共通の
-/// 全順序。spec §7)。欠損は呼び出し側で除外済みのため扱わない。
-pub(crate) fn compare_order_values(a: &Value, b: &Value) -> std::cmp::Ordering {
-    match (a, b) {
-        (Value::Int(x), Value::Int(y)) => x.cmp(y),
-        (Value::Str(x), Value::Str(y)) => x.cmp(y),
-        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        (Value::Timestamp(x), Value::Timestamp(y)) => x.seconds.cmp(&y.seconds),
-        _ => type_rank(a).cmp(&type_rank(b)),
-    }
-}
-
-fn type_rank(v: &Value) -> u8 {
-    match v {
-        Value::Nil => 0,
-        Value::Bool(_) => 1,
-        Value::Int(_) => 2,
-        Value::Timestamp(_) => 3,
-        Value::Str(_) => 4,
-        Value::Array(_) => 5,
-        Value::Map(_) => 6,
-        _ => 7,
-    }
-}
-
-pub(crate) fn is_simple_field_name(segment: &str) -> bool {
-    let mut chars = segment.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-}
-
 pub(crate) fn paths_overlap(a: &str, b: &str) -> bool {
     if a == b {
         return true;
@@ -133,7 +99,14 @@ pub(crate) fn validate_no_overlapping_paths<'a>(
 /// 非対応なので、バッククォートや空セグメントを含むキーはエラーにする。
 pub(crate) fn validate_field_path(key: &str) -> Result<(), Box<dyn Error>> {
     for segment in key.split('.') {
-        if !is_simple_field_name(segment) {
+        let valid = match segment.chars().next() {
+            Some(c) => c.is_ascii_alphabetic() || c == '_',
+            None => false,
+        } && segment
+            .chars()
+            .skip(1)
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
             return Err(format!(
                 "invalid field path: {key} (segment {segment:?} must match [A-Za-z_][A-Za-z0-9_]*)"
             )
@@ -182,11 +155,18 @@ pub enum WriteOp {
     },
 }
 
+/// クエリ候補: フィルタに一致した (相対ドキュメントパス, フィールド) の列。
+/// 順序・offset/limit・`__name__` は未適用(runtime が付ける)。
+pub type QueryCandidates = Vec<(String, BTreeMap<String, Value>)>;
+
 pub trait Firestore {
     fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
     /// Apply writes atomically: either all writes persist or none do.
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>>;
-    fn run_query(&self, query: &QueryRef) -> Result<Vec<Value>, Box<dyn Error>>;
+    /// Returns filter-matching candidates as (relative path, document fields).
+    /// Ordering, offset/limit, and `__name__` are NOT applied here; the runtime
+    /// applies them uniformly for both backends (spec §7).
+    fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>>;
 
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>>;
     fn transaction_get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;

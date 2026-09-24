@@ -151,6 +151,33 @@ impl Value {
     pub fn truthy(&self) -> bool {
         !matches!(self, Value::Bool(false) | Value::Nil)
     }
+
+    /// クエリ `order_by` 用の全順序。同型は自然順(Int 数値順 / Str 辞書順 /
+    /// Bool `false < true` / Timestamp 秒)、異型は Nil < Bool < Int <
+    /// Timestamp < Str < Array < Map < その他 の型ランクで比べる。
+    /// 両バックエンドの決定性を同じコードで保証するために使う(spec §7)。
+    pub fn cmp_for_order(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Value::Int(x), Value::Int(y)) => x.cmp(y),
+            (Value::Str(x), Value::Str(y)) => x.cmp(y),
+            (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+            (Value::Timestamp(x), Value::Timestamp(y)) => x.seconds.cmp(&y.seconds),
+            _ => type_rank(self).cmp(&type_rank(other)),
+        }
+    }
+}
+
+fn type_rank(v: &Value) -> u8 {
+    match v {
+        Value::Nil => 0,
+        Value::Bool(_) => 1,
+        Value::Int(_) => 2,
+        Value::Timestamp(_) => 3,
+        Value::Str(_) => 4,
+        Value::Array(_) => 5,
+        Value::Map(_) => 6,
+        _ => 7,
+    }
 }
 
 impl CollectionRef {
