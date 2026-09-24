@@ -53,15 +53,18 @@ fn runs_example_scripts_successfully() {
 fn runs_query_example_with_expected_shape() {
     let src = std::fs::read_to_string("examples/scripts/05_query.fl").unwrap();
     let out = run_script(&src).unwrap();
-    match out {
-        Value::Array(rows) => {
-            assert_eq!(rows.len(), 1);
-            let debug = format!("{:?}", rows[0]);
-            assert!(debug.contains("users/2"));
-            assert!(debug.contains("age"));
-        }
-        _ => panic!("expected array output from query example"),
-    }
+    let Value::Array(rows) = out else {
+        panic!("expected array output from query example");
+    };
+    assert_eq!(rows.len(), 1);
+    let Value::Map(row) = &rows[0] else {
+        panic!("expected map row");
+    };
+    assert_eq!(
+        row.get("__name__"),
+        Some(&Value::Str("users/2".to_string()))
+    );
+    assert_eq!(row.get("age"), Some(&Value::Int(30)));
 }
 
 #[test]
@@ -75,6 +78,9 @@ fn runs_error_example_and_fails_as_expected() {
 fn emulator_smoke_example_round_trips_in_memory() {
     let src = std::fs::read_to_string("examples/scripts/09_emulator_smoke.fl").unwrap();
     let out = run_script(&src).unwrap();
-    let s = format!("{out:?}");
-    assert!(s.contains("Bool(true)") && s.contains("Timestamp"), "{s}");
+    let Value::Map(m) = out else {
+        panic!("expected map");
+    };
+    assert_eq!(m.get("ok"), Some(&Value::Bool(true)));
+    assert!(matches!(m.get("checked_at"), Some(Value::Timestamp(_))));
 }

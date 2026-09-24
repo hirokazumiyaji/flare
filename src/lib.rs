@@ -22,9 +22,5 @@ pub fn run_script_with_firestore<F: Firestore>(
     source: &str,
     firestore: F,
 ) -> Result<Value, Box<dyn Error>> {
-    let spanned = lexer::lex_spanned(source)?;
-    let mut parser = parser::Parser::from_spanned(spanned);
-    let (program, spans) = parser.parse_program_with_spans()?;
-    let mut runtime = Runtime::new(firestore);
-    runtime.eval_program_with_spans(&program, &spans)
+    Runtime::new(firestore).run(source)
 }
