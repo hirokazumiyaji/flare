@@ -213,6 +213,9 @@ impl Parser {
         Ok(left)
     }
     fn parse_unary(&mut self) -> Result<Expr, Box<dyn Error>> {
+        if self.depth > 0 {
+            self.skip_newlines();
+        }
         if self.at(&Token::Bang) {
             self.bump();
             let expr = self.parse_unary()?;
@@ -341,10 +344,17 @@ impl Parser {
         self.parse_comma_separated(Token::RBrace, |p| {
             let key = match p.peek().clone() {
                 Token::Str(parts) => {
+                    let span = p.peek_span();
                     p.bump();
                     match parts.as_slice() {
                         [StrPart::Lit(s)] => s.clone(),
-                        _ => return Err(p.parse_err("interpolation is not allowed in map keys")),
+                        _ => {
+                            return Err(FirelangError::parse(
+                                "interpolation is not allowed in map keys",
+                                span,
+                            )
+                            .into())
+                        }
                     }
                 }
                 Token::Ident(s) => {
@@ -479,7 +489,7 @@ impl Parser {
         if !parser.at(&Token::Eof) {
             return Err(FirelangError::parse(
                 "interpolation must contain a single expression",
-                parser.peek_span(),
+                None,
             )
             .into());
         }
@@ -501,19 +511,22 @@ impl Parser {
         if !self.at(&Token::LBrace) || self.suppress_block_calls > 0 {
             return Ok(None);
         }
-        Ok(Some(self.parse_brace_block_with_params()?))
+        Ok(Some(self.parse_brace_block_with_params()?.0))
     }
     fn parse_brace_block(&mut self) -> Result<Vec<Stmt>, Box<dyn Error>> {
-        let block = self.parse_brace_block_with_params()?;
+        let (block, params_span) = self.parse_brace_block_with_params()?;
         if !block.params.is_empty() {
-            return Err(self.parse_err("block parameters are not allowed here"));
+            return Err(
+                FirelangError::parse("block parameters are not allowed here", params_span).into(),
+            );
         }
         Ok(block.body)
     }
-    fn parse_brace_block_with_params(&mut self) -> Result<Block, Box<dyn Error>> {
+    fn parse_brace_block_with_params(&mut self) -> Result<(Block, Option<Span>), Box<dyn Error>> {
         self.expect(Token::LBrace)?;
         // `{\n|x| ... }` のようにパラメータリストの直前に改行が置けるようにする。
         self.skip_newlines();
+        let params_span = self.peek_span();
         let params = self.parse_block_params()?;
         // 本文は「文の並び」なので `;` も文の区切りとして扱う。
         self.skip_separators();
@@ -523,7 +536,13 @@ impl Parser {
             self.skip_separators();
         }
         self.expect(Token::RBrace)?;
-        Ok(Block { params, body })
+        Ok((
+            Block {
+                params: params.clone(),
+                body,
+            },
+            params_span.filter(|_| !params.is_empty()),
+        ))
     }
     fn parse_block_params(&mut self) -> Result<Vec<String>, Box<dyn Error>> {
         // 空パラメータ `||` は lexer が OrOr 1 トークンにまとめるため、ここで吸収する。

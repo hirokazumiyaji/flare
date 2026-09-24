@@ -102,7 +102,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let out = match backend_config {
         None => run_script(&src)?,
         Some((host, project_id)) => {
-            run_script_with_firestore(&src, FirestoreEmulator::new(host, project_id))?
+            run_script_with_firestore(&src, FirestoreEmulator::new(host, project_id)?)?
         }
     };
 
