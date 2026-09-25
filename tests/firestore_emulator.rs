@@ -130,6 +130,43 @@ fn emulator_server_timestamp_resolves() {
 }
 
 #[test]
+fn emulator_server_timestamp_is_shared_within_batch_and_transaction_commits() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let run = unique("stcommit");
+    let script = format!(
+        r#"
+batch {{
+  set("users/{run}/batch_1", {{a: server_timestamp(), b: server_timestamp()}})
+  set("users/{run}/batch_2", {{c: server_timestamp()}})
+}}
+transaction {{
+  set("users/{run}/tx_1", {{a: server_timestamp(), b: server_timestamp()}})
+  set("users/{run}/tx_2", {{c: server_timestamp()}})
+}}
+[
+  get("users/{run}/batch_1")["a"],
+  get("users/{run}/batch_1")["b"],
+  get("users/{run}/batch_2")["c"],
+  get("users/{run}/tx_1")["a"],
+  get("users/{run}/tx_1")["b"],
+  get("users/{run}/tx_2")["c"],
+]
+"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    let Value::Array(times) = out else {
+        panic!("expected timestamp list, got {out:?}");
+    };
+    assert_eq!(times.len(), 6);
+    assert!(matches!(times[0], Value::Timestamp(_)));
+    assert!(times[0..3].iter().all(|value| value == &times[0]));
+    assert!(times[3..].iter().all(|value| value == &times[3]));
+}
+
+#[test]
 fn emulator_batch_atomic_commit() {
     let Some(fs) = emulator() else {
         eprintln!("skip: no emulator");

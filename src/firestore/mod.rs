@@ -4,7 +4,7 @@ mod emulator;
 mod memory;
 
 pub use emulator::FirestoreEmulator;
-pub use memory::InMemoryFirestore;
+pub use memory::{InMemoryFirestore, RequestClock};
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -162,6 +162,7 @@ pub type QueryCandidates = Vec<(String, BTreeMap<String, Value>)>;
 pub trait Firestore {
     fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
     /// Apply writes atomically: either all writes persist or none do.
+    /// All `ServerTimestamp` sentinels in this call use one request time.
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>>;
     /// Returns filter-matching candidates as (relative path, document fields).
     /// Ordering, offset/limit, and `__name__` are NOT applied here; the runtime
@@ -170,6 +171,8 @@ pub trait Firestore {
 
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>>;
     fn transaction_get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
+    /// Commit transaction writes atomically. All `ServerTimestamp` sentinels
+    /// use the one request time of this commit.
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>>;
     /// Rollback an open transaction. Idempotent: succeeds when no
     /// transaction is open. Failures are returned so callers can decide;

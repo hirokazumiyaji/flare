@@ -5,6 +5,7 @@ mod common;
 
 use firelang::run_script;
 use firelang::runtime::Runtime;
+use firelang::value::Timestamp;
 use firelang::{InMemoryFirestore, Value};
 
 /// 同じ `Runtime` で複数スクリプトを続けて評価する(状態保持のテスト用)。
@@ -1545,4 +1546,128 @@ fn overlapping_update_and_delete_paths_are_rejected() {
         format!("{err}").contains("overlapping field paths"),
         "{err}"
     );
+}
+
+#[test]
+fn server_timestamp_samples_one_clock_per_write_commit() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let clock_calls = Arc::clone(&calls);
+    let fs = InMemoryFirestore::with_clock(move || {
+        let n = clock_calls.fetch_add(1, Ordering::SeqCst) as i64;
+        Ok(Timestamp { seconds: 1000 + n })
+    });
+    let mut runtime = Runtime::new(fs);
+    let out = runtime
+        .run(
+            r#"
+set("users/clock_1", {a: server_timestamp(), b: server_timestamp()})
+set("users/clock_2", {c: server_timestamp()})
+[get("users/clock_1"), get("users/clock_2")]
+"#,
+        )
+        .unwrap();
+
+    let Value::Array(docs) = out else {
+        panic!("expected two documents, got {out:?}");
+    };
+    let Value::Map(first) = &docs[0] else {
+        panic!("expected map");
+    };
+    let Value::Map(second) = &docs[1] else {
+        panic!("expected map");
+    };
+    assert_eq!(
+        first.get("a"),
+        Some(&Value::Timestamp(Timestamp { seconds: 1000 }))
+    );
+    assert_eq!(
+        first.get("b"),
+        Some(&Value::Timestamp(Timestamp { seconds: 1000 }))
+    );
+    assert_eq!(
+        second.get("c"),
+        Some(&Value::Timestamp(Timestamp { seconds: 1001 }))
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn server_timestamp_samples_one_clock_per_batch_and_transaction_commit() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let clock_calls = Arc::clone(&calls);
+    let fs = InMemoryFirestore::with_clock(move || {
+        let n = clock_calls.fetch_add(1, Ordering::SeqCst) as i64;
+        Ok(Timestamp { seconds: 2000 + n })
+    });
+    let mut runtime = Runtime::new(fs);
+    let out = runtime
+        .run(
+            r#"
+batch {
+  set("users/batch_clock_1", {a: server_timestamp(), b: server_timestamp()})
+  set("users/batch_clock_2", {c: server_timestamp()})
+}
+transaction {
+  set("users/tx_clock_1", {a: server_timestamp(), b: server_timestamp()})
+  set("users/tx_clock_2", {c: server_timestamp()})
+}
+[
+  get("users/batch_clock_1")["a"],
+  get("users/batch_clock_1")["b"],
+  get("users/batch_clock_2")["c"],
+  get("users/tx_clock_1")["a"],
+  get("users/tx_clock_1")["b"],
+  get("users/tx_clock_2")["c"],
+]
+"#,
+        )
+        .unwrap();
+
+    let Value::Array(times) = out else {
+        panic!("expected timestamp list, got {out:?}");
+    };
+    assert_eq!(times[0], Value::Timestamp(Timestamp { seconds: 2000 }));
+    assert_eq!(times[1], Value::Timestamp(Timestamp { seconds: 2000 }));
+    assert_eq!(times[2], Value::Timestamp(Timestamp { seconds: 2000 }));
+    assert_eq!(times[3], Value::Timestamp(Timestamp { seconds: 2001 }));
+    assert_eq!(times[4], Value::Timestamp(Timestamp { seconds: 2001 }));
+    assert_eq!(times[5], Value::Timestamp(Timestamp { seconds: 2001 }));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn server_timestamp_uses_request_time_for_update_and_merge_set() {
+    let fs = InMemoryFirestore::with_fixed_timestamp(3000);
+    let mut runtime = Runtime::new(fs);
+    let out = runtime
+        .run(
+            r#"
+set("users/fixed_clock", {initial: 1})
+update("users/fixed_clock", {updated: server_timestamp(), changed: server_timestamp()})
+set("users/fixed_clock", {merged: server_timestamp()}, merge: true)
+get("users/fixed_clock")
+"#,
+        )
+        .unwrap();
+
+    let Value::Map(doc) = out else {
+        panic!("expected map, got {out:?}");
+    };
+    for key in ["updated", "changed", "merged"] {
+        assert_eq!(
+            doc.get(key),
+            Some(&Value::Timestamp(Timestamp { seconds: 3000 })),
+            "{key}: {doc:?}"
+        );
+    }
 }

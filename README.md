@@ -23,7 +23,7 @@ puts "found #{rows}"
 cargo run --bin fl -- path/to/script.fl
 ```
 
-デフォルトは in-memory バックエンドです。Firestore エミュレータに接続する場合(`FIRESTORE_EMULATOR_HOST` が必須。プロジェクト ID は省略時 `firelang-test`):
+デフォルトは in-memory バックエンドです。in-memory では `server_timestamp()` の request time を commit 単位で一度だけ取得するため、Rust から `InMemoryFirestore::with_clock(...)` で決定論的な clock を注入できます。Firestore エミュレータに接続する場合(`FIRESTORE_EMULATOR_HOST` が必須。プロジェクト ID は省略時 `firelang-test`):
 
 ```bash
 export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080
