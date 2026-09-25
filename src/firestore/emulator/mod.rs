@@ -67,9 +67,6 @@ impl Firestore for FirestoreEmulator {
 
     fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
-        if super::query_has_no_matches(&query.filters) {
-            return Ok(vec![]);
-        }
 
         // Firestore has restrictions that do not exist in firelang's query
         // model (for example, multiple inequality/membership clauses).  Keep

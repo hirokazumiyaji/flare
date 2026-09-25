@@ -61,18 +61,6 @@ fn check_element_size(field: &str, v: &Value) -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// A filter that is known to match no document can be answered without asking
-/// the backend for candidates.  Keeping this rule next to the shared matcher is
-/// important: both backends must apply it after validation and before any
-/// backend-specific query construction.
-pub(crate) fn query_has_no_matches(filters: &[QueryFilter]) -> bool {
-    filters.iter().any(|f| match (f.op, &f.value) {
-        (QueryOp::In | QueryOp::ArrayContainsAny, Value::Array(items)) => items.is_empty(),
-        (QueryOp::NotIn, Value::Array(items)) => items.contains(&Value::Nil),
-        _ => false,
-    })
-}
-
 /// Apply the firelang query semantics to one decoded document.
 ///
 /// The emulator intentionally re-evaluates every filter after fetching
