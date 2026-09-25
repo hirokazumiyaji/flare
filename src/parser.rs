@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::error::Error;
 
 use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
@@ -102,7 +103,10 @@ impl Parser {
         let mut params = vec![];
         if self.at(&Token::LParen) {
             self.bump();
-            let parsed = self.parse_comma_separated(Token::RParen, |p| p.expect_ident());
+            let mut seen = HashSet::new();
+            let parsed = self.parse_comma_separated(Token::RParen, |p| {
+                p.parse_unique_param(&mut seen, "function")
+            });
             params = parsed?;
             self.expect(Token::RParen)?;
         }
@@ -578,8 +582,9 @@ impl Parser {
             self.bump();
             return Ok(params);
         }
+        let mut seen = HashSet::new();
         loop {
-            params.push(self.expect_ident()?);
+            params.push(self.parse_unique_param(&mut seen, "block")?);
             self.skip_newlines();
             if self.at(&Token::Comma) {
                 self.bump();
@@ -593,6 +598,20 @@ impl Parser {
         }
         self.expect(Token::Pipe)?;
         Ok(params)
+    }
+    fn parse_unique_param(
+        &mut self,
+        seen: &mut HashSet<String>,
+        kind: &str,
+    ) -> Result<String, Box<dyn Error>> {
+        let span = self.peek_span();
+        let name = self.expect_ident()?;
+        if !seen.insert(name.clone()) {
+            return Err(
+                FirelangError::parse(format!("duplicate {kind} parameter: {name}"), span).into(),
+            );
+        }
+        Ok(name)
     }
     fn is_arg_start(&self) -> bool {
         matches!(

@@ -710,6 +710,15 @@ fn block_param_must_match_yielded_argument_count() {
 }
 
 #[test]
+fn duplicate_block_params_are_rejected_at_parse() {
+    let err = run_script("[1].map { |item, item| item }").unwrap_err();
+    assert!(
+        format!("{err}").contains("duplicate block parameter: item"),
+        "{err}"
+    );
+}
+
+#[test]
 fn each_and_map_require_block() {
     let err = run_script("[1].each()").unwrap_err();
     assert!(
@@ -931,6 +940,23 @@ fn newlines_before_operators_and_postfix_inside_delimiters_parse() {
 }
 
 #[test]
+fn duplicate_function_params_are_rejected_at_definition() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(&mut runtime, "fn f(a, a) { a }\nf(1, 2)").unwrap_err();
+    assert!(
+        format!("{err}").contains("duplicate function parameter: a"),
+        "{err}"
+    );
+    assert!(run_in(&mut runtime, "a").is_err());
+    assert_eq!(
+        run_in(&mut runtime, "fn f(a) { a }\nf(2)").unwrap(),
+        Value::Int(2)
+    );
+}
+
+#[test]
+
+#[test]
 fn newlines_before_postfix_outside_delimiters_keep_statement_boundaries() {
     // `a` と配列リテラルは別の文。delimiter 外では `a[1]` に連結しない。
     let out = run_script("a = [10, 20]\na\n[1]").unwrap();
@@ -959,6 +985,32 @@ fn newlines_before_operators_outside_delimiters_keep_statement_boundaries() {
     // `-` は二項演算子として続行せず、单項の新しい文になる。
     let out = run_script("a = 1\n- 2").unwrap();
     assert_eq!(out, Value::Int(-2));
+}
+
+#[test]
+fn failed_function_call_restores_scope_for_runtime_reuse() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(
+        &mut runtime,
+        "outer = 10\nfn f(param) { undefined_inside }\nf(1)",
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("undefined variable"), "{err}");
+    assert_eq!(run_in(&mut runtime, "outer").unwrap(), Value::Int(10));
+    assert!(run_in(&mut runtime, "param").is_err());
+}
+
+#[test]
+fn failed_block_call_restores_scope_for_runtime_reuse() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(
+        &mut runtime,
+        "outer = 10\n[1].map { |item| undefined_inside }",
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("undefined variable"), "{err}");
+    assert_eq!(run_in(&mut runtime, "outer").unwrap(), Value::Int(10));
+    assert!(run_in(&mut runtime, "item").is_err());
 }
 
 #[test]

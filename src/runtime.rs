@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 
 use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
@@ -91,6 +91,7 @@ impl<F: Firestore> Runtime<F> {
                 Ok(ExecFlow::Value(v))
             }
             Stmt::Def { name, params, body } => {
+                validate_unique_params(params, "function")?;
                 if is_builtin_name(name) {
                     return Err(format!("cannot redefine builtin: {name}").into());
                 }
@@ -396,27 +397,23 @@ impl<F: Firestore> Runtime<F> {
         let Some(Value::Func(func)) = self.get_var(name).cloned() else {
             return Err(format!("undefined function: {name}").into());
         };
+        validate_unique_params(&func.params, "function")?;
         let bound = bind_function_args(&func.params, args, kwargs)?;
-        // 関数はグローバルスコープと仮引数のみを見える(静的スコープ)。
-        // 呼び出し元のローカル変数・呼び出された関数自身のローカスは隠す。
-        // フレームを積む前に全仮引数を検証して、途中エラーでスコープを
-        // 取り残さないようにし、呼び出し元を深い clone せず最小の深さだけ復元する。
-        let mut function_scope = HashMap::new();
+        // 呼び出し元のローカル変数・呼び出された関数自身のローカルは隠す。
+        //
+        // caller scope の保存と frame の破棄を guard に任せる。引数の
+        // binding、本体の runtime error、panic unwind のいずれでも同じ復元が
+        // 進み、手動の cleanup 処理に依存しない。
+        let scope = ScopeGuard::function(self);
         for (param, value) in bound {
-            // One clone for the key and the error message, as in `call_block`.
-            if function_scope.insert(param.clone(), value).is_some() {
-                return Err(format!("reassignment is not allowed: {param}").into());
-            }
+            scope.runtime.set_var(&param, value)?;
         }
-        let mut saved = self.scopes.split_off(1);
-        self.scopes.push(function_scope);
-        let res = self.eval_block(&func.body);
-        self.scopes.pop();
-        self.scopes.append(&mut saved);
+        let result = scope.runtime.eval_block(&func.body);
+        drop(scope);
         // 関数呼び出しは制御フロー境界。関数本体(または本体内のブロック)からの
         // Return は、この関数の戻り値として消費する。外側のブロックへ伝播するのは
         // call_block や batch/transaction のブロックから直接来た Return だけ。
-        Ok(ExecFlow::Value(res?.into_value()))
+        result.map(|flow| ExecFlow::Value(flow.into_value()))
     }
 
     fn eval_method_call(
@@ -517,23 +514,17 @@ impl<F: Firestore> Runtime<F> {
     }
 
     fn call_block(&mut self, block: &Block, args: Vec<Value>) -> Result<ExecFlow, Box<dyn Error>> {
+        validate_unique_params(&block.params, "block")?;
         check_block_arity(block, args.len())?;
-        let mut block_scope = HashMap::new();
+        let scope = ScopeGuard::block(self);
         for (param, value) in block.params.iter().cloned().zip(args) {
-            // Single lookup: `check_block_arity` above guarantees exactly one
-            // param per invocation here, so the guard never fires on this path,
-            // but keep it in the same form as `call_function` for symmetry.
-            if block_scope.insert(param.clone(), value).is_some() {
-                return Err(format!("reassignment is not allowed: {param}").into());
-            }
+            scope.runtime.set_var(&param, value)?;
         }
-        self.scopes.push(block_scope);
-        let res = self.eval_block(&block.body);
-        // Pop before propagating, so the block's scope is restored on the error
-        // path too. Returning `res` directly keeps the error path and the scope
-        // restore on the same statement.
-        self.scopes.pop();
-        res
+        // `call_block` propagates Return to its caller (unlike `eval_call`,
+        // which consumes it): the `each`/`map` dispatch decides per item.
+        let result = scope.runtime.eval_block(&block.body);
+        drop(scope);
+        result
     }
 
     fn eval_query_method(
@@ -612,6 +603,61 @@ impl<F: Firestore> Runtime<F> {
     fn var_exists(&self, name: &str) -> bool {
         self.scopes.iter().rev().any(|s| s.contains_key(name))
     }
+}
+
+/// Scope cleanup guard for function and block calls.
+///
+/// A function temporarily hides all caller-local scopes while keeping the
+/// global scope visible. A block only adds one frame. In both cases the
+/// original scope stack is restored on every exit path, including `?` returns
+/// and panic unwinding.
+struct ScopeGuard<'a, F: Firestore> {
+    runtime: &'a mut Runtime<F>,
+    // `Some` is a function frame and contains the caller-local suffix. `None`
+    // is a block frame, which is removed from the end on drop.
+    saved: Option<Vec<HashMap<String, Value>>>,
+}
+
+impl<'a, F: Firestore> ScopeGuard<'a, F> {
+    fn function(runtime: &'a mut Runtime<F>) -> Self {
+        let saved = runtime.scopes.split_off(1);
+        runtime.scopes.push(HashMap::new());
+        Self {
+            runtime,
+            saved: Some(saved),
+        }
+    }
+
+    fn block(runtime: &'a mut Runtime<F>) -> Self {
+        runtime.scopes.push(HashMap::new());
+        Self {
+            runtime,
+            saved: None,
+        }
+    }
+}
+
+impl<F: Firestore> Drop for ScopeGuard<'_, F> {
+    fn drop(&mut self) {
+        if let Some(mut saved) = self.saved.take() {
+            // Keep the global frame and discard every frame created while the
+            // function was running before restoring the caller-local suffix.
+            self.runtime.scopes.truncate(1);
+            self.runtime.scopes.append(&mut saved);
+        } else {
+            self.runtime.scopes.pop();
+        }
+    }
+}
+
+fn validate_unique_params(params: &[String], kind: &str) -> Result<(), Box<dyn Error>> {
+    let mut seen = HashSet::with_capacity(params.len());
+    for param in params {
+        if !seen.insert(param.as_str()) {
+            return Err(format!("duplicate {kind} parameter: {param}").into());
+        }
+    }
+    Ok(())
 }
 
 fn bind_function_args(
@@ -1317,6 +1363,7 @@ impl ExecFlow {
 mod tests {
     use super::*;
     use crate::firestore::InMemoryFirestore;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     #[test]
     fn array_index_conversion_respects_target_width() {
@@ -1515,5 +1562,76 @@ mod tests {
         runtime.fs.abort_transaction().unwrap();
         assert!(!runtime.fs.in_tx);
         runtime.fs.begin_transaction().unwrap();
+
+    struct PanicQueryFirestore;
+
+    impl Firestore for PanicQueryFirestore {
+        fn get(&self, _path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+            Ok(None)
+        }
+        fn apply(&mut self, _writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+        fn run_query(
+            &self,
+            _query: &QueryRef,
+        ) -> Result<crate::firestore::QueryCandidates, Box<dyn Error>> {
+            panic!("query panic")
+        }
+        fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+        fn transaction_get(&self, _path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+            Ok(None)
+        }
+        fn commit_transaction(&mut self, _writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+        fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn scope_guards_restore_after_binding_error() {
+        let mut runtime = Runtime::new(InMemoryFirestore::default());
+        runtime.scopes.push(std::collections::HashMap::from([(
+            "caller".to_string(),
+            Value::Int(7),
+        )]));
+
+        {
+            let scope = ScopeGuard::function(&mut runtime);
+            scope.runtime.set_var("param", Value::Int(1)).unwrap();
+            assert!(scope.runtime.set_var("param", Value::Int(2)).is_err());
+        }
+        assert_eq!(runtime.get_var("caller"), Some(&Value::Int(7)));
+        assert!(runtime.get_var("param").is_none());
+
+        {
+            let scope = ScopeGuard::block(&mut runtime);
+            scope.runtime.set_var("item", Value::Int(1)).unwrap();
+            assert!(scope.runtime.set_var("item", Value::Int(2)).is_err());
+        }
+        assert_eq!(runtime.get_var("caller"), Some(&Value::Int(7)));
+        assert!(runtime.get_var("item").is_none());
+        runtime.scopes.pop();
+    }
+
+    #[test]
+    fn scope_guards_restore_after_panic_unwind() {
+        let mut runtime = Runtime::new(PanicQueryFirestore);
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            runtime.run("fn f(param) { col(\"things\").get() }\nf(1)")
+        }));
+        assert!(result.is_err());
+        assert!(runtime.run("param").is_err());
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            runtime.run("[1].map { |item| col(\"things\").get() }")
+        }));
+        assert!(result.is_err());
+        assert!(runtime.run("item").is_err());
     }
 }
