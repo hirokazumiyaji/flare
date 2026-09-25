@@ -5,37 +5,103 @@ on:
     tags:
       - 'v*'
 
+# The release job is the only job that needs to write to the repository.  The
+# reusable CI workflow is deliberately called below instead of being copied
+# into a second, potentially divergent list of release checks.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  quality-gate:
+    name: Required CI checks
+    # This reusable workflow runs cargo fmt --check, cargo clippy
+    # --all-targets -- -D warnings, cargo test --all-targets, and the release
+    # build.  Its integration-emulator job is part of the same gate.
+    uses: ./.github/workflows/ci.yml
+
+  validate-version:
+    name: Validate release tag
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup default stable
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - name: Validate tag against Cargo metadata
+        # validate-release-tag.sh compares the tag with the package version
+        # returned by cargo metadata --no-deps --format-version 1.
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: scripts/validate-release-tag.sh "$RELEASE_TAG"
 
-      - name: Build release binary
-        run: cargo build --release --bin fl
+  release:
+    name: Publish release package
+    needs:
+      - quality-gate
+      - validate-version
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Package artifact
+      - name: Setup Rust
         run: |
-          mkdir -p dist
-          cp target/release/fl dist/fl-linux-x86_64
+          rustup default stable
+          rustup component add rustfmt clippy
 
-      - name: Upload artifact to workflow
+      # The quality-gate job above has already run this build.  Rebuilding here
+      # keeps the release job self-contained while retaining the gate's result
+      # as a hard dependency.
+      - name: Build release binary
+        run: cargo build --release --bin fl --locked
+
+      - name: Package executable, documentation, license, and checksums
+        # package-release.sh chmods fl to 0755 and creates SHA256SUMS plus
+        # the archive's .sha256 sidecar.
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: scripts/package-release.sh "$RELEASE_TAG" target/release/fl dist
+
+      - name: Verify release package before upload
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          archive="dist/firelang-${version}-linux-x86_64.tar.gz"
+          checksum="${archive}.sha256"
+          test -f "$archive"
+          test -f "$checksum"
+          (cd dist && sha256sum -c "$(basename "$checksum")")
+          verify_dir="$(mktemp -d)"
+          trap 'rm -rf "$verify_dir"' EXIT
+          tar -xzf "$archive" -C "$verify_dir"
+          package_dir="$verify_dir/firelang-${version}-linux-x86_64"
+          test -x "$package_dir/fl"
+          test -f "$package_dir/README.md"
+          test -f "$package_dir/LICENSE"
+          test -f "$package_dir/docs/spec.md"
+          (cd "$package_dir" && sha256sum -c SHA256SUMS)
+
+      - name: Upload release package to workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: fl-linux-x86_64
-          path: dist/fl-linux-x86_64
+          name: firelang-${{ github.ref_name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
 
-      - name: Publish GitHub Release asset
+      - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/fl-linux-x86_64
+          tag_name: ${{ github.ref_name }}
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true
