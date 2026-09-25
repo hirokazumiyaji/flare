@@ -135,6 +135,9 @@ impl Firestore for FirestoreEmulator {
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        // Validate before consuming the local transaction id. A rejected write
+        // must still be abortable so the server transaction is rolled back.
+        super::validate_writes(&writes)?;
         let tid = self.transaction_id.take().ok_or("not in transaction")?;
         let sdk_writes = writes::write_ops_to_sdk_writes(&self.client.project_id, &writes)?;
         writes::commit_writes(&self.client.db, &self.client.runtime, sdk_writes, tid)

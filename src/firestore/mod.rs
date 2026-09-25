@@ -62,7 +62,7 @@ fn validate_write_value(value: &Value, direct: bool) -> Result<(), Box<dyn Error
         | Value::CollectionRef(_)
         | Value::CollectionGroupRef(_)
         | Value::QueryRef(_)
-        | Value::Func(_) => Err(format!("unsupported value in write: {value:?}").into()),
+        | Value::Func(_) => Err(format!("unsupported value in write: {}", value.inspect()).into()),
     }
 }
 
