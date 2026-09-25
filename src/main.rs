@@ -68,13 +68,10 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let backend_config = match backend {
         "in-memory" => None,
-        "emulator" => {
-            let host = env::var("FIRESTORE_EMULATOR_HOST")
-                .map_err(|_| "FIRESTORE_EMULATOR_HOST must be set when using --backend emulator")?;
-            let project_id =
-                env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".to_string());
-            Some((host, project_id))
-        }
+        "emulator" => Some(
+            FirestoreEmulator::from_env()?
+                .ok_or("FIRESTORE_EMULATOR_HOST must be set when using --backend emulator")?,
+        ),
         other => {
             return Err(format!("unknown backend: {other} (use in-memory or emulator)").into());
         }
@@ -112,9 +109,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let out = match backend_config {
         None => run_script(&src)?,
-        Some((host, project_id)) => {
-            run_script_with_firestore(&src, FirestoreEmulator::new(host, project_id)?)?
-        }
+        Some(firestore) => run_script_with_firestore(&src, firestore)?,
     };
 
     println!("=> {}", out.inspect());

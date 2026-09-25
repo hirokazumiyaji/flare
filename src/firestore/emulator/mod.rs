@@ -5,6 +5,7 @@ mod codec;
 mod path;
 mod writes;
 
+use std::env::{self, VarError};
 use std::error::Error;
 
 use gcloud_sdk::google::firestore::v1::{
@@ -30,20 +31,58 @@ pub struct FirestoreEmulator {
 }
 
 impl FirestoreEmulator {
-    pub fn from_env() -> Option<Self> {
-        let host = std::env::var("FIRESTORE_EMULATOR_HOST").ok()?;
-        let project_id =
-            std::env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".to_string());
-        Self::new(host, project_id).ok()
+    /// Reads the emulator configuration from the environment.
+    ///
+    /// `Ok(None)` means that `FIRESTORE_EMULATOR_HOST` is not set. A value
+    /// that is present but cannot be used (for example, invalid UTF-8, an
+    /// empty value, or an unreachable emulator) is an error instead of a
+    /// second way of saying "not configured".
+    pub fn from_env() -> Result<Option<Self>, Box<dyn Error>> {
+        let host = match env::var("FIRESTORE_EMULATOR_HOST") {
+            Ok(host) => host,
+            Err(VarError::NotPresent) => return Ok(None),
+            Err(VarError::NotUnicode(_)) => {
+                return Err("FIRESTORE_EMULATOR_HOST must be valid UTF-8".into());
+            }
+        };
+        validate_config("FIRESTORE_EMULATOR_HOST", &host)?;
+
+        let project_id = match env::var("FIRESTORE_PROJECT_ID") {
+            Ok(project_id) => project_id,
+            Err(VarError::NotPresent) => "firelang-test".to_string(),
+            Err(VarError::NotUnicode(_)) => {
+                return Err("FIRESTORE_PROJECT_ID must be valid UTF-8".into());
+            }
+        };
+
+        Ok(Some(Self::new(host, project_id)?))
     }
 
     /// 接続を確立して作る。emulator に届かない場合はエラーを返す。
     pub fn new(host: String, project_id: String) -> Result<Self, Box<dyn Error>> {
+        validate_config("FIRESTORE_EMULATOR_HOST", &host)?;
+        validate_config("FIRESTORE_PROJECT_ID", &project_id)?;
+
+        let client = match client::connect(&host, &project_id) {
+            Ok(client) => client,
+            Err(error) => {
+                return Err(
+                    format!("failed to connect to Firestore emulator at {host}: {error}").into(),
+                );
+            }
+        };
         Ok(Self {
-            client: client::connect(&host, &project_id)?,
+            client,
             transaction_id: None,
         })
     }
+}
+
+fn validate_config(name: &str, value: &str) -> Result<(), Box<dyn Error>> {
+    if value.trim().is_empty() {
+        return Err(format!("{name} must not be empty").into());
+    }
+    Ok(())
 }
 
 impl Firestore for FirestoreEmulator {

@@ -1,6 +1,7 @@
 //! Smoke tests for the `fl` binary.
 
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 const FL_EXE: &str = env!("CARGO_BIN_EXE_fl");
 
@@ -172,7 +173,6 @@ fn fl_error_goes_to_stderr_with_position() {
 
 fn run_fl_with_piped_stdin(args: &[&str], stdin_text: &str) -> std::process::Output {
     use std::io::Write;
-    use std::process::Stdio;
     let mut child = Command::new(FL_EXE)
         .args(args)
         .stdin(Stdio::piped())
@@ -187,6 +187,38 @@ fn run_fl_with_piped_stdin(args: &[&str], stdin_text: &str) -> std::process::Out
         .write_all(stdin_text.as_bytes())
         .expect("write stdin");
     child.wait_with_output().expect("wait fl")
+}
+
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll fl") {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn read_child_output(child: &mut Child) -> std::process::Output {
+    use std::io::Read;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_end(&mut stdout).expect("read fl stdout");
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_end(&mut stderr).expect("read fl stderr");
+    }
+    std::process::Output {
+        status: child.wait().expect("wait fl"),
+        stdout,
+        stderr,
+    }
 }
 
 #[test]
@@ -298,6 +330,55 @@ fn fl_validates_backend_before_reading_stdin() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("FIRESTORE_EMULATOR_HOST must be set"),
+        "{stderr:?}"
+    );
+}
+
+#[test]
+fn fl_rejects_empty_emulator_host_before_reading_stdin() {
+    let mut child = Command::new(FL_EXE)
+        .args(["--backend", "emulator", "-"])
+        .env("FIRESTORE_EMULATOR_HOST", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fl");
+    let _stdin = child.stdin.take().expect("keep stdin open");
+    let status = wait_for_exit(&mut child, Duration::from_secs(2))
+        .expect("fl read stdin before rejecting an empty emulator host");
+    assert!(!status.success());
+    let out = read_child_output(&mut child);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("FIRESTORE_EMULATOR_HOST must not be empty"),
+        "{stderr:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fl_rejects_non_utf8_emulator_host_before_reading_stdin() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let host = OsString::from_vec(vec![0xff]);
+    let mut child = Command::new(FL_EXE)
+        .args(["--backend", "emulator", "-"])
+        .env("FIRESTORE_EMULATOR_HOST", host)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fl");
+    let _stdin = child.stdin.take().expect("keep stdin open");
+    let status = wait_for_exit(&mut child, Duration::from_secs(2))
+        .expect("fl read stdin before rejecting a non-UTF-8 emulator host");
+    assert!(!status.success());
+    let out = read_child_output(&mut child);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("FIRESTORE_EMULATOR_HOST must be valid UTF-8"),
         "{stderr:?}"
     );
 }
