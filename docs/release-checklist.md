@@ -6,13 +6,15 @@ Use before tagging a release or publishing binaries.
    - `cargo fmt --check`
    - `cargo clippy --all-targets -- -D warnings`
    - `cargo test --all-targets`
+   - `cargo test --test firebase_config`
    - `cargo build --release --bin fl`
 
 2. **Firestore emulator (optional but recommended)**
    - Install [Firebase CLI](https://firebase.google.com/docs/cli) and Java 11+.
-   - From the repo root:  
-     `firebase emulators:exec --only firestore --project demo-firelang 'FIRESTORE_PROJECT_ID=demo-firelang cargo test --test firestore_emulator -- --nocapture'`
-   - Same command runs in CI (`.github/workflows/ci.yml`, job `integration-emulator`).
+   - From the repo root, use the explicit local-only config and `demo-firelang` project:
+     `firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang 'FIRESTORE_PROJECT_ID=demo-firelang cargo test --test firestore_emulator -- --nocapture'`
+   - Never run `firebase deploy --config firebase.emulators.json`.
+   - Same emulator test runs in CI (`.github/workflows/ci.yml`, job `integration-emulator`).
 
 3. **Smoke**
    - `./target/release/fl --help`

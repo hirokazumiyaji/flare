@@ -20,6 +20,24 @@ fn unique(prefix: &str) -> String {
 }
 
 #[test]
+fn production_config_denies_firestore_writes() {
+    if std::env::var("FIRELANG_FIRESTORE_RULES").as_deref() != Ok("deny") {
+        return;
+    }
+
+    let fs = emulator().expect("the deny-rules check must run with an emulator");
+    let doc_path = format!("production_guard/{}", unique("write"));
+    let script = format!("set(doc(\"{doc_path}\"), {{value: \"blocked\"}})");
+    let err = run_script_with_firestore(&script, fs).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("PERMISSION_DENIED")
+            || message.to_ascii_lowercase().contains("permission denied"),
+        "expected a permission error, got: {message}"
+    );
+}
+
+#[test]
 fn firestore_global_functions_with_emulator() {
     let Some(fs) = emulator() else {
         eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");

@@ -28,6 +28,9 @@ jobs:
       - name: Test
         run: cargo test --all-targets
 
+      - name: Validate Firebase deployment guard
+        run: cargo test --test firebase_config
+
       - name: Build release binary
         run: cargo build --release --bin fl
 
@@ -58,7 +61,12 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Run integration tests with Firestore emulator
+      - name: Run integration tests with allow-all emulator rules
         run: |
-          firebase emulators:exec --only firestore --project demo-firelang \
+          firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang \
             'FIRESTORE_PROJECT_ID=demo-firelang cargo test --test firestore_emulator -- --nocapture'
+
+      - name: Verify deploy config denies Firestore writes
+        run: |
+          firebase emulators:exec --config firebase.json --only firestore --project demo-firelang \
+            'FIRESTORE_PROJECT_ID=demo-firelang FIRELANG_FIRESTORE_RULES=deny cargo test --test firestore_emulator production_config_denies_firestore_writes -- --exact --nocapture'

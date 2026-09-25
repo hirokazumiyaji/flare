@@ -11,6 +11,9 @@ gcloud-sdk = "0.30"
 prost-types = "0.14"
 tokio = { version = "1", features = ["net", "rt", "time"] }
 
+[dev-dependencies]
+serde_json = "1"
+
 [[bin]]
 name = "fl"
 path = "src/main.rs"
