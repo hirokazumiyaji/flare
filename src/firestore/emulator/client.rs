@@ -66,7 +66,7 @@ where
     F: Future<Output = Result<T, E>>,
 {
     let started = Instant::now();
-    match runtime.block_on(tokio::time::timeout(timeout, future)) {
+    match runtime.block_on(async move { tokio::time::timeout(timeout, future).await }) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(error.into()),
         Err(_) => Err(timeout_error(operation, started.elapsed(), timeout)),

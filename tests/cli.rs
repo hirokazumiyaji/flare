@@ -204,6 +204,45 @@ fn fl_emulator_timeout_rejects_zero_and_malformed_values() {
 }
 
 #[test]
+fn fl_timeout_environment_override_and_cli_precedence_are_observable() {
+    let out = Command::new(FL_EXE)
+        .args(["--backend", "emulator", "-e", "1"])
+        .env("FIRESTORE_EMULATOR_HOST", "127.0.0.1:1")
+        .env("FIRESTORE_EMULATOR_TIMEOUT_MS", "not-a-number")
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("emulator timeout must be") || stderr.contains("positive integer"),
+        "malformed environment timeout should be reported: {stderr:?}"
+    );
+
+    // A valid CLI value takes precedence over the malformed environment value,
+    // so execution proceeds to the emulator connection instead of failing while
+    // resolving the timeout.
+    let out = Command::new(FL_EXE)
+        .args([
+            "--backend",
+            "emulator",
+            "--emulator-timeout-ms",
+            "25",
+            "-e",
+            "1",
+        ])
+        .env("FIRESTORE_EMULATOR_HOST", "127.0.0.1:1")
+        .env("FIRESTORE_EMULATOR_TIMEOUT_MS", "not-a-number")
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("emulator timeout must be"),
+        "CLI timeout should override the environment: {stderr:?}"
+    );
+}
+
+#[test]
 fn fl_timeout_alias_reports_the_alias_and_help_uses_the_default_constant() {
     let out = Command::new(FL_EXE)
         .args(["--backend", "emulator", "--timeout-ms"])
