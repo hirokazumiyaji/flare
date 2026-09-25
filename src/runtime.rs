@@ -159,6 +159,15 @@ impl<F: Firestore> Runtime<F> {
         }
     }
 
+    /// Abort is cleanup, not the error being reported by a transaction.
+    /// Keeping the call non-propagating is important: if the block or commit
+    /// already failed, that original error must reach the caller even when
+    /// rollback also fails. Backends may retain the transaction id so a
+    /// later explicit backend call can retry the abort.
+    fn abort_transaction_best_effort(&mut self) {
+        let _ = self.fs.abort_transaction();
+    }
+
     fn dispatch_write(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
         match &mut self.exec {
             ExecCtx::Normal => self.fs.apply(vec![op]).map_err(backend_err),
@@ -824,16 +833,14 @@ fn builtin_transaction<F: Firestore>(
     match flow {
         Ok(flow) => {
             if let Err(e) = rt.fs.commit_transaction(writes) {
-                let _ = rt.fs.abort_transaction();
+                rt.abort_transaction_best_effort();
                 return Err(backend_err(e));
             }
             Ok(flow.into_value())
         }
         Err(e) => {
-            // Rollback は best-effort: 元のブロックエラーを優先し、
-            // rollback 自体の失敗は無視する(サーバ側タイムアウトが
-            // 最終的な後ろ盾になる)。
-            let _ = rt.fs.abort_transaction();
+            // Preserve the block error if rollback also fails.
+            rt.abort_transaction_best_effort();
             Err(e)
         }
     }
@@ -1227,6 +1234,8 @@ mod tests {
     struct FailingCommitFirestore {
         in_tx: bool,
         aborted: bool,
+        abort_calls: usize,
+        abort_failures_remaining: usize,
     }
 
     impl Firestore for FailingCommitFirestore {
@@ -1256,20 +1265,22 @@ mod tests {
             Err("commit failed".into())
         }
         fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+            self.abort_calls += 1;
+            if !self.in_tx {
+                return Ok(());
+            }
+            if self.abort_failures_remaining > 0 {
+                self.abort_failures_remaining -= 1;
+                return Err("abort failed".into());
+            }
             self.in_tx = false;
             self.aborted = true;
             Ok(())
         }
     }
 
-    #[test]
-    fn transaction_aborts_on_commit_failure() {
-        let fs = FailingCommitFirestore {
-            in_tx: false,
-            aborted: false,
-        };
-        let mut runtime = Runtime::new(fs);
-        let res = runtime.eval_program(&[Stmt::Expr(Expr::Call {
+    fn empty_transaction_stmt() -> Stmt {
+        Stmt::Expr(Expr::Call {
             receiver: None,
             name: "transaction".into(),
             args: vec![],
@@ -1278,9 +1289,62 @@ mod tests {
                 params: vec![],
                 body: vec![],
             }),
-        })]);
+        })
+    }
+
+    fn failing_commit_runtime(abort_failures_remaining: usize) -> Runtime<FailingCommitFirestore> {
+        Runtime::new(FailingCommitFirestore {
+            in_tx: false,
+            aborted: false,
+            abort_calls: 0,
+            abort_failures_remaining,
+        })
+    }
+
+    #[test]
+    fn transaction_aborts_on_commit_failure() {
+        let mut runtime = failing_commit_runtime(0);
+        let res = runtime.eval_program(&[empty_transaction_stmt()]);
         assert!(res.is_err());
+        assert_eq!(runtime.fs.abort_calls, 1);
         assert!(runtime.fs.aborted);
         assert!(!runtime.fs.in_tx);
+    }
+
+    #[test]
+    fn transaction_keeps_commit_error_when_abort_also_fails() {
+        let mut runtime = failing_commit_runtime(1);
+        let err = runtime
+            .eval_program(&[empty_transaction_stmt()])
+            .unwrap_err();
+        assert_eq!(err.to_string(), "commit failed");
+        assert_eq!(runtime.fs.abort_calls, 1);
+        // A failed rollback leaves the transaction available for retry.
+        assert!(runtime.fs.in_tx);
+    }
+
+    #[test]
+    fn transaction_keeps_block_error_when_abort_also_fails() {
+        let mut runtime = failing_commit_runtime(1);
+        let err = runtime.run("transaction { undefined_var }").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("undefined variable: undefined_var"));
+        assert_eq!(runtime.fs.abort_calls, 1);
+        assert!(runtime.fs.in_tx);
+    }
+
+    #[test]
+    fn transaction_abort_can_be_retried() {
+        let mut runtime = failing_commit_runtime(1);
+        runtime.fs.begin_transaction().unwrap();
+        assert_eq!(
+            runtime.fs.abort_transaction().unwrap_err().to_string(),
+            "abort failed"
+        );
+        assert!(runtime.fs.in_tx);
+        runtime.fs.abort_transaction().unwrap();
+        assert!(!runtime.fs.in_tx);
+        runtime.fs.begin_transaction().unwrap();
     }
 }
