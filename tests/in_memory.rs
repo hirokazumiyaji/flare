@@ -266,7 +266,8 @@ fn transaction_can_restart_after_commit_failure_clears_state() {
         "transaction { set(\"users/tx_commit_err\", {x: 2}) }\nget(\"users/tx_commit_err\")",
     )
     .unwrap();
-    assert!(format!("{out:?}").contains("Int(2)"), "{out:?}");
+    // 再開後の transaction が失敗をまたいで値を保持することを、型とフィールドまで検証する。
+    assert_eq!(out, map! {"x" => Value::Int(2)});
 }
 
 #[test]
