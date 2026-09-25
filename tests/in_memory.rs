@@ -804,10 +804,32 @@ fn firestore_path_segment_ids_follow_firestore_constraints() {
 }
 
 #[test]
-fn reserved_ids_are_allowed_for_collection_segments() {
+fn reserved_ids_are_rejected_in_collection_segments_too() {
+    // spec §6: ID 制約(予約パターン `__.*__` を含む)は document / collection
+    // で同一。collection ID だけ通すと `col("__x__")` と `doc("users/__x__")`
+    // で挙動が割れる。
+    for source in [
+        r#"col("__reserved__").get()"#,
+        r#"col_group("__reserved__").get()"#,
+        r#"set("__reserved__/m1", {ok: true})"#,
+        r#"get("__reserved__/m1")"#,
+        r#"col("users").doc("__reserved__")"#,
+    ] {
+        let err = run_script(source).unwrap_err();
+        let message = format!("{err}");
+        assert!(
+            message.contains("__.*__"),
+            "expected the reserved-pattern error for {source}, got: {message}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_collection_ids_still_work() {
+    // 予約パターンに当たらない collection ID は従来どおり使える。
     let out = run_script(
-        r#"set("__reserved__/m1", {ok: true})
-[col("__reserved__").get().len(), col_group("__reserved__").get().len()]"#,
+        r#"set("_meta/m1", {ok: true})
+[col("_meta").get().len(), col_group("_meta").get().len()]"#,
     )
     .unwrap();
     assert_eq!(out, Value::Array(vec![Value::Int(1), Value::Int(1)]));

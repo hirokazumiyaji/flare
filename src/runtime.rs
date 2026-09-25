@@ -909,27 +909,32 @@ const MAX_FIRESTORE_ID_BYTES: usize = 1_500;
 
 /// 単一 ID 引数(`col().doc()` / `col_group()`)を検証する。
 fn validate_document_id(id: &str) -> Result<(), Box<dyn Error>> {
-    validate_standalone_id(id, "document id", true)
+    validate_standalone_id(id, "document id")
 }
 
 fn validate_collection_group_id(id: &str) -> Result<(), Box<dyn Error>> {
-    validate_standalone_id(id, "collection group id", false)
+    validate_standalone_id(id, "collection group id")
 }
 
-fn validate_standalone_id(id: &str, kind: &str, is_document: bool) -> Result<(), Box<dyn Error>> {
+fn validate_standalone_id(id: &str, kind: &str) -> Result<(), Box<dyn Error>> {
     // 空文字と `/` は既存の error format を保ちつつ、他の ID 制約も同じ
     // runtime エラーにする。
     if id.is_empty() || id.contains('/') {
         return Err(format!("invalid {kind}: {id}").into());
     }
-    if let Err(reason) = validate_firestore_id(id, is_document) {
+    if let Err(reason) = validate_firestore_id(id) {
         return Err(format!("invalid {kind}: {id} ({reason})").into());
     }
     Ok(())
 }
 
 /// Firestore の ID 固有の制約。パス上のセグメントと単一 ID 引数で共有する。
-fn validate_firestore_id(id: &str, is_document: bool) -> Result<(), &'static str> {
+///
+/// spec §6 の通り、document ID と collection ID で制約は同一。予約パターン
+/// `__.*__` の検査も document だけを対象にせず両方に適用する(片方だけだと
+/// `col("__meta__")` が通るが `doc("users/__x__")` は弾くというズレが
+/// in-memory / emulator の食い違いの原因になる)。
+fn validate_firestore_id(id: &str) -> Result<(), &'static str> {
     if id.is_empty() {
         return Err("must not be empty");
     }
@@ -942,7 +947,7 @@ fn validate_firestore_id(id: &str, is_document: bool) -> Result<(), &'static str
     if id == "." || id == ".." {
         return Err("must not be \".\" or \"..\"");
     }
-    if is_document && is_reserved_firestore_id(id) {
+    if is_reserved_firestore_id(id) {
         return Err("must not match the reserved pattern __.*__");
     }
     Ok(())
@@ -983,14 +988,15 @@ fn validate_path(path: &str, collection: bool) -> Result<(), Box<dyn Error>> {
 
     let path_kind = if collection { "collection" } else { "document" };
     for (index, segment) in segments.iter().enumerate() {
-        // 偶数番目は collection ID、奇数番目は document ID。制約自体は
-        // 同じだが、エラーではどのセグメントが不正かを区別する。
+        // 偶数番目は collection ID、奇数番目は document ID。ID 制約自体は
+        // 両者で同一(spec §6)だが、エラー文でどのセグメントが不正かを
+        // 区別するため id_kind は残す。
         let id_kind = if index % 2 == 0 {
             "collection"
         } else {
             "document"
         };
-        if let Err(reason) = validate_firestore_id(segment, index % 2 == 1) {
+        if let Err(reason) = validate_firestore_id(segment) {
             return Err(format!(
                 "invalid {path_kind} path: {path} (segment {segment:?} is an invalid {id_kind} id: {reason})"
             )
