@@ -343,12 +343,17 @@ mod tests {
             .iter()
             .map(|transform| transform.field_path.as_str())
             .collect();
-        assert!(paths.contains(&r#"`1start_digit`"#));
-        assert!(paths.contains(&r#"`a-b`"#));
-        assert!(paths.contains(&r#"`a.b`"#));
-        assert!(paths.contains(&r#"`a\`b`"#));
-        assert!(paths.contains(&r#"`a\\b`"#));
-        assert!(paths.contains(&"simple_2"));
+        assert_eq!(
+            paths,
+            vec![
+                r#"`1start_digit`"#,
+                r#"`a-b`"#,
+                r#"`a.b`"#,
+                r#"`a\\b`"#,
+                r#"`a\`b`"#,
+                "simple_2",
+            ]
+        );
     }
 
     #[test]

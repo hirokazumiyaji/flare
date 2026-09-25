@@ -186,9 +186,6 @@ fn apply_update_map(
     current: &mut BTreeMap<String, Value>,
     updates: &BTreeMap<String, Value>,
 ) -> Result<(), Box<dyn Error>> {
-    for value in updates.values() {
-        reject_nested_sentinels(value, false)?;
-    }
     let super::WriteValues {
         plain,
         transforms,
@@ -252,7 +249,7 @@ fn resolve_sentinel_map(
     current: Option<&BTreeMap<String, Value>>,
 ) -> Result<(), Box<dyn Error>> {
     for (k, v) in map.clone() {
-        reject_nested_sentinels(&v, false)?;
+        super::reject_nested_sentinels(&v, false)?;
         let segments: Vec<&str> = k.split('.').collect();
         let base = || lookup_field_path(current, &segments);
         let resolved = match v {
@@ -294,35 +291,6 @@ fn resolve_sentinel_map(
             other => other,
         };
         map.insert(k, resolved);
-    }
-    Ok(())
-}
-
-fn reject_nested_sentinels(value: &Value, nested: bool) -> Result<(), Box<dyn Error>> {
-    if nested
-        && matches!(
-            value,
-            Value::ArrayUnion(_)
-                | Value::ArrayRemove(_)
-                | Value::ServerTimestamp
-                | Value::Increment(_)
-                | Value::DeleteField
-        )
-    {
-        return Err("field transforms cannot be nested".into());
-    }
-    match value {
-        Value::Array(items) | Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
-            for item in items {
-                reject_nested_sentinels(item, true)?;
-            }
-        }
-        Value::Map(map) => {
-            for item in map.values() {
-                reject_nested_sentinels(item, true)?;
-            }
-        }
-        _ => {}
     }
     Ok(())
 }

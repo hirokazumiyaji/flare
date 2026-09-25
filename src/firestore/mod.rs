@@ -153,6 +153,37 @@ pub(crate) fn split_write_values(data: &BTreeMap<String, Value>) -> WriteValues 
     }
 }
 
+/// センチネルは data_map の直下にだけ置ける。値の中の Map / Array を
+/// 再帰的にたどり、ネストされた transform を両バックエンドで拒否する。
+pub(crate) fn reject_nested_sentinels(value: &Value, nested: bool) -> Result<(), Box<dyn Error>> {
+    if nested
+        && matches!(
+            value,
+            Value::ArrayUnion(_)
+                | Value::ArrayRemove(_)
+                | Value::ServerTimestamp
+                | Value::Increment(_)
+                | Value::DeleteField
+        )
+    {
+        return Err("field transforms cannot be nested".into());
+    }
+    match value {
+        Value::Array(items) | Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
+            for item in items {
+                reject_nested_sentinels(item, true)?;
+            }
+        }
+        Value::Map(map) => {
+            for item in map.values() {
+                reject_nested_sentinels(item, true)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// update / merge set 共通の plan。plain と delete は mask に入るため互いに
 /// overlap してはいけない。transform 同士も targets が曖昧になるため
 /// overlap を拒否する。transform と mask の重なりは仕様 §6 の順序
@@ -174,6 +205,11 @@ pub(crate) fn plan_update_writes(
             .chain(values.plain.keys().map(String::as_str)),
     )?;
     validate_no_overlapping_paths(values.transforms.iter().map(|(path, _)| path.as_str()))?;
+    // Keep the nested-sentinel rule in the shared plan so the emulator and
+    // in-memory backend reject the same payload with the same message.
+    for value in data.values() {
+        reject_nested_sentinels(value, false)?;
+    }
     Ok(values)
 }
 
