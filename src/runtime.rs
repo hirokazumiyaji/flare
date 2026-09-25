@@ -397,7 +397,6 @@ impl<F: Firestore> Runtime<F> {
         let Some(Value::Func(func)) = self.get_var(name).cloned() else {
             return Err(format!("undefined function: {name}").into());
         };
-        validate_unique_params(&func.params, "function")?;
         let bound = bind_function_args(&func.params, args, kwargs)?;
         // 呼び出し元のローカル変数・呼び出された関数自身のローカルは隠す。
         //
@@ -514,7 +513,6 @@ impl<F: Firestore> Runtime<F> {
     }
 
     fn call_block(&mut self, block: &Block, args: Vec<Value>) -> Result<ExecFlow, Box<dyn Error>> {
-        validate_unique_params(&block.params, "block")?;
         check_block_arity(block, args.len())?;
         let scope = ScopeGuard::block(self);
         for (param, value) in block.params.iter().cloned().zip(args) {
