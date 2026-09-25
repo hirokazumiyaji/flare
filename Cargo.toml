@@ -14,3 +14,7 @@ tokio = { version = "1", features = ["net", "rt", "time"] }
 [[bin]]
 name = "fl"
 path = "src/main.rs"
+
+[[bench]]
+name = "query_payload"
+harness = false

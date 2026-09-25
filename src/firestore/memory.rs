@@ -33,6 +33,36 @@ impl Firestore for InMemoryFirestore {
             .collect())
     }
 
+    fn run_query_page(&self, query: &QueryRef) -> Result<super::QueryCandidates, Box<dyn Error>> {
+        super::validate_query_filters(&query.filters)?;
+        let mut rows: Vec<_> = self
+            .candidates(&query.source)
+            .filter(|(_, doc)| matches_filters(doc, &query.filters))
+            .collect();
+        if query.order_by.is_empty() {
+            rows.sort_by(|a, b| a.0.cmp(b.0));
+        } else {
+            rows.retain(|(path, doc)| super::candidate_has_order_fields(path, doc, query));
+            rows.sort_by(|a, b| super::compare_query_candidates(a.0, a.1, b.0, b.1, query));
+        }
+        let skip = query.offset.unwrap_or(0);
+        let limit = query.limit.unwrap_or(usize::MAX);
+        Ok(rows
+            .into_iter()
+            .skip(skip)
+            .take(limit)
+            .map(|(path, doc)| (path.clone(), doc.clone()))
+            .collect())
+    }
+
+    fn count_query(&self, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
+        super::validate_query_filters(&query.filters)?;
+        Ok(self
+            .candidates(&query.source)
+            .filter(|(_, doc)| matches_filters(doc, &query.filters))
+            .count() as i64)
+    }
+
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
         if self.tx_snapshot.is_some() {
             return Err("already in transaction".into());

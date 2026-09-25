@@ -440,13 +440,17 @@ impl<F: Firestore> Runtime<F> {
                 unpaged.offset = None;
                 unpaged.limit = None;
                 Ok(Value::Int(
-                    self.fs.run_query(&unpaged).map_err(backend_err)?.len() as i64,
+                    self.fs.count_query(&unpaged).map_err(backend_err)?,
                 ))
             }
             "get" => {
                 self.forbid_query_in_batch_or_transaction()?;
-                let rows = self.fs.run_query(&query).map_err(backend_err)?;
-                Ok(Value::Array(apply_query_shape(rows, &query)))
+                let rows = self.fs.run_query_page(&query).map_err(backend_err)?;
+                Ok(Value::Array(
+                    rows.into_iter()
+                        .map(|(path, doc)| wrap_doc(&path, &doc))
+                        .collect(),
+                ))
             }
             _ => Err(format!("unknown query method: {name}").into()),
         }
@@ -942,81 +946,11 @@ fn check_block_arity(block: &Block, yielded: usize) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-/// バックエンドが返した候補(相対パス・フィールド)に `__name__` を付け、
-/// 順序・offset・limit を適用する。両バックエンド共通の決定性はここで
-/// 保証する(spec §7)。`order_by` 対象を持たないドキュメントは除外する。
-fn apply_query_shape(
-    mut rows: Vec<(String, BTreeMap<String, Value>)>,
-    query: &QueryRef,
-) -> Vec<Value> {
-    if query.order_by.is_empty() {
-        rows.sort_by(|a, b| a.0.cmp(&b.0));
-    } else {
-        rows.retain(|(path, doc)| {
-            query
-                .order_by
-                .iter()
-                .all(|(f, _)| get_field_value(path, doc, f).is_some())
-        });
-        rows.sort_by(|a, b| {
-            for (field, dir) in &query.order_by {
-                let val_a = get_field_value(&a.0, &a.1, field).unwrap();
-                let val_b = get_field_value(&b.0, &b.1, field).unwrap();
-                let ord = val_a.cmp_for_order(&val_b);
-                let ord = match dir {
-                    Direction::Asc => ord,
-                    Direction::Desc => ord.reverse(),
-                };
-                if ord != std::cmp::Ordering::Equal {
-                    return ord;
-                }
-            }
-            a.0.cmp(&b.0)
-        });
-    }
-    let skip = query.offset.unwrap_or(0).min(rows.len());
-    let mut values: Vec<Value> = rows
-        .into_iter()
-        .skip(skip)
-        .map(|(path, doc)| wrap_doc(&path, &doc))
-        .collect();
-    if let Some(l) = query.limit {
-        values.truncate(l.min(values.len()));
-    }
-    values
-}
-
+/// バックエンドが page 処理済みの候補に相対パスの `__name__` を付ける。
 fn wrap_doc(path: &str, doc: &BTreeMap<String, Value>) -> Value {
     let mut out = doc.clone();
     out.insert("__name__".to_string(), Value::Str(path.to_string()));
     Value::Map(out)
-}
-
-fn get_field_value(path: &str, doc: &BTreeMap<String, Value>, field: &str) -> Option<Value> {
-    if field == "__name__" {
-        Some(Value::Str(path.to_string()))
-    } else {
-        let segments: Vec<&str> = field.split('.').collect();
-        lookup_field_path(Some(doc), &segments).cloned()
-    }
-}
-
-fn lookup_field_path<'a>(
-    map: Option<&'a BTreeMap<String, Value>>,
-    segments: &[&str],
-) -> Option<&'a Value> {
-    let mut cur = map?;
-    for (i, seg) in segments.iter().enumerate() {
-        let v = cur.get(*seg)?;
-        if i == segments.len() - 1 {
-            return Some(v);
-        }
-        match v {
-            Value::Map(m) => cur = m,
-            _ => return None,
-        }
-    }
-    None
 }
 
 fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {

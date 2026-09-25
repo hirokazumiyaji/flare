@@ -407,6 +407,37 @@ set("users/{run}/rows/r6", {{other: 1}})
     );
 }
 
+#[test]
+fn emulator_count_and_path_page_handle_large_payloads() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let run = unique("payload");
+    let payload = "x".repeat(32 * 1024);
+    let script = format!(
+        r#"set("users/{run}/rows/z", {{kind: "match", payload: "{payload}"}})
+set("users/{run}/rows/a", {{kind: "match", payload: "{payload}"}})
+set("users/{run}/rows/m", {{kind: "match", payload: "{payload}"}})
+set("users/{run}/rows/other", {{kind: "skip", payload: "{payload}"}})
+[
+  col("users/{run}/rows").where("kind", "==", "match").order_by("payload", "asc").offset(99).limit(1).count(),
+  col("users/{run}/rows").where("kind", "==", "match").offset(1).limit(1).get().map {{ |r| [r["__name__"], len(r["payload"])] }},
+]"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(3),
+            Value::Array(vec![
+                Value::Str(format!("users/{run}/rows/m")),
+                Value::Int((32 * 1024) as i64),
+            ]),
+        ])
+    );
+}
+
 fn run_on_shared_runtime(
     rt: &mut firelang::runtime::Runtime<FirestoreEmulator>,
     source: &str,

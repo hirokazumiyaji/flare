@@ -6,10 +6,12 @@ mod memory;
 pub use emulator::FirestoreEmulator;
 pub use memory::InMemoryFirestore;
 
+use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::error::Error;
 
-use crate::value::{QueryFilter, QueryOp, QueryRef, Value};
+use crate::value::{Direction, QueryFilter, QueryOp, QueryRef, Value};
 
 /// クエリフィルタ値の共有検証。in-memory / emulator のクエリ実行前に
 /// 両バックエンドが呼び、同じエラーを同じメッセージで返す。
@@ -156,17 +158,115 @@ pub enum WriteOp {
 }
 
 /// クエリ候補: フィルタに一致した (相対ドキュメントパス, フィールド) の列。
-/// 順序・offset/limit・`__name__` は未適用(runtime が付ける)。
+/// `run_query` が返す列には順序・offset/limit・`__name__` を適用しない。
 pub type QueryCandidates = Vec<(String, BTreeMap<String, Value>)>;
+
+/// クエリの決定的な順序とページングを候補へ適用する。
+/// バックエンドが page 全体を処理できない場合の安全なフォールバックでも使う。
+pub(crate) fn apply_query_shape(mut rows: QueryCandidates, query: &QueryRef) -> QueryCandidates {
+    if query.order_by.is_empty() {
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+    } else {
+        rows.retain(|(path, doc)| candidate_has_order_fields(path, doc, query));
+        rows.sort_by(|a, b| compare_query_candidates(&a.0, &a.1, &b.0, &b.1, query));
+    }
+    let skip = query.offset.unwrap_or(0);
+    let mut rows = rows.into_iter().skip(skip).collect::<Vec<_>>();
+    if let Some(limit) = query.limit {
+        rows.truncate(limit);
+    }
+    rows
+}
+
+/// 注文対象を持つ候補だけを順序付け・ページング対象へ残す。
+pub(crate) fn candidate_has_order_fields(
+    path: &str,
+    doc: &BTreeMap<String, Value>,
+    query: &QueryRef,
+) -> bool {
+    query
+        .order_by
+        .iter()
+        .all(|(field, _)| query_field_value(path, doc, field).is_some())
+}
+
+/// 共通比較器で 2 候補を比較する。
+/// 値が同じ場合は常に相対ドキュメントパスの昇順で決める。
+pub(crate) fn compare_query_candidates(
+    a_path: &str,
+    a_doc: &BTreeMap<String, Value>,
+    b_path: &str,
+    b_doc: &BTreeMap<String, Value>,
+    query: &QueryRef,
+) -> Ordering {
+    for (field, direction) in &query.order_by {
+        let a = query_field_value(a_path, a_doc, field)
+            .expect("candidates missing order fields are filtered before sorting");
+        let b = query_field_value(b_path, b_doc, field)
+            .expect("candidates missing order fields are filtered before sorting");
+        let mut ordering = a.cmp_for_order(&b);
+        if *direction == Direction::Desc {
+            ordering = ordering.reverse();
+        }
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    a_path.cmp(b_path)
+}
+
+fn query_field_value<'a>(
+    path: &'a str,
+    doc: &'a BTreeMap<String, Value>,
+    field: &str,
+) -> Option<Cow<'a, Value>> {
+    if field == "__name__" {
+        return Some(Cow::Owned(Value::Str(path.to_string())));
+    }
+    lookup_field_path(Some(doc), &field.split('.').collect::<Vec<_>>()).map(Cow::Borrowed)
+}
+
+fn lookup_field_path<'a>(
+    map: Option<&'a BTreeMap<String, Value>>,
+    segments: &[&str],
+) -> Option<&'a Value> {
+    let mut current = map?;
+    for (index, segment) in segments.iter().enumerate() {
+        let value = current.get(*segment)?;
+        if index == segments.len() - 1 {
+            return Some(value);
+        }
+        match value {
+            Value::Map(map) => current = map,
+            _ => return None,
+        }
+    }
+    None
+}
 
 pub trait Firestore {
     fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
     /// Apply writes atomically: either all writes persist or none do.
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>>;
     /// Returns filter-matching candidates as (relative path, document fields).
-    /// Ordering, offset/limit, and `__name__` are NOT applied here; the runtime
-    /// applies them uniformly for both backends (spec §7).
+    /// Ordering, offset, and limit are NOT applied here. This method remains the
+    /// unshaped compatibility path for Firestore implementations.
     fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>>;
+
+    /// Returns only the documents selected by the query's order, offset, and
+    /// limit. Backends may implement this without cloning/materializing full
+    /// document payloads for rows outside the page. The default is a safe client
+    /// fallback over [`Firestore::run_query`].
+    fn run_query_page(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
+        Ok(apply_query_shape(self.run_query(query)?, query))
+    }
+
+    /// Counts all documents matching the filters, ignoring order, offset, and
+    /// limit. Backends may count without returning document payloads. The
+    /// default is a safe fallback over [`Firestore::run_query`].
+    fn count_query(&self, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
+        Ok(self.run_query(query)?.len() as i64)
+    }
 
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>>;
     fn transaction_get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
@@ -175,4 +275,71 @@ pub trait Firestore {
     /// transaction is open. Failures are returned so callers can decide;
     /// `Runtime` ignores them to preserve the original block error.
     fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::QuerySource;
+
+    struct FallbackFirestore;
+
+    impl Firestore for FallbackFirestore {
+        fn get(&self, _path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+            Ok(None)
+        }
+
+        fn apply(&mut self, _writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+
+        fn run_query(&self, _query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
+            Ok(vec![
+                (
+                    "users/b".to_string(),
+                    BTreeMap::from([("ord".to_string(), Value::Int(1))]),
+                ),
+                (
+                    "users/c".to_string(),
+                    BTreeMap::from([("ord".to_string(), Value::Int(2))]),
+                ),
+                (
+                    "users/a".to_string(),
+                    BTreeMap::from([("ord".to_string(), Value::Int(1))]),
+                ),
+            ])
+        }
+
+        fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+
+        fn transaction_get(&self, _path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+            Ok(None)
+        }
+
+        fn commit_transaction(&mut self, _writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+
+        fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_page_and_count_methods_preserve_unshaped_query_semantics() {
+        let firestore = FallbackFirestore;
+        let query = QueryRef {
+            source: QuerySource::Collection("users".to_string()),
+            filters: vec![],
+            order_by: vec![("ord".to_string(), Direction::Asc)],
+            offset: Some(1),
+            limit: Some(1),
+        };
+        let page = firestore.run_query_page(&query).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].0, "users/b");
+        assert_eq!(firestore.count_query(&query).unwrap(), 3);
+    }
 }

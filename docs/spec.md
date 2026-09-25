@@ -302,12 +302,13 @@ col("users").doc("1")       # doc("users/1") と同等
   - `where` の値には `doc("users/1")` などの `DocRef` も指定可能(同一データベース内の参照型フィールドに対する `==` や `in`、`array_contains` 等のクエリ。emulator バックエンドでは同一プロジェクト・同一データベースの完全リソース名へエンコードされて実行される)。
   - 異なる型同士の比較は未規定(§13)。in-memory ではマッチしない。
   - フィールドが存在しないドキュメントはマッチしない(`!=` / `not-in` を含む)。
-- `order_by(field, dir)` — `dir` は `"asc"` / `"desc"`(それ以外は呼び出し時にエラー)。複数回呼ぶと順に適用される。対象フィールドを持たないドキュメントは結果から除外される(`__name__` は全ドキュメントが持つ)。同値は firelang 相対ドキュメントパス文字列の辞書順でタイブレークする。同型の値は where と同じ順序(Int 数値順 / Str 辞書順 / Bool `false < true` / Timestamp 秒)で比べ、型が異なる値同士は Nil < Bool < Int < Timestamp < Str < Array < Map の順に並べる(両バックエンド共通)。順序付けは取得後に両バックエンド共通の比較器で適用するため、サーバ側の複合インデックス制約は受けない。
+- `order_by(field, dir)` — `dir` は `"asc"` / `"desc"`(それ以外は呼び出し時にエラー)。複数回呼ぶと順に適用される。対象フィールドを持たないドキュメントは結果から除外される(`__name__` は全ドキュメントが持つ)。同値は firelang 相対ドキュメントパス文字列の辞書順でタイブレークする。同型の値は where と同じ順序(Int 数値順 / Str 辞書順 / Bool `false < true` / Timestamp 秒)で比べ、型が異なる値同士は Nil < Bool < Int < Timestamp < Str < Array < Map の順に並べる(両バックエンド共通)。`order_by` があるクエリは取得した候補をこの比較器で順序付けるため、サーバ側の複合インデックス制約を受けない。
 - `limit(n)` — 件数上限。後勝ち(複数回呼ぶと最後の値)。`n` は 0 以上で、負数はエラー(`limit must be >= 0`)。
 - `offset(n)` — 先頭から `n` 件を飛ばす。後勝ち。`n` は 0 以上で、負数はエラー(`offset must be >= 0`)。件数を超える offset は空結果になる。
 - `get()` — 実行して `Array<Map>` を返す。各 Map には `__name__` キーで**相対ドキュメントパス**(例 `"users/1"`)が入る。
-- `count()` — フィルタに一致する件数を Int で返す。順序・offset・limit は無視する。
+- `count()` — フィルタに一致する件数を Int で返す。順序・offset・limit は無視する。in-memory では保存済みドキュメントへの参照を直接数え、emulator では `COUNT(*)` aggregation query を使う。
 - **決定的順序**: `order_by` がなければ結果は firelang 相対ドキュメントパス文字列の辞書順(`users/a` < `users/b`)。`order_by` があれば上記の順序。`offset` → `limit` の順に適用される。
+- **クエリ実行経路**: in-memory の `get()` は候補への参照を順序付けしてから page に含まれるフィールドだけを複製する。emulator は `order_by` がなく、範囲比較 filter がなく、offset/limit が protobuf の i32 範囲に収まる場合にだけ `__name__` の順序と page 条件をサーバへ渡す。その他の `get()`、または aggregation RPC 非対応 emulator の `count()` は全候補を返す安全なフォールバックを使い、page 外の document payload を取得する。
 - `col()` のクエリは**直下のドキュメントのみ**対象(サブコレクション内は含まない)。`col_group(id)` はパス中のいずれかの階層でコレクション名が `id` に一致するドキュメントすべてが対象。
 - クエリの**構築**(`.where()` / `.order_by()` / `.offset()` / `.limit()`)は `batch` / `transaction` 内でも可。**実行**(`.get()` / `.count()`)のみ不可。
 - カーソル(`start_after` 等)は非対応(12 章)。ページネーションは `order_by` + `offset` + `limit` で行う。
