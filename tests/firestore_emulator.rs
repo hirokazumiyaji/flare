@@ -6,7 +6,8 @@
 mod common;
 
 use firelang::run_script_with_firestore;
-use firelang::{FirestoreEmulator, Value};
+use firelang::run_script_with_firestore_and_limits;
+use firelang::{FirestoreEmulator, RuntimeLimits, Value};
 
 fn emulator() -> Option<FirestoreEmulator> {
     FirestoreEmulator::from_env()
@@ -74,6 +75,26 @@ col("users").where("age", ">=", 20).limit(2).get()"#
             Some(&Value::Str(format!("users/{suffix}")))
         );
     }
+}
+
+#[test]
+fn emulator_query_result_budget_uses_the_bounded_stream_path() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let run = unique("budget");
+    let script = format!(
+        r#"set("users/{run}/rows/a", {{kind: "match"}})
+set("users/{run}/rows/b", {{kind: "match"}})
+col("users/{run}/rows").where("kind", "==", "match").get()"#
+    );
+    let limits = RuntimeLimits::default().with_max_query_results(1);
+    let err = run_script_with_firestore_and_limits(&script, fs, limits).unwrap_err();
+    assert!(
+        format!("{err}").contains("query result limit exceeded (max 1)"),
+        "{err}"
+    );
 }
 
 #[test]

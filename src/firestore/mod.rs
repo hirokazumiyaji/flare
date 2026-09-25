@@ -9,6 +9,7 @@ pub use memory::InMemoryFirestore;
 use std::collections::BTreeMap;
 use std::error::Error;
 
+use crate::error::FirelangError;
 use crate::value::{QueryFilter, QueryOp, QueryRef, Value};
 
 /// クエリフィルタ値の共有検証。in-memory / emulator のクエリ実行前に
@@ -159,6 +160,14 @@ pub enum WriteOp {
 /// 順序・offset/limit・`__name__` は未適用(runtime が付ける)。
 pub type QueryCandidates = Vec<(String, BTreeMap<String, Value>)>;
 
+/// Error used when a backend would materialize more query candidates than
+/// the runtime's query budget permits.  It is a runtime error (rather than a
+/// backend error) so the CLI and embedding callers can treat all budget
+/// failures uniformly and attach the source span.
+pub(crate) fn query_result_limit_error(max_results: usize) -> Box<dyn Error> {
+    FirelangError::runtime(format!("query result limit exceeded (max {max_results})")).into()
+}
+
 pub trait Firestore {
     fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
     /// Apply writes atomically: either all writes persist or none do.
@@ -167,6 +176,34 @@ pub trait Firestore {
     /// Ordering, offset/limit, and `__name__` are NOT applied here; the runtime
     /// applies them uniformly for both backends (spec §7).
     fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>>;
+
+    /// Run a query while refusing to materialize more than `max_results`
+    /// matching candidates. Implementations must stop before cloning the
+    /// first extra candidate; a post-collection length check is not a
+    /// sufficient resource boundary.
+    fn run_query_bounded(
+        &self,
+        query: &QueryRef,
+        max_results: usize,
+    ) -> Result<QueryCandidates, Box<dyn Error>>;
+
+    /// Configure a per-call timeout for backends that support one.
+    ///
+    /// The default is intentionally a no-op so existing third-party
+    /// implementations remain source-compatible. Such an implementation
+    /// cannot be forcibly interrupted by a synchronous trait call; it should
+    /// override this hook when it has a cancellable I/O path. The built-in
+    /// emulator overrides it and applies the deadline to every RPC.
+    fn set_timeout(&mut self, _timeout: Option<std::time::Duration>) {}
+
+    /// Whether this backend actually enforces the configured timeout.
+    ///
+    /// This is a capability query, not another limit. It lets embedders
+    /// distinguish the built-in adapter from a legacy synchronous backend
+    /// that must retain the compatibility no-op above.
+    fn supports_backend_timeout(&self) -> bool {
+        false
+    }
 
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>>;
     fn transaction_get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;

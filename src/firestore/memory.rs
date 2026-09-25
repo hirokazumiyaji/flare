@@ -33,6 +33,28 @@ impl Firestore for InMemoryFirestore {
             .collect())
     }
 
+    fn run_query_bounded(
+        &self,
+        query: &QueryRef,
+        max_results: usize,
+    ) -> Result<super::QueryCandidates, Box<dyn Error>> {
+        super::validate_query_filters(&query.filters)?;
+        // Keep this as a separate iterator loop instead of delegating to
+        // `run_query`: the runtime must be able to reject the first extra
+        // match before cloning any more document payloads.
+        let mut out = Vec::new();
+        for (path, doc) in self
+            .candidates(&query.source)
+            .filter(|(_, doc)| matches_filters(doc, &query.filters))
+        {
+            if out.len() >= max_results {
+                return Err(super::query_result_limit_error(max_results));
+            }
+            out.push((path.clone(), doc.clone()));
+        }
+        Ok(out)
+    }
+
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
         if self.tx_snapshot.is_some() {
             return Err("already in transaction".into());

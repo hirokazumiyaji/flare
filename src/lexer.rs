@@ -1,6 +1,7 @@
 use std::error::Error;
 
 use crate::error::{FirelangError, Span};
+use crate::limits::ParserLimits;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StrPart {
@@ -63,15 +64,31 @@ struct Lexer<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
     line: usize,
     col: usize,
+    limits: ParserLimits,
+    tokens_emitted: usize,
+    interpolation_depth: usize,
 }
 
 impl<'a> Lexer<'a> {
-    fn new(input: &'a str) -> Self {
-        Self {
+    fn new(input: &'a str, limits: ParserLimits) -> Result<Self, Box<dyn Error>> {
+        if let Some(max) = limits.max_source_bytes {
+            if input.len() > max {
+                return Err(FirelangError::lex(
+                    format!("source exceeds maximum size of {max} bytes"),
+                    1,
+                    1,
+                )
+                .into());
+            }
+        }
+        Ok(Self {
             chars: input.chars().peekable(),
             line: 1,
             col: 1,
-        }
+            limits,
+            tokens_emitted: 0,
+            interpolation_depth: 0,
+        })
     }
 
     fn span(&self) -> Span {
@@ -108,8 +125,28 @@ impl<'a> Lexer<'a> {
     }
 
     /// 入力からトークンを 1 つ読む。空白・コメントは読み飛ばす。
-    /// EOF に達したら `None` を返す。
+    /// EOF に達したら `None` を返す。内部で返すトークンはすべてこの
+    /// wrapper を通し、補間内を含む token 数を一貫して制限する。
     fn next_token(&mut self) -> Result<Option<SpannedToken>, Box<dyn Error>> {
+        let result = self.next_token_inner()?;
+        if result.is_some() {
+            self.tokens_emitted = self.tokens_emitted.saturating_add(1);
+            if let Some(max) = self.limits.max_tokens {
+                if self.tokens_emitted > max {
+                    let span = self.span();
+                    return Err(FirelangError::lex(
+                        format!("token limit exceeded (max {max})"),
+                        span.line,
+                        span.col,
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn next_token_inner(&mut self) -> Result<Option<SpannedToken>, Box<dyn Error>> {
         loop {
             let Some(c) = self.peek() else {
                 return Ok(None);
@@ -310,6 +347,23 @@ impl<'a> Lexer<'a> {
     /// トークン単位で `{` `}` を数えるため、中の文字列リテラル内の
     /// 括弧に惑わされない。末尾に Eof を付けて返す。
     fn lex_interp_tokens(&mut self) -> Result<Vec<SpannedToken>, Box<dyn Error>> {
+        if let Some(max) = self.limits.max_interpolation_depth {
+            if self.interpolation_depth >= max {
+                return Err(FirelangError::lex(
+                    format!("interpolation nesting limit exceeded (max {max})"),
+                    self.line,
+                    self.col,
+                )
+                .into());
+            }
+        }
+        self.interpolation_depth += 1;
+        let result = self.lex_interp_tokens_inner();
+        self.interpolation_depth -= 1;
+        result
+    }
+
+    fn lex_interp_tokens_inner(&mut self) -> Result<Vec<SpannedToken>, Box<dyn Error>> {
         let mut out = vec![];
         let mut depth = 0usize;
         loop {
@@ -344,11 +398,25 @@ impl<'a> Lexer<'a> {
 }
 
 pub fn lex(input: &str) -> Result<Vec<Token>, Box<dyn Error>> {
-    Ok(lex_spanned(input)?.into_iter().map(|s| s.token).collect())
+    lex_with_limits(input, ParserLimits::default())
+}
+
+pub fn lex_with_limits(input: &str, limits: ParserLimits) -> Result<Vec<Token>, Box<dyn Error>> {
+    Ok(lex_spanned_with_limits(input, limits)?
+        .into_iter()
+        .map(|s| s.token)
+        .collect())
 }
 
 pub fn lex_spanned(input: &str) -> Result<Vec<SpannedToken>, Box<dyn Error>> {
-    let mut lx = Lexer::new(input);
+    lex_spanned_with_limits(input, ParserLimits::default())
+}
+
+pub fn lex_spanned_with_limits(
+    input: &str,
+    limits: ParserLimits,
+) -> Result<Vec<SpannedToken>, Box<dyn Error>> {
+    let mut lx = Lexer::new(input, limits)?;
     let mut tokens = Vec::new();
     while let Some(st) = lx.next_token()? {
         tokens.push(st);

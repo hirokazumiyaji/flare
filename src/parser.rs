@@ -3,6 +3,7 @@ use std::error::Error;
 use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
 use crate::error::{FirelangError, Span};
 use crate::lexer::{SpannedToken, StrPart, Token};
+use crate::limits::ParserLimits;
 
 type ParsedArgs = (Vec<Expr>, Vec<(String, Expr)>);
 
@@ -32,10 +33,18 @@ pub struct Parser {
     /// マップ / 配列リテラル・引数リスト・グループ化・添字・仮引数リストの
     /// 内側で 1 以上。内側では改行をトークンとして透過的に無視する。
     depth: usize,
+    /// Recursive syntax depth guard.  Unlike `depth`, this also covers
+    /// unary expressions, `else if` chains, and embedded newlines.
+    nesting: usize,
+    limits: ParserLimits,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
+        Self::new_with_limits(tokens, ParserLimits::default())
+    }
+
+    pub fn new_with_limits(tokens: Vec<Token>, limits: ParserLimits) -> Self {
         let spans = vec![None; tokens.len()];
         Self {
             tokens,
@@ -43,10 +52,22 @@ impl Parser {
             pos: 0,
             suppress_block_calls: 0,
             depth: 0,
+            nesting: 0,
+            limits,
         }
     }
 
+    /// Replace limits on an already constructed parser.
+    pub fn with_limits(mut self, limits: ParserLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
     pub fn from_spanned(spanned: Vec<SpannedToken>) -> Self {
+        Self::from_spanned_with_limits(spanned, ParserLimits::default())
+    }
+
+    pub fn from_spanned_with_limits(spanned: Vec<SpannedToken>, limits: ParserLimits) -> Self {
         let mut tokens = Vec::with_capacity(spanned.len());
         let mut spans = Vec::with_capacity(spanned.len());
         for s in spanned {
@@ -59,6 +80,8 @@ impl Parser {
             pos: 0,
             suppress_block_calls: 0,
             depth: 0,
+            nesting: 0,
+            limits,
         }
     }
     pub fn parse_program(&mut self) -> Result<Vec<Stmt>, Box<dyn Error>> {
@@ -68,6 +91,14 @@ impl Parser {
     /// トップレベル文と各文の開始位置を返す。runtime のエラーに文単位の
     /// 位置を付与するために使う。
     pub fn parse_program_with_spans(&mut self) -> Result<(Vec<Stmt>, Vec<Span>), Box<dyn Error>> {
+        if let Some(max) = self.limits.max_tokens {
+            // EOF is a synthetic token and is not charged to the source budget.
+            let eof = if self.at(&Token::Eof) { 1 } else { 0 };
+            let count = self.tokens.len().saturating_sub(eof);
+            if count > max {
+                return Err(self.parse_err(format!("token limit exceeded (max {max})")));
+            }
+        }
         let mut out = Vec::new();
         let mut spans = Vec::new();
         self.skip_separators();
@@ -76,6 +107,7 @@ impl Parser {
             out.push(self.parse_stmt()?);
             self.skip_separators();
         }
+        self.validate_program_limits(&out)?;
         Ok((out, spans))
     }
     fn parse_stmt(&mut self) -> Result<Stmt, Box<dyn Error>> {
@@ -133,7 +165,10 @@ impl Parser {
             // `else if ...` は else の直後が If なら再帰的にパースし、
             // else_body に1文だけ入れる。`elsif` は増やさない。
             if self.at(&Token::If) {
-                else_body = vec![self.parse_if()?];
+                self.enter_nesting()?;
+                let nested = self.parse_if();
+                self.leave_nesting();
+                else_body = vec![nested?];
             } else {
                 else_body = self.parse_brace_block()?;
             }
@@ -218,7 +253,7 @@ impl Parser {
         }
         if self.at(&Token::Bang) {
             self.bump();
-            let expr = self.parse_unary()?;
+            let expr = self.with_nesting(|parser| parser.parse_unary())?;
             return Ok(Expr::Unary {
                 op: UnOp::Not,
                 expr: Box::new(expr),
@@ -226,7 +261,7 @@ impl Parser {
         }
         if self.at(&Token::Minus) {
             self.bump();
-            let expr = self.parse_unary()?;
+            let expr = self.with_nesting(|parser| parser.parse_unary())?;
             return Ok(Expr::Unary {
                 op: UnOp::Neg,
                 expr: Box::new(expr),
@@ -250,10 +285,12 @@ impl Parser {
                 };
             } else if self.at(&Token::LBracket) {
                 self.bump();
+                self.enter_nesting()?;
                 self.depth += 1;
                 self.skip_newlines();
                 let index = self.parse_expr();
                 self.depth -= 1;
+                self.leave_nesting();
                 let index = index?;
                 self.skip_newlines();
                 self.expect(Token::RBracket)?;
@@ -275,7 +312,7 @@ impl Parser {
             }
             Token::Str(parts) => {
                 self.bump();
-                Self::expr_from_string_parts(parts)
+                self.expr_from_string_parts(parts)
             }
             Token::True => {
                 self.bump();
@@ -312,10 +349,12 @@ impl Parser {
             }
             Token::LParen => {
                 self.bump();
+                self.enter_nesting()?;
                 self.depth += 1;
                 self.skip_newlines();
                 let out = self.parse_expr();
                 self.depth -= 1;
+                self.leave_nesting();
                 let out = out?;
                 self.skip_newlines();
                 self.expect(Token::RParen)?;
@@ -326,16 +365,18 @@ impl Parser {
             Token::Newline if self.depth > 0 => {
                 // delimiter の内側では改行を透過的に無視する(式の途中を含む)。
                 self.bump();
-                self.parse_primary()
+                self.with_nesting(|parser| parser.parse_primary())
             }
             t => Err(self.parse_err(format!("unexpected token: {t:?}"))),
         }
     }
     fn parse_map_literal(&mut self) -> Result<Expr, Box<dyn Error>> {
         self.expect(Token::LBrace)?;
+        self.enter_nesting()?;
         self.depth += 1;
         let entries = self.parse_map_entries();
         self.depth -= 1;
+        self.leave_nesting();
         let entries = entries?;
         self.expect(Token::RBrace)?;
         Ok(Expr::Map(entries))
@@ -374,9 +415,11 @@ impl Parser {
     }
     fn parse_array_literal(&mut self) -> Result<Expr, Box<dyn Error>> {
         self.expect(Token::LBracket)?;
+        self.enter_nesting()?;
         self.depth += 1;
         let items = self.parse_array_items();
         self.depth -= 1;
+        self.leave_nesting();
         let items = items?;
         self.expect(Token::RBracket)?;
         Ok(Expr::Array(items))
@@ -428,9 +471,11 @@ impl Parser {
         let mut kwargs = vec![];
         if self.at(&Token::LParen) {
             self.bump();
+            self.enter_nesting()?;
             self.depth += 1;
             let parsed = self.parse_paren_args(&mut args, &mut kwargs);
             self.depth -= 1;
+            self.leave_nesting();
             parsed?;
             self.expect(Token::RParen)?;
             return Ok((args, kwargs));
@@ -463,7 +508,7 @@ impl Parser {
         })?;
         Ok(())
     }
-    fn expr_from_string_parts(parts: Vec<StrPart>) -> Result<Expr, Box<dyn Error>> {
+    fn expr_from_string_parts(&self, parts: Vec<StrPart>) -> Result<Expr, Box<dyn Error>> {
         if let [StrPart::Lit(s)] = parts.as_slice() {
             return Ok(Expr::Str(s.clone()));
         }
@@ -471,9 +516,9 @@ impl Parser {
         for part in parts {
             match part {
                 StrPart::Lit(s) => pieces.push(StrPiece::Lit(s)),
-                StrPart::Interp(tokens) => {
-                    pieces.push(StrPiece::Expr(Self::parse_embedded_tokens(tokens)?))
-                }
+                StrPart::Interp(tokens) => pieces.push(StrPiece::Expr(
+                    Self::parse_embedded_tokens(tokens, self.limits)?,
+                )),
             }
         }
         Ok(Expr::StrInterp(pieces))
@@ -481,8 +526,11 @@ impl Parser {
 
     /// 補間の中身(トークン列、末尾 Eof 付き)を単一の式として読む。
     /// 前後の改行・`;` は許すが、文が 2 つ以上あるとエラー。
-    fn parse_embedded_tokens(tokens: Vec<SpannedToken>) -> Result<Expr, Box<dyn Error>> {
-        let mut parser = Parser::from_spanned(tokens);
+    fn parse_embedded_tokens(
+        tokens: Vec<SpannedToken>,
+        limits: ParserLimits,
+    ) -> Result<Expr, Box<dyn Error>> {
+        let mut parser = Parser::from_spanned_with_limits(tokens, limits);
         parser.skip_separators();
         let expr = parser.parse_expr()?;
         parser.skip_separators();
@@ -493,6 +541,7 @@ impl Parser {
             )
             .into());
         }
+        parser.validate_expr_limits(&expr)?;
         Ok(expr)
     }
 
@@ -603,6 +652,199 @@ impl Parser {
             self.bump();
         }
     }
+    fn enter_nesting(&mut self) -> Result<(), Box<dyn Error>> {
+        if let Some(max) = self.limits.max_depth {
+            if self.nesting >= max {
+                return Err(self.parse_err(format!("parser nesting limit exceeded (max {max})")));
+            }
+        }
+        self.nesting = self.nesting.saturating_add(1);
+        Ok(())
+    }
+
+    fn leave_nesting(&mut self) {
+        self.nesting = self.nesting.saturating_sub(1);
+    }
+
+    fn with_nesting<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>> {
+        self.enter_nesting()?;
+        let result = f(self);
+        self.leave_nesting();
+        result
+    }
+
+    fn validate_program_limits(&self, stmts: &[Stmt]) -> Result<(), Box<dyn Error>> {
+        if self.limits.max_depth.is_none() {
+            return Ok(());
+        }
+        for stmt in stmts {
+            self.validate_stmt_limits(stmt)?;
+        }
+        Ok(())
+    }
+
+    fn validate_stmt_limits(&self, stmt: &Stmt) -> Result<(), Box<dyn Error>> {
+        let Some(max) = self.limits.max_depth else {
+            return Ok(());
+        };
+        let mut stack = vec![(stmt, 0usize)];
+        while let Some((stmt, depth)) = stack.pop() {
+            if depth > max {
+                return Err(self.parse_err(format!("parser nesting limit exceeded (max {max})")));
+            }
+            match stmt {
+                Stmt::Expr(expr) => self.validate_expr_depth(expr, depth + 1, max)?,
+                Stmt::Assign { value, .. } => self.validate_expr_depth(value, depth + 1, max)?,
+                Stmt::Def { body, .. } => {
+                    for child in body {
+                        stack.push((child, depth + 1));
+                    }
+                }
+                Stmt::Return(Some(expr)) => self.validate_expr_depth(expr, depth + 1, max)?,
+                Stmt::Return(None) => {}
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    self.validate_expr_depth(cond, depth + 1, max)?;
+                    for child in then_body.iter().chain(else_body) {
+                        stack.push((child, depth + 1));
+                    }
+                }
+                Stmt::While { cond, body } => {
+                    self.validate_expr_depth(cond, depth + 1, max)?;
+                    for child in body {
+                        stack.push((child, depth + 1));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_expr_limits(&self, expr: &Expr) -> Result<(), Box<dyn Error>> {
+        let Some(max) = self.limits.max_depth else {
+            return Ok(());
+        };
+        self.validate_expr_depth(expr, 0, max)
+    }
+
+    /// Iterative AST walk: validating with recursive Rust calls would itself
+    /// overflow on precisely the input this guard is meant to reject.
+    fn validate_expr_depth(
+        &self,
+        expr: &Expr,
+        initial_depth: usize,
+        max: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut stack = vec![(expr, initial_depth)];
+        while let Some((expr, depth)) = stack.pop() {
+            if depth > max {
+                return Err(self.parse_err(format!("parser nesting limit exceeded (max {max})")));
+            }
+            let child_depth = depth.saturating_add(1);
+            match expr {
+                Expr::StrInterp(pieces) => {
+                    for piece in pieces {
+                        if let StrPiece::Expr(child) = piece {
+                            stack.push((child, child_depth));
+                        }
+                    }
+                }
+                Expr::Binary { left, right, .. }
+                | Expr::Index {
+                    base: left,
+                    index: right,
+                } => {
+                    stack.push((left, child_depth));
+                    stack.push((right, child_depth));
+                }
+                Expr::Unary { expr, .. } => stack.push((expr, child_depth)),
+                Expr::Call {
+                    receiver,
+                    args,
+                    kwargs,
+                    block,
+                    ..
+                } => {
+                    if let Some(receiver) = receiver {
+                        stack.push((receiver, child_depth));
+                    }
+                    for arg in args {
+                        stack.push((arg, child_depth));
+                    }
+                    for (_, arg) in kwargs {
+                        stack.push((arg, child_depth));
+                    }
+                    if let Some(block) = block {
+                        for stmt in &block.body {
+                            self.validate_stmt_depth_iterative(stmt, child_depth, max)?;
+                        }
+                    }
+                }
+                Expr::Map(entries) => {
+                    for (_, value) in entries {
+                        stack.push((value, child_depth));
+                    }
+                }
+                Expr::Array(items) => {
+                    for item in items {
+                        stack.push((item, child_depth));
+                    }
+                }
+                Expr::Int(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Nil | Expr::Var(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_stmt_depth_iterative(
+        &self,
+        stmt: &Stmt,
+        initial_depth: usize,
+        max: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut stack = vec![(stmt, initial_depth)];
+        while let Some((stmt, depth)) = stack.pop() {
+            if depth > max {
+                return Err(self.parse_err(format!("parser nesting limit exceeded (max {max})")));
+            }
+            let child_depth = depth.saturating_add(1);
+            match stmt {
+                Stmt::Expr(expr) => self.validate_expr_depth(expr, child_depth, max)?,
+                Stmt::Assign { value, .. } => self.validate_expr_depth(value, child_depth, max)?,
+                Stmt::Def { body, .. } => {
+                    for child in body {
+                        stack.push((child, child_depth));
+                    }
+                }
+                Stmt::Return(Some(expr)) => self.validate_expr_depth(expr, child_depth, max)?,
+                Stmt::Return(None) => {}
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    self.validate_expr_depth(cond, child_depth, max)?;
+                    for child in then_body.iter().chain(else_body) {
+                        stack.push((child, child_depth));
+                    }
+                }
+                Stmt::While { cond, body } => {
+                    self.validate_expr_depth(cond, child_depth, max)?;
+                    for child in body {
+                        stack.push((child, child_depth));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn at(&self, token: &Token) -> bool {
         self.peek() == token
     }

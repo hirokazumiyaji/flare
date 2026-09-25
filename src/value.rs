@@ -130,6 +130,80 @@ pub struct UserFunc {
     pub body: Vec<Stmt>,
 }
 
+/// Validate a runtime value without recursively walking its Rust data
+/// structure.  Runtime values can come from a backend, so checking only
+/// parser-generated literals is not sufficient.  The root has depth zero;
+/// nested arrays/maps increase the depth by one.
+pub fn validate_value_depth(value: &Value, max_depth: usize) -> Result<(), Box<dyn Error>> {
+    validate_value_limits(value, Some(max_depth), None)
+}
+
+/// Validate both nesting and total node count of a runtime value.
+pub fn validate_value_limits(
+    value: &Value,
+    max_depth: Option<usize>,
+    max_nodes: Option<usize>,
+) -> Result<(), Box<dyn Error>> {
+    let mut stack = vec![(value, 0usize)];
+    let mut nodes = 0usize;
+
+    while let Some((value, depth)) = stack.pop() {
+        if let Some(max) = max_depth {
+            if depth > max {
+                return Err(format!("value nesting limit exceeded (max {max})").into());
+            }
+        }
+        nodes = nodes.saturating_add(1);
+        if let Some(max) = max_nodes {
+            if nodes > max {
+                return Err(format!("value node limit exceeded (max {max})").into());
+            }
+        }
+
+        match value {
+            Value::Array(items) | Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
+                for item in items {
+                    stack.push((item, depth + 1));
+                }
+            }
+            Value::Map(map) => {
+                for item in map.values() {
+                    stack.push((item, depth + 1));
+                }
+            }
+            // Function bodies are ASTs and are checked by the parser.  Other
+            // scalar/reference values are leaves from the data-value point of
+            // view.
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Return the maximum nesting depth of a value.  This iterative form is safe
+/// to call on values received from an untrusted backend.
+pub fn value_depth(value: &Value) -> usize {
+    let mut stack = vec![(value, 0usize)];
+    let mut max = 0usize;
+    while let Some((value, depth)) = stack.pop() {
+        max = max.max(depth);
+        match value {
+            Value::Array(items) | Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
+                for item in items {
+                    stack.push((item, depth + 1));
+                }
+            }
+            Value::Map(map) => {
+                for item in map.values() {
+                    stack.push((item, depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    max
+}
+
 impl Timestamp {
     pub fn now() -> Result<Self, Box<dyn Error>> {
         let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
