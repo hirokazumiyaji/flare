@@ -22,6 +22,13 @@ pub enum Value {
     /// emulator が読んだ firelang 外の型(double / geo_point / bytes)の
     /// 表示専用値。スクリプトからは生成できず、書き戻しもできない。
     Opaque(String),
+    /// A local Firebase Auth session.  This is intentionally a distinct value
+    /// from a Map so token fields cannot be accidentally interpolated by the
+    /// ordinary `inspect`/`to_s` paths.
+    AuthSession(crate::auth::AuthSession),
+    /// A token projected out of an AuthSession for script field access.  The
+    /// raw token is never represented as a script Value.
+    RedactedToken(&'static str),
     DocRef(DocRef),
     CollectionRef(CollectionRef),
     CollectionGroupRef(CollectionGroupRef),
@@ -237,6 +244,12 @@ impl Value {
             Value::DeleteField => "DeleteField".to_string(),
             Value::Increment(n) => format!("Increment({n})"),
             Value::Opaque(s) => s.clone(),
+            Value::AuthSession(session) => format!(
+                "AuthSession(user={}, id_token=<redacted>, refresh_token=<redacted>, expires_at={})",
+                session.user.to_value().inspect(),
+                session.expires_at
+            ),
+            Value::RedactedToken(name) => format!("<redacted:{name}>"),
             Value::DocRef(d) => format!("#<DocRef path={}>", inspect_str(&d.path)),
             Value::CollectionRef(c) => format!("#<CollectionRef path={}>", inspect_str(&c.path)),
             Value::CollectionGroupRef(cg) => {

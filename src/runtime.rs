@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
 use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
+use crate::auth::{Auth, AuthError, InMemoryAuth};
 use crate::error::{FirelangError, Span};
 use crate::firestore::{Firestore, WriteOp};
 use crate::value::{
@@ -18,16 +19,41 @@ enum ExecCtx {
 pub struct Runtime<F: Firestore> {
     scopes: Vec<HashMap<String, Value>>,
     fs: F,
+    auth: Box<dyn Auth>,
     exec: ExecCtx,
 }
 
 impl<F: Firestore> Runtime<F> {
     pub fn new(fs: F) -> Self {
+        Self::new_with_auth(fs, InMemoryAuth::default())
+    }
+
+    /// Construct a runtime with an explicit authentication backend.
+    ///
+    /// The backend is kept behind a trait object so adding Auth does not force
+    /// every existing Firestore-only `Runtime<F>` user to add a second type
+    /// parameter.  `new` retains the in-memory Auth behavior used by the
+    /// existing entry points.
+    pub fn new_with_auth<A: Auth + 'static>(fs: F, auth: A) -> Self {
         Self {
             scopes: vec![HashMap::new()],
             fs,
+            auth: Box::new(auth),
             exec: ExecCtx::Normal,
         }
+    }
+
+    /// Alias for [`Runtime::new_with_auth`] that reads naturally at call sites.
+    pub fn with_auth<A: Auth + 'static>(fs: F, auth: A) -> Self {
+        Self::new_with_auth(fs, auth)
+    }
+
+    pub fn auth(&self) -> &dyn Auth {
+        self.auth.as_ref()
+    }
+
+    pub fn auth_mut(&mut self) -> &mut dyn Auth {
+        self.auth.as_mut()
     }
 
     pub fn eval_program(&mut self, stmts: &[Stmt]) -> Result<Value, Box<dyn Error>> {
@@ -345,6 +371,12 @@ impl<F: Firestore> Runtime<F> {
                 }
                 Ok(map.get(name).cloned().unwrap_or(Value::Nil))
             }
+            Value::AuthSession(session) => {
+                if !args.is_empty() {
+                    return Err(format!("unknown auth session method: {name}").into());
+                }
+                Ok(auth_session_field(&session, name))
+            }
             _ => Err("unsupported method receiver".into()),
         }
     }
@@ -528,6 +560,10 @@ const BUILTIN_NAMES: &[&str] = &[
     "delete",
     "batch",
     "transaction",
+    "auth_sign_up",
+    "auth_sign_in",
+    "auth_current_user",
+    "auth_sign_out",
 ];
 
 type Builtin<F> = fn(
@@ -538,7 +574,7 @@ type Builtin<F> = fn(
 ) -> Result<Value, Box<dyn Error>>;
 
 /// ビルトインの対応テーブル。
-fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 19] {
+fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 23] {
     [
         ("puts", builtin_puts),
         ("doc", builtin_doc),
@@ -559,6 +595,10 @@ fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 19] {
         ("delete", builtin_delete),
         ("batch", builtin_batch),
         ("transaction", builtin_transaction),
+        ("auth_sign_up", builtin_auth_sign_up),
+        ("auth_sign_in", builtin_auth_sign_in),
+        ("auth_current_user", builtin_auth_current_user),
+        ("auth_sign_out", builtin_auth_sign_out),
     ]
 }
 
@@ -836,6 +876,99 @@ fn builtin_transaction<F: Firestore>(
     }
 }
 
+fn builtin_auth_sign_up<F: Firestore>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    reject_auth_call_args("auth_sign_up", &args, &kwargs, block)?;
+    let email = expect_string(args.first())?.to_string();
+    let password = expect_string(args.get(1))?.to_string();
+    let session = rt
+        .auth
+        .sign_up(&email, &password)
+        .map_err(auth_backend_err)?;
+    Ok(Value::AuthSession(session))
+}
+
+fn builtin_auth_sign_in<F: Firestore>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    reject_auth_call_args("auth_sign_in", &args, &kwargs, block)?;
+    let email = expect_string(args.first())?.to_string();
+    let password = expect_string(args.get(1))?.to_string();
+    let session = rt
+        .auth
+        .sign_in(&email, &password)
+        .map_err(auth_backend_err)?;
+    Ok(Value::AuthSession(session))
+}
+
+fn builtin_auth_current_user<F: Firestore>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    reject_auth_call_args("auth_current_user", &args, &kwargs, block)?;
+    Ok(rt
+        .auth
+        .current_user()
+        .map_err(auth_backend_err)?
+        .map(|user| user.to_value())
+        .unwrap_or(Value::Nil))
+}
+
+fn builtin_auth_sign_out<F: Firestore>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    reject_auth_call_args("auth_sign_out", &args, &kwargs, block)?;
+    rt.auth.sign_out().map_err(auth_backend_err)?;
+    Ok(Value::Nil)
+}
+
+fn reject_auth_call_args(
+    name: &str,
+    args: &[Value],
+    kwargs: &BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<(), Box<dyn Error>> {
+    if (name == "auth_current_user" || name == "auth_sign_out") && !args.is_empty() {
+        return Err(format!("{name} does not take arguments").into());
+    }
+    if args.len() > 2 {
+        return Err(format!("{name} takes at most 2 arguments").into());
+    }
+    if !kwargs.is_empty() {
+        return Err(format!("{name} does not accept keyword arguments").into());
+    }
+    if block.is_some() {
+        return Err(format!("{name} does not accept a block").into());
+    }
+    Ok(())
+}
+
+fn auth_backend_err(error: AuthError) -> Box<dyn Error> {
+    FirelangError::auth(error.kind(), error.to_string()).into()
+}
+
+fn auth_session_field(session: &crate::auth::AuthSession, name: &str) -> Value {
+    match name {
+        "user" => session.user_value(),
+        "id_token" => Value::RedactedToken("id_token"),
+        "refresh_token" => Value::RedactedToken("refresh_token"),
+        "expires_at" => Value::Int(session.expires_at),
+        _ => Value::Nil,
+    }
+}
+
 fn parse_timestamp_arg(v: Option<&Value>) -> Result<i64, Box<dyn Error>> {
     match v {
         Some(Value::Int(i)) => Ok(*i),
@@ -1022,6 +1155,7 @@ fn lookup_field_path<'a>(
 fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {
     match (base, index) {
         (Value::Map(map), Value::Str(key)) => Ok(map.get(&key).cloned().unwrap_or(Value::Nil)),
+        (Value::AuthSession(session), Value::Str(key)) => Ok(auth_session_field(&session, &key)),
         (Value::Array(items), Value::Int(i)) => {
             if i < 0 {
                 return Ok(Value::Nil);

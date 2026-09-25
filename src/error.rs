@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::auth::AuthErrorKind;
+
 /// Source position (1-based line and column, in characters).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
@@ -51,6 +53,11 @@ pub struct FirelangError {
     pub kind: ErrorKind,
     pub message: String,
     pub span: Option<Span>,
+    /// Present when a backend error originated in the Auth adapter.  Keeping
+    /// the category alongside the existing generic Backend kind lets library
+    /// callers make typed decisions while preserving the CLI's line/column
+    /// error format.
+    pub auth_kind: Option<AuthErrorKind>,
 }
 
 impl FirelangError {
@@ -59,6 +66,7 @@ impl FirelangError {
             kind,
             message: message.into(),
             span: None,
+            auth_kind: None,
         }
     }
 
@@ -83,6 +91,12 @@ impl FirelangError {
 
     pub fn backend(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Backend, message)
+    }
+
+    pub fn auth(kind: AuthErrorKind, message: impl Into<String>) -> Self {
+        let mut error = Self::backend(message);
+        error.auth_kind = Some(kind);
+        error
     }
 }
 

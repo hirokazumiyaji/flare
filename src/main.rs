@@ -3,7 +3,10 @@ use std::error::Error;
 use std::fs;
 use std::io::{IsTerminal, Read};
 
-use firelang::{run_script, run_script_with_firestore, FirestoreEmulator};
+use firelang::{
+    run_script, run_script_with_auth, run_script_with_backends, run_script_with_firestore,
+    AuthEmulator, FirestoreEmulator,
+};
 
 fn main() {
     if let Err(e) = run() {
@@ -16,6 +19,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
 
     let mut backend = "in-memory";
+    let mut auth_backend = "in-memory";
     let mut paths: Vec<String> = vec![];
     let mut inline: Vec<String> = vec![];
     let mut use_stdin = false;
@@ -31,6 +35,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                     .get(i + 1)
                     .ok_or("--backend requires in-memory or emulator")?;
                 backend = b.as_str();
+                i += 2;
+            }
+            "--auth-backend" => {
+                let b = args
+                    .get(i + 1)
+                    .ok_or("--auth-backend requires in-memory or emulator")?;
+                auth_backend = b.as_str();
                 i += 2;
             }
             "-e" => {
