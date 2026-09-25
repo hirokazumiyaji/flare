@@ -11,6 +11,71 @@ use std::error::Error;
 
 use crate::value::{QueryFilter, QueryOp, QueryRef, Value};
 
+/// `set` / `update` の data_map を再帰的に検証する共有契約。
+///
+/// `direct` はその値が data_map の直下のフィールド値かどうかを表す。
+/// 通常の値(Map / Array も含む)はどの深さでも許可するが、フィールド
+/// transform は直下だけで許可する。Func、参照、クエリ、Opaque などの
+/// Firestore に保存できない値は backend に渡す前に拒否する。
+pub(crate) fn validate_write_data(data: &BTreeMap<String, Value>) -> Result<(), Box<dyn Error>> {
+    for value in data.values() {
+        validate_write_value(value, true)?;
+    }
+    Ok(())
+}
+
+/// 全ての staged write を、backend へ渡す前に検証する。
+pub(crate) fn validate_writes(writes: &[WriteOp]) -> Result<(), Box<dyn Error>> {
+    for op in writes {
+        match op {
+            WriteOp::Set { data, .. } | WriteOp::Update { data, .. } => {
+                validate_write_data(data)?;
+            }
+            WriteOp::Delete { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_write_value(value: &Value, direct: bool) -> Result<(), Box<dyn Error>> {
+    match value {
+        Value::Int(_) | Value::Str(_) | Value::Bool(_) | Value::Nil | Value::Timestamp(_) => Ok(()),
+        Value::Array(items) => validate_write_values(items, false),
+        Value::Map(map) => validate_write_values(map.values(), false),
+        Value::ServerTimestamp
+        | Value::DeleteField
+        | Value::Increment(_)
+        | Value::ArrayUnion(_)
+        | Value::ArrayRemove(_) => {
+            if !direct {
+                return Err("field transforms cannot be nested".into());
+            }
+            match value {
+                Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
+                    validate_write_values(items, false)
+                }
+                _ => Ok(()),
+            }
+        }
+        Value::Opaque(_)
+        | Value::DocRef(_)
+        | Value::CollectionRef(_)
+        | Value::CollectionGroupRef(_)
+        | Value::QueryRef(_)
+        | Value::Func(_) => Err(format!("unsupported value in write: {value:?}").into()),
+    }
+}
+
+fn validate_write_values<'a>(
+    values: impl IntoIterator<Item = &'a Value>,
+    direct: bool,
+) -> Result<(), Box<dyn Error>> {
+    for value in values {
+        validate_write_value(value, direct)?;
+    }
+    Ok(())
+}
+
 /// クエリフィルタ値の共有検証。in-memory / emulator のクエリ実行前に
 /// 両バックエンドが呼び、同じエラーを同じメッセージで返す。
 /// - 文字列フィルタ値は 1,500 UTF-8 バイト未満(Firestore 準拠。`in` 等の

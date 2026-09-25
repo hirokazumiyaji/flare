@@ -6,6 +6,7 @@
 mod common;
 
 use firelang::run_script_with_firestore;
+use firelang::runtime::Runtime;
 use firelang::{FirestoreEmulator, Value};
 
 fn emulator() -> Option<FirestoreEmulator> {
@@ -17,6 +18,19 @@ fn unique(prefix: &str) -> String {
         .unwrap()
         .as_nanos();
     format!("{prefix}_{n}")
+}
+
+fn assert_runtime_write_error(err: Box<dyn std::error::Error>) {
+    use firelang::{ErrorKind, FirelangError};
+
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("write validation should produce a FirelangError");
+    assert_eq!(ferr.kind, ErrorKind::Runtime, "{ferr}");
+    assert!(
+        ferr.message.contains("unsupported value in write"),
+        "{ferr}"
+    );
 }
 
 #[test]
@@ -435,4 +449,102 @@ fn emulator_failed_transaction_aborts_and_restarts() {
     )
     .unwrap();
     assert_eq!(out, map! {"x" => Value::Int(2)});
+}
+
+#[test]
+fn emulator_set_rejects_unsupported_values_recursively() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let mut rt = Runtime::new(fs);
+    let run = unique("write_set");
+    let cases = [
+        format!("fn f() {{ 1 }}\nset(\"users/{run}/func\", {{value: f}})"),
+        format!("set(\"users/{run}/doc\", {{value: doc(\"users/ref\")}})"),
+        format!("set(\"users/{run}/collection\", {{value: col(\"users\")}})"),
+        format!("set(\"users/{run}/group\", {{value: col_group(\"members\")}})"),
+        format!("set(\"users/{run}/query\", {{value: col(\"users\").where(\"x\", \"==\", 1)}})"),
+        format!("set(\"users/{run}/nested\", {{value: {{nested: [col(\"users\")]}}}})"),
+    ];
+    for source in cases {
+        let err = rt.run(&source).unwrap_err();
+        assert_runtime_write_error(err);
+    }
+}
+
+#[test]
+fn emulator_update_rejects_unsupported_values_before_staging() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let mut rt = Runtime::new(fs);
+    let run = unique("write_update");
+    let path = format!("users/{run}");
+    rt.run(&format!("set(\"{path}\", {{value: 1}})")).unwrap();
+    let err = rt
+        .run(&format!("fn f() {{ 1 }}\nupdate(\"{path}\", {{value: f}})"))
+        .unwrap_err();
+    assert_runtime_write_error(err);
+    assert_eq!(
+        rt.run(&format!("get(\"{path}\")")).unwrap(),
+        map! {"value" => Value::Int(1)}
+    );
+}
+
+#[test]
+fn emulator_batch_with_unsupported_value_persists_nothing() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let mut rt = Runtime::new(fs);
+    let run = unique("write_batch");
+    let good = format!("users/{run}/good");
+    let bad = format!("users/{run}/bad");
+    let err = rt
+        .run(&format!(
+            "batch {{ set(\"{good}\", {{ok: true}})\nset(\"{bad}\", {{value: col(\"users\")}}) }}"
+        ))
+        .unwrap_err();
+    assert_runtime_write_error(err);
+    assert_eq!(rt.run(&format!("get(\"{good}\")")).unwrap(), Value::Nil);
+    assert_eq!(rt.run(&format!("get(\"{bad}\")")).unwrap(), Value::Nil);
+}
+
+#[test]
+fn emulator_documented_values_and_direct_transforms_remain_writable() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let mut rt = Runtime::new(fs);
+    let path = format!("users/{}/allowed", unique("write_allowed"));
+    let source = format!(
+        "set(\"{path}\", {{int: 1, str: \"s\", bool: true, nil: nil, array: [1, {{nested: timestamp(2)}}], map: {{ok: false}}, ts: timestamp(3), tags: array_union([\"a\"]), items: [\"x\"], remove_me: true, count: 10}})\nupdate(\"{path}\", {{tags: array_union([\"b\"]), items: array_remove([\"x\"]), remove_me: delete_field(), count: increment(2), updated_at: server_timestamp()}})\nget(\"{path}\")"
+    );
+    let out = rt.run(&source).unwrap();
+    let Value::Map(fields) = out else {
+        panic!("expected document map");
+    };
+    assert_eq!(fields.get("int"), Some(&Value::Int(1)));
+    assert_eq!(fields.get("str"), Some(&Value::Str("s".to_string())));
+    assert_eq!(fields.get("bool"), Some(&Value::Bool(true)));
+    assert_eq!(fields.get("nil"), Some(&Value::Nil));
+    assert!(matches!(fields.get("ts"), Some(Value::Timestamp(_))));
+    assert_eq!(
+        fields.get("tags"),
+        Some(&Value::Array(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string())
+        ]))
+    );
+    assert_eq!(fields.get("items"), Some(&Value::Array(vec![])));
+    assert!(!fields.contains_key("remove_me"));
+    assert_eq!(fields.get("count"), Some(&Value::Int(12)));
+    assert!(matches!(
+        fields.get("updated_at"),
+        Some(Value::Timestamp(_))
+    ));
 }

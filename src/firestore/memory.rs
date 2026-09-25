@@ -16,6 +16,7 @@ impl Firestore for InMemoryFirestore {
     }
 
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        super::validate_writes(&writes)?;
         let mut next = self.docs.clone();
         for op in writes {
             apply_write_to_docs(&mut next, op)?;
@@ -49,6 +50,7 @@ impl Firestore for InMemoryFirestore {
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        super::validate_writes(&writes)?;
         let mut next = self.tx_snapshot.take().ok_or("not in transaction")?;
         for op in writes {
             apply_write_to_docs(&mut next, op)?;

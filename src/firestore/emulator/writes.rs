@@ -13,7 +13,7 @@ use tokio::runtime::Runtime;
 
 use super::codec::encode_fields;
 use super::path::document_name;
-use crate::firestore::{insert_at_field_path, validate_field_path, WriteOp};
+use crate::firestore::{insert_at_field_path, validate_field_path, validate_writes, WriteOp};
 use crate::value::Value;
 
 pub(super) fn commit_writes(
@@ -93,6 +93,7 @@ pub(super) fn write_ops_to_sdk_writes(
     project_id: &str,
     ops: &[WriteOp],
 ) -> Result<Vec<Write>, Box<dyn Error>> {
+    validate_writes(ops)?;
     ops.iter().map(|op| build_write(project_id, op)).collect()
 }
 

@@ -75,9 +75,9 @@ Firestore 操作のための特殊な値:
 | Increment | `increment(n)` | 数値加算センチネル |
 | Opaque | (生成不可。emulator 読み取りのみ) | `double` / `geo_point` / `bytes` フィールドの表示専用値(`Double(1.5)` 等)。書き込みには使えない |
 
-センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(emulator バックエンドではエラー)。
+センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(両バックエンドでエラー)。`set` / `update` は write を staging する前に data_map を再帰的に検証し、Func / 参照 / クエリ / `Opaque` など Firestore に保存できない値も backend へ送らずエラーにする(`unsupported value in write`)。
 
-emulator バックエンドで firelang が持たない型のフィールドを含むドキュメントを読んだ場合、ドキュメント全体はエラーにせず次のように読み替える:`double` / `geo_point` / `bytes` は `Opaque` の表示専用値(例 `Double(1.5)`、`GeoPoint(35.7, 139.7)`、`Bytes(00ff)`)、`reference` は同一データベース内であれば相対パスの `DocRef`(別プロジェクトや別データベースの参照は `Reference(...)` の `Opaque` 値)。`Opaque` 値はクエリの `==` 等でマッチさせることはできず(スクリプトからは生成できない)、書き戻しはエラー(`unsupported value in emulator write`)。
+emulator バックエンドで firelang が持たない型のフィールドを含むドキュメントを読んだ場合、ドキュメント全体はエラーにせず次のように読み替える:`double` / `geo_point` / `bytes` は `Opaque` の表示専用値(例 `Double(1.5)`、`GeoPoint(35.7, 139.7)`、`Bytes(00ff)`)、`reference` は同一データベース内であれば相対パスの `DocRef`(別プロジェクトや別データベースの参照は `Reference(...)` の `Opaque` 値)。`Opaque` 値はクエリの `==` 等でマッチさせることはできず(スクリプトからは生成できない)、書き戻しは両バックエンドでエラー(`unsupported value in write`)。
 
 ### 真偽値判定(truthiness)
 
@@ -268,7 +268,7 @@ while cond { ... }
 | `batch { ... }` | ブロックの値 | 8 章参照 |
 | `transaction { ... }` | ブロックの値 | 8 章参照 |
 
-`data_map` の値に使えるのは: Int / Str / Bool / Nil / Array / Map / Timestamp、および直下フィールドのセンチネル 5 種。
+`data_map` の値に使えるのは: Int / Str / Bool / Nil / Array / Map / Timestamp、および直下フィールドのセンチネル 5 種。`set` / `update` は write を staging する前に共有の recursive validator で Map / Array と ArrayUnion / ArrayRemove の要素まで再帰検証する。`Func`、DocRef / CollectionRef / CollectionGroupRef、QueryRef、`Opaque` は保存値として許可されず、in-memory / emulator とも同じ runtime エラー(`unsupported value in write`)になる。
 
 センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(エラー: `field transforms cannot be nested`)。`delete_field()` は `update` と merge `set` でのみ使え、置換の `set` ではエラー(`delete_field() cannot be used with set() without merge`)。
 
@@ -381,6 +381,7 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 - ランタイムは `Firestore` トレイトでバックエンドを抽象化する。デフォルトは `InMemoryFirestore`。
 - emulator バックエンドは Firestore Rust SDK(`firestore` crate)の gRPC クライアントで Firestore API を呼ぶ。database は `(default)` 固定。
 - 両バックエンドは同じ可視挙動(値の往復・クエリ順序・batch/transaction の原子性)を持たなければならない。
+- write data の recursive validation は Runtime の staging 前と各 backend の write 境界で共有し、in-memory / emulator の両方で同じ許可値・同じエラー_kind にする。emulator codec の値検証も防御的に残し、RPC へ値を送らない。
 - ただし emulator 側に firelang 外の型(`double` / `reference` / `geo_point` / `bytes`)で書かれたフィールドがある場合、emulator バックエンドは `Opaque` / `DocRef` に読み替えて返す(§3)。in-memory にはそのような値は存在しない。
 
 ## 12. スコープ外(MVP)
