@@ -154,8 +154,8 @@ pub(crate) fn split_write_values(data: &BTreeMap<String, Value>) -> WriteValues 
 }
 
 /// update / merge set 共通の plan。plain と delete は mask に入るため互いに
-/// overlap してはいけないが、Firestore の演算順序を保つため transform とは
-/// overlap してもよい。
+/// overlap してはいけない。transform 同士も targets が曖昧になるため
+/// overlap を拒否し、plain との適用順序は Firestore 契約として残す。
 pub(crate) fn plan_update_writes(
     data: &BTreeMap<String, Value>,
 ) -> Result<WriteValues, Box<dyn Error>> {
@@ -171,6 +171,7 @@ pub(crate) fn plan_update_writes(
             .map(String::as_str)
             .chain(values.plain.keys().map(String::as_str)),
     )?;
+    validate_no_overlapping_paths(values.transforms.iter().map(|(path, _)| path.as_str()))?;
     Ok(values)
 }
 
@@ -270,6 +271,16 @@ mod tests {
         let err = plan_update_writes(&BTreeMap::from([
             ("a".to_string(), Value::DeleteField),
             ("a.b".to_string(), Value::Int(1)),
+        ]))
+        .unwrap_err();
+        assert_eq!(err.to_string(), "overlapping field paths: a and a.b");
+    }
+
+    #[test]
+    fn update_plan_rejects_overlapping_transform_targets() {
+        let err = plan_update_writes(&BTreeMap::from([
+            ("a".to_string(), Value::Increment(1)),
+            ("a.b".to_string(), Value::Increment(1)),
         ]))
         .unwrap_err();
         assert_eq!(err.to_string(), "overlapping field paths: a and a.b");
