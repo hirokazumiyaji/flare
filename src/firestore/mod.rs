@@ -1,8 +1,10 @@
 //! Firestore backend abstraction.
 
+#[cfg(feature = "emulator")]
 mod emulator;
 mod memory;
 
+#[cfg(feature = "emulator")]
 pub use emulator::{EmulatorConfig, EmulatorConnectionError, FirestoreEmulator};
 pub use memory::InMemoryFirestore;
 

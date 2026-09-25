@@ -22,7 +22,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release --bin fl
+        run: cargo build --release --features emulator --bin fl
 
       - name: Package artifact
         run: |

@@ -28,8 +28,48 @@ jobs:
       - name: Test
         run: cargo test --all-targets
 
+      - name: Test in-memory-only build
+        run: cargo test --no-default-features --all-targets
+
       - name: Build release binary
         run: cargo build --release --bin fl
+
+  # Keep the optional dependency boundary covered in CI.  The default build
+  # is in-memory-only; `emulator` is the explicit opt-in build.
+  feature-builds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            cargo_args: ""
+          - name: in-memory-only
+            cargo_args: "--no-default-features"
+          - name: emulator
+            cargo_args: "--features emulator"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test ${{ matrix.name }} build
+        run: cargo test --all-targets ${{ matrix.cargo_args }}
+
+      - name: Lint ${{ matrix.name }} build
+        run: cargo clippy --all-targets ${{ matrix.cargo_args }} -- -D warnings
+
+      - name: Build release emulator binary
+        if: matrix.name == 'emulator'
+        run: cargo build --release --features emulator --bin fl
 
   # Firestore emulator integration tests (Task 06). Uses firebase-tools + Java.
   integration-emulator:
@@ -61,4 +101,4 @@ jobs:
       - name: Run integration tests with Firestore emulator
         run: |
           firebase emulators:exec --only firestore --project demo-firelang \
-            'FIRESTORE_PROJECT_ID=demo-firelang cargo test --test firestore_emulator -- --nocapture'
+            'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator -- --nocapture'

@@ -367,10 +367,15 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 - スクリプトの指定はちょうど 1 つ:ファイルパス / `-`(stdin) / `-e <script>`(ワンライナー。複数回指定時は改行で連結)。引数なしで stdin がパイプ接続されている場合も stdin から読む(端末直結の引数なしは usage 表示で終了)。`-e` とファイル/`-` の併用はエラー。`--help` / `-h` で usage 表示。未知のオプション・未知のバックエンドはエラー終了。
   ```sh
   fl script.fl
-  echo 'get("users/1")' | fl --backend emulator -
+  cargo run --features emulator --bin fl -- --backend emulator script.fl
+  echo 'get("users/1")' | cargo run --features emulator --bin fl -- --backend emulator -
   fl -e 'col("users").get().len()'
   ```
-- `--backend emulator` のとき:
+- `--backend emulator` を使うバイナリは `emulator` feature を有効にして
+  ビルドする必要がある。feature なしで指定した場合は
+  `emulator backend requires the \`emulator\` Cargo feature; rebuild with --features emulator`
+  を表示して終了する。
+- `--backend emulator` のとき(`emulator` feature 有効時):
   - `FIRESTORE_EMULATOR_HOST` — **必須**。未設定なら即エラー。
   - `FIRESTORE_PROJECT_ID` — 省略時 `firelang-test`。
 - 実行結果は `=> <inspect表現>` で印字。
@@ -378,11 +383,30 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 
 ## 11. バックエンド
 
-| エントリポイント | `in-memory` | `emulator` |
-|------------------|-------------|------------|
+| エントリポイント | `in-memory` | `emulator` feature |
+|------------------|-------------|--------------------|
 | `run_script` | ○(固定) | × |
 | `run_script_with_firestore` | ○ | ○(`FirestoreEmulator` を渡す) |
 | `fl` CLI | ○(デフォルト) | ○(`--backend emulator`) |
+
+### build feature と公開 API
+
+- 既定の feature は空です。`cargo build` / `cargo test` は in-memory
+  backend とライブラリ API だけをビルドし、Firestore SDK・gRPC・TLS の
+  依存層をリンクしません。
+- `emulator` feature を有効にすると、Firestore emulator client と
+  `FirestoreEmulator` が有効になります:
+  `cargo build --features emulator`。
+- `Firestore`、`InMemoryFirestore`、`run_script`、
+  `run_script_with_firestore` は feature なしで利用できるため、in-memory
+  の custom backend を埋め込む consumer は SDK を引き込まない。
+- `FirestoreEmulator` は feature なしの build では公開されない。CLI は
+  feature なしでも `--backend emulator` を指定できるが、環境変数の検証後に
+  feature を有効にする方法を案内する明確なエラーになる。既存コードで
+  emulator を利用する場合は CLI では `--features emulator`、Rust の依存宣言では
+  `features = ["emulator"]` を指定する。
+- 将来的な Auth / Storage client も、emulator と同様のサービス別 feature
+  group に分離する前提とする。
 
 - 認証付きの**本番 Firestore は非対応**(スコープ外)。
 - ランタイムは `Firestore` トレイトでバックエンドを抽象化する。デフォルトは `InMemoryFirestore`。
