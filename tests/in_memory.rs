@@ -779,6 +779,78 @@ fn where_comparison_supports_str_timestamp_and_bool() {
 }
 
 #[test]
+fn where_cross_type_comparison_contract_is_shared() {
+    // emulator テスト(emulator_where_cross_type_comparison_contract_is_shared)と
+    // 同じ fixture / 期待値。7 種類の値を一つの collection に置き、各
+    // フィルタ型がその型の値だけを見ることを確認する。
+    let setup = r#"set("users/where_int", {v: 1})
+set("users/where_str", {v: "b"})
+set("users/where_bool", {v: true})
+set("users/where_timestamp", {v: timestamp(200)})
+set("users/where_nil", {v: nil})
+set("users/where_array", {v: [1]})
+set("users/where_map", {v: {a: 1}})
+set("users/where_missing", {other: 1})"#;
+    let cases: &[(&str, &str, &[&str])] = &[
+        (">", "0", &["users/where_int"]),
+        (">=", "0", &["users/where_int"]),
+        ("<", "2", &["users/where_int"]),
+        ("<=", "2", &["users/where_int"]),
+        (">", "\"a\"", &["users/where_str"]),
+        (">=", "\"a\"", &["users/where_str"]),
+        ("<", "\"c\"", &["users/where_str"]),
+        ("<=", "\"c\"", &["users/where_str"]),
+        (">", "false", &["users/where_bool"]),
+        (">=", "false", &["users/where_bool"]),
+        ("<", "true", &[]),
+        ("<=", "true", &["users/where_bool"]),
+        (">", "timestamp(100)", &["users/where_timestamp"]),
+        (">=", "timestamp(100)", &["users/where_timestamp"]),
+        ("<", "timestamp(300)", &["users/where_timestamp"]),
+        ("<=", "timestamp(300)", &["users/where_timestamp"]),
+        (">", "nil", &[]),
+        (">=", "nil", &[]),
+        ("<", "nil", &[]),
+        ("<=", "nil", &[]),
+        (">", "[0]", &[]),
+        (">=", "[0]", &[]),
+        ("<", "[2]", &[]),
+        ("<=", "[2]", &[]),
+        (">", "{a: 0}", &[]),
+        (">=", "{a: 0}", &[]),
+        ("<", "{a: 2}", &[]),
+        ("<=", "{a: 2}", &[]),
+    ];
+    for &(op, filter, expected_names) in cases {
+        let source = format!(
+            "{setup}\ncol(\"users\").where(\"v\", \"{op}\", {filter}).get().map {{ |r| r[\"__name__\"] }}"
+        );
+        let out = run_script(&source).unwrap();
+        let expected = Value::Array(
+            expected_names
+                .iter()
+                .map(|name| Value::Str((*name).to_string()))
+                .collect(),
+        );
+        assert_eq!(out, expected, "op={op}, filter={filter}");
+    }
+
+    // nil は equality では存在する値として扱われるが、欠損 field は
+    // `!=` の対象にもならない。
+    let out = run_script(&format!(
+        "{setup}\n[col(\"users\").where(\"v\", \"==\", nil).get().len(), col(\"users\").where(\"v\", \"!=\", nil).get().len()]"
+    ))
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1), Value::Int(6)]));
+
+    let out = run_script(&format!(
+        "{setup}\ncol(\"users\").where(\"v\", \">\", \"a\").count()"
+    ))
+    .unwrap();
+    assert_eq!(out, Value::Int(1));
+}
+
+#[test]
 fn update_supports_dotted_field_paths_like_firestore() {
     // emulator テスト(emulator_dotted_field_path_update_matches_in_memory)と
     // 同じケース。{"profile.name": ...} はネストしたフィールドを更新する。

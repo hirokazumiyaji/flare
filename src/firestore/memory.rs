@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
 use super::{Firestore, WriteOp};
-use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value};
+use crate::value::{QueryRef, QuerySource, Timestamp, Value};
 
 #[derive(Default)]
 pub struct InMemoryFirestore {
@@ -28,7 +28,7 @@ impl Firestore for InMemoryFirestore {
         super::validate_query_filters(&query.filters)?;
         Ok(self
             .candidates(&query.source)
-            .filter(|(_, doc)| matches_filters(doc, &query.filters))
+            .filter(|(path, doc)| super::matches_filters(path, doc, &query.filters))
             .map(|(path, doc)| (path.clone(), doc.clone()))
             .collect())
     }
@@ -64,8 +64,8 @@ impl Firestore for InMemoryFirestore {
 }
 
 impl InMemoryFirestore {
-    /// ソースに属するドキュメント候補を列挙する。フィルタ・順序・
-    /// offset/limit・`__name__` は呼び出し側(runtime)が適用する。
+    /// ソースに属するドキュメント候補を列挙する。フィルタはバックエンド
+    /// 共通の matcher、順序・offset/limit・`__name__` は runtime が適用する。
     fn candidates<'a>(
         &'a self,
         source: &'a QuerySource,
@@ -122,63 +122,6 @@ fn apply_write_to_docs(
             docs.remove(&path);
             Ok(())
         }
-    }
-}
-
-fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bool {
-    filters.iter().all(|f| {
-        // `!=` / `in` / `not-in` はフィールドの存在を要求する(存在しなければ
-        // マッチしない)。`order_by` 対象の存在チェックは sort 側で行う。
-        let segments: Vec<&str> = f.field.split('.').collect();
-        let actual = lookup_field_path(Some(doc), &segments);
-        match f.op {
-            QueryOp::Eq => actual == Some(&f.value),
-            QueryOp::Ne => actual.is_some_and(|v| v != &f.value),
-            QueryOp::Gt => compare_values(actual, &f.value, |o| o.is_gt()),
-            QueryOp::Ge => compare_values(actual, &f.value, |o| o.is_ge()),
-            QueryOp::Lt => compare_values(actual, &f.value, |o| o.is_lt()),
-            QueryOp::Le => compare_values(actual, &f.value, |o| o.is_le()),
-            QueryOp::In => match (&f.value, actual) {
-                (Value::Array(list), Some(v)) => list.contains(v),
-                _ => false,
-            },
-            QueryOp::NotIn => match (&f.value, actual) {
-                (Value::Array(list), Some(v)) => {
-                    if list.contains(&Value::Nil) {
-                        false
-                    } else {
-                        !list.contains(v)
-                    }
-                }
-                _ => false,
-            },
-            QueryOp::ArrayContains => match actual {
-                Some(Value::Array(arr)) => arr.contains(&f.value),
-                _ => false,
-            },
-            QueryOp::ArrayContainsAny => match (&f.value, actual) {
-                (Value::Array(list), Some(Value::Array(arr))) => {
-                    arr.iter().any(|x| list.contains(x))
-                }
-                _ => false,
-            },
-        }
-    })
-}
-
-/// 大小比較は同型のみを規定する(Int / Str / Bool / Timestamp)。
-/// 型が異なる・Nil は常にマッチしない(emulator の Firestore と実用上の
-/// 挙動を合わせる。異なる型同士の Firestore の型順序は未規定 = spec §13)。
-/// フィルタの文字列値は 1,500 バイト未満に制限されており(emulator の
-/// Firestore と同じ)、有効なフィルタに対しては全文比較でよい(最初の差異
-/// 位置は常にフィルタ自身の長さ以内 = 1,500 バイト未満に収まる)。
-fn compare_values(a: Option<&Value>, b: &Value, pred: impl Fn(std::cmp::Ordering) -> bool) -> bool {
-    match (a, b) {
-        (Some(Value::Int(x)), Value::Int(y)) => pred(x.cmp(y)),
-        (Some(Value::Str(x)), Value::Str(y)) => pred(x.cmp(y)),
-        (Some(Value::Bool(x)), Value::Bool(y)) => pred(x.cmp(y)),
-        (Some(Value::Timestamp(x)), Value::Timestamp(y)) => pred(x.seconds.cmp(&y.seconds)),
-        _ => false,
     }
 }
 
