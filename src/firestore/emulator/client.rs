@@ -81,10 +81,13 @@ where
 }
 
 fn timeout_error(operation: &str, elapsed: Duration, timeout: Duration) -> Box<dyn Error> {
+    // `as_millis()` は切り捨てなので、500µs のような sub-millisecond の予算が
+    // "timeout 0ms" と誤表示され、運用者が設定値を判断できなくなる。
+    // `Duration` の `Debug` は設定単位に合わせて出るため、runtime 側の
+    // `format_duration` と同じ表記に揃える。
     FirelangError::backend(format!(
-        "Firestore emulator operation '{operation}' timed out: elapsed {}ms exceeded timeout {}ms",
-        elapsed.as_millis(),
-        timeout.as_millis(),
+        "Firestore emulator operation '{operation}' timed out: \
+         elapsed {elapsed:?} exceeded timeout {timeout:?}"
     ))
     .into()
 }

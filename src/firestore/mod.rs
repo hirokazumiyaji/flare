@@ -177,15 +177,26 @@ pub trait Firestore {
     /// applies them uniformly for both backends (spec §7).
     fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>>;
 
-    /// Run a query while refusing to materialize more than `max_results`
-    /// matching candidates. Implementations must stop before cloning the
-    /// first extra candidate; a post-collection length check is not a
-    /// sufficient resource boundary.
+    /// Run a query while refusing to return more than `max_results` matching
+    /// candidates.
+    ///
+    /// The default is a compatibility fallback: it delegates to `run_query`
+    /// and then rejects an oversized result, so existing third-party
+    /// implementations of [`Firestore`] keep compiling. That bounds the value
+    /// handed to the runtime, but *not* peak memory during collection. A
+    /// backend that must bound memory has to override this and stop before the
+    /// first extra candidate is materialized.
     fn run_query_bounded(
         &self,
         query: &QueryRef,
         max_results: usize,
-    ) -> Result<QueryCandidates, Box<dyn Error>>;
+    ) -> Result<QueryCandidates, Box<dyn Error>> {
+        let rows = self.run_query(query)?;
+        if rows.len() > max_results {
+            return Err(query_result_limit_error(max_results));
+        }
+        Ok(rows)
+    }
 
     /// Configure a per-call timeout for backends that support one.
     ///
