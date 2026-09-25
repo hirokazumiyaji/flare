@@ -33,32 +33,39 @@ pub(super) fn relative_document_name_for(
     Ok(relative.join("/"))
 }
 
-fn parse_resource_name(name: &str) -> Result<(String, String, Vec<&str>), Box<dyn Error>> {
+/// `projects/{p}/databases/{db}/documents/{relative}` を 1 回だけ走査して分解する。
+///
+/// `project` / `database` は `name` からの借用で返す(この関数は decode / query の
+/// ホットパスで呼ばれるため、`String` の確保を避ける)。
+fn parse_resource_name(
+    name: &str,
+) -> Result<(&str, &str, Vec<&str>), Box<dyn Error>> {
+    let invalid = || format!("invalid document name: {name}");
     let mut segments = name.split('/');
-    if segments.next() != Some("projects")
-        || segments.next().is_none_or(str::is_empty)
-        || segments.next() != Some("databases")
-        || segments.next().is_none_or(str::is_empty)
-        || segments.next() != Some("documents")
-    {
-        return Err(format!("invalid document name: {name}").into());
-    }
-    let project = name
-        .split('/')
-        .nth(1)
-        .ok_or_else(|| format!("invalid document name: {name}"))?;
-    let database = name
-        .split('/')
-        .nth(3)
-        .ok_or_else(|| format!("invalid document name: {name}"))?;
+    // 先頭 5 セグメントを 1 回のパスで検証しつつ取り出す。
+    let Some("projects") = segments.next() else {
+        return Err(invalid().into());
+    };
+    let Some(project) = segments.next().filter(|s| !s.is_empty()) else {
+        return Err(invalid().into());
+    };
+    let Some("databases") = segments.next() else {
+        return Err(invalid().into());
+    };
+    let Some(database) = segments.next().filter(|s| !s.is_empty()) else {
+        return Err(invalid().into());
+    };
+    let Some("documents") = segments.next() else {
+        return Err(invalid().into());
+    };
     let relative: Vec<&str> = segments.collect();
     if relative.is_empty()
         || relative.iter().any(|segment| segment.is_empty())
         || !relative.len().is_multiple_of(2)
     {
-        return Err(format!("invalid document name: {name}").into());
+        return Err(invalid().into());
     }
-    Ok((project.to_string(), database.to_string(), relative))
+    Ok((project, database, relative))
 }
 
 pub(super) fn split_collection_path(path: &str) -> Result<(Option<String>, &str), Box<dyn Error>> {
@@ -84,5 +91,72 @@ mod tests {
         let (parent, collection_id) = split_collection_path("teams/t1/members").unwrap();
         assert_eq!(parent.as_deref(), Some("teams/t1"));
         assert_eq!(collection_id, "members");
+    }
+
+    #[test]
+    fn parse_resource_name_borrows_project_and_database() {
+        let (project, database, relative) =
+            parse_resource_name("projects/p1/databases/(default)/documents/teams/t1").unwrap();
+        assert_eq!(project, "p1");
+        assert_eq!(database, "(default)");
+        assert_eq!(relative, vec!["teams", "t1"]);
+    }
+
+    #[test]
+    fn parse_resource_name_accepts_nested_collection_documents() {
+        // `documents` はパス中に再度現れても正常なサブコレクション。
+        let (_, _, relative) =
+            parse_resource_name("projects/p1/databases/(default)/documents/teams/t1/documents/x1")
+                .unwrap();
+        assert_eq!(relative, vec!["teams", "t1", "documents", "x1"]);
+    }
+
+    #[test]
+    fn parse_resource_name_rejects_malformed_prefixes() {
+        for name in [
+            "",
+            "projects",
+            "projects//databases/(default)/documents/a/b",
+            "projects/p1/database/(default)/documents/a/b",
+            "projects/p1/databases//documents/a/b",
+            "projects/p1/databases/(default)",
+            "projects/p1/databases/(default)/doc",
+        ] {
+            assert!(
+                parse_resource_name(name).is_err(),
+                "expected error for {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_resource_name_rejects_odd_or_empty_relative_paths() {
+        for name in [
+            // 空の相対パス
+            "projects/p1/databases/(default)/documents",
+            // 奇数セグメント(ドキュメントが閉じられていない)
+            "projects/p1/databases/(default)/documents/teams",
+            // 空セグメント
+            "projects/p1/databases/(default)/documents/teams//t1",
+        ] {
+            assert!(
+                parse_resource_name(name).is_err(),
+                "expected error for {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_document_name_for_rejects_foreign_project() {
+        let err = relative_document_name_for(
+            "projects/other/databases/(default)/documents/a/b",
+            "p1",
+            "(default)",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("another project/database"),
+            "{err}"
+        );
     }
 }
