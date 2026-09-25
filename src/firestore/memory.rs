@@ -11,6 +11,22 @@ use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value
 /// 返すクロージャーを注入できる。コミット処理はこのクロージャーを一度だけ呼ぶ。
 pub type RequestClock = Arc<dyn Fn() -> Result<Timestamp, Box<dyn Error>> + Send + Sync + 'static>;
 
+struct RequestTime<'a> {
+    clock: &'a RequestClock,
+    value: Option<Timestamp>,
+}
+
+impl RequestTime<'_> {
+    fn get(&mut self) -> Result<&Timestamp, Box<dyn Error>> {
+        if self.value.is_none() {
+            self.value = Some((self.clock)()?);
+        }
+        self.value
+            .as_ref()
+            .ok_or_else(|| "request time was not initialized".into())
+    }
+}
+
 pub struct InMemoryFirestore {
     docs: HashMap<String, BTreeMap<String, Value>>,
     tx_snapshot: Option<HashMap<String, BTreeMap<String, Value>>>,
@@ -50,12 +66,15 @@ impl Firestore for InMemoryFirestore {
     }
 
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
-        // Firestore の REQUEST_TIME は commit 単位の値。すべての
-        // ServerTimestamp を変換する前に一度だけサンプリングする。
-        let request_time = (self.request_clock)()?;
+        // Sample REQUEST_TIME lazily: ordinary writes must not depend on a
+        // fallible clock callback, and all sentinels in one commit share it.
+        let mut request_time = RequestTime {
+            clock: &self.request_clock,
+            value: None,
+        };
         let mut next = self.docs.clone();
         for op in writes {
-            apply_write_to_docs(&mut next, op, &request_time)?;
+            apply_write_to_docs(&mut next, op, &mut request_time)?;
         }
         self.docs = next;
         Ok(())
@@ -86,14 +105,16 @@ impl Firestore for InMemoryFirestore {
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
-        if self.tx_snapshot.is_none() {
+        let Some(mut next) = self.tx_snapshot.take() else {
             return Err("not in transaction".into());
-        }
+        };
         // transaction も同じ commit request の clock を全 write で共有する。
-        let request_time = (self.request_clock)()?;
-        let mut next = self.tx_snapshot.take().expect("transaction checked above");
+        let mut request_time = RequestTime {
+            clock: &self.request_clock,
+            value: None,
+        };
         for op in writes {
-            apply_write_to_docs(&mut next, op, &request_time)?;
+            apply_write_to_docs(&mut next, op, &mut request_time)?;
         }
         self.docs = next;
         Ok(())
@@ -137,7 +158,7 @@ fn path_in_group(id: &str, doc_path: &str) -> bool {
 fn apply_write_to_docs(
     docs: &mut HashMap<String, BTreeMap<String, Value>>,
     op: WriteOp,
-    request_time: &Timestamp,
+    request_time: &mut RequestTime<'_>,
 ) -> Result<(), Box<dyn Error>> {
     match op {
         WriteOp::Set {
@@ -228,7 +249,7 @@ fn compare_values(a: Option<&Value>, b: &Value, pred: impl Fn(std::cmp::Ordering
 fn apply_update_map(
     current: &mut BTreeMap<String, Value>,
     updates: &mut BTreeMap<String, Value>,
-    request_time: &Timestamp,
+    request_time: &mut RequestTime<'_>,
 ) -> Result<(), Box<dyn Error>> {
     for (k, v) in updates.iter() {
         super::validate_field_path(k)?;
@@ -286,7 +307,7 @@ fn apply_update_map(
                 };
                 Value::Array(arr.into_iter().filter(|v| !values.contains(v)).collect())
             }
-            Value::ServerTimestamp => Value::Timestamp(request_time.clone()),
+            Value::ServerTimestamp => Value::Timestamp(request_time.get()?.clone()),
             Value::Increment(n) => match base {
                 Some(Value::Int(cur)) => Value::Int(cur.checked_add(n).unwrap_or_else(|| {
                     if n.is_negative() {
@@ -308,7 +329,7 @@ fn apply_update_map(
 fn resolve_sentinel_map(
     map: &mut BTreeMap<String, Value>,
     current: Option<&BTreeMap<String, Value>>,
-    request_time: &Timestamp,
+    request_time: &mut RequestTime<'_>,
 ) -> Result<(), Box<dyn Error>> {
     for (k, v) in map.clone() {
         reject_nested_sentinels(&v, false)?;
@@ -334,7 +355,7 @@ fn resolve_sentinel_map(
                 };
                 Value::Array(arr.into_iter().filter(|v| !values.contains(v)).collect())
             }
-            Value::ServerTimestamp => Value::Timestamp(request_time.clone()),
+            Value::ServerTimestamp => Value::Timestamp(request_time.get()?.clone()),
             Value::Increment(n) => match base() {
                 Some(Value::Int(cur)) => Value::Int(cur.checked_add(n).unwrap_or_else(|| {
                     if n.is_negative() {
