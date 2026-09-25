@@ -319,7 +319,7 @@ col("users").doc("1")       # doc("users/1") と同等
 
 ## 8. batch / transaction
 
-どちらも `{ ... }` ブロックが必須で、ブロックの最後の値を返す。ネスト(batch/transaction 内での batch/transaction)は不可(エラーメッセージ: `batch cannot be nested inside batch/transaction` / `transaction cannot be nested inside batch/transaction`)。
+どちらも `{ ... }` ブロックが必須で、ブロックの最後の値を返す。ブロックは**字句的な子スコープ**で評価され、呼び出し元(外側のスコープ)の変数は読める。ただし、見える外側の名前への代入は変数の不変性規則によりエラーになる。ブロック内で定義した変数・関数はブロック外へ公開されず、成功時だけでなくランタイムエラーやバックエンドエラー時も子スコープが破棄される。したがって、失敗後に同じ Runtime で再度 `batch` / `transaction` を実行できる。ネスト(batch/transaction 内での batch/transaction)は不可(エラーメッセージ: `batch cannot be nested inside batch/transaction` / `transaction cannot be nested inside batch/transaction`)。
 
 ### batch
 

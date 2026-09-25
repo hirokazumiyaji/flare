@@ -142,15 +142,26 @@ impl<F: Firestore> Runtime<F> {
         Ok(ExecFlow::Value(last))
     }
 
-    /// `exec` をステージング用 ctx に差し替えてブロックを評価し、元の ctx に
-    /// 戻してステージされた writes を返す。ブロックの成否にかかわらず復元する。
+    /// `exec` をステージング用 ctx に差し替え、子スコープでブロックを評価する。
+    /// ブロックの成否にかかわらず元の ctx とスコープへ戻し、ステージされた
+    /// writes を返す。
     fn run_staged_block(
         &mut self,
         ctx: ExecCtx,
         body: &[Stmt],
     ) -> (Result<ExecFlow, Box<dyn Error>>, Vec<WriteOp>) {
         let prev = std::mem::replace(&mut self.exec, ctx);
+        // batch / transaction は呼び出し元を読める字句的な子スコープで
+        // 評価する。ブロック内で定義した変数・関数は外へ漏れず、成功・
+        // ランタイムエラー/backend エラーのどちらでも同じスコープを片付ける。
+        // Save the complete stack rather than only its depth: a failed nested
+        // function binding can remove caller-local frames before returning.
+        // Restoring the snapshot makes staged-block cleanup unconditional even
+        // when an inner evaluator has partially rearranged the stack.
+        let saved_scopes = self.scopes.clone();
+        self.scopes.push(HashMap::new());
         let flow = self.eval_block(body);
+        self.scopes = saved_scopes;
         let writes = match std::mem::replace(&mut self.exec, prev) {
             ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => writes,
             ExecCtx::Normal => unreachable!("exec ctx changed inside batch/transaction"),

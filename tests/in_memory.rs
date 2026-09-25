@@ -144,6 +144,129 @@ fn batch_rolls_back_on_runtime_error() {
 }
 
 #[test]
+fn staged_blocks_read_outer_scope_and_keep_locals_private() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let out = run_in(
+        &mut runtime,
+        r#"outer = 7
+batch {
+  local = outer + 1
+  set("users/scope_batch", {n: local})
+}
+transaction {
+  read = get("users/scope_batch")
+  set("users/scope_tx", {n: read["n"] + outer})
+}
+[get("users/scope_batch")["n"], get("users/scope_tx")["n"]]"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(8), Value::Int(15)]));
+
+    let err = run_in(&mut runtime, "local").unwrap_err();
+    assert!(
+        format!("{err}").contains("undefined variable: local"),
+        "{err}"
+    );
+    let err = run_in(&mut runtime, "read").unwrap_err();
+    assert!(
+        format!("{err}").contains("undefined variable: read"),
+        "{err}"
+    );
+}
+
+#[test]
+fn staged_blocks_restore_scopes_after_nested_binding_error() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(&mut runtime, "fn f(x, x) { x }\nbatch { f(1, 2) }").unwrap_err();
+    assert!(
+        format!("{err}").contains("reassignment is not allowed: x"),
+        "{err}"
+    );
+    let err = run_in(&mut runtime, "x").unwrap_err();
+    assert!(format!("{err}").contains("undefined variable: x"), "{err}");
+}
+
+#[test]
+fn staged_blocks_cannot_assign_outer_names() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(&mut runtime, "outer = 1\nbatch { outer = 2 }").unwrap_err();
+    assert!(
+        format!("{err}").contains("reassignment is not allowed: outer"),
+        "{err}"
+    );
+    assert_eq!(run_in(&mut runtime, "outer").unwrap(), Value::Int(1));
+
+    let err = run_in(&mut runtime, "transaction { outer = 2 }").unwrap_err();
+    assert!(
+        format!("{err}").contains("reassignment is not allowed: outer"),
+        "{err}"
+    );
+    assert_eq!(run_in(&mut runtime, "outer").unwrap(), Value::Int(1));
+}
+
+#[test]
+fn batch_can_be_reused_after_runtime_error() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let failing = run_in(&mut runtime, "batch { batch_local = 1\nundefined_var }");
+    assert!(failing.is_err());
+
+    let out = run_in(&mut runtime, "batch { batch_local = 2\nbatch_local }").unwrap();
+    assert_eq!(out, Value::Int(2));
+}
+
+#[test]
+fn transaction_can_be_reused_after_runtime_error() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let failing = run_in(&mut runtime, "transaction { tx_local = 1\nundefined_var }");
+    assert!(failing.is_err());
+
+    let out = run_in(&mut runtime, "transaction { tx_local = 2\ntx_local }").unwrap();
+    assert_eq!(out, Value::Int(2));
+}
+
+#[test]
+fn batch_can_be_reused_after_backend_error_without_partial_writes() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let failing = run_in(
+        &mut runtime,
+        "batch { batch_backend_local = 1\nset(\"users/batch_backend\", {x: 1})\nupdate(\"users/missing\", {y: 2}) }",
+    );
+    assert!(failing.is_err());
+    assert_eq!(
+        run_in(&mut runtime, "get(\"users/batch_backend\")").unwrap(),
+        Value::Nil
+    );
+
+    let out = run_in(
+        &mut runtime,
+        "batch { batch_backend_local = 2\nset(\"users/batch_backend\", {x: batch_backend_local}) }\nget(\"users/batch_backend\")[\"x\"]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(2));
+}
+
+#[test]
+fn transaction_can_be_reused_after_backend_error_without_partial_writes() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let failing = run_in(
+        &mut runtime,
+        "transaction { tx_backend_local = 1\nupdate(\"users/missing\", {x: tx_backend_local}) }",
+    );
+    assert!(failing.is_err());
+    assert_eq!(
+        run_in(&mut runtime, "get(\"users/missing\")").unwrap(),
+        Value::Nil
+    );
+
+    let out = run_in(
+        &mut runtime,
+        "transaction { tx_backend_local = 2\nset(\"users/tx_backend\", {x: tx_backend_local}) }\nget(\"users/tx_backend\")[\"x\"]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(2));
+}
+
+#[test]
 fn transaction_rejects_get_after_write() {
     let err = run_script("transaction { set(\"users/txa\", {n: 1})\nget(\"users/txa\") }");
     assert!(err.is_err());

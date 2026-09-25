@@ -470,8 +470,9 @@ fn run_on_shared_runtime(
 
 #[test]
 fn emulator_failed_transaction_aborts_and_restarts() {
-    // 失敗した transaction は rollback RPC で中断され、同じ接続で
-    // 新しい transaction を開始できる("already in transaction" にならない)。
+    // 失敗した transaction は rollback RPC で中断され、子スコープの local も
+    // 残らない。同じ接続で新しい transaction を開始できる
+    // ("already in transaction" にならない)。
     let Some(fs) = emulator() else {
         eprintln!("skip: no emulator");
         return;
@@ -480,12 +481,16 @@ fn emulator_failed_transaction_aborts_and_restarts() {
     let run = unique("txab");
     let failing = run_on_shared_runtime(
         &mut rt,
-        &format!("transaction {{ set(\"users/{run}\", {{x: 1}})\nundefined_var }}"),
+        &format!(
+            "transaction {{ tx_local = 1\nset(\"users/{run}\", {{x: tx_local}})\nundefined_var }}"
+        ),
     );
     assert!(failing.is_err());
     let out = run_on_shared_runtime(
         &mut rt,
-        &format!("transaction {{ set(\"users/{run}\", {{x: 2}}) }}\nget(\"users/{run}\")"),
+        &format!(
+            "transaction {{ tx_local = 2\nset(\"users/{run}\", {{x: tx_local}}) }}\nget(\"users/{run}\")"
+        ),
     )
     .unwrap();
     assert_eq!(out, map! {"x" => Value::Int(2)});
