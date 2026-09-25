@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
-use super::{Firestore, WriteOp};
-use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value};
+use super::{lookup_field_path, matches_filters, Firestore, WriteOp};
+use crate::value::{QueryRef, QuerySource, Timestamp, Value};
 
 #[derive(Default)]
 pub struct InMemoryFirestore {
@@ -26,6 +26,9 @@ impl Firestore for InMemoryFirestore {
 
     fn run_query(&self, query: &QueryRef) -> Result<super::QueryCandidates, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
+        if super::query_has_no_matches(&query.filters) {
+            return Ok(vec![]);
+        }
         Ok(self
             .candidates(&query.source)
             .filter(|(_, doc)| matches_filters(doc, &query.filters))
@@ -122,63 +125,6 @@ fn apply_write_to_docs(
             docs.remove(&path);
             Ok(())
         }
-    }
-}
-
-fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bool {
-    filters.iter().all(|f| {
-        // `!=` / `in` / `not-in` はフィールドの存在を要求する(存在しなければ
-        // マッチしない)。`order_by` 対象の存在チェックは sort 側で行う。
-        let segments: Vec<&str> = f.field.split('.').collect();
-        let actual = lookup_field_path(Some(doc), &segments);
-        match f.op {
-            QueryOp::Eq => actual == Some(&f.value),
-            QueryOp::Ne => actual.is_some_and(|v| v != &f.value),
-            QueryOp::Gt => compare_values(actual, &f.value, |o| o.is_gt()),
-            QueryOp::Ge => compare_values(actual, &f.value, |o| o.is_ge()),
-            QueryOp::Lt => compare_values(actual, &f.value, |o| o.is_lt()),
-            QueryOp::Le => compare_values(actual, &f.value, |o| o.is_le()),
-            QueryOp::In => match (&f.value, actual) {
-                (Value::Array(list), Some(v)) => list.contains(v),
-                _ => false,
-            },
-            QueryOp::NotIn => match (&f.value, actual) {
-                (Value::Array(list), Some(v)) => {
-                    if list.contains(&Value::Nil) {
-                        false
-                    } else {
-                        !list.contains(v)
-                    }
-                }
-                _ => false,
-            },
-            QueryOp::ArrayContains => match actual {
-                Some(Value::Array(arr)) => arr.contains(&f.value),
-                _ => false,
-            },
-            QueryOp::ArrayContainsAny => match (&f.value, actual) {
-                (Value::Array(list), Some(Value::Array(arr))) => {
-                    arr.iter().any(|x| list.contains(x))
-                }
-                _ => false,
-            },
-        }
-    })
-}
-
-/// 大小比較は同型のみを規定する(Int / Str / Bool / Timestamp)。
-/// 型が異なる・Nil は常にマッチしない(emulator の Firestore と実用上の
-/// 挙動を合わせる。異なる型同士の Firestore の型順序は未規定 = spec §13)。
-/// フィルタの文字列値は 1,500 バイト未満に制限されており(emulator の
-/// Firestore と同じ)、有効なフィルタに対しては全文比較でよい(最初の差異
-/// 位置は常にフィルタ自身の長さ以内 = 1,500 バイト未満に収まる)。
-fn compare_values(a: Option<&Value>, b: &Value, pred: impl Fn(std::cmp::Ordering) -> bool) -> bool {
-    match (a, b) {
-        (Some(Value::Int(x)), Value::Int(y)) => pred(x.cmp(y)),
-        (Some(Value::Str(x)), Value::Str(y)) => pred(x.cmp(y)),
-        (Some(Value::Bool(x)), Value::Bool(y)) => pred(x.cmp(y)),
-        (Some(Value::Timestamp(x)), Value::Timestamp(y)) => pred(x.seconds.cmp(&y.seconds)),
-        _ => false,
     }
 }
 
@@ -359,23 +305,4 @@ fn remove_at_field_path(
         Some(Value::Map(inner)) => remove_at_field_path(inner, rest),
         Some(_) => Err(format!("cannot update field path: field {first:?} is not a map").into()),
     }
-}
-
-/// フィールドパスでネストした値を参照する(中間が Map でなければ見つからない)。
-fn lookup_field_path<'a>(
-    map: Option<&'a BTreeMap<String, Value>>,
-    segments: &[&str],
-) -> Option<&'a Value> {
-    let mut cur = map?;
-    for (i, seg) in segments.iter().enumerate() {
-        let v = cur.get(*seg)?;
-        if i == segments.len() - 1 {
-            return Some(v);
-        }
-        match v {
-            Value::Map(m) => cur = m,
-            _ => return None,
-        }
-    }
-    None
 }

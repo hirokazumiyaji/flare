@@ -407,6 +407,59 @@ set("users/{run}/rows/r6", {{other: 1}})
     );
 }
 
+#[test]
+fn emulator_membership_null_and_empty_array_queries_match_in_memory() {
+    // This is the parity matrix for the filters that must not be delegated
+    // wholesale to Firestore.  In particular, null is a value in firelang and
+    // an array may contain null elements.
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let run = unique("qparity");
+    let script = format!(
+        r#"set("users/{run}/rows/n1", {{v: 1, tags: [1, nil]}})
+set("users/{run}/rows/n2", {{v: nil, tags: [nil]}})
+set("users/{run}/rows/n3", {{v: "1", tags: []}})
+set("users/{run}/rows/n4", {{tags: [2]}})
+set("users/{run}/rows/n5", {{v: 2, tags: [1, 2]}})
+[
+  col("users/{run}/rows").where("v", "!=", nil).get().len(),
+  col("users/{run}/rows").where("v", "!=", 1).get().len(),
+  col("users/{run}/rows").where("v", "not-in", [1]).get().len(),
+  col("users/{run}/rows").where("v", "in", [nil]).get().len(),
+  col("users/{run}/rows").where("v", "not-in", []).get().len(),
+  col("users/{run}/rows").where("v", "not-in", [1, nil]).get().len(),
+  col("users/{run}/rows").where("tags", "array_contains", nil).get().len(),
+  col("users/{run}/rows").where("tags", "array_contains_any", [nil]).get().len(),
+  col("users/{run}/rows").where("tags", "array_contains_any", []).get().len(),
+  col("users/{run}/rows").where("v", "in", []).get().len(),
+  col("users/{run}/rows").where("v", "!=", 1).where("v", "!=", 2).get().len(),
+  col("users/{run}/rows").where("v", "in", [1, 2]).where("v", "not-in", [2]).get().len(),
+  col("users/{run}/rows").where("tags", "array_contains_any", [1]).where("tags", "array_contains_any", [2]).get().len(),
+]"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(3),
+            Value::Int(3),
+            Value::Int(3),
+            Value::Int(1),
+            Value::Int(4),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(2),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(1),
+            Value::Int(1),
+        ])
+    );
+}
+
 fn run_on_shared_runtime(
     rt: &mut firelang::runtime::Runtime<FirestoreEmulator>,
     source: &str,

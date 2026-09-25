@@ -1479,6 +1479,51 @@ fn where_supports_array_contains_operators() {
 }
 
 #[test]
+fn membership_null_and_empty_array_queries_match_emulator_matrix() {
+    // Keep this matrix in lockstep with
+    // `emulator_membership_null_and_empty_array_queries_match_in_memory`.
+    let script = r#"set("items/n1", {v: 1, tags: [1, nil]})
+set("items/n2", {v: nil, tags: [nil]})
+set("items/n3", {v: "1", tags: []})
+set("items/n4", {tags: [2]})
+set("items/n5", {v: 2, tags: [1, 2]})
+[
+  col("items").where("v", "!=", nil).get().len(),
+  col("items").where("v", "!=", 1).get().len(),
+  col("items").where("v", "not-in", [1]).get().len(),
+  col("items").where("v", "in", [nil]).get().len(),
+  col("items").where("v", "not-in", []).get().len(),
+  col("items").where("v", "not-in", [1, nil]).get().len(),
+  col("items").where("tags", "array_contains", nil).get().len(),
+  col("items").where("tags", "array_contains_any", [nil]).get().len(),
+  col("items").where("tags", "array_contains_any", []).get().len(),
+  col("items").where("v", "in", []).get().len(),
+  col("items").where("v", "!=", 1).where("v", "!=", 2).get().len(),
+  col("items").where("v", "in", [1, 2]).where("v", "not-in", [2]).get().len(),
+  col("items").where("tags", "array_contains_any", [1]).where("tags", "array_contains_any", [2]).get().len(),
+]"#;
+    let out = run_script(script).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(3),
+            Value::Int(3),
+            Value::Int(3),
+            Value::Int(1),
+            Value::Int(4),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(2),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(1),
+            Value::Int(1),
+        ])
+    );
+}
+
+#[test]
 fn offset_skips_after_sort_and_count_ignores_paging() {
     // emulator テスト(emulator_extended_query_matches_in_memory)と
     // 同じケース。sort → offset → limit の順に適用、count は全件。

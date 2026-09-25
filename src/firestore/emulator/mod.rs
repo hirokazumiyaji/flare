@@ -14,7 +14,7 @@ use gcloud_sdk::google::firestore::v1::{
 };
 use gcloud_sdk::tonic::{Code, Request};
 
-use super::{Firestore, QueryCandidates, WriteOp};
+use super::{matches_filters, Firestore, QueryCandidates, WriteOp};
 use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Value};
 
 pub struct FirestoreEmulator {
@@ -67,15 +67,24 @@ impl Firestore for FirestoreEmulator {
 
     fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
+        if super::query_has_no_matches(&query.filters) {
+            return Ok(vec![]);
+        }
+
+        // Firestore has restrictions that do not exist in firelang's query
+        // model (for example, multiple inequality/membership clauses).  Keep
+        // the server query deliberately small and let the shared matcher
+        // evaluate the complete predicate over its candidates.
+        let server_filters = server_filters(&query.filters);
         match &query.source {
             QuerySource::Collection(path) => {
                 let (parent, collection_id) = path::split_collection_path(path)?;
-                let sq = structured_query(collection_id, false, &query.filters)?;
-                run_query_candidates(self, parent.as_deref(), sq)
+                let sq = structured_query(collection_id, false, &server_filters)?;
+                run_query_candidates(self, parent.as_deref(), sq, &query.filters)
             }
             QuerySource::CollectionGroup(id) => {
-                let sq = structured_query(id, true, &query.filters)?;
-                run_query_candidates(self, None, sq)
+                let sq = structured_query(id, true, &server_filters)?;
+                run_query_candidates(self, None, sq, &query.filters)
             }
         }
     }
@@ -164,6 +173,7 @@ fn run_query_candidates(
     fs: &FirestoreEmulator,
     parent: Option<&str>,
     query: StructuredQuery,
+    filters: &[QueryFilter],
 ) -> Result<QueryCandidates, Box<dyn Error>> {
     let db = &fs.client.db;
     let parent = path::parent_path(&fs.client.project_id, parent);
@@ -196,7 +206,60 @@ fn run_query_candidates(
         };
         out.push((rel, fields));
     }
+    // The server query is only a candidate-generation optimization.  Re-run
+    // every predicate with the same matcher used by the in-memory backend so
+    // server-specific null and structural-value behavior cannot leak through.
+    out.retain(|(_, fields)| matches_filters(fields, filters));
     Ok(out)
+}
+
+/// Select at most one predicate for Firestore's candidate query.
+///
+/// A single predicate is enough to keep the common case selective while
+/// avoiding composite-query restrictions (multiple inequality/membership
+/// clauses, or combinations that require an index).  The complete predicate
+/// is applied by `matches_filters` after the response arrives.  Structural,
+/// null-containing, and otherwise unsupported values are also kept
+/// client-side; the shared matcher can represent them without asking Firestore
+/// to reject the query.
+fn server_filters(filters: &[QueryFilter]) -> Vec<QueryFilter> {
+    filters
+        .iter()
+        .filter(|f| is_server_filter(f))
+        .take(1)
+        .cloned()
+        .collect()
+}
+
+fn is_server_filter(filter: &QueryFilter) -> bool {
+    if super::validate_field_path(&filter.field).is_err() {
+        return false;
+    }
+    match filter.op {
+        QueryOp::Eq | QueryOp::Gt | QueryOp::Ge | QueryOp::Lt | QueryOp::Le => {
+            is_server_scalar(&filter.value)
+        }
+        QueryOp::In => match &filter.value {
+            Value::Array(items) => !items.is_empty() && items.iter().all(is_server_scalar),
+            _ => false,
+        },
+        QueryOp::ArrayContains => is_server_scalar(&filter.value),
+        QueryOp::ArrayContainsAny => match &filter.value {
+            Value::Array(items) => !items.is_empty() && items.iter().all(is_server_scalar),
+            _ => false,
+        },
+        // These operators intentionally have different server semantics.  In
+        // particular, NOT_IN excludes null fields on Firestore while
+        // firelang evaluates the predicate structurally.
+        QueryOp::Ne | QueryOp::NotIn => false,
+    }
+}
+
+fn is_server_scalar(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Int(_) | Value::Str(_) | Value::Bool(_) | Value::Timestamp(_)
+    )
 }
 
 fn structured_query(
@@ -225,6 +288,12 @@ fn build_where(
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
     let mut parts = vec![];
     for f in filters {
+        // Keep this guard here as well as in `server_filters`: callers of the
+        // query builder must not accidentally reintroduce a predicate that
+        // Firestore cannot express with firelang's semantics.
+        if !is_server_filter(f) {
+            continue;
+        }
         let op = match f.op {
             QueryOp::Eq => structured_query::field_filter::Operator::Equal,
             QueryOp::Ne => structured_query::field_filter::Operator::NotEqual,
