@@ -394,6 +394,24 @@ fn query_rows_support_index_access_including_dunder_name() {
 }
 
 #[test]
+fn document_name_filters_match_relative_paths() {
+    let out = run_script(
+        r#"set("users/name1", {n: 1})
+set("users/name2", {n: 2})
+[
+  col("users").where("__name__", "==", "users/name1").get().len(),
+  col("users").where("__name__", "!=", "users/name1").get().len(),
+  col("users").where("__name__", "in", ["users/name1", "users/name2"]).get().len()
+]"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(1), Value::Int(1), Value::Int(2)])
+    );
+}
+
+#[test]
 fn index_access_read_value_for_branching() {
     let out = run_script(
         "set(\"users/br\", {active: true})\nu = get(\"users/br\")\nif u[\"active\"] { 1 } else { 2 }",

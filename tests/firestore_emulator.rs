@@ -77,6 +77,31 @@ col("users").where("age", ">=", 20).limit(2).get()"#
 }
 
 #[test]
+fn emulator_document_name_filters_match_relative_paths() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let id = unique("name");
+    let first = format!("users/{id}_1");
+    let second = format!("users/{id}_2");
+    let script = format!(
+        r#"set("{first}", {{n: 1}})
+set("{second}", {{n: 2}})
+[
+  col("users").where("__name__", "==", "{first}").get().len(),
+  col("users").where("__name__", "!=", "{first}").get().len(),
+  col("users").where("__name__", "in", ["{first}", "{second}"]).get().len()
+]"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(1), Value::Int(1), Value::Int(2)])
+    );
+}
+
+#[test]
 fn emulator_collection_group_query() {
     let Some(fs) = emulator() else {
         eprintln!("skip: no emulator");

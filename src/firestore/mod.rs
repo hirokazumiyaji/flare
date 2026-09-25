@@ -6,7 +6,6 @@ mod memory;
 pub use emulator::FirestoreEmulator;
 pub use memory::InMemoryFirestore;
 
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -75,8 +74,10 @@ pub(crate) fn matches_filters(
 ) -> bool {
     filters.iter().all(|filter| {
         // `__name__` は保存された field ではなく相対ドキュメントパス。
-        let actual = query_field_value(path, doc, &filter.field);
-        let actual = actual.as_deref();
+        if filter.field == "__name__" {
+            return matches_document_name_filter(path, filter);
+        }
+        let actual = query_field_value(doc, &filter.field);
         match filter.op {
             QueryOp::Eq => actual == Some(&filter.value),
             QueryOp::Ne => actual.is_some_and(|value| value != &filter.value),
@@ -110,16 +111,40 @@ pub(crate) fn matches_filters(
     })
 }
 
-fn query_field_value<'a>(
-    path: &str,
-    doc: &'a BTreeMap<String, Value>,
-    field: &str,
-) -> Option<Cow<'a, Value>> {
-    if field == "__name__" {
-        return Some(Cow::Owned(Value::Str(path.to_string())));
+fn query_field_value<'a>(doc: &'a BTreeMap<String, Value>, field: &str) -> Option<&'a Value> {
+    let mut current = doc;
+    let mut segments = field.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let value = current.get(segment)?;
+        if segments.peek().is_none() {
+            return Some(value);
+        }
+        current = match value {
+            Value::Map(inner) => inner,
+            _ => return None,
+        };
     }
-    let segments: Vec<&str> = field.split('.').collect();
-    lookup_field_path(Some(doc), &segments).map(Cow::Borrowed)
+    None
+}
+
+fn matches_document_name_filter(path: &str, filter: &QueryFilter) -> bool {
+    let is_path = |value: &Value| matches!(value, Value::Str(actual) if actual == path);
+    match filter.op {
+        QueryOp::Eq => is_path(&filter.value),
+        QueryOp::Ne => !is_path(&filter.value),
+        QueryOp::In => match &filter.value {
+            Value::Array(values) => values.iter().any(is_path),
+            _ => false,
+        },
+        QueryOp::NotIn => match &filter.value {
+            Value::Array(values) if !values.iter().any(|value| matches!(value, Value::Nil)) => {
+                !values.iter().any(is_path)
+            }
+            _ => false,
+        },
+        QueryOp::ArrayContains | QueryOp::ArrayContainsAny => false,
+        QueryOp::Gt | QueryOp::Ge | QueryOp::Lt | QueryOp::Le => false,
+    }
 }
 
 fn compare_where_values(
@@ -130,24 +155,6 @@ fn compare_where_values(
     actual
         .and_then(|value| value.cmp_for_where(filter))
         .is_some_and(predicate)
-}
-
-fn lookup_field_path<'a>(
-    map: Option<&'a BTreeMap<String, Value>>,
-    segments: &[&str],
-) -> Option<&'a Value> {
-    let mut current = map?;
-    for (index, segment) in segments.iter().enumerate() {
-        let value = current.get(*segment)?;
-        if index == segments.len() - 1 {
-            return Some(value);
-        }
-        match value {
-            Value::Map(inner) => current = inner,
-            _ => return None,
-        }
-    }
-    None
 }
 
 pub(crate) fn paths_overlap(a: &str, b: &str) -> bool {

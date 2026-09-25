@@ -71,21 +71,17 @@ impl Firestore for FirestoreEmulator {
         // 最終的な一致判定は必ず共通の local matcher で行う(特に異型の
         // 大小比較を Firestore の型順序に委ねない)。
         let server_filters = server_prefilters(&query.filters);
-        let candidates = match &query.source {
+        match &query.source {
             QuerySource::Collection(path) => {
                 let (parent, collection_id) = path::split_collection_path(path)?;
                 let sq = structured_query(collection_id, false, &server_filters)?;
-                run_query_candidates(self, parent.as_deref(), sq)?
+                run_query_candidates(self, parent.as_deref(), sq, &query.filters)
             }
             QuerySource::CollectionGroup(id) => {
                 let sq = structured_query(id, true, &server_filters)?;
-                run_query_candidates(self, None, sq)?
+                run_query_candidates(self, None, sq, &query.filters)
             }
-        };
-        Ok(candidates
-            .into_iter()
-            .filter(|(path, doc)| super::matches_filters(path, doc, &query.filters))
-            .collect())
+        }
     }
 
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
@@ -172,10 +168,12 @@ fn run_query_candidates(
     fs: &FirestoreEmulator,
     parent: Option<&str>,
     query: StructuredQuery,
+    filters: &[QueryFilter],
 ) -> Result<QueryCandidates, Box<dyn Error>> {
     let db = &fs.client.db;
     let parent = path::parent_path(&fs.client.project_id, parent);
-    let docs = fs.client.runtime.block_on(async move {
+    let filters = filters.to_vec();
+    fs.client.runtime.block_on(async move {
         let response = db
             .client()
             .get()
@@ -187,24 +185,19 @@ fn run_query_candidates(
             }))
             .await?;
         let mut stream = response.into_inner();
-        let mut docs = vec![];
+        let mut out = vec![];
         while let Some(row) = stream.message().await? {
-            if let Some(doc) = row.document {
-                docs.push(doc);
+            let Some(doc) = row.document else { continue };
+            let rel = path::relative_document_name(&doc.name)?;
+            let Value::Map(fields) = codec::decode_document(&doc)? else {
+                return Err("query result must be a map".into());
+            };
+            if super::matches_filters(&rel, &fields, &filters) {
+                out.push((rel, fields));
             }
         }
-        Ok::<_, gcloud_sdk::tonic::Status>(docs)
-    })?;
-
-    let mut out = vec![];
-    for doc in docs {
-        let rel = path::relative_document_name(&doc.name)?;
-        let Value::Map(fields) = codec::decode_document(&doc)? else {
-            return Err("query result must be a map".into());
-        };
-        out.push((rel, fields));
-    }
-    Ok(out)
+        Ok::<QueryCandidates, Box<dyn Error>>(out)
+    })
 }
 
 /// Server へ渡す候補絞り込みを、最大一つの安全な predicate だけにする。
@@ -215,10 +208,12 @@ fn run_query_candidates(
 /// と結果が一致する一つだけを送る。異型 / Nil / Array / Map の大小比較は
 /// そもそも server へ送らず、すべての候補を local で判定する。
 fn server_prefilters(filters: &[QueryFilter]) -> Vec<QueryFilter> {
-    match filters {
-        [filter] if is_server_prefilter_safe(filter) => vec![filter.clone()],
-        _ => vec![],
-    }
+    filters
+        .iter()
+        .find(|filter| is_server_prefilter_safe(filter))
+        .cloned()
+        .into_iter()
+        .collect()
 }
 
 fn is_server_prefilter_safe(filter: &QueryFilter) -> bool {
