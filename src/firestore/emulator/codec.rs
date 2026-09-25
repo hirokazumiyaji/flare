@@ -7,7 +7,7 @@ use std::error::Error;
 use gcloud_sdk::google::firestore::v1::{value, ArrayValue, Document, MapValue, Value as SdkValue};
 use prost_types::{NullValue, Timestamp as ProtoTimestamp};
 
-use super::path::relative_document_name;
+use super::path::{document_name, relative_document_name};
 use crate::value::{DocRef, Timestamp, Value};
 
 pub(super) fn encode_array_items(items: &[Value]) -> Result<Vec<SdkValue>, Box<dyn Error>> {
@@ -44,6 +44,37 @@ pub(super) fn encode_field_value(v: &Value) -> Result<SdkValue, Box<dyn Error>> 
             _ => return Err(format!("unsupported value in emulator write: {v:?}").into()),
         }),
     })
+}
+
+/// Query-only value encoder.  In particular, a DocRef is encoded as a
+/// Firestore reference value; the write encoder intentionally remains strict.
+pub(super) fn encode_query_value(project_id: &str, v: &Value) -> Result<SdkValue, Box<dyn Error>> {
+    match v {
+        Value::DocRef(reference) => Ok(SdkValue {
+            value_type: Some(value::ValueType::ReferenceValue(document_name(
+                project_id,
+                &reference.path,
+            ))),
+        }),
+        Value::Array(items) => Ok(SdkValue {
+            value_type: Some(value::ValueType::ArrayValue(ArrayValue {
+                values: items
+                    .iter()
+                    .map(|item| encode_query_value(project_id, item))
+                    .collect::<Result<Vec<_>, _>>()?,
+            })),
+        }),
+        Value::Map(map) => {
+            let mut fields = HashMap::new();
+            for (key, value) in map {
+                fields.insert(key.clone(), encode_query_value(project_id, value)?);
+            }
+            Ok(SdkValue {
+                value_type: Some(value::ValueType::MapValue(MapValue { fields })),
+            })
+        }
+        other => encode_field_value(other),
+    }
 }
 
 pub(super) fn decode_document(doc: &Document) -> Result<Value, Box<dyn Error>> {

@@ -262,6 +262,63 @@ get("{path}")"#
 }
 
 #[test]
+fn emulator_query_field_paths_match_in_memory() {
+    // Simple, implicitly quoted, explicitly quoted, nested, and __name__ paths
+    // use the same field-path contract in both backends.
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let run = unique("qfp");
+    let one = format!("users/{run}/rows/one");
+    let two = format!("users/{run}/rows/two");
+    let script = format!(
+        r#"set("{one}", {{"a-b": 1, "a.b": 2, profile: {{age: 3}}}})
+set("{two}", {{"a-b": 9, "a.b": 8, profile: {{age: 1}}}})
+[
+  col("users/{run}/rows").where("a-b", "==", 1).get()[0]["__name__"],
+  col("users/{run}/rows").where("`a.b`", "==", 2).get()[0]["__name__"],
+  col("users/{run}/rows").where("profile.age", ">=", 3).get()[0]["__name__"],
+  col("users/{run}/rows").where("__name__", "==", "{one}").get().len(),
+  col("users/{run}/rows").where("__name__", "==", doc("{two}")).get().len(),
+  col("users/{run}/rows").order_by("a-b", "asc").get()[0]["__name__"]
+]"#,
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str(one.clone()),
+            Value::Str(one.clone()),
+            Value::Str(one.clone()),
+            Value::Int(1),
+            Value::Int(1),
+            Value::Str(two),
+        ])
+    );
+}
+
+#[test]
+fn emulator_rejects_invalid_query_field_paths_before_rpc() {
+    let run = unique("qfp_invalid");
+    for field in ["", "a.", ".a", "a..b", "`unterminated"] {
+        let Some(fs) = emulator() else {
+            eprintln!("skip: no emulator");
+            return;
+        };
+        let script = format!(
+            r#"col("users/{run}/rows").where("{}", "==", 1).get()"#,
+            field
+        );
+        let err = run_script_with_firestore(&script, fs).unwrap_err();
+        assert!(
+            format!("{err}").contains("invalid field path"),
+            "{field}: {err}"
+        );
+    }
+}
+
+#[test]
 fn emulator_replacement_set_sentinel_with_dotted_key_matches_in_memory() {
     // Same case as in-memory
     // `replacement_set_resolves_sentinels_against_literal_dotted_keys`:

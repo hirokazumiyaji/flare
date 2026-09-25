@@ -14,8 +14,8 @@ use gcloud_sdk::google::firestore::v1::{
 };
 use gcloud_sdk::tonic::{Code, Request};
 
-use super::{Firestore, QueryCandidates, WriteOp};
-use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Value};
+use super::{parse_query_field_path, Firestore, QueryCandidates, WriteOp};
+use crate::value::{DocRef, QueryFilter, QueryOp, QueryRef, QuerySource, Value};
 
 pub struct FirestoreEmulator {
     client: client::EmulatorClient,
@@ -67,14 +67,25 @@ impl Firestore for FirestoreEmulator {
 
     fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
+        // Parse every filter before constructing/sending the RPC.  This keeps
+        // malformed paths from reaching Firestore and gives both backends the
+        // same validation error.
+        for filter in &query.filters {
+            parse_query_field_path(&filter.field)?;
+        }
         match &query.source {
             QuerySource::Collection(path) => {
                 let (parent, collection_id) = path::split_collection_path(path)?;
-                let sq = structured_query(collection_id, false, &query.filters)?;
+                let sq = structured_query(
+                    &self.client.project_id,
+                    collection_id,
+                    false,
+                    &query.filters,
+                )?;
                 run_query_candidates(self, parent.as_deref(), sq)
             }
             QuerySource::CollectionGroup(id) => {
-                let sq = structured_query(id, true, &query.filters)?;
+                let sq = structured_query(&self.client.project_id, id, true, &query.filters)?;
                 run_query_candidates(self, None, sq)
             }
         }
@@ -200,6 +211,7 @@ fn run_query_candidates(
 }
 
 fn structured_query(
+    project_id: &str,
     collection_id: &str,
     all_descendants: bool,
     filters: &[QueryFilter],
@@ -210,7 +222,7 @@ fn structured_query(
             collection_id: collection_id.to_string(),
             all_descendants,
         }],
-        r#where: build_where(filters)?,
+        r#where: build_where(project_id, filters)?,
         order_by: vec![],
         start_at: None,
         end_at: None,
@@ -221,10 +233,12 @@ fn structured_query(
 }
 
 fn build_where(
+    project_id: &str,
     filters: &[QueryFilter],
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
     let mut parts = vec![];
     for f in filters {
+        let field_path = parse_query_field_path(&f.field)?;
         let op = match f.op {
             QueryOp::Eq => structured_query::field_filter::Operator::Equal,
             QueryOp::Ne => structured_query::field_filter::Operator::NotEqual,
@@ -237,14 +251,19 @@ fn build_where(
             QueryOp::ArrayContains => structured_query::field_filter::Operator::ArrayContains,
             QueryOp::ArrayContainsAny => structured_query::field_filter::Operator::ArrayContainsAny,
         };
+        let value = if field_path.is_document_id() {
+            encode_document_id_query_value(project_id, &f.value)?
+        } else {
+            codec::encode_query_value(project_id, &f.value)?
+        };
         parts.push(structured_query::Filter {
             filter_type: Some(structured_query::filter::FilterType::FieldFilter(
                 structured_query::FieldFilter {
                     field: Some(structured_query::FieldReference {
-                        field_path: f.field.clone(),
+                        field_path: field_path.wire().to_string(),
                     }),
                     op: op.into(),
-                    value: Some(codec::encode_field_value(&f.value)?),
+                    value: Some(value),
                 },
             )),
         });
@@ -261,6 +280,33 @@ fn build_where(
             )),
         }),
     })
+}
+
+/// `__name__` is a document reference on the wire, while the public API uses
+/// a relative path string.  Convert both strings and DocRefs recursively so
+/// `==`, `in`, and nested membership values have the same meaning.
+fn encode_document_id_query_value(
+    project_id: &str,
+    value: &Value,
+) -> Result<gcloud_sdk::google::firestore::v1::Value, Box<dyn Error>> {
+    match value {
+        Value::Str(path) => {
+            codec::encode_query_value(project_id, &Value::DocRef(DocRef { path: path.clone() }))
+        }
+        Value::Array(items) => Ok(gcloud_sdk::google::firestore::v1::Value {
+            value_type: Some(
+                gcloud_sdk::google::firestore::v1::value::ValueType::ArrayValue(
+                    gcloud_sdk::google::firestore::v1::ArrayValue {
+                        values: items
+                            .iter()
+                            .map(|item| encode_document_id_query_value(project_id, item))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    },
+                ),
+            ),
+        }),
+        other => codec::encode_query_value(project_id, other),
+    }
 }
 
 #[cfg(test)]

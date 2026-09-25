@@ -3,7 +3,9 @@ use std::error::Error;
 
 use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
 use crate::error::{FirelangError, Span};
-use crate::firestore::{Firestore, WriteOp};
+use crate::firestore::{
+    normalize_query_field_path, parse_query_field_path, Firestore, QueryFieldPath, WriteOp,
+};
 use crate::value::{
     CollectionGroupRef, CollectionRef, Direction, DocRef, QueryFilter, QueryOp, QueryRef,
     Timestamp, UserFunc, Value,
@@ -407,9 +409,12 @@ impl<F: Firestore> Runtime<F> {
     ) -> Result<Value, Box<dyn Error>> {
         match name {
             "where" => {
+                let field = expect_string(args.first())?;
+                let op = QueryOp::parse(expect_string(args.get(1))?)?;
+                let field = normalize_query_field_path(field)?;
                 query.filters.push(QueryFilter {
-                    field: expect_string(args.first())?.to_string(),
-                    op: QueryOp::parse(expect_string(args.get(1))?)?,
+                    field,
+                    op,
                     value: args.get(2).cloned().ok_or("where requires value")?,
                 });
                 Ok(Value::QueryRef(query))
@@ -427,8 +432,9 @@ impl<F: Firestore> Runtime<F> {
                 Ok(Value::QueryRef(query))
             }
             "order_by" => {
-                let field = expect_string(args.first())?.to_string();
+                let field = expect_string(args.first())?;
                 let dir = Direction::parse(expect_string(args.get(1))?)?;
+                let field = normalize_query_field_path(field)?;
                 query.order_by.push((field, dir));
                 Ok(Value::QueryRef(query))
             }
@@ -446,7 +452,7 @@ impl<F: Firestore> Runtime<F> {
             "get" => {
                 self.forbid_query_in_batch_or_transaction()?;
                 let rows = self.fs.run_query(&query).map_err(backend_err)?;
-                Ok(Value::Array(apply_query_shape(rows, &query)))
+                Ok(Value::Array(apply_query_shape(rows, &query)?))
             }
             _ => Err(format!("unknown query method: {name}").into()),
         }
@@ -948,22 +954,27 @@ fn check_block_arity(block: &Block, yielded: usize) -> Result<(), Box<dyn Error>
 fn apply_query_shape(
     mut rows: Vec<(String, BTreeMap<String, Value>)>,
     query: &QueryRef,
-) -> Vec<Value> {
-    if query.order_by.is_empty() {
+) -> Result<Vec<Value>, Box<dyn Error>> {
+    let order_by = query
+        .order_by
+        .iter()
+        .map(|(field, direction)| Ok((parse_query_field_path(field)?, *direction)))
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+
+    if order_by.is_empty() {
         rows.sort_by(|a, b| a.0.cmp(&b.0));
     } else {
         rows.retain(|(path, doc)| {
-            query
-                .order_by
+            order_by
                 .iter()
-                .all(|(f, _)| get_field_value(path, doc, f).is_some())
+                .all(|(field, _)| get_field_value(path, doc, field).is_some())
         });
         rows.sort_by(|a, b| {
-            for (field, dir) in &query.order_by {
+            for (field, direction) in &order_by {
                 let val_a = get_field_value(&a.0, &a.1, field).unwrap();
                 let val_b = get_field_value(&b.0, &b.1, field).unwrap();
                 let ord = val_a.cmp_for_order(&val_b);
-                let ord = match dir {
+                let ord = match direction {
                     Direction::Asc => ord,
                     Direction::Desc => ord.reverse(),
                 };
@@ -983,7 +994,7 @@ fn apply_query_shape(
     if let Some(l) = query.limit {
         values.truncate(l.min(values.len()));
     }
-    values
+    Ok(values)
 }
 
 fn wrap_doc(path: &str, doc: &BTreeMap<String, Value>) -> Value {
@@ -992,31 +1003,16 @@ fn wrap_doc(path: &str, doc: &BTreeMap<String, Value>) -> Value {
     Value::Map(out)
 }
 
-fn get_field_value(path: &str, doc: &BTreeMap<String, Value>, field: &str) -> Option<Value> {
-    if field == "__name__" {
+fn get_field_value(
+    path: &str,
+    doc: &BTreeMap<String, Value>,
+    field: &QueryFieldPath,
+) -> Option<Value> {
+    if field.is_document_id() {
         Some(Value::Str(path.to_string()))
     } else {
-        let segments: Vec<&str> = field.split('.').collect();
-        lookup_field_path(Some(doc), &segments).cloned()
+        field.lookup(doc).cloned()
     }
-}
-
-fn lookup_field_path<'a>(
-    map: Option<&'a BTreeMap<String, Value>>,
-    segments: &[&str],
-) -> Option<&'a Value> {
-    let mut cur = map?;
-    for (i, seg) in segments.iter().enumerate() {
-        let v = cur.get(*seg)?;
-        if i == segments.len() - 1 {
-            return Some(v);
-        }
-        match v {
-            Value::Map(m) => cur = m,
-            _ => return None,
-        }
-    }
-    None
 }
 
 fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {
