@@ -2,17 +2,24 @@
 
 use std::error::Error;
 
+/// `projects/{project_id}/databases/(default)/documents` を返す。
+///
+/// Firestore の reference をローカルの相対パスへ変換するときは、まず
+/// この resource root が現在のクライアントと一致することを確認する。
+pub(super) fn document_root(project_id: &str) -> String {
+    format!("projects/{project_id}/databases/(default)/documents")
+}
+
 /// `projects/{project_id}/databases/(default)/documents/{path}` を組み立てる。
 pub(super) fn document_name(project_id: &str, path: &str) -> String {
-    format!("projects/{project_id}/databases/(default)/documents/{path}")
+    format!("{}/{path}", document_root(project_id))
 }
 
 pub(super) fn parent_path(project_id: &str, relative_parent: Option<&str>) -> String {
+    let root = document_root(project_id);
     match relative_parent {
-        Some(parent) if !parent.is_empty() => {
-            format!("projects/{project_id}/databases/(default)/documents/{parent}")
-        }
-        _ => format!("projects/{project_id}/databases/(default)/documents"),
+        Some(parent) if !parent.is_empty() => format!("{root}/{parent}"),
+        _ => root,
     }
 }
 

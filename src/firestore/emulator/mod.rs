@@ -61,7 +61,10 @@ impl Firestore for FirestoreEmulator {
                 .await
         });
         match result {
-            Ok(resp) => codec::decode_document(&resp.into_inner()).map(Some),
+            Ok(resp) => {
+                codec::decode_document(&resp.into_inner(), self.client.db.get_documents_path())
+                    .map(Some)
+            }
             Err(status) if status.code() == Code::NotFound => Ok(None),
             Err(status) => Err(status.into()),
         }
@@ -138,7 +141,10 @@ impl Firestore for FirestoreEmulator {
             }
             Ok::<_, gcloud_sdk::tonic::Status>(None)
         })?;
-        result.as_ref().map(codec::decode_document).transpose()
+        result
+            .as_ref()
+            .map(|doc| codec::decode_document(doc, self.client.db.get_documents_path()))
+            .transpose()
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
@@ -223,7 +229,8 @@ fn run_query_candidates(
     let mut out = vec![];
     for doc in docs {
         let rel = path::relative_document_name(&doc.name)?;
-        let Value::Map(fields) = codec::decode_document(&doc)? else {
+        let Value::Map(fields) = codec::decode_document(&doc, fs.client.db.get_documents_path())?
+        else {
             return Err("query result must be a map".into());
         };
         out.push((rel, fields));
