@@ -222,20 +222,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_document_rejects_malformed_document_path() {
-        // パス中の "documents" は相対パス化(呼び出し側)で保持される。
-        // decode 自体は名前に触らない。
-        let doc = Document {
-            name: "projects/p/databases/(default)/documents/teams/t1/x".to_string(),
-            fields: HashMap::new(),
-            create_time: None,
-            update_time: None,
-        };
-        let err = relative_document_name_for(&doc.name, "p", "(default)").unwrap_err();
-        assert!(err.to_string().contains("invalid document name"), "{err}");
-    }
-
-    #[test]
     fn decode_exotic_field_values_as_opaque_or_docref() {
         let sdk = |t| SdkValue {
             value_type: Some(t),
