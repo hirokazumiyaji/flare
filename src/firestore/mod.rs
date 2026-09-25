@@ -51,22 +51,69 @@ fn validate_firestore_value_at(value: &Value, inside_array: bool) -> Result<(), 
         }
         // transform の引数も、適用後の Array の要素として検証する。
         Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
+            if inside_array {
+                return Err("Nested arrays are not allowed".into());
+            }
             validate_firestore_array_items(items)
         }
         _ => Ok(()),
     }
 }
 
+/// Firestore に保存できる値の型を検証する。query の filter operand と
+/// write data は同じ Value 型を使うため、書き込み専用の型制約はここへ分ける。
+pub(crate) fn validate_firestore_writable_value(value: &Value) -> Result<(), Box<dyn Error>> {
+    match value {
+        Value::Str(_)
+        | Value::Int(_)
+        | Value::Bool(_)
+        | Value::Nil
+        | Value::Timestamp(_)
+        | Value::ServerTimestamp
+        | Value::Increment(_)
+        | Value::ArrayUnion(_)
+        | Value::ArrayRemove(_)
+        | Value::DeleteField => Ok(()),
+        Value::Array(items) => {
+            for item in items {
+                validate_firestore_writable_value(item)?;
+            }
+            Ok(())
+        }
+        Value::Map(fields) => {
+            for (name, value) in fields {
+                validate_firestore_field_name(name)?;
+                validate_firestore_writable_value(value)?;
+            }
+            Ok(())
+        }
+        _ => Err(format!("unsupported value in write: {}", value.inspect()).into()),
+    }
+}
+
 /// ドキュメント / Map の全フィールドを、バックエンド共通で検証する。
 /// フィールド名と値の両方を再帰的に検査し、フィールド transform の
 /// ネストもここで両バックエンドに同じ規則を適用する。
+#[cfg(test)]
 pub(crate) fn validate_firestore_fields(
     fields: &BTreeMap<String, Value>,
 ) -> Result<(), Box<dyn Error>> {
+    validate_firestore_fields_with_keys(fields, false)
+}
+
+fn validate_firestore_fields_with_keys(
+    fields: &BTreeMap<String, Value>,
+    keys_are_paths: bool,
+) -> Result<(), Box<dyn Error>> {
     for (name, value) in fields {
-        validate_firestore_field_name(name)?;
+        if keys_are_paths {
+            validate_field_path(name)?;
+        } else {
+            validate_firestore_field_name(name)?;
+        }
         reject_nested_sentinels(value, false)?;
         validate_firestore_value(value)?;
+        validate_firestore_writable_value(value)?;
     }
     Ok(())
 }
@@ -75,9 +122,10 @@ pub(crate) fn validate_firestore_fields(
 /// 同じ helper を使い、variant を追加したときの検証漏れを防ぐ。
 pub(crate) fn validate_write_op(op: &WriteOp) -> Result<(), Box<dyn Error>> {
     match op {
-        WriteOp::Set { data, .. } | WriteOp::Update { data, .. } => {
-            validate_firestore_fields(data)?;
+        WriteOp::Set { data, merge, .. } => {
+            validate_firestore_fields_with_keys(data, *merge)?;
         }
+        WriteOp::Update { data, .. } => validate_firestore_fields_with_keys(data, true)?,
         WriteOp::Delete { .. } => {}
     }
     Ok(())
@@ -141,9 +189,18 @@ pub(crate) fn reject_nested_sentinels(value: &Value, nested: bool) -> Result<(),
 /// - `in` / `not-in` / `array_contains_any` の値は Array で要素は最大 10 個
 pub(crate) fn validate_query_filters(filters: &[QueryFilter]) -> Result<(), Box<dyn Error>> {
     for f in filters {
-        // クエリ値も Firestore の Value であり、in-memory でだけ許される
-        // 直接配列や不正な Map キーを通さない。
-        validate_firestore_value(&f.value)?;
+        // `in` / `not-in` / `array_contains_any` の配列は候補値の一覧であり、
+        // その要素を保存用 ArrayValue とみなすと、配列要素である候補を
+        // 誤って拒否してしまう。各要素を独立したトップレベル値として検証する。
+        if let (Value::Array(items), QueryOp::In | QueryOp::NotIn | QueryOp::ArrayContainsAny) =
+            (&f.value, f.op)
+        {
+            for item in items {
+                validate_firestore_value(item)?;
+            }
+        } else {
+            validate_firestore_value(&f.value)?;
+        }
         if let Value::Str(s) = &f.value {
             if s.len() >= 1500 {
                 return Err(
