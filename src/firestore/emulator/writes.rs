@@ -147,7 +147,11 @@ fn build_masked_write(
 ) -> Result<Write, Box<dyn Error>> {
     validated_field_paths(data)?;
     let split = split_fields_and_transforms(data);
-    // DeleteField は update_mask に含めつつ fields から除外する。
+    // mask には plain と delete を含める。transform の対象は mask に
+    // 列挙しない: emulator で実測すると、対象を mask にも 넣ると
+    // fields 側に値が無いのに「0 起点の増分」になり、in-memory の
+    // 「保存済みの値 + 増分」と食い違う(例: 10 -> 5 が 0 -> 5)。
+    // delete は mask に入れて fields 側からは除外する。
     let mut field_paths: Vec<String> = split.plain.keys().cloned().collect();
     field_paths.extend(split.deletes);
     let fields = encode_fields(&nest_field_paths(split.plain)?)?;

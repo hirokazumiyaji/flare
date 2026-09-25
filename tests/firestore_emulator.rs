@@ -6,7 +6,7 @@
 mod common;
 
 use firelang::run_script_with_firestore;
-use firelang::{FirestoreEmulator, Value};
+use firelang::{EmulatorAuth, FirestoreEmulator, Value};
 
 fn emulator() -> Option<FirestoreEmulator> {
     FirestoreEmulator::from_env()
@@ -25,14 +25,25 @@ fn production_config_denies_firestore_writes() {
         return;
     }
 
-    let fs = emulator().expect("the deny-rules check must run with an emulator");
+    // 既定の `owner` 資格は emulator の admin で security rules を
+    // バイパスするため、deny .rules の検証には admin でない資格が要る。
+    // (owner のままだと書き込みが成功し、この検査は Always-green に
+    // なってしまう。実測で `Ok` になって確認済み。)
+    let fs = FirestoreEmulator::from_env_with_auth(EmulatorAuth::EnforceRules)
+        .expect("the deny-rules check must run with an emulator");
     let doc_path = format!("production_guard/{}", unique("write"));
     let script = format!("set(doc(\"{doc_path}\"), {{value: \"blocked\"}})");
     let err = run_script_with_firestore(&script, fs).unwrap_err();
     let message = err.to_string();
+    // emulator は rules 違反を gRPC の PermissionDenied(英語メッセージ
+    // "The caller does not have permission...")として返すので、
+    // PERMISSION_DENIED / permission / "does not have permission" を
+    // すべて「拒否された」証拠として扱う。
+    let lower = message.to_ascii_lowercase();
     assert!(
         message.contains("PERMISSION_DENIED")
-            || message.to_ascii_lowercase().contains("permission denied"),
+            || lower.contains("permission denied")
+            || lower.contains("does not have permission"),
         "expected a permission error, got: {message}"
     );
 }

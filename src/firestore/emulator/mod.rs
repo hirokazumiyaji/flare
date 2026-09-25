@@ -17,6 +17,8 @@ use gcloud_sdk::tonic::{Code, Request};
 use super::{Firestore, QueryCandidates, WriteOp};
 use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Value};
 
+pub use client::EmulatorAuth;
+
 pub struct FirestoreEmulator {
     client: client::EmulatorClient,
     transaction_id: Option<Vec<u8>>,
@@ -24,16 +26,31 @@ pub struct FirestoreEmulator {
 
 impl FirestoreEmulator {
     pub fn from_env() -> Option<Self> {
+        Self::from_env_with_auth(client::EmulatorAuth::Owner)
+    }
+
+    /// `FIRESTORE_EMULATOR_HOST` から作る。`auth` で資格情報を選ぶ。
+    pub fn from_env_with_auth(auth: client::EmulatorAuth) -> Option<Self> {
         let host = std::env::var("FIRESTORE_EMULATOR_HOST").ok()?;
         let project_id =
             std::env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".to_string());
-        Self::new(host, project_id).ok()
+        Self::new_with_auth(host, project_id, auth).ok()
     }
 
     /// 接続を確立して作る。emulator に届かない場合はエラーを返す。
     pub fn new(host: String, project_id: String) -> Result<Self, Box<dyn Error>> {
+        Self::new_with_auth(host, project_id, client::EmulatorAuth::Owner)
+    }
+
+    /// 接続を確立して作る。`auth = EnforceRules` なら admin 資格を使わず
+    /// security rules を評価させる(deploy rules の検証用)。
+    pub fn new_with_auth(
+        host: String,
+        project_id: String,
+        auth: client::EmulatorAuth,
+    ) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
-            client: client::connect(&host, &project_id)?,
+            client: client::connect(&host, &project_id, auth)?,
             transaction_id: None,
         })
     }
