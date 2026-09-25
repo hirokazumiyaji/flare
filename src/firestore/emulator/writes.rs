@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::time::Duration;
 
 use firestore::FirestoreDb;
 use gcloud_sdk::google::firestore::v1::{
@@ -11,6 +12,7 @@ use gcloud_sdk::google::firestore::v1::{
 use gcloud_sdk::tonic::{Code, Request, Status};
 use tokio::runtime::Runtime;
 
+use super::client;
 use super::codec::encode_fields;
 use super::path::document_name;
 use crate::firestore::{insert_at_field_path, validate_field_path, WriteOp};
@@ -19,13 +21,14 @@ use crate::value::Value;
 pub(super) fn commit_writes(
     db: &FirestoreDb,
     runtime: &Runtime,
+    operation_timeout: Duration,
     writes: Vec<Write>,
     transaction: Vec<u8>,
 ) -> Result<(), Box<dyn Error>> {
     let database = db.get_database_path().clone();
     let not_found_context = write_targets(&writes);
     let has_exists_precondition = writes.iter().any(write_requires_existing_document);
-    let result = runtime.block_on(async move {
+    let result = client::run_operation(runtime, operation_timeout, "commit", async move {
         db.client()
             .get()
             .commit(Request::new(CommitRequest {
@@ -37,11 +40,25 @@ pub(super) fn commit_writes(
     });
     match result {
         Ok(_) => Ok(()),
-        Err(status) if missing_document_status(&status, has_exists_precondition) => {
-            Err(not_found_error(&status, not_found_context.as_deref()).into())
+        Err(error) if status_is_missing_document(error.as_ref(), has_exists_precondition) => {
+            // Preserve the existing not-found contract while retaining the
+            // typed timeout error for cancellation.
+            let status = error
+                .downcast_ref::<Status>()
+                .expect("commit error should be a gRPC status");
+            Err(not_found_error(status, not_found_context.as_deref()).into())
         }
-        Err(status) => Err(status.into()),
+        Err(error) => Err(error),
     }
+}
+
+fn status_is_missing_document(
+    error: &(dyn Error + 'static),
+    has_exists_precondition: bool,
+) -> bool {
+    error
+        .downcast_ref::<Status>()
+        .is_some_and(|status| missing_document_status(status, has_exists_precondition))
 }
 
 fn missing_document_status(status: &Status, has_exists_precondition: bool) -> bool {

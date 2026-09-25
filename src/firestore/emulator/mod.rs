@@ -6,6 +6,7 @@ mod path;
 mod writes;
 
 use std::error::Error;
+use std::time::Duration;
 
 use gcloud_sdk::google::firestore::v1::{
     batch_get_documents_request, batch_get_documents_response, run_query_request, structured_query,
@@ -17,52 +18,170 @@ use gcloud_sdk::tonic::{Code, Request};
 use super::{Firestore, QueryCandidates, WriteOp};
 use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Value};
 
+/// Default application-level deadline for one emulator RPC.
+///
+/// The deadline is deliberately owned by the firelang adapter rather than the
+/// SDK transport.  A timed-out future is dropped, while the current-thread
+/// runtime and SDK client remain available for the next operation.
+pub const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Environment variable used by [`FirestoreEmulator::from_env`] and the CLI
+/// for an application-level per-operation timeout, in milliseconds.
+pub const OPERATION_TIMEOUT_ENV: &str = "FIRESTORE_EMULATOR_TIMEOUT_MS";
+
+/// Optional constructor settings for [`FirestoreEmulator`].
+#[derive(Debug, Clone, Copy)]
+pub struct FirestoreEmulatorOptions {
+    pub operation_timeout: Duration,
+}
+
+impl Default for FirestoreEmulatorOptions {
+    fn default() -> Self {
+        Self {
+            operation_timeout: DEFAULT_OPERATION_TIMEOUT,
+        }
+    }
+}
+
+impl FirestoreEmulatorOptions {
+    pub fn with_operation_timeout(mut self, operation_timeout: Duration) -> Self {
+        self.operation_timeout = operation_timeout;
+        self
+    }
+}
+
 pub struct FirestoreEmulator {
     client: client::EmulatorClient,
     transaction_id: Option<Vec<u8>>,
 }
 
 impl FirestoreEmulator {
+    /// Construct from emulator environment variables using the default
+    /// timeout, or `FIRESTORE_EMULATOR_TIMEOUT_MS` when it is set.
     pub fn from_env() -> Option<Self> {
-        let host = std::env::var("FIRESTORE_EMULATOR_HOST").ok()?;
-        let project_id =
-            std::env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".to_string());
-        Self::new(host, project_id).ok()
+        Self::try_from_env().ok().flatten()
     }
 
-    /// 接続を確立して作る。emulator に届かない場合はエラーを返す。
+    /// Fallible form of [`Self::from_env`].  It is useful to embedding callers
+    /// that want a malformed timeout/host configuration to be reported instead
+    /// of silently treated as an unavailable emulator.
+    pub fn try_from_env() -> Result<Option<Self>, Box<dyn Error>> {
+        let Ok(host) = std::env::var("FIRESTORE_EMULATOR_HOST") else {
+            return Ok(None);
+        };
+        let project_id =
+            std::env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".to_string());
+        let operation_timeout = operation_timeout_from_env()?;
+        Ok(Some(Self::new_with_timeout(
+            host,
+            project_id,
+            operation_timeout,
+        )?))
+    }
+
+    /// Construct using the configured application default.
     pub fn new(host: String, project_id: String) -> Result<Self, Box<dyn Error>> {
+        Self::new_with_timeout(host, project_id, DEFAULT_OPERATION_TIMEOUT)
+    }
+
+    /// Construct with an embedding-level per-operation timeout override.
+    pub fn new_with_timeout(
+        host: String,
+        project_id: String,
+        operation_timeout: Duration,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::new_with_options(
+            host,
+            project_id,
+            FirestoreEmulatorOptions { operation_timeout },
+        )
+    }
+
+    pub fn new_with_options(
+        host: String,
+        project_id: String,
+        options: FirestoreEmulatorOptions,
+    ) -> Result<Self, Box<dyn Error>> {
         Ok(Self {
-            client: client::connect(&host, &project_id)?,
+            client: client::connect(&host, &project_id, options.operation_timeout)?,
             transaction_id: None,
         })
     }
+
+    /// Override the timeout after construction without replacing the SDK client
+    /// or its reusable runtime.
+    pub fn with_operation_timeout(mut self, operation_timeout: Duration) -> Self {
+        self.client.operation_timeout = operation_timeout;
+        self
+    }
+
+    /// Short alias for [`Self::with_operation_timeout`].
+    pub fn with_timeout(self, operation_timeout: Duration) -> Self {
+        self.with_operation_timeout(operation_timeout)
+    }
+
+    pub fn set_operation_timeout(&mut self, operation_timeout: Duration) {
+        self.client.operation_timeout = operation_timeout;
+    }
+
+    pub fn operation_timeout(&self) -> Duration {
+        self.client.operation_timeout
+    }
+}
+
+fn operation_timeout_from_env() -> Result<Duration, Box<dyn Error>> {
+    match std::env::var(OPERATION_TIMEOUT_ENV) {
+        Ok(value) => parse_timeout_ms(&value),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_OPERATION_TIMEOUT),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn parse_timeout_ms(value: &str) -> Result<Duration, Box<dyn Error>> {
+    let millis = value.trim().parse::<u64>().map_err(|_| {
+        format!("{OPERATION_TIMEOUT_ENV} must be a positive integer number of milliseconds")
+    })?;
+    if millis == 0 {
+        return Err(format!("{OPERATION_TIMEOUT_ENV} must be greater than zero").into());
+    }
+    Ok(Duration::from_millis(millis))
 }
 
 impl Firestore for FirestoreEmulator {
     fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>> {
         let db = &self.client.db;
         let name = path::document_name(&self.client.project_id, path);
-        let result = self.client.runtime.block_on(async move {
-            db.client()
-                .get()
-                .get_document(Request::new(GetDocumentRequest {
-                    name,
-                    mask: None,
-                    consistency_selector: None,
-                }))
-                .await
-        });
+        let result = client::run_operation(
+            &self.client.runtime,
+            self.client.operation_timeout,
+            "get",
+            async move {
+                db.client()
+                    .get()
+                    .get_document(Request::new(GetDocumentRequest {
+                        name,
+                        mask: None,
+                        consistency_selector: None,
+                    }))
+                    .await
+            },
+        );
         match result {
             Ok(resp) => codec::decode_document(&resp.into_inner()).map(Some),
-            Err(status) if status.code() == Code::NotFound => Ok(None),
-            Err(status) => Err(status.into()),
+            Err(error) if is_not_found(error.as_ref()) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
         let sdk_writes = writes::write_ops_to_sdk_writes(&self.client.project_id, &writes)?;
-        writes::commit_writes(&self.client.db, &self.client.runtime, sdk_writes, vec![])
+        writes::commit_writes(
+            &self.client.db,
+            &self.client.runtime,
+            self.client.operation_timeout,
+            sdk_writes,
+            vec![],
+        )
     }
 
     fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
@@ -86,17 +205,22 @@ impl Firestore for FirestoreEmulator {
         }
         let db = &self.client.db;
         let database = db.get_database_path().clone();
-        let transaction_id = self.client.runtime.block_on(async move {
-            let resp = db
-                .client()
-                .get()
-                .begin_transaction(Request::new(BeginTransactionRequest {
-                    database,
-                    options: None,
-                }))
-                .await?;
-            Ok::<_, gcloud_sdk::tonic::Status>(resp.into_inner().transaction)
-        })?;
+        let transaction_id = client::run_operation(
+            &self.client.runtime,
+            self.client.operation_timeout,
+            "transaction",
+            async move {
+                let resp = db
+                    .client()
+                    .get()
+                    .begin_transaction(Request::new(BeginTransactionRequest {
+                        database,
+                        options: None,
+                    }))
+                    .await?;
+                Ok::<_, gcloud_sdk::tonic::Status>(resp.into_inner().transaction)
+            },
+        )?;
         self.transaction_id = Some(transaction_id);
         Ok(())
     }
@@ -106,38 +230,49 @@ impl Firestore for FirestoreEmulator {
         let db = &self.client.db;
         let database = db.get_database_path().clone();
         let document = path::document_name(&self.client.project_id, path);
-        let result = self.client.runtime.block_on(async move {
-            let response = db
-                .client()
-                .get()
-                .batch_get_documents(Request::new(BatchGetDocumentsRequest {
-                    database,
-                    documents: vec![document],
-                    mask: None,
-                    consistency_selector: Some(
-                        batch_get_documents_request::ConsistencySelector::Transaction(tid),
-                    ),
-                }))
-                .await?;
-            let mut stream = response.into_inner();
-            while let Some(row) = stream.message().await? {
-                match row.result {
-                    Some(batch_get_documents_response::Result::Found(doc)) => {
-                        return Ok(Some(doc));
+        let result = client::run_operation(
+            &self.client.runtime,
+            self.client.operation_timeout,
+            "transaction_get",
+            async move {
+                let response = db
+                    .client()
+                    .get()
+                    .batch_get_documents(Request::new(BatchGetDocumentsRequest {
+                        database,
+                        documents: vec![document],
+                        mask: None,
+                        consistency_selector: Some(
+                            batch_get_documents_request::ConsistencySelector::Transaction(tid),
+                        ),
+                    }))
+                    .await?;
+                let mut stream = response.into_inner();
+                while let Some(row) = stream.message().await? {
+                    match row.result {
+                        Some(batch_get_documents_response::Result::Found(doc)) => {
+                            return Ok(Some(doc));
+                        }
+                        Some(batch_get_documents_response::Result::Missing(_)) => return Ok(None),
+                        None => {}
                     }
-                    Some(batch_get_documents_response::Result::Missing(_)) => return Ok(None),
-                    None => {}
                 }
-            }
-            Ok::<_, gcloud_sdk::tonic::Status>(None)
-        })?;
+                Ok::<_, gcloud_sdk::tonic::Status>(None)
+            },
+        )?;
         result.as_ref().map(codec::decode_document).transpose()
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
         let tid = self.transaction_id.take().ok_or("not in transaction")?;
         let sdk_writes = writes::write_ops_to_sdk_writes(&self.client.project_id, &writes)?;
-        writes::commit_writes(&self.client.db, &self.client.runtime, sdk_writes, tid)
+        writes::commit_writes(
+            &self.client.db,
+            &self.client.runtime,
+            self.client.operation_timeout,
+            sdk_writes,
+            tid,
+        )
     }
 
     fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
@@ -146,16 +281,21 @@ impl Firestore for FirestoreEmulator {
         };
         let db = &self.client.db;
         let database = db.get_database_path().clone();
-        self.client.runtime.block_on(async move {
-            db.client()
-                .get()
-                .rollback(Request::new(RollbackRequest {
-                    database,
-                    transaction: tid,
-                }))
-                .await?;
-            Ok::<_, gcloud_sdk::tonic::Status>(())
-        })?;
+        client::run_operation(
+            &self.client.runtime,
+            self.client.operation_timeout,
+            "transaction_rollback",
+            async move {
+                db.client()
+                    .get()
+                    .rollback(Request::new(RollbackRequest {
+                        database,
+                        transaction: tid,
+                    }))
+                    .await?;
+                Ok::<_, gcloud_sdk::tonic::Status>(())
+            },
+        )?;
         Ok(())
     }
 }
@@ -167,26 +307,31 @@ fn run_query_candidates(
 ) -> Result<QueryCandidates, Box<dyn Error>> {
     let db = &fs.client.db;
     let parent = path::parent_path(&fs.client.project_id, parent);
-    let docs = fs.client.runtime.block_on(async move {
-        let response = db
-            .client()
-            .get()
-            .run_query(Request::new(RunQueryRequest {
-                parent,
-                explain_options: None,
-                query_type: Some(run_query_request::QueryType::StructuredQuery(query)),
-                consistency_selector: None,
-            }))
-            .await?;
-        let mut stream = response.into_inner();
-        let mut docs = vec![];
-        while let Some(row) = stream.message().await? {
-            if let Some(doc) = row.document {
-                docs.push(doc);
+    let docs = client::run_operation(
+        &fs.client.runtime,
+        fs.client.operation_timeout,
+        "query",
+        async move {
+            let response = db
+                .client()
+                .get()
+                .run_query(Request::new(RunQueryRequest {
+                    parent,
+                    explain_options: None,
+                    query_type: Some(run_query_request::QueryType::StructuredQuery(query)),
+                    consistency_selector: None,
+                }))
+                .await?;
+            let mut stream = response.into_inner();
+            let mut docs = vec![];
+            while let Some(row) = stream.message().await? {
+                if let Some(doc) = row.document {
+                    docs.push(doc);
+                }
             }
-        }
-        Ok::<_, gcloud_sdk::tonic::Status>(docs)
-    })?;
+            Ok::<_, gcloud_sdk::tonic::Status>(docs)
+        },
+    )?;
 
     let mut out = vec![];
     for doc in docs {
@@ -197,6 +342,12 @@ fn run_query_candidates(
         out.push((rel, fields));
     }
     Ok(out)
+}
+
+fn is_not_found(error: &(dyn Error + 'static)) -> bool {
+    error
+        .downcast_ref::<gcloud_sdk::tonic::Status>()
+        .is_some_and(|status| status.code() == Code::NotFound)
 }
 
 fn structured_query(
@@ -271,7 +422,11 @@ mod tests {
     fn new_fails_fast_without_emulator() {
         // 接続は構築時に確立する。届かない相手には即エラーになる。
         // (9番ポートは discard のため emulator がいることはない)
-        let res = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
+        let res = FirestoreEmulator::new_with_timeout(
+            "127.0.0.1:9".to_string(),
+            "p".to_string(),
+            std::time::Duration::from_millis(50),
+        );
         match res {
             Ok(_) => panic!("expected connection failure"),
             Err(e) => assert!(!format!("{e}").is_empty()),

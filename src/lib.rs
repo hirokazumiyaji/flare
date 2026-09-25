@@ -11,7 +11,10 @@ use std::error::Error;
 use runtime::Runtime;
 
 pub use error::{ErrorKind, FirelangError, Span};
-pub use firestore::{Firestore, FirestoreEmulator, InMemoryFirestore};
+pub use firestore::{
+    Firestore, FirestoreEmulator, FirestoreEmulatorOptions, InMemoryFirestore,
+    DEFAULT_OPERATION_TIMEOUT, OPERATION_TIMEOUT_ENV,
+};
 pub use value::Value;
 
 pub fn run_script(source: &str) -> Result<Value, Box<dyn Error>> {

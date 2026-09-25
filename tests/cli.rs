@@ -180,6 +180,55 @@ fn fl_inline_script_accepts_help_argument_without_triggering_usage() {
 }
 
 #[test]
+fn fl_emulator_timeout_rejects_zero_and_malformed_values() {
+    for value in ["0", "-1", "not-a-number"] {
+        let out = Command::new(FL_EXE)
+            .args([
+                "--backend",
+                "emulator",
+                "--emulator-timeout-ms",
+                value,
+                "-e",
+                "1",
+            ])
+            .env("FIRESTORE_EMULATOR_HOST", "127.0.0.1:1")
+            .output()
+            .expect("spawn fl");
+        assert!(!out.status.success(), "timeout {value} should fail");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("emulator timeout must be") || stderr.contains("positive integer"),
+            "timeout {value}: {stderr:?}"
+        );
+    }
+}
+
+#[test]
+fn fl_timeout_alias_reports_the_alias_and_help_uses_the_default_constant() {
+    let out = Command::new(FL_EXE)
+        .args(["--backend", "emulator", "--timeout-ms"])
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--timeout-ms requires a value"),
+        "{stderr:?}"
+    );
+
+    let out = Command::new(FL_EXE)
+        .args(["--help"])
+        .output()
+        .expect("spawn fl");
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("per-RPC timeout (default: 30000ms)"),
+        "{stderr:?}"
+    );
+}
+
+#[test]
 fn fl_validates_backend_before_reading_stdin() {
     // 未知のバックエンド指定で stdin を要求した場合、stdin を読み取ることなく即時失敗すること
     let out = Command::new(FL_EXE)
