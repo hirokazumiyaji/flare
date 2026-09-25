@@ -269,9 +269,13 @@ mod tests {
 
     #[test]
     fn new_fails_fast_without_emulator() {
-        // 接続は構築時に確立する。届かない相手には即エラーになる。
-        // (9番ポートは discard のため emulator がいることはない)
-        let res = FirestoreEmulator::new("127.0.0.1:9".to_string(), "p".to_string());
+        // OS に一時的に確保させ、接続していない loopback port を取得する。
+        // discard port のように「通常誰も使わない」固定 port には依存しない。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        let res = FirestoreEmulator::new(host, "p".to_string());
         match res {
             Ok(_) => panic!("expected connection failure"),
             Err(e) => assert!(!format!("{e}").is_empty()),

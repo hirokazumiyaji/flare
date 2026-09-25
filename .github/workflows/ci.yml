@@ -58,7 +58,12 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Run integration tests with Firestore emulator
+      - name: Run library and CLI integration matrix twice with Firestore emulator
         run: |
-          firebase emulators:exec --only firestore --project demo-firelang \
-            'FIRESTORE_PROJECT_ID=demo-firelang cargo test --test firestore_emulator -- --nocapture'
+          FIRESTORE_PROJECT_ID=demo-firelang firebase emulators:exec \
+            --only firestore --project demo-firelang \
+            'set -eu
+              env | grep -q "^FIRESTORE_EMULATOR_HOST="
+              for run in 1 2; do
+                cargo test --test firestore_emulator --test cli -- --nocapture
+              done'

@@ -31,11 +31,16 @@ export FIRESTORE_PROJECT_ID=firelang-test
 cargo run --bin fl -- --backend emulator path/to/script.fl
 ```
 
-エミュレータは Firebase CLI で起動します(別ターミナルで `firebase emulators:start --only firestore` など)。リポジトリ直下の `firebase.json` を使ってワンショットで試す例:
+エミュレータは Firebase CLI で起動します(別ターミナルで `firebase emulators:start --only firestore` など)。リポジトリ直下の `firebase.json` を使って、同じ emulator に対して library / CLI の integration test を 2 回実行する例:
 
 ```bash
-firebase emulators:exec --only firestore --project demo-firelang \
-  'FIRESTORE_PROJECT_ID=demo-firelang cargo test --test firestore_emulator -- --nocapture'
+FIRESTORE_PROJECT_ID=demo-firelang firebase emulators:exec \
+  --only firestore --project demo-firelang \
+  'set -eu
+    env | grep -q "^FIRESTORE_EMULATOR_HOST="
+    for run in 1 2; do
+      cargo test --test firestore_emulator --test cli -- --nocapture
+    done'
 ```
 
 本番 Firestore(認証付き)は非対応です。詳細は [仕様の 11-12 章](docs/spec.md#11-バックエンド) を参照してください。
@@ -48,16 +53,19 @@ cargo test --test example_scripts   # サンプルスクリプト一括実行
 cargo test --test cli               # CLI スモークテスト
 ```
 
-エミュレータ統合テストは `FIRESTORE_EMULATOR_HOST` が未設定なら早期 return でスキップされます。実際に叩くには上記の `firebase emulators:exec` を使うか、エミュレータ起動後に環境変数を設定して:
+エミュレータ統合テストは `FIRESTORE_EMULATOR_HOST` が未設定なら早期 return でスキップされます。永続 emulator へ接続中は、CI と同じ library / CLI test matrix を実行でき、同じコマンドの繰り返しや別 test process 同士でも contention しません:
 
 ```bash
-cargo test --test firestore_emulator -- --nocapture
+FIRESTORE_PROJECT_ID=demo-firelang \
+  cargo test --test firestore_emulator --test cli -- --nocapture
 ```
+
+各 test は `_firelang_tests/<test-name>_<unique-run>/...` の固有 hierarchy へ書き込みます。環境変数が設定済みで接続に失敗した場合は skip せず失敗します。
 
 ## CI / CD (GitHub Actions)
 
 - **`test` ジョブ**: `cargo fmt --check`, `cargo test --all-targets`, `cargo build --release --bin fl`
-- **`integration-emulator` ジョブ**: Firestore エミュレータを起動して `cargo test --test firestore_emulator` を実行
+- **`integration-emulator` ジョブ**: Firestore エミュレータを起動して library / CLI の integration test を同じ emulator 上で 2 回実行
 - **`CD`**: `v*` タグ push で `fl` の Linux バイナリをビルドして GitHub Release に添付
 
 ## ライセンス

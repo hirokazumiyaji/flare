@@ -5,27 +5,30 @@
 #[macro_use]
 mod common;
 
+use common::{test_collection, test_namespace, unique};
 use firelang::run_script_with_firestore;
 use firelang::{FirestoreEmulator, Value};
 
 fn emulator() -> Option<FirestoreEmulator> {
-    FirestoreEmulator::from_env()
-}
-fn unique(prefix: &str) -> String {
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{prefix}_{n}")
+    let Some(host) = std::env::var("FIRESTORE_EMULATOR_HOST").ok() else {
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
+        return None;
+    };
+    let project_id =
+        std::env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".to_string());
+    Some(
+        FirestoreEmulator::new(host, project_id).unwrap_or_else(|e| {
+            panic!("FIRESTORE_EMULATOR_HOST is set, but connecting to the emulator failed: {e}")
+        }),
+    )
 }
 
 #[test]
 fn firestore_global_functions_with_emulator() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
-    let doc_path = format!("users/{}", unique("smoke"));
+    let doc_path = format!("{}/smoke", test_collection("global_functions"));
     let script = format!("set(doc(\"{doc_path}\"), {{value: \"ok\"}})\nget(\"{doc_path}\")");
     let out = run_script_with_firestore(&script, fs).unwrap();
     assert_eq!(out, map! {"value" => Value::Str("ok".to_string())});
@@ -34,11 +37,9 @@ fn firestore_global_functions_with_emulator() {
 #[test]
 fn emulator_merge_set() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
-    let p = unique("merge");
-    let path = format!("users/{p}");
+    let path = format!("{}/merge", test_collection("merge_set"));
     // Same pattern as in-memory keyword merge test (lib.rs).
     let script = format!(
         "set(\"{path}\", {{count: 1}})\nset(\"{path}\", {{count: 2}}, merge: true)\nget(\"{path}\")"
@@ -50,28 +51,27 @@ fn emulator_merge_set() {
 #[test]
 fn emulator_query_where_and_limit() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
-    let id = unique("q");
+    let collection = test_collection("query_where_and_limit");
     let script = format!(
-        r#"set("users/{id}_z", {{age: 10}})
-set("users/{id}_a", {{age: 30}})
-set("users/{id}_m", {{age: 25}})
-col("users").where("age", ">=", 20).limit(2).get()"#
+        r#"set("{collection}/z", {{age: 10}})
+set("{collection}/a", {{age: 30}})
+set("{collection}/m", {{age: 25}})
+col("{collection}").where("age", ">=", 20).limit(2).get()"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
     let Value::Array(rows) = out else {
         panic!("expected array");
     };
     assert_eq!(rows.len(), 2);
-    for (row, suffix) in rows.iter().zip([format!("{id}_a"), format!("{id}_m")]) {
+    for (row, suffix) in rows.iter().zip(["a", "m"]) {
         let Value::Map(m) = row else {
             panic!("expected map row");
         };
         assert_eq!(
             m.get("__name__"),
-            Some(&Value::Str(format!("users/{suffix}")))
+            Some(&Value::Str(format!("{collection}/{suffix}")))
         );
     }
 }
@@ -79,32 +79,45 @@ col("users").where("age", ">=", 20).limit(2).get()"#
 #[test]
 fn emulator_collection_group_query() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
-    let id = unique("cg");
+    let namespace = test_namespace("collection_group_query");
+    let group = unique("members");
+    let path_x = format!("{namespace}/teams/t1/{group}/x");
+    let path_y = format!("{namespace}/teams/t2/{group}/y");
     let script = format!(
-        r#"set("teams/t1/members/{id}_x", {{active: true}})
-set("teams/t2/members/{id}_y", {{active: true}})
-col_group("members").where("active", "==", true).get()"#
+        r#"set("{path_x}", {{active: true}})
+set("{path_y}", {{active: true}})
+col_group("{group}").where("active", "==", true).get()"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    // 他テストの docs が混ざってもよいよう、対象行の存在で判定する。
-    assert!(
-        out.inspect().contains(&format!("teams/t1/members/{id}_x")),
-        "{}",
-        out.inspect()
-    );
+    let Value::Array(rows) = out else {
+        panic!("expected array");
+    };
+    let mut names: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            let Value::Map(row) = row else {
+                panic!("expected map row");
+            };
+            let Some(Value::Str(name)) = row.get("__name__") else {
+                panic!("expected document name");
+            };
+            name.clone()
+        })
+        .collect();
+    names.sort();
+    let mut expected = vec![path_x, path_y];
+    expected.sort();
+    assert_eq!(names, expected);
 }
 
 #[test]
 fn emulator_nested_map_roundtrip() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
-    let p = unique("nest");
-    let path = format!("cfg/{p}");
+    let path = format!("{}/nested", test_collection("nested_map_roundtrip"));
     let script = format!(
         r#"set("{path}", {{outer: {{inner: 42}}}})
 get("{path}")"#
@@ -116,11 +129,9 @@ get("{path}")"#
 #[test]
 fn emulator_server_timestamp_resolves() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
-    let p = unique("st");
-    let path = format!("users/{p}");
+    let path = format!("{}/timestamp", test_collection("server_timestamp"));
     let script = format!("set(\"{path}\", {{t: server_timestamp()}})\nget(\"{path}\")");
     let out = run_script_with_firestore(&script, fs).unwrap();
     let Value::Map(m) = out else {
@@ -132,17 +143,17 @@ fn emulator_server_timestamp_resolves() {
 #[test]
 fn emulator_batch_atomic_commit() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
-    let a = unique("ba");
-    let b = unique("bb");
+    let collection = test_collection("batch_atomic_commit");
+    let path_a = format!("{collection}/a");
+    let path_b = format!("{collection}/b");
     let script = format!(
         r#"batch {{
-  set("users/{a}", {{n: 1}})
-  set("users/{b}", {{n: 2}})
+  set("{path_a}", {{n: 1}})
+  set("{path_b}", {{n: 2}})
 }}
-get("users/{b}")"#
+get("{path_b}")"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
     assert_eq!(out, map! {"n" => Value::Int(2)});
@@ -151,11 +162,9 @@ get("users/{b}")"#
 #[test]
 fn emulator_transaction_read_then_write() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
-    let p = unique("tx");
-    let path = format!("users/{p}");
+    let path = format!("{}/transaction", test_collection("transaction_read_write"));
     let script = format!(
         r#"set("{path}", {{before: 1}})
 transaction {{
@@ -171,12 +180,11 @@ get("{path}")"#
 #[test]
 fn emulator_transaction_multiple_gets_before_write() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
-    let p = unique("mg");
-    let path_a = format!("users/{p}_a");
-    let path_b = format!("users/{p}_b");
+    let collection = test_collection("transaction_multiple_gets");
+    let path_a = format!("{collection}/a");
+    let path_b = format!("{collection}/b");
     let script = format!(
         r#"set("{path_a}", {{x: 1}})
 set("{path_b}", {{y: 2}})
@@ -194,11 +202,9 @@ get("{path_a}")"#
 #[test]
 fn emulator_update_missing_fails() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
-    let p = unique("nom");
-    let path = format!("users/{p}_missing");
+    let path = format!("{}/missing", test_collection("update_missing"));
     let script = format!(r#"update("{path}", {{x: 1}})"#);
     let err = run_script_with_firestore(&script, fs).unwrap_err();
     assert!(
@@ -213,17 +219,16 @@ fn emulator_where_compare_matches_in_memory_semantics() {
     // Fixtures live in a per-run subcollection so the collection-scoped
     // queries stay repeatable against a long-lived local emulator.
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
-    let run = unique("cmp");
+    let collection = test_collection("where_compare");
     let script = format!(
-        r#"set("users/{run}/rows/{run}_1", {{name: "alice", created: timestamp(100), active: true}})
-set("users/{run}/rows/{run}_2", {{name: "bob", created: timestamp(200), active: false}})
+        r#"set("{collection}/1", {{name: "alice", created: timestamp(100), active: true}})
+set("{collection}/2", {{name: "bob", created: timestamp(200), active: false}})
 [
-  col("users/{run}/rows").where("name", ">", "a").get().len(),
-  col("users/{run}/rows").where("created", ">", timestamp(150)).get().len(),
-  col("users/{run}/rows").where("active", ">", false).get().len(),
+  col("{collection}").where("name", ">", "a").get().len(),
+  col("{collection}").where("created", ">", timestamp(150)).get().len(),
+  col("{collection}").where("active", ">", false).get().len(),
 ]"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
@@ -237,11 +242,9 @@ set("users/{run}/rows/{run}_2", {{name: "bob", created: timestamp(200), active: 
 fn emulator_dotted_field_path_update_matches_in_memory() {
     // Same case as in-memory `update_supports_dotted_field_path_like_firestore`.
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
-    let p = unique("fp");
-    let path = format!("users/{p}");
+    let path = format!("{}/dotted", test_collection("dotted_field_path_update"));
     let script = format!(
         r#"set("{path}", {{profile: {{name: "a", age: 1}}, n: 5}})
 update("{path}", {{"profile.name": "b"}})
@@ -268,15 +271,14 @@ fn emulator_replacement_set_sentinel_with_dotted_key_matches_in_memory() {
     // a replacement `set` treats dotted keys as literal field names, so the
     // transform must be sent with a backtick-escaped path.
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
-    let run = unique("gv");
+    let collection = test_collection("replacement_set_dotted_sentinel");
     let script = format!(
-        r#"set("users/{run}/docs/d1", {{"a.b": array_union([1])}})
-set("users/{run}/docs/d2", {{"x.y": ["a"]}})
-set("users/{run}/docs/d2", {{"x.y": array_remove(["a"])}})
-[get("users/{run}/docs/d1")["a.b"], get("users/{run}/docs/d2")["x.y"]]"#
+        r#"set("{collection}/d1", {{"a.b": array_union([1])}})
+set("{collection}/d2", {{"x.y": ["a"]}})
+set("{collection}/d2", {{"x.y": array_remove(["a"])}})
+[get("{collection}/d1")["a.b"], get("{collection}/d2")["x.y"]]"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
     assert_eq!(
@@ -294,14 +296,13 @@ fn emulator_where_rejects_large_string_filter_values() {
     // Firestore rejects string query filter values of 1,500 bytes or more
     // (`value for s is too large to be used in a query`); a 1,499-byte filter
     // evaluates normally on both backends.
-    let run = unique("gp");
+    let collection = test_collection("large_string_filter");
     let p = "x".repeat(1500);
     let script = format!(
-        r#"set("users/{run}/docs/gp1", {{s: "{p}a"}})
-col("users/{run}/docs").where("s", "==", "{p}").get()"#
+        r#"set("{collection}/gp1", {{s: "{p}a"}})
+col("{collection}").where("s", "==", "{p}").get()"#
     );
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
     let err = run_script_with_firestore(&script, fs).unwrap_err();
@@ -310,12 +311,11 @@ col("users/{run}/docs").where("s", "==", "{p}").get()"#
         "{err}"
     );
     let script = format!(
-        r#"set("users/{run}/docs/gp2", {{s: "{p}a"}})
-col("users/{run}/docs").where("s", "==", "{}x").get().len()"#,
+        r#"set("{collection}/gp2", {{s: "{p}a"}})
+col("{collection}").where("s", "==", "{}x").get().len()"#,
         "x".repeat(1498)
     );
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
     let out = run_script_with_firestore(&script, fs).unwrap();
@@ -328,17 +328,16 @@ fn emulator_update_field_paths_match_in_memory_validation() {
     // Sentinel (transform) keys are validated too: Firestore's field_transforms
     // accepts quoted paths, so the write is rejected before the RPC to keep the
     // two backends consistent.
-    let run = unique("gvv");
+    let path = format!("{}/d1", test_collection("field_path_validation"));
     for script in [
-        format!(r#"update("users/{run}/docs/d1", {{"`a.b`": 1}})"#),
-        format!(r#"update("users/{run}/docs/d1", {{"a..b": 1}})"#),
-        format!(r#"update("users/{run}/docs/d1", {{"`a.b`": array_union([1])}})"#),
-        format!(r#"update("users/{run}/docs/d1", {{"a..b": array_union([1])}})"#),
-        format!(r#"set("users/{run}/docs/d1", {{"`a.b`": array_union([1])}}, merge: true)"#),
-        format!(r#"set("users/{run}/docs/d1", {{"a..b": array_union([1])}}, merge: true)"#),
+        format!(r#"update("{path}", {{"`a.b`": 1}})"#),
+        format!(r#"update("{path}", {{"a..b": 1}})"#),
+        format!(r#"update("{path}", {{"`a.b`": array_union([1])}})"#),
+        format!(r#"update("{path}", {{"a..b": array_union([1])}})"#),
+        format!(r#"set("{path}", {{"`a.b`": array_union([1])}}, merge: true)"#),
+        format!(r#"set("{path}", {{"a..b": array_union([1])}}, merge: true)"#),
     ] {
         let Some(fs) = emulator() else {
-            eprintln!("skip: no emulator");
             return;
         };
         let err = run_script_with_firestore(&script, fs).unwrap_err();
@@ -354,15 +353,20 @@ fn emulator_delete_field_and_increment_match_in_memory() {
     // Same cases as in-memory `delete_field_removes_fields_via_update_and_merge_set`
     // and `increment_adds_to_numeric_fields`.
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
-    let run = unique("sent");
+    let path = format!("{}/sentinel", test_collection("field_sentinels"));
     let script = format!(
-        "set(\"users/{run}\", {{name: \"a\", age: 1, visits: 10}})\nupdate(\"users/{run}\", {{age: delete_field(), visits: increment(5)}})\nget(\"users/{run}\")"
+        "set(\"{path}\", {{name: \"a\", age: 1, visits: 10}})\nupdate(\"{path}\", {{age: delete_field(), visits: increment(5)}})\nget(\"{path}\")"
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    assert_eq!(out, map! {"visits" => Value::Int(15)});
+    assert_eq!(
+        out,
+        map! {
+            "name" => Value::Str("a".to_string()),
+            "visits" => Value::Int(15)
+        }
+    );
 }
 
 #[test]
@@ -371,25 +375,24 @@ fn emulator_extended_query_matches_in_memory() {
     // Fixtures live in a per-run subcollection so the collection-scoped
     // queries stay repeatable against a long-lived local emulator.
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
-    let run = unique("xq");
+    let collection = test_collection("extended_query");
     let script = format!(
-        r#"set("users/{run}/rows/r1", {{ord: 1, age: 20, tags: ["a", "b"]}})
-set("users/{run}/rows/r2", {{ord: 2, age: 30, tags: ["b", "c"]}})
-set("users/{run}/rows/r3", {{ord: 3, age: 20, tags: ["c"]}})
-set("users/{run}/rows/r4", {{ord: 4, age: 40}})
-set("users/{run}/rows/r5", {{ord: 5, age: 50, tags: []}})
-set("users/{run}/rows/r6", {{other: 1}})
+        r#"set("{collection}/r1", {{ord: 1, age: 20, tags: ["a", "b"]}})
+set("{collection}/r2", {{ord: 2, age: 30, tags: ["b", "c"]}})
+set("{collection}/r3", {{ord: 3, age: 20, tags: ["c"]}})
+set("{collection}/r4", {{ord: 4, age: 40}})
+set("{collection}/r5", {{ord: 5, age: 50, tags: []}})
+set("{collection}/r6", {{other: 1}})
 [
-  col("users/{run}/rows").order_by("ord", "desc").limit(2).get().map {{ |r| r["ord"] }},
-  col("users/{run}/rows").where("age", "!=", 20).get().len(),
-  col("users/{run}/rows").where("age", "in", [20, 30]).get().len(),
-  col("users/{run}/rows").where("tags", "array_contains", "b").get().len(),
-  col("users/{run}/rows").where("tags", "array_contains_any", ["a", "c"]).get().len(),
-  col("users/{run}/rows").order_by("ord", "asc").offset(3).get().len(),
-  col("users/{run}/rows").where("age", ">=", 20).count(),
+  col("{collection}").order_by("ord", "desc").limit(2).get().map {{ |r| r["ord"] }},
+  col("{collection}").where("age", "!=", 20).get().len(),
+  col("{collection}").where("age", "in", [20, 30]).get().len(),
+  col("{collection}").where("tags", "array_contains", "b").get().len(),
+  col("{collection}").where("tags", "array_contains_any", ["a", "c"]).get().len(),
+  col("{collection}").order_by("ord", "asc").offset(3).get().len(),
+  col("{collection}").where("age", ">=", 20).count(),
 ]"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
@@ -419,19 +422,18 @@ fn emulator_failed_transaction_aborts_and_restarts() {
     // 失敗した transaction は rollback RPC で中断され、同じ接続で
     // 新しい transaction を開始できる("already in transaction" にならない)。
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
         return;
     };
     let mut rt = firelang::runtime::Runtime::new(fs);
-    let run = unique("txab");
+    let path = format!("{}/transaction", test_collection("failed_transaction"));
     let failing = run_on_shared_runtime(
         &mut rt,
-        &format!("transaction {{ set(\"users/{run}\", {{x: 1}})\nundefined_var }}"),
+        &format!("transaction {{ set(\"{path}\", {{x: 1}})\nundefined_var }}"),
     );
     assert!(failing.is_err());
     let out = run_on_shared_runtime(
         &mut rt,
-        &format!("transaction {{ set(\"users/{run}\", {{x: 2}}) }}\nget(\"users/{run}\")"),
+        &format!("transaction {{ set(\"{path}\", {{x: 2}}) }}\nget(\"{path}\")"),
     )
     .unwrap();
     assert_eq!(out, map! {"x" => Value::Int(2)});

@@ -61,20 +61,20 @@ mod tests {
 
     #[test]
     fn sdk_options_targets_emulator_host() {
-        let options = sdk_options("127.0.0.1:9", "p");
+        let options = sdk_options("emulator.test", "p");
         assert_eq!(options.google_project_id, "p");
         assert_eq!(
             options.firebase_api_url.as_deref(),
-            Some("http://127.0.0.1:9")
+            Some("http://emulator.test")
         );
     }
 
     #[test]
     fn sdk_options_keeps_explicit_scheme() {
-        let options = sdk_options("http://localhost:8080", "p");
+        let options = sdk_options("http://emulator.test/firestore", "p");
         assert_eq!(
             options.firebase_api_url.as_deref(),
-            Some("http://localhost:8080")
+            Some("http://emulator.test/firestore")
         );
     }
 }
