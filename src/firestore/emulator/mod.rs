@@ -227,10 +227,10 @@ fn run_query_candidates(
     })?;
 
     let mut out = vec![];
+    let resource_root = fs.client.db.get_documents_path();
     for doc in docs {
         let rel = path::relative_document_name(&doc.name)?;
-        let Value::Map(fields) = codec::decode_document(&doc, fs.client.db.get_documents_path())?
-        else {
+        let Value::Map(fields) = codec::decode_document(&doc, resource_root)? else {
             return Err("query result must be a map".into());
         };
         out.push((rel, fields));

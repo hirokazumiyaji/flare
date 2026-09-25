@@ -12,14 +12,15 @@ pub(super) fn document_root(project_id: &str) -> String {
 
 /// `projects/{project_id}/databases/(default)/documents/{path}` を組み立てる。
 pub(super) fn document_name(project_id: &str, path: &str) -> String {
-    format!("{}/{path}", document_root(project_id))
+    format!("projects/{project_id}/databases/(default)/documents/{path}")
 }
 
 pub(super) fn parent_path(project_id: &str, relative_parent: Option<&str>) -> String {
-    let root = document_root(project_id);
     match relative_parent {
-        Some(parent) if !parent.is_empty() => format!("{root}/{parent}"),
-        _ => root,
+        Some(parent) if !parent.is_empty() => {
+            format!("projects/{project_id}/databases/(default)/documents/{parent}")
+        }
+        _ => document_root(project_id),
     }
 }
 
