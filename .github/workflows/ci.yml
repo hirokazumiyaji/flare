@@ -36,9 +36,6 @@ jobs:
       - name: Test
         run: cargo test --all-targets
 
-      - name: Validate Firebase deployment guard
-        run: cargo test --test firebase_config
-
       - name: Build release binary
         run: cargo build --release --bin fl
 
@@ -77,5 +74,20 @@ jobs:
 
       - name: Verify deploy config denies Firestore writes
         run: |
+          set -euo pipefail
+          # `--exact` は対象テストが 0 件でも終了コード 0 になるため、
+          # 名前が変わっていないことを先に確認する。
+          cargo test --test firestore_emulator -- --list \
+            | grep -Fqx 'production_config_denies_firestore_writes: test'
+          # テストは FIRELANG_FIRESTORE_RULES が "deny" でなければ黙って
+          # 成功する。変数名をどちらかの側で変更すると、この検査が
+          # assertion を一度も実行しないまま緑になってしまうため、
+          # テストと同じシェルで変数が実際に渡っていることを確認する。
           firebase emulators:exec --config firebase.json --only firestore --project demo-firelang \
-            'FIRESTORE_PROJECT_ID=demo-firelang FIRELANG_FIRESTORE_RULES=deny cargo test --test firestore_emulator production_config_denies_firestore_writes -- --exact --nocapture'
+            'FIRESTORE_PROJECT_ID=demo-firelang FIRELANG_FIRESTORE_RULES=deny sh -c '"'"'
+               test "$FIRELANG_FIRESTORE_RULES" = deny || {
+                 echo "FIRELANG_FIRESTORE_RULES did not reach the test process" >&2
+                 exit 1
+               }
+               cargo test --test firestore_emulator production_config_denies_firestore_writes -- --exact --nocapture
+             '"'"''
