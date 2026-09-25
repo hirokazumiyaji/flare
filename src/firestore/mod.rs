@@ -79,8 +79,15 @@ pub(crate) fn query_has_no_matches(filters: &[QueryFilter]) -> bool {
 /// candidates.  In particular, Firestore's `!=`/`not-in` and its handling of
 /// null values are not identical to firelang's structural semantics.  Keeping
 /// this matcher shared prevents the two backends from drifting again.
-pub(crate) fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bool {
+pub(crate) fn matches_filters_with_name(
+    doc: &BTreeMap<String, Value>,
+    path: &str,
+    filters: &[QueryFilter],
+) -> bool {
     filters.iter().all(|f| {
+        if f.field == "__name__" {
+            return matches_document_name_filter(path, f);
+        }
         // `!=` / `in` / `not-in` require the field to exist.  `order_by`'s
         // presence check is applied later by the runtime.
         let actual = lookup_field_path_split(Some(doc), &f.field);
@@ -117,6 +124,26 @@ pub(crate) fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFil
             },
         }
     })
+}
+
+fn matches_document_name_filter(path: &str, filter: &QueryFilter) -> bool {
+    let is_path = |value: &Value| matches!(value, Value::Str(actual) if actual == path);
+    match filter.op {
+        QueryOp::Eq => is_path(&filter.value),
+        QueryOp::Ne => !is_path(&filter.value),
+        QueryOp::In => match &filter.value {
+            Value::Array(values) => values.iter().any(is_path),
+            _ => false,
+        },
+        QueryOp::NotIn => match &filter.value {
+            Value::Array(values) if !values.iter().any(|value| matches!(value, Value::Nil)) => {
+                !values.iter().any(is_path)
+            }
+            _ => false,
+        },
+        QueryOp::ArrayContains | QueryOp::ArrayContainsAny => false,
+        QueryOp::Gt | QueryOp::Ge | QueryOp::Lt | QueryOp::Le => false,
+    }
 }
 
 /// Compare only same-typed scalar values.  Firestore's type ordering is not

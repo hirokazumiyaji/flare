@@ -14,7 +14,7 @@ use gcloud_sdk::google::firestore::v1::{
 };
 use gcloud_sdk::tonic::{Code, Request};
 
-use super::{matches_filters, Firestore, QueryCandidates, WriteOp};
+use super::{Firestore, QueryCandidates, WriteOp};
 use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Value};
 
 pub struct FirestoreEmulator {
@@ -209,7 +209,7 @@ fn run_query_candidates(
     // The server query is only a candidate-generation optimization.  Re-run
     // every predicate with the same matcher used by the in-memory backend so
     // server-specific null and structural-value behavior cannot leak through.
-    out.retain(|(_, fields)| matches_filters(fields, filters));
+    out.retain(|(rel, fields)| super::matches_filters_with_name(fields, rel, filters));
     Ok(out)
 }
 

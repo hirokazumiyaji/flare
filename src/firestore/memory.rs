@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
-use super::{lookup_field_path, matches_filters, Firestore, WriteOp};
+use super::{lookup_field_path, matches_filters_with_name, Firestore, WriteOp};
 use crate::value::{QueryRef, QuerySource, Timestamp, Value};
 
 #[derive(Default)]
@@ -26,12 +26,9 @@ impl Firestore for InMemoryFirestore {
 
     fn run_query(&self, query: &QueryRef) -> Result<super::QueryCandidates, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
-        if super::query_has_no_matches(&query.filters) {
-            return Ok(vec![]);
-        }
         Ok(self
             .candidates(&query.source)
-            .filter(|(_, doc)| matches_filters(doc, &query.filters))
+            .filter(|(path, doc)| matches_filters_with_name(doc, path, &query.filters))
             .map(|(path, doc)| (path.clone(), doc.clone()))
             .collect())
     }
