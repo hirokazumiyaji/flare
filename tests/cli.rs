@@ -30,6 +30,66 @@ fn run_fl_script(name: &str, source: &str) -> std::process::Output {
     out
 }
 
+#[cfg(unix)]
+#[test]
+fn fl_handles_script_with_non_utf8_path() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let base = std::env::temp_dir().join(format!("fl-test-{}-non-utf8", std::process::id()));
+    let mut path_bytes = base.as_os_str().as_bytes().to_vec();
+    path_bytes.push(0xff);
+    path_bytes.extend_from_slice(b".fl");
+    let path = std::path::PathBuf::from(OsString::from_vec(path_bytes));
+    let script_created = std::fs::write(&path, "1").is_ok();
+
+    let out = Command::new(FL_EXE).arg(&path).output().expect("spawn fl");
+    let _ = std::fs::remove_file(&path);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    if script_created {
+        assert!(
+            out.status.success(),
+            "fl should execute a non-UTF-8 path; status: {:?}, stderr: {stderr}",
+            out.status
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "=> 1\n");
+    } else {
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "fl should report a controlled error for a non-UTF-8 path; status: {:?}, stderr: {stderr}",
+            out.status
+        );
+        assert!(stderr.starts_with("error: "), "stderr: {stderr:?}");
+        assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fl_rejects_non_utf8_option_values_without_panicking() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let value = OsString::from_vec(vec![0xff]);
+    for (option, expected_error) in [
+        ("--backend", "--backend value must be valid UTF-8"),
+        ("-e", "-e value must be valid UTF-8"),
+    ] {
+        let out = Command::new(FL_EXE)
+            .arg(option)
+            .arg(&value)
+            .output()
+            .expect("spawn fl");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert_eq!(out.status.code(), Some(1), "{option}: {stderr:?}");
+        assert!(stderr.contains(expected_error), "{option}: {stderr:?}");
+        assert!(!stderr.contains("panicked"), "{option}: {stderr:?}");
+    }
+}
+
 #[test]
 fn fl_final_result_uses_inspect() {
     let out = run_fl_script("inspect", "{b: 2, a: [1, \"x\"]}");
