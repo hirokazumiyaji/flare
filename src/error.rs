@@ -27,6 +27,12 @@ pub enum ErrorKind {
     Parse,
     Runtime,
     Backend,
+    /// A service was not configured for the requested operation.
+    ///
+    /// This is distinct from a backend failure: a capability error means the
+    /// embedding application did not provide Auth, Storage, or Firestore to
+    /// the `RuntimeContext`.
+    Capability,
 }
 
 impl fmt::Display for ErrorKind {
@@ -36,6 +42,7 @@ impl fmt::Display for ErrorKind {
             Self::Parse => "parse",
             Self::Runtime => "runtime",
             Self::Backend => "backend",
+            Self::Capability => "capability",
         };
         write!(f, "{s}")
     }
@@ -84,6 +91,15 @@ impl FirelangError {
     pub fn backend(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Backend, message)
     }
+
+    /// Construct the stable error used when a service was not supplied to a
+    /// `RuntimeContext`.
+    pub fn capability(service: impl Into<String>, operation: impl Into<String>) -> Self {
+        Self::new(
+            ErrorKind::Capability,
+            CapabilityError::new(service, operation).to_string(),
+        )
+    }
 }
 
 impl fmt::Display for FirelangError {
@@ -96,3 +112,42 @@ impl fmt::Display for FirelangError {
 }
 
 impl Error for FirelangError {}
+
+impl From<CapabilityError> for FirelangError {
+    fn from(error: CapabilityError) -> Self {
+        Self::new(ErrorKind::Capability, error.to_string())
+    }
+}
+
+/// Structured form of a missing-service error.
+///
+/// `FirelangError::capability` is used at runtime so source spans can be
+/// attached just like other Firelang errors.  This value is public as well so
+/// embedders can construct and test capability failures without parsing a
+/// message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityError {
+    pub service: String,
+    pub operation: String,
+}
+
+impl CapabilityError {
+    pub fn new(service: impl Into<String>, operation: impl Into<String>) -> Self {
+        Self {
+            service: service.into(),
+            operation: operation.into(),
+        }
+    }
+}
+
+impl fmt::Display for CapabilityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "capability unavailable: {} ({})",
+            self.service, self.operation
+        )
+    }
+}
+
+impl Error for CapabilityError {}

@@ -1,9 +1,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
+use std::marker::PhantomData;
 
 use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
+use crate::auth::Auth;
 use crate::error::{FirelangError, Span};
-use crate::firestore::{Firestore, WriteOp};
+use crate::firestore::{Firestore, InMemoryFirestore, WriteOp};
+use crate::services::{capability_error, RuntimeContext, Services};
+use crate::storage::Storage;
 use crate::value::{
     CollectionGroupRef, CollectionRef, Direction, DocRef, QueryFilter, QueryOp, QueryRef,
     Timestamp, UserFunc, Value,
@@ -15,21 +19,134 @@ enum ExecCtx {
     Transaction { writes: Vec<WriteOp> },
 }
 
-pub struct Runtime<F: Firestore> {
+/// The synchronous script evaluator.
+///
+/// `F` is retained as a source-compatible marker for the original
+/// `Runtime<Firestore>` API.  The evaluator itself stores a
+/// [`RuntimeContext`], not a concrete service type, so adding Auth or Storage
+/// does not add another generic parameter to the runtime or its builtins.
+/// New code can use [`Runtime::from_context`] and normally relies on the
+/// default `F = InMemoryFirestore` type parameter.
+pub struct Runtime<F = InMemoryFirestore> {
     scopes: Vec<HashMap<String, Value>>,
-    fs: F,
+    context: RuntimeContext,
     exec: ExecCtx,
+    _legacy_firestore: PhantomData<F>,
 }
 
-impl<F: Firestore> Runtime<F> {
-    pub fn new(fs: F) -> Self {
+impl<F> Runtime<F> {
+    /// Construct from a complete service context.
+    pub fn from_context(context: RuntimeContext) -> Self {
         Self {
             scopes: vec![HashMap::new()],
-            fs,
+            context,
             exec: ExecCtx::Normal,
+            _legacy_firestore: PhantomData,
         }
     }
 
+    /// Alias for [`Self::from_context`].
+    pub fn with_context(context: RuntimeContext) -> Self {
+        Self::from_context(context)
+    }
+
+    /// Construct with an explicitly selected service set and the default
+    /// project configuration.
+    pub fn with_services(services: impl Into<Services>) -> Self {
+        Self::from_context(RuntimeContext::new(services))
+    }
+
+    /// Construct with project configuration and an explicitly selected
+    /// service set.
+    pub fn with_services_and_config(
+        config: crate::services::ProjectConfig,
+        services: impl Into<Services>,
+    ) -> Self {
+        Self::from_context(RuntimeContext::with_config(config, services))
+    }
+
+    pub fn context(&self) -> &RuntimeContext {
+        &self.context
+    }
+
+    pub fn context_mut(&mut self) -> &mut RuntimeContext {
+        &mut self.context
+    }
+
+    pub fn services(&self) -> &Services {
+        self.context.services()
+    }
+
+    pub fn services_mut(&mut self) -> &mut Services {
+        self.context.services_mut()
+    }
+
+    pub fn project_config(&self) -> &crate::services::ProjectConfig {
+        self.context.project_config()
+    }
+
+    fn firestore(&self) -> Result<&dyn Firestore, Box<dyn Error>> {
+        self.context
+            .services
+            .firestore_ref()
+            .ok_or_else(|| capability_error("firestore", "service"))
+    }
+
+    fn firestore_mut(&mut self) -> Result<&mut (dyn Firestore + 'static), Box<dyn Error>> {
+        self.context
+            .services
+            .firestore_mut()
+            .ok_or_else(|| capability_error("firestore", "service"))
+    }
+
+    fn auth(&self) -> Result<&dyn Auth, Box<dyn Error>> {
+        self.context
+            .services
+            .auth_ref()
+            .ok_or_else(|| capability_error("auth", "service"))
+    }
+
+    fn auth_mut(&mut self) -> Result<&mut (dyn Auth + 'static), Box<dyn Error>> {
+        self.context
+            .services
+            .auth_mut()
+            .ok_or_else(|| capability_error("auth", "service"))
+    }
+
+    fn storage(&self) -> Result<&dyn Storage, Box<dyn Error>> {
+        self.context
+            .services
+            .storage_ref()
+            .ok_or_else(|| capability_error("storage", "service"))
+    }
+
+    fn storage_mut(&mut self) -> Result<&mut (dyn Storage + 'static), Box<dyn Error>> {
+        self.context
+            .services
+            .storage_mut()
+            .ok_or_else(|| capability_error("storage", "service"))
+    }
+}
+
+impl Default for Runtime<InMemoryFirestore> {
+    fn default() -> Self {
+        Self::from_context(RuntimeContext::default())
+    }
+}
+
+impl<F: Firestore + 'static> Runtime<F> {
+    /// Original Firestore-only constructor retained as an adapter.
+    pub fn new(fs: F) -> Self {
+        Self::from_context(RuntimeContext::new(Services::from_firestore(fs)))
+    }
+
+    /// Explicit spelling of the legacy adapter.
+    pub fn with_firestore(fs: F) -> Self {
+        Self::new(fs)
+    }
+}
+
+impl<F: Firestore + 'static> Runtime<F> {
     pub fn eval_program(&mut self, stmts: &[Stmt]) -> Result<Value, Box<dyn Error>> {
         self.eval_block(stmts).map(ExecFlow::into_value)
     }
@@ -161,7 +278,7 @@ impl<F: Firestore> Runtime<F> {
 
     fn dispatch_write(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
         match &mut self.exec {
-            ExecCtx::Normal => self.fs.apply(vec![op]).map_err(backend_err),
+            ExecCtx::Normal => self.firestore_mut()?.apply(vec![op]).map_err(backend_err),
             ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => {
                 writes.push(op);
                 Ok(())
@@ -440,12 +557,15 @@ impl<F: Firestore> Runtime<F> {
                 unpaged.offset = None;
                 unpaged.limit = None;
                 Ok(Value::Int(
-                    self.fs.run_query(&unpaged).map_err(backend_err)?.len() as i64,
+                    self.firestore()?
+                        .run_query(&unpaged)
+                        .map_err(backend_err)?
+                        .len() as i64,
                 ))
             }
             "get" => {
                 self.forbid_query_in_batch_or_transaction()?;
-                let rows = self.fs.run_query(&query).map_err(backend_err)?;
+                let rows = self.firestore()?.run_query(&query).map_err(backend_err)?;
                 Ok(Value::Array(apply_query_shape(rows, &query)))
             }
             _ => Err(format!("unknown query method: {name}").into()),
@@ -528,6 +648,18 @@ const BUILTIN_NAMES: &[&str] = &[
     "delete",
     "batch",
     "transaction",
+    "auth_sign_in",
+    "auth_sign_out",
+    "auth_current_user",
+    "auth_sign_in_anonymously",
+    "auth_user",
+    "storage_put",
+    "storage_get",
+    "storage_delete",
+    "storage_list",
+    "storage_read",
+    "storage_write",
+    "storage_remove",
 ];
 
 type Builtin<F> = fn(
@@ -538,7 +670,7 @@ type Builtin<F> = fn(
 ) -> Result<Value, Box<dyn Error>>;
 
 /// ビルトインの対応テーブル。
-fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 19] {
+fn builtin_entries<F: Firestore + 'static>() -> [(&'static str, Builtin<F>); 31] {
     [
         ("puts", builtin_puts),
         ("doc", builtin_doc),
@@ -559,11 +691,23 @@ fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 19] {
         ("delete", builtin_delete),
         ("batch", builtin_batch),
         ("transaction", builtin_transaction),
+        ("auth_sign_in", builtin_auth_sign_in),
+        ("auth_sign_out", builtin_auth_sign_out),
+        ("auth_current_user", builtin_auth_current_user),
+        ("auth_sign_in_anonymously", builtin_auth_sign_in_anonymously),
+        ("auth_user", builtin_auth_user),
+        ("storage_put", builtin_storage_put),
+        ("storage_get", builtin_storage_get),
+        ("storage_delete", builtin_storage_delete),
+        ("storage_list", builtin_storage_list),
+        ("storage_read", builtin_storage_read),
+        ("storage_write", builtin_storage_write),
+        ("storage_remove", builtin_storage_remove),
     ]
 }
 
 /// ビルトインのテーブル引き。
-fn lookup_builtin<F: Firestore>(name: &str) -> Option<Builtin<F>> {
+fn lookup_builtin<F: Firestore + 'static>(name: &str) -> Option<Builtin<F>> {
     builtin_entries::<F>()
         .into_iter()
         .find(|(n, _)| *n == name)
@@ -574,7 +718,7 @@ fn is_builtin_name(name: &str) -> bool {
     BUILTIN_NAMES.contains(&name)
 }
 
-fn builtin_puts<F: Firestore>(
+fn builtin_puts<F: Firestore + 'static>(
     _rt: &mut Runtime<F>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -586,7 +730,7 @@ fn builtin_puts<F: Firestore>(
     Ok(Value::Nil)
 }
 
-fn builtin_doc<F: Firestore>(
+fn builtin_doc<F: Firestore + 'static>(
     _rt: &mut Runtime<F>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -599,7 +743,7 @@ fn builtin_doc<F: Firestore>(
     }))
 }
 
-fn builtin_col<F: Firestore>(
+fn builtin_col<F: Firestore + 'static>(
     _rt: &mut Runtime<F>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -612,7 +756,7 @@ fn builtin_col<F: Firestore>(
     }))
 }
 
-fn builtin_col_group<F: Firestore>(
+fn builtin_col_group<F: Firestore + 'static>(
     _rt: &mut Runtime<F>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -627,7 +771,7 @@ fn builtin_col_group<F: Firestore>(
     }))
 }
 
-fn builtin_array<F: Firestore>(
+fn builtin_array<F: Firestore + 'static>(
     _rt: &mut Runtime<F>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -636,7 +780,7 @@ fn builtin_array<F: Firestore>(
     Ok(Value::Array(args))
 }
 
-fn builtin_len<F: Firestore>(
+fn builtin_len<F: Firestore + 'static>(
     _rt: &mut Runtime<F>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -650,7 +794,7 @@ fn builtin_len<F: Firestore>(
     }
 }
 
-fn builtin_now<F: Firestore>(
+fn builtin_now<F: Firestore + 'static>(
     _rt: &mut Runtime<F>,
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -659,7 +803,7 @@ fn builtin_now<F: Firestore>(
     Ok(Value::Timestamp(Timestamp::now()?))
 }
 
-fn builtin_timestamp<F: Firestore>(
+fn builtin_timestamp<F: Firestore + 'static>(
     _rt: &mut Runtime<F>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -670,7 +814,7 @@ fn builtin_timestamp<F: Firestore>(
     }))
 }
 
-fn builtin_server_timestamp<F: Firestore>(
+fn builtin_server_timestamp<F: Firestore + 'static>(
     _rt: &mut Runtime<F>,
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -679,7 +823,7 @@ fn builtin_server_timestamp<F: Firestore>(
     Ok(Value::ServerTimestamp)
 }
 
-fn builtin_array_union<F: Firestore>(
+fn builtin_array_union<F: Firestore + 'static>(
     _rt: &mut Runtime<F>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -688,7 +832,7 @@ fn builtin_array_union<F: Firestore>(
     Ok(Value::ArrayUnion(expect_array(args.first())?.clone()))
 }
 
-fn builtin_array_remove<F: Firestore>(
+fn builtin_array_remove<F: Firestore + 'static>(
     _rt: &mut Runtime<F>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -697,7 +841,7 @@ fn builtin_array_remove<F: Firestore>(
     Ok(Value::ArrayRemove(expect_array(args.first())?.clone()))
 }
 
-fn builtin_delete_field<F: Firestore>(
+fn builtin_delete_field<F: Firestore + 'static>(
     _rt: &mut Runtime<F>,
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -706,7 +850,7 @@ fn builtin_delete_field<F: Firestore>(
     Ok(Value::DeleteField)
 }
 
-fn builtin_increment<F: Firestore>(
+fn builtin_increment<F: Firestore + 'static>(
     _rt: &mut Runtime<F>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -715,7 +859,7 @@ fn builtin_increment<F: Firestore>(
     Ok(Value::Increment(expect_int(args.first())?))
 }
 
-fn builtin_get<F: Firestore>(
+fn builtin_get<F: Firestore + 'static>(
     rt: &mut Runtime<F>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -730,16 +874,20 @@ fn builtin_get<F: Firestore>(
             return Err("get is not allowed after the first write in a transaction".into());
         }
         ExecCtx::Transaction { .. } => rt
-            .fs
+            .firestore()?
             .transaction_get(path)
             .map_err(backend_err)?
             .unwrap_or(Value::Nil),
-        ExecCtx::Normal => rt.fs.get(path).map_err(backend_err)?.unwrap_or(Value::Nil),
+        ExecCtx::Normal => rt
+            .firestore()?
+            .get(path)
+            .map_err(backend_err)?
+            .unwrap_or(Value::Nil),
     };
     Ok(v)
 }
 
-fn builtin_set<F: Firestore>(
+fn builtin_set<F: Firestore + 'static>(
     rt: &mut Runtime<F>,
     args: Vec<Value>,
     kwargs: BTreeMap<String, Value>,
@@ -757,7 +905,7 @@ fn builtin_set<F: Firestore>(
     Ok(Value::Nil)
 }
 
-fn builtin_update<F: Firestore>(
+fn builtin_update<F: Firestore + 'static>(
     rt: &mut Runtime<F>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -769,7 +917,7 @@ fn builtin_update<F: Firestore>(
     Ok(Value::Nil)
 }
 
-fn builtin_delete<F: Firestore>(
+fn builtin_delete<F: Firestore + 'static>(
     rt: &mut Runtime<F>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -780,7 +928,7 @@ fn builtin_delete<F: Firestore>(
     Ok(Value::Nil)
 }
 
-fn builtin_batch<F: Firestore>(
+fn builtin_batch<F: Firestore + 'static>(
     rt: &mut Runtime<F>,
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -797,11 +945,11 @@ fn builtin_batch<F: Firestore>(
     }
     let (flow, writes) = rt.run_staged_block(ExecCtx::Batch { writes: vec![] }, &stmts.body);
     let flow = flow?;
-    rt.fs.apply(writes).map_err(backend_err)?;
+    rt.firestore_mut()?.apply(writes).map_err(backend_err)?;
     Ok(flow.into_value())
 }
 
-fn builtin_transaction<F: Firestore>(
+fn builtin_transaction<F: Firestore + 'static>(
     rt: &mut Runtime<F>,
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
@@ -816,12 +964,14 @@ fn builtin_transaction<F: Firestore>(
     if !matches!(rt.exec, ExecCtx::Normal) {
         return Err("transaction cannot be nested inside batch/transaction".into());
     }
-    rt.fs.begin_transaction().map_err(backend_err)?;
+    rt.firestore_mut()?
+        .begin_transaction()
+        .map_err(backend_err)?;
     let (flow, writes) = rt.run_staged_block(ExecCtx::Transaction { writes: vec![] }, &stmts.body);
     match flow {
         Ok(flow) => {
-            if let Err(e) = rt.fs.commit_transaction(writes) {
-                let _ = rt.fs.abort_transaction();
+            if let Err(e) = rt.firestore_mut()?.commit_transaction(writes) {
+                let _ = rt.firestore_mut()?.abort_transaction();
                 return Err(backend_err(e));
             }
             Ok(flow.into_value())
@@ -830,9 +980,247 @@ fn builtin_transaction<F: Firestore>(
             // Rollback は best-effort: 元のブロックエラーを優先し、
             // rollback 自体の失敗は無視する(サーバ側タイムアウトが
             // 最終的な後ろ盾になる)。
-            let _ = rt.fs.abort_transaction();
+            let _ = rt.firestore_mut()?.abort_transaction();
             Err(e)
         }
+    }
+}
+
+fn builtin_auth_sign_in<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    reject_service_kwargs(&kwargs)?;
+    if args.len() != 2 {
+        return Err("auth_sign_in expects email and password".into());
+    }
+    let email = expect_string(args.first())?;
+    let password = expect_string(args.get(1))?;
+    let user = rt
+        .auth_mut()?
+        .sign_in(email, password)
+        .map_err(service_err)?;
+    Ok(auth_user_value(user))
+}
+
+fn builtin_auth_sign_out<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    reject_service_kwargs(&kwargs)?;
+    expect_no_service_args("auth_sign_out", &args)?;
+    rt.auth_mut()?.sign_out().map_err(service_err)?;
+    Ok(Value::Nil)
+}
+
+fn builtin_auth_current_user<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    reject_service_kwargs(&kwargs)?;
+    expect_no_service_args("auth_current_user", &args)?;
+    Ok(rt
+        .auth()?
+        .current_user()
+        .map_err(service_err)?
+        .map(auth_user_value)
+        .unwrap_or(Value::Nil))
+}
+
+fn builtin_auth_sign_in_anonymously<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    reject_service_kwargs(&kwargs)?;
+    expect_no_service_args("auth_sign_in_anonymously", &args)?;
+    let user = rt.auth_mut()?.sign_in_anonymously().map_err(service_err)?;
+    Ok(auth_user_value(user))
+}
+
+fn builtin_auth_user<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    // `auth_user` is a short alias for `auth_current_user`.
+    builtin_auth_current_user(rt, args, kwargs, block)
+}
+
+fn builtin_storage_put<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    if args.len() != 2 {
+        return Err("storage_put expects path and data".into());
+    }
+    let path = expect_string(args.first())?.to_string();
+    let mut object = rt
+        .storage_mut()?
+        .put(&path, args[1].clone())
+        .map_err(service_err)?;
+    if let Some(content_type) = kwargs.get("content_type") {
+        let Value::Str(content_type) = content_type else {
+            return Err("storage_put content_type must be string".into());
+        };
+        object.content_type = Some(content_type.clone());
+    }
+    for key in kwargs.keys() {
+        if key != "content_type" {
+            return Err(format!("unknown keyword arguments: {key}").into());
+        }
+    }
+    Ok(object.to_value())
+}
+
+fn builtin_storage_get<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    reject_service_kwargs(&kwargs)?;
+    if args.len() != 1 {
+        return Err("storage_get expects path".into());
+    }
+    let path = expect_string(args.first())?;
+    Ok(rt
+        .storage()?
+        .get(path)
+        .map_err(service_err)?
+        .map(|object| object.data)
+        .unwrap_or(Value::Nil))
+}
+
+fn builtin_storage_delete<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    reject_service_kwargs(&kwargs)?;
+    if args.len() != 1 {
+        return Err("storage_delete expects path".into());
+    }
+    let path = expect_string(args.first())?;
+    Ok(Value::Bool(
+        rt.storage_mut()?.delete(path).map_err(service_err)?,
+    ))
+}
+
+fn builtin_storage_list<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    reject_service_kwargs(&kwargs)?;
+    if args.len() > 1 {
+        return Err("storage_list expects an optional prefix".into());
+    }
+    let prefix = match args.first() {
+        Some(value) => expect_string(Some(value))?,
+        None => "",
+    };
+    Ok(Value::Array(
+        rt.storage()?
+            .list(prefix)
+            .map_err(service_err)?
+            .iter()
+            .map(|object| object.to_value())
+            .collect(),
+    ))
+}
+
+fn builtin_storage_read<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    builtin_storage_get(rt, args, kwargs, block)
+}
+
+fn builtin_storage_write<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    builtin_storage_put(rt, args, kwargs, block)
+}
+
+fn builtin_storage_remove<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    builtin_storage_delete(rt, args, kwargs, block)
+}
+
+fn reject_service_kwargs(kwargs: &BTreeMap<String, Value>) -> Result<(), Box<dyn Error>> {
+    if kwargs.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "keyword arguments are not supported for this service operation: {}",
+            kwargs.keys().cloned().collect::<Vec<_>>().join(", ")
+        )
+        .into())
+    }
+}
+
+fn expect_no_service_args(name: &str, args: &[Value]) -> Result<(), Box<dyn Error>> {
+    if args.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{name} does not take arguments").into())
+    }
+}
+
+fn auth_user_value(user: crate::auth::AuthUser) -> Value {
+    let mut fields = BTreeMap::new();
+    fields.insert("uid".to_string(), Value::Str(user.uid));
+    fields.insert(
+        "email".to_string(),
+        user.email.map(Value::Str).unwrap_or(Value::Nil),
+    );
+    fields.insert(
+        "display_name".to_string(),
+        user.display_name.map(Value::Str).unwrap_or(Value::Nil),
+    );
+    fields.insert(
+        "email_verified".to_string(),
+        Value::Bool(user.email_verified),
+    );
+    fields.insert(
+        "custom_claims".to_string(),
+        Value::Map(
+            user.custom_claims
+                .into_iter()
+                .map(|(key, value)| (key, Value::Str(value)))
+                .collect(),
+        ),
+    );
+    Value::Map(fields)
+}
+
+fn service_err(e: Box<dyn Error>) -> Box<dyn Error> {
+    if e.downcast_ref::<FirelangError>().is_some() {
+        e
+    } else {
+        FirelangError::backend(e.to_string()).into()
     }
 }
 
@@ -1191,8 +1579,8 @@ mod tests {
     }
 
     struct FailingCommitFirestore {
-        in_tx: bool,
-        aborted: bool,
+        in_tx: std::rc::Rc<std::cell::Cell<bool>>,
+        aborted: std::rc::Rc<std::cell::Cell<bool>>,
     }
 
     impl Firestore for FailingCommitFirestore {
@@ -1209,10 +1597,10 @@ mod tests {
             Ok(vec![])
         }
         fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
-            if self.in_tx {
+            if self.in_tx.get() {
                 return Err("already in transaction".into());
             }
-            self.in_tx = true;
+            self.in_tx.set(true);
             Ok(())
         }
         fn transaction_get(&self, _path: &str) -> Result<Option<Value>, Box<dyn Error>> {
@@ -1222,17 +1610,19 @@ mod tests {
             Err("commit failed".into())
         }
         fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
-            self.in_tx = false;
-            self.aborted = true;
+            self.in_tx.set(false);
+            self.aborted.set(true);
             Ok(())
         }
     }
 
     #[test]
     fn transaction_aborts_on_commit_failure() {
+        let in_tx = std::rc::Rc::new(std::cell::Cell::new(false));
+        let aborted = std::rc::Rc::new(std::cell::Cell::new(false));
         let fs = FailingCommitFirestore {
-            in_tx: false,
-            aborted: false,
+            in_tx: in_tx.clone(),
+            aborted: aborted.clone(),
         };
         let mut runtime = Runtime::new(fs);
         let res = runtime.eval_program(&[Stmt::Expr(Expr::Call {
@@ -1246,7 +1636,7 @@ mod tests {
             }),
         })]);
         assert!(res.is_err());
-        assert!(runtime.fs.aborted);
-        assert!(!runtime.fs.in_tx);
+        assert!(aborted.get());
+        assert!(!in_tx.get());
     }
 }

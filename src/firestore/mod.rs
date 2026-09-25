@@ -176,3 +176,36 @@ pub trait Firestore {
     /// `Runtime` ignores them to preserve the original block error.
     fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>>;
 }
+
+/// Forwarding adapter for already-boxed providers.  It is useful when a
+/// host stores a service as `Box<dyn Firestore>` and also keeps the old
+/// `Runtime<F>` construction source-compatible.
+impl<T: Firestore + ?Sized> Firestore for Box<T> {
+    fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+        (**self).get(path)
+    }
+
+    fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        (**self).apply(writes)
+    }
+
+    fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
+        (**self).run_query(query)
+    }
+
+    fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+        (**self).begin_transaction()
+    }
+
+    fn transaction_get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+        (**self).transaction_get(path)
+    }
+
+    fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        (**self).commit_transaction(writes)
+    }
+
+    fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+        (**self).abort_transaction()
+    }
+}
