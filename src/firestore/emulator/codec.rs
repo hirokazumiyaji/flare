@@ -7,7 +7,7 @@ use std::error::Error;
 use gcloud_sdk::google::firestore::v1::{value, ArrayValue, Document, MapValue, Value as SdkValue};
 use prost_types::{NullValue, Timestamp as ProtoTimestamp};
 
-use super::path::{document_name, relative_document_name};
+use super::path::{document_name, relative_document_name_for};
 use crate::value::{DocRef, Timestamp, Value};
 
 pub(super) fn encode_array_items(items: &[Value]) -> Result<Vec<SdkValue>, Box<dyn Error>> {
@@ -104,15 +104,31 @@ fn query_reference_name(project_id: &str, doc_ref: &DocRef) -> Result<String, Bo
     Ok(document_name(project_id, &doc_ref.path))
 }
 
-pub(super) fn decode_document(doc: &Document) -> Result<Value, Box<dyn Error>> {
+pub(super) fn decode_document(
+    doc: &Document,
+    project_id: &str,
+    database_id: &str,
+) -> Result<Value, Box<dyn Error>> {
     let mut out = BTreeMap::new();
     for (k, fv) in &doc.fields {
-        out.insert(k.clone(), decode_field_value(fv)?);
+        out.insert(
+            k.clone(),
+            decode_field_value_for_context(fv, project_id, database_id)?,
+        );
     }
     Ok(Value::Map(out))
 }
 
+#[cfg(test)]
 pub(super) fn decode_field_value(v: &SdkValue) -> Result<Value, Box<dyn Error>> {
+    decode_field_value_for_context(v, "p", "(default)")
+}
+
+pub(super) fn decode_field_value_for_context(
+    v: &SdkValue,
+    project_id: &str,
+    database_id: &str,
+) -> Result<Value, Box<dyn Error>> {
     match v
         .value_type
         .as_ref()
@@ -128,14 +144,17 @@ pub(super) fn decode_field_value(v: &SdkValue) -> Result<Value, Box<dyn Error>> 
         value::ValueType::ArrayValue(arr) => {
             let mut out = vec![];
             for x in &arr.values {
-                out.push(decode_field_value(x)?);
+                out.push(decode_field_value_for_context(x, project_id, database_id)?);
             }
             Ok(Value::Array(out))
         }
         value::ValueType::MapValue(map) => {
             let mut out = BTreeMap::new();
             for (k, fv) in &map.fields {
-                out.insert(k.clone(), decode_field_value(fv)?);
+                out.insert(
+                    k.clone(),
+                    decode_field_value_for_context(fv, project_id, database_id)?,
+                );
             }
             Ok(Value::Map(out))
         }
@@ -148,10 +167,12 @@ pub(super) fn decode_field_value(v: &SdkValue) -> Result<Value, Box<dyn Error>> 
             "GeoPoint({}, {})",
             p.latitude, p.longitude
         ))),
-        value::ValueType::ReferenceValue(name) => match relative_document_name(name) {
-            Ok(rel) => Ok(Value::DocRef(DocRef { path: rel })),
-            Err(_) => Ok(Value::Opaque(format!("Reference({name})"))),
-        },
+        value::ValueType::ReferenceValue(name) => {
+            match relative_document_name_for(name, project_id, database_id) {
+                Ok(rel) => Ok(Value::DocRef(DocRef { path: rel })),
+                Err(_) => Ok(Value::Opaque(format!("Reference({name})"))),
+            }
+        }
         other => Err(format!("unsupported Firestore field value: {other:?}").into()),
     }
 }
@@ -173,7 +194,7 @@ mod tests {
             create_time: None,
             update_time: None,
         };
-        let Value::Map(m) = decode_document(&doc).unwrap() else {
+        let Value::Map(m) = decode_document(&doc, "p", "(default)").unwrap() else {
             panic!();
         };
         assert!(!m.contains_key("__name__"));
@@ -193,7 +214,7 @@ mod tests {
             create_time: None,
             update_time: None,
         };
-        let Value::Map(m) = decode_document(&doc).unwrap() else {
+        let Value::Map(m) = decode_document(&doc, "p", "(default)").unwrap() else {
             panic!();
         };
         assert_eq!(m.get("a"), Some(&Value::Str("v".to_string())));
@@ -201,23 +222,17 @@ mod tests {
     }
 
     #[test]
-    fn decode_document_ignores_nested_documents_in_path() {
+    fn decode_document_rejects_malformed_document_path() {
         // パス中の "documents" は相対パス化(呼び出し側)で保持される。
         // decode 自体は名前に触らない。
         let doc = Document {
-            name: "projects/p/databases/(default)/documents/teams/t1/documents/x".to_string(),
+            name: "projects/p/databases/(default)/documents/teams/t1/x".to_string(),
             fields: HashMap::new(),
             create_time: None,
             update_time: None,
         };
-        let Value::Map(m) = decode_document(&doc).unwrap() else {
-            panic!();
-        };
-        assert!(m.is_empty());
-        assert_eq!(
-            relative_document_name(&doc.name).unwrap(),
-            "teams/t1/documents/x"
-        );
+        let err = relative_document_name_for(&doc.name, "p", "(default)").unwrap_err();
+        assert!(err.to_string().contains("invalid document name"), "{err}");
     }
 
     #[test]
@@ -252,6 +267,19 @@ mod tests {
                 path: "users/1".to_string()
             })
         );
+        assert_eq!(
+            decode_field_value_for_context(
+                &sdk(value::ValueType::ReferenceValue(
+                    "projects/other/databases/(default)/documents/users/1".to_string(),
+                )),
+                "p",
+                "(default)",
+            )
+            .unwrap(),
+            Value::Opaque(
+                "Reference(projects/other/databases/(default)/documents/users/1)".to_string()
+            )
+        );
     }
 
     #[test]
@@ -275,7 +303,7 @@ mod tests {
             create_time: None,
             update_time: None,
         };
-        let Value::Map(m) = decode_document(&doc).unwrap() else {
+        let Value::Map(m) = decode_document(&doc, "p", "(default)").unwrap() else {
             panic!();
         };
         assert_eq!(m.get("name"), Some(&Value::Str("a".to_string())));
