@@ -381,3 +381,56 @@ fn lookup_field_path<'a>(
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::value::DocRef;
+
+    #[test]
+    fn apply_rejects_values_that_firestore_cannot_store() {
+        let mut fs = InMemoryFirestore::default();
+        let err = fs
+            .apply(vec![WriteOp::Set {
+                path: "users/ref".to_string(),
+                data: BTreeMap::from([(
+                    "ref".to_string(),
+                    Value::DocRef(DocRef {
+                        path: "users/other".to_string(),
+                    }),
+                )]),
+                merge: false,
+            }])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported value in write"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejected_transaction_commit_can_still_be_aborted_and_restarted() {
+        let mut fs = InMemoryFirestore::default();
+        fs.begin_transaction().unwrap();
+        let invalid = WriteOp::Set {
+            path: "users/x".to_string(),
+            data: BTreeMap::from([(
+                "ref".to_string(),
+                Value::DocRef(DocRef {
+                    path: "users/y".to_string(),
+                }),
+            )]),
+            merge: false,
+        };
+        assert!(fs.commit_transaction(vec![invalid]).is_err());
+        fs.abort_transaction().unwrap();
+        fs.begin_transaction().unwrap();
+        fs.commit_transaction(vec![WriteOp::Set {
+            path: "users/ok".to_string(),
+            data: BTreeMap::from([("n".to_string(), Value::Int(1))]),
+            merge: false,
+        }])
+        .unwrap();
+        assert!(matches!(fs.get("users/ok").unwrap(), Some(Value::Map(_))));
+    }
+}

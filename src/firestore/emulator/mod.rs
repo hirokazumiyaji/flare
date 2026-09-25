@@ -135,9 +135,6 @@ impl Firestore for FirestoreEmulator {
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
-        // Validate before consuming the local transaction id. A rejected write
-        // must still be abortable so the server transaction is rolled back.
-        super::validate_writes(&writes)?;
         // Build the SDK payload before consuming the id: field-path and
         // transform conversion can also fail, and the runtime must still be
         // able to issue Rollback for the live server transaction.
