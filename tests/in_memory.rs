@@ -778,15 +778,7 @@ fn firestore_path_segment_ids_follow_firestore_constraints() {
             "invalid collection path",
         ),
         (
-            r#"col("teams/__reserved__/members")"#.to_string(),
-            "invalid collection path",
-        ),
-        (
             r#"col_group(".")"#.to_string(),
-            "invalid collection group id",
-        ),
-        (
-            r#"col_group("__reserved__")"#.to_string(),
             "invalid collection group id",
         ),
         (format!(r#"col_group("{long_id}")"#), "1,500 UTF-8 bytes"),
@@ -809,6 +801,16 @@ fn firestore_path_segment_ids_follow_firestore_constraints() {
         let message = err.to_string();
         assert!(message.contains(expected), "{source}: {message}");
     }
+}
+
+#[test]
+fn reserved_ids_are_allowed_for_collection_segments() {
+    let out = run_script(
+        r#"set("__reserved__/m1", {ok: true})
+[col("__reserved__").get().len(), col_group("__reserved__").get().len()]"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1), Value::Int(1)]));
 }
 
 #[test]

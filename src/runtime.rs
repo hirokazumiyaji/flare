@@ -909,27 +909,27 @@ const MAX_FIRESTORE_ID_BYTES: usize = 1_500;
 
 /// 単一 ID 引数(`col().doc()` / `col_group()`)を検証する。
 fn validate_document_id(id: &str) -> Result<(), Box<dyn Error>> {
-    validate_standalone_id(id, "document id")
+    validate_standalone_id(id, "document id", true)
 }
 
 fn validate_collection_group_id(id: &str) -> Result<(), Box<dyn Error>> {
-    validate_standalone_id(id, "collection group id")
+    validate_standalone_id(id, "collection group id", false)
 }
 
-fn validate_standalone_id(id: &str, kind: &str) -> Result<(), Box<dyn Error>> {
+fn validate_standalone_id(id: &str, kind: &str, is_document: bool) -> Result<(), Box<dyn Error>> {
     // 空文字と `/` は既存の error format を保ちつつ、他の ID 制約も同じ
     // runtime エラーにする。
     if id.is_empty() || id.contains('/') {
         return Err(format!("invalid {kind}: {id}").into());
     }
-    if let Err(reason) = validate_firestore_id(id) {
+    if let Err(reason) = validate_firestore_id(id, is_document) {
         return Err(format!("invalid {kind}: {id} ({reason})").into());
     }
     Ok(())
 }
 
 /// Firestore の ID 固有の制約。パス上のセグメントと単一 ID 引数で共有する。
-fn validate_firestore_id(id: &str) -> Result<(), &'static str> {
+fn validate_firestore_id(id: &str, is_document: bool) -> Result<(), &'static str> {
     if id.is_empty() {
         return Err("must not be empty");
     }
@@ -942,7 +942,7 @@ fn validate_firestore_id(id: &str) -> Result<(), &'static str> {
     if id == "." || id == ".." {
         return Err("must not be \".\" or \"..\"");
     }
-    if is_reserved_firestore_id(id) {
+    if is_document && is_reserved_firestore_id(id) {
         return Err("must not match the reserved pattern __.*__");
     }
     Ok(())
@@ -990,7 +990,7 @@ fn validate_path(path: &str, collection: bool) -> Result<(), Box<dyn Error>> {
         } else {
             "document"
         };
-        if let Err(reason) = validate_firestore_id(segment) {
+        if let Err(reason) = validate_firestore_id(segment, index % 2 == 1) {
             return Err(format!(
                 "invalid {path_kind} path: {path} (segment {segment:?} is an invalid {id_kind} id: {reason})"
             )
