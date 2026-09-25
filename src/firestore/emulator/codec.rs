@@ -35,6 +35,7 @@ pub(super) fn encode_field_value(v: &Value) -> Result<SdkValue, Box<dyn Error>> 
                 seconds: ts.seconds,
                 nanos: 0,
             }),
+            Value::Bytes(bytes) => value::ValueType::BytesValue(bytes.clone()),
             Value::Array(items) => value::ValueType::ArrayValue(ArrayValue {
                 values: encode_array_items(items)?,
             }),
@@ -67,6 +68,7 @@ pub(super) fn decode_field_value(v: &SdkValue) -> Result<Value, Box<dyn Error>> 
         value::ValueType::TimestampValue(ts) => Ok(Value::Timestamp(Timestamp {
             seconds: ts.seconds,
         })),
+        value::ValueType::BytesValue(bytes) => Ok(Value::Bytes(bytes.clone())),
         value::ValueType::ArrayValue(arr) => {
             let mut out = vec![];
             for x in &arr.values {
@@ -82,10 +84,9 @@ pub(super) fn decode_field_value(v: &SdkValue) -> Result<Value, Box<dyn Error>> 
             Ok(Value::Map(out))
         }
         // firelang が持たない型は読めることだけを目標にする。double・
-        // geo_point・bytes は表示専用の Opaque にし、reference は相対パス
-        // の DocRef にする。書き戻しは unsupported のまま(§3)。
+        // geo_point は表示専用の Opaque にし、reference は相対パスの
+        // DocRef にする。書き戻しは unsupported のまま(§3)。
         value::ValueType::DoubleValue(f) => Ok(Value::Opaque(format!("Double({f})"))),
-        value::ValueType::BytesValue(b) => Ok(Value::Opaque(format!("Bytes({})", hex_bytes(b)))),
         value::ValueType::GeoPointValue(p) => Ok(Value::Opaque(format!(
             "GeoPoint({}, {})",
             p.latitude, p.longitude
@@ -96,10 +97,6 @@ pub(super) fn decode_field_value(v: &SdkValue) -> Result<Value, Box<dyn Error>> 
         },
         other => Err(format!("unsupported Firestore field value: {other:?}").into()),
     }
-}
-
-fn hex_bytes(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -163,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_exotic_field_values_as_opaque_or_docref() {
+    fn decode_exotic_field_values_as_first_class_or_opaque_values() {
         let sdk = |t| SdkValue {
             value_type: Some(t),
         };
@@ -173,7 +170,7 @@ mod tests {
         );
         assert_eq!(
             decode_field_value(&sdk(value::ValueType::BytesValue(vec![0x00, 0xff]))).unwrap(),
-            Value::Opaque("Bytes(00ff)".to_string())
+            Value::Bytes(vec![0x00, 0xff])
         );
         assert_eq!(
             decode_field_value(&sdk(value::ValueType::GeoPointValue(
@@ -225,6 +222,16 @@ mod tests {
             m.get("score"),
             Some(&Value::Opaque("Double(4.5)".to_string()))
         );
+    }
+
+    #[test]
+    fn bytes_encode_and_decode_losslessly_when_nested() {
+        let value = Value::Array(vec![Value::Map(BTreeMap::from([(
+            "payload".to_string(),
+            Value::Bytes(vec![0x00, 0x7f, 0x80, 0xff]),
+        )]))]);
+        let encoded = encode_field_value(&value).unwrap();
+        assert_eq!(decode_field_value(&encoded).unwrap(), value);
     }
 
     #[test]

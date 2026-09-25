@@ -114,6 +114,48 @@ get("{path}")"#
 }
 
 #[test]
+fn emulator_bytes_roundtrip_and_query_equality() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let run = unique("bytes");
+    let script = format!(
+        r#"
+set("files/{run}/a", {{payload: bytes([0, 255]), parts: [bytes(""), bytes([0, 127, 128, 255])], meta: {{checksum: bytes([1, 2])}}}})
+set("files/{run}/b", {{payload: bytes([1, 0])}})
+set("files/{run}/c", {{payload: bytes([0, 255, 1])}})
+rows = col("files/{run}").where("payload", "==", bytes([0, 255])).get()
+[
+  get("files/{run}/a")["payload"],
+  get("files/{run}/a")["parts"],
+  rows[0]["meta"],
+  rows.len(),
+  col("files/{run}").order_by("payload", "asc").get().map {{ |row| row["__name__"] }},
+]
+"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Bytes(vec![0, 255]),
+            Value::Array(vec![
+                Value::Bytes(vec![]),
+                Value::Bytes(vec![0, 127, 128, 255]),
+            ]),
+            map! {"checksum" => Value::Bytes(vec![1, 2])},
+            Value::Int(1),
+            Value::Array(vec![
+                Value::Str(format!("files/{run}/a")),
+                Value::Str(format!("files/{run}/c")),
+                Value::Str(format!("files/{run}/b")),
+            ]),
+        ])
+    );
+}
+
+#[test]
 fn emulator_server_timestamp_resolves() {
     let Some(fs) = emulator() else {
         eprintln!("skip: no emulator");

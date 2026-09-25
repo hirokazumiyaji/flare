@@ -59,6 +59,7 @@ puts "found #{rows}"
 | Array | `[1, 2, "a"]` | 任意の値の列 |
 | Map | `{name: "a", age: 1}` | 文字列キーの辞書。キー昇順で保持される |
 | Timestamp | `timestamp(100)` / `now()` | Unix 秒(整数)。ナノ秒精度なし |
+| Bytes | `bytes("fire")` / `bytes([102, 105, 114, 101])` | immutable なバイナリ列。文字列は UTF-8 バイト列、整数配列は各要素が 0..=255 |
 | Func | `fn f(a) { a }` | ユーザー定義関数 |
 
 Firestore 操作のための特殊な値:
@@ -73,11 +74,11 @@ Firestore 操作のための特殊な値:
 | ArrayUnion / ArrayRemove | `array_union([..])` / `array_remove([..])` | 配列フィールド変換センチネル |
 | DeleteField | `delete_field()` | フィールド削除センチネル(`update` / merge `set` のみ) |
 | Increment | `increment(n)` | 数値加算センチネル |
-| Opaque | (生成不可。emulator 読み取りのみ) | `double` / `geo_point` / `bytes` フィールドの表示専用値(`Double(1.5)` 等)。書き込みには使えない |
+| Opaque | (生成不可。emulator 読み取りのみ) | `double` / `geo_point` など、firelang が持たないフィールド型の表示専用値(`Double(1.5)` 等)。書き込みには使えない |
 
 センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(emulator バックエンドではエラー)。
 
-emulator バックエンドで firelang が持たない型のフィールドを含むドキュメントを読んだ場合、ドキュメント全体はエラーにせず次のように読み替える:`double` / `geo_point` / `bytes` は `Opaque` の表示専用値(例 `Double(1.5)`、`GeoPoint(35.7, 139.7)`、`Bytes(00ff)`)、`reference` は同一データベース内であれば相対パスの `DocRef`(別プロジェクトや別データベースの参照は `Reference(...)` の `Opaque` 値)。`Opaque` 値はクエリの `==` 等でマッチさせることはできず(スクリプトからは生成できない)、書き戻しはエラー(`unsupported value in emulator write`)。
+emulator バックエンドで firelang が持たない型のフィールドを含むドキュメントを読んだ場合、ドキュメント全体はエラーにせず次のように読み替える:`bytes` は lossless な第一級の `Bytes` 値、`double` / `geo_point` は `Opaque` の表示専用値(例 `Double(1.5)`、`GeoPoint(35.7, 139.7)`)、`reference` は同一データベース内であれば相対パスの `DocRef`(別プロジェクトや別データベースの参照は `Reference(...)` の `Opaque` 値)。`Opaque` 値はクエリの `==` 等でマッチさせることはできず(スクリプトからは生成できない)、書き戻しはエラー(`unsupported value in emulator write`)。
 
 ### 真偽値判定(truthiness)
 
@@ -139,7 +140,7 @@ rows[0]["__name__"]  # => "users/1"(クエリ結果 Map の要素アクセス。
 | 1(最低) | `\|\|` | 任意の値(Ruby と同じく短絡評価し、オペランドそのものを返す) |
 | 2 | `&&` | 任意の値(短絡評価し、オペランドそのものを返す) |
 | 3 | `==` `!=` | 任意の値同士(構造比較) |
-| 3 | `>` `<` `>=` `<=` | Int 同士 / Timestamp 同士のみ。他はエラー |
+| 3 | `>` `<` `>=` `<=` | Int / Timestamp / Bytes 同士(Bytes は unsigned byte の辞書順)。他はエラー |
 | 4 | `+` `-` | `+`: Int 同士 / Str 同士(連結)。`-`: Int 同士 / Timestamp − Timestamp → Int(秒差)。他はエラー |
 | 5 | `*` `/` | Int のみ。`/ 0` は "division by zero" エラー |
 | 6 | `!` `-` (単項) | `!v` は任意の値を受け `Bool(!truthy(v))`。`-v` は Int のみ(範囲外は `integer overflow`) |
@@ -163,7 +164,7 @@ a = 2   # エラー: reassignment is not allowed: a
 ```
 
 - 変数は再代入不可。関数定義名も同じ名前空間を使い、再定義不可。
-- ビルトイン関数(`puts` `get` `set` `update` `delete` `batch` `transaction` `doc` `col` `col_group` `array` `len` `now` `timestamp` `server_timestamp` `array_union` `array_remove` `delete_field` `increment`)と同名の関数定義はエラー(`cannot redefine builtin: <name>`)。ビルトイン呼び出しが常に優先されるため。
+- ビルトイン関数(`puts` `get` `set` `update` `delete` `batch` `transaction` `doc` `col` `col_group` `array` `len` `now` `timestamp` `bytes` `server_timestamp` `array_union` `array_remove` `delete_field` `increment`)と同名の関数定義はエラー(`cannot redefine builtin: <name>`)。ビルトイン呼び出しが常に優先されるため。
 - 関数本体内でも外側スコープに見える名前への代入はエラー(シャドーイング不可)。ただし**関数の仮引数**は外側の名前と重なってもよい。
 
 ### スコープ規則(静的スコープ)
@@ -239,7 +240,7 @@ while cond { ... }
 
 ### 組み込み出力
 
-`puts(v, ...)` — 各値を `to_s` 形式で 1 行ずつ印字して nil を返す。`to_s` は Str を素(クォートなし)で出し、それ以外は `inspect` 形式。`inspect` 形式は Ruby 風: `[1, "x"]` / `{"a" => 1}` / `nil` / `"str"`(Str はダブルクォート付き、キー昇順)。`fl` の最終結果は `=> <inspect>` で印字される(トップレベルの Str もクォート付き)。文字列補間 `#{式}` の埋め込みは `to_s` 形式。
+`puts(v, ...)` — 各値を `to_s` 形式で 1 行ずつ印字して nil を返す。`to_s` は Str を素(クォートなし)で出し、それ以外は `inspect` 形式。`inspect` 形式は Ruby 風: `[1, "x"]` / `{"a" => 1}` / `nil` / `"str"`(Str はダブルクォート付き、キー昇順)。Bytes は `Bytes(00ff)` のように先頭から最大 32 バイトを hex 表示し、それより長い場合は `Bytes(<先頭32バイト>, <省略バイト数> more bytes)` とする(Unicode 文字列にはデコードしない)。`fl` の最終結果は `=> <inspect>` で印字される(トップレベルの Str もクォート付き)。文字列補間 `#{式}` の埋め込みは `to_s` 形式なので、Bytes も同じ bounded な `Bytes(...)` 表現になる。
 
 ## 6. Firestore API
 
@@ -260,6 +261,7 @@ while cond { ... }
 | `update(target, data_map)` | Nil | フィールド更新。**ドキュメントが存在しなければエラー**(作成しない)。キーは `.` 区切りの**フィールドパス**として解釈し、ネストしたフィールドを更新する(中間 Map は必要なら作成、中間が Map でなければエラー)。パスの各セグメントは Firestore の単純フィールドパス(`[A-Za-z_][A-Za-z0-9_]*`)のみで、バッククォートによるエスケープは非対応 |
 | `delete(target)` | Nil | ドキュメント削除。存在しなくてもエラーにならない |
 | `array(...)` | Array | `[...]` リテラルと同等 |
+| `bytes(str)` / `bytes(int_array)` | Bytes | 文字列の UTF-8 バイト列、または 0..=255 の Int からなる配列を immutable なバイナリ列にする。引数は厳密に 1 個 |
 | `array_union(array)` | センチネル | 配列フィールドへの追加(重複は追加されない) |
 | `array_remove(array)` | センチネル | 配列フィールドからの除去 |
 | `server_timestamp()` | センチネル | 書き込み時にサーバ時刻に解決 |
@@ -268,7 +270,7 @@ while cond { ... }
 | `batch { ... }` | ブロックの値 | 8 章参照 |
 | `transaction { ... }` | ブロックの値 | 8 章参照 |
 
-`data_map` の値に使えるのは: Int / Str / Bool / Nil / Array / Map / Timestamp、および直下フィールドのセンチネル 5 種。
+`data_map` の値に使えるのは: Int / Str / Bool / Nil / Array / Map / Timestamp / Bytes、および直下フィールドのセンチネル 5 種。
 
 センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(エラー: `field transforms cannot be nested`)。`delete_field()` は `update` と merge `set` でのみ使え、置換の `set` ではエラー(`delete_field() cannot be used with set() without merge`)。
 
@@ -294,7 +296,7 @@ col("users").doc("1")       # doc("users/1") と同等
 
 - `where(field, op, value)` — op は `"=="` `"!="` `">"` `">="` `"<"` `"<="` `"in"` `"not-in"` `"array_contains"` `"array_contains_any"` の 10 種。複数 `where` は AND。
   - 未対応の op を渡すと `where()` 呼び出し時に即エラー(`unsupported query op: ...`)。
-  - `==` は任意の値の構造比較。大小比較(`>` 等)は**同型のフィールド同士のみ**マッチ:Int は数値順、Str は辞書順、Bool は `false < true`、Timestamp は秒。型が異なる・Nil・存在しないフィールドはマッチしない。
+  - `==` は任意の値の構造比較(Bytes は全バイト一致)。大小比較(`>` 等)は**同型のフィールド同士のみ**マッチ:Int は数値順、Str は辞書順、Bool は `false < true`、Timestamp は秒、Bytes は unsigned byte の辞書順。型が異なる・Nil・存在しないフィールドはマッチしない。
   - `!=` はフィールドが存在し、値が構造比較で異なる場合にマッチ(存在しないフィールドはマッチしない。型が異なる値は不一致とみなす。emulator バックエンドでは Double と Int の数値比較や Opaque 値の扱いとの整合のため、`!=` はサーバ RPC では絞り込まずクライアント側で評価される)。
   - `in` / `not-in` — `value` は Array(要素は最大 10 個)。`in` はフィールド値がいずれかの要素と等しい場合、`not-in` はフィールドが存在し、どの要素とも等しくない場合にマッチ(ただし Firestore 仕様に準拠し、比較配列に `nil` が含まれる `not-in` は何もマッチしない)。空配列の `in` は何もマッチせず、空配列の `not-in` はフィールドを持つ全ドキュメントにマッチする。Array でない値を渡すとクエリ実行時にエラー。
   - `array_contains` — フィールドが Array で `value` を要素に含む場合にマッチ。`array_contains_any` — `value` は Array(要素は最大 10 個)で、フィールドの Array と 1 つ以上共通の要素を持つ場合にマッチ(空配列は何もマッチしない)。Array でない値を渡すとクエリ実行時にエラー。
@@ -302,7 +304,7 @@ col("users").doc("1")       # doc("users/1") と同等
   - `where` の値には `doc("users/1")` などの `DocRef` も指定可能(同一データベース内の参照型フィールドに対する `==` や `in`、`array_contains` 等のクエリ。emulator バックエンドでは同一プロジェクト・同一データベースの完全リソース名へエンコードされて実行される)。
   - 異なる型同士の比較は未規定(§13)。in-memory ではマッチしない。
   - フィールドが存在しないドキュメントはマッチしない(`!=` / `not-in` を含む)。
-- `order_by(field, dir)` — `dir` は `"asc"` / `"desc"`(それ以外は呼び出し時にエラー)。複数回呼ぶと順に適用される。対象フィールドを持たないドキュメントは結果から除外される(`__name__` は全ドキュメントが持つ)。同値は firelang 相対ドキュメントパス文字列の辞書順でタイブレークする。同型の値は where と同じ順序(Int 数値順 / Str 辞書順 / Bool `false < true` / Timestamp 秒)で比べ、型が異なる値同士は Nil < Bool < Int < Timestamp < Str < Array < Map の順に並べる(両バックエンド共通)。順序付けは取得後に両バックエンド共通の比較器で適用するため、サーバ側の複合インデックス制約は受けない。
+- `order_by(field, dir)` — `dir` は `"asc"` / `"desc"`(それ以外は呼び出し時にエラー)。複数回呼ぶと順に適用される。対象フィールドを持たないドキュメントは結果から除外される(`__name__` は全ドキュメントが持つ)。同値は firelang 相対ドキュメントパス文字列の辞書順でタイブレークする。同型の値は where と同じ順序(Int 数値順 / Str 辞書順 / Bool `false < true` / Timestamp 秒 / Bytes の unsigned byte 辞書順)で比べ、型が異なる値同士は Nil < Bool < Int < Timestamp < Str < Bytes < Array < Map < その他の順に並べる(両バックエンド共通)。順序付けは取得後に両バックエンド共通の比較器で適用するため、サーバ側の複合インデックス制約は受けない。
 - `limit(n)` — 件数上限。後勝ち(複数回呼ぶと最後の値)。`n` は 0 以上で、負数はエラー(`limit must be >= 0`)。
 - `offset(n)` — 先頭から `n` 件を飛ばす。後勝ち。`n` は 0 以上で、負数はエラー(`offset must be >= 0`)。件数を超える offset は空結果になる。
 - `get()` — 実行して `Array<Map>` を返す。各 Map には `__name__` キーで**相対ドキュメントパス**(例 `"users/1"`)が入る。
@@ -381,7 +383,7 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 - ランタイムは `Firestore` トレイトでバックエンドを抽象化する。デフォルトは `InMemoryFirestore`。
 - emulator バックエンドは Firestore Rust SDK(`firestore` crate)の gRPC クライアントで Firestore API を呼ぶ。database は `(default)` 固定。
 - 両バックエンドは同じ可視挙動(値の往復・クエリ順序・batch/transaction の原子性)を持たなければならない。
-- ただし emulator 側に firelang 外の型(`double` / `reference` / `geo_point` / `bytes`)で書かれたフィールドがある場合、emulator バックエンドは `Opaque` / `DocRef` に読み替えて返す(§3)。in-memory にはそのような値は存在しない。
+- ただし emulator 側に firelang 外の型(`double` / `reference` / `geo_point`)で書かれたフィールドがある場合、emulator バックエンドは `Opaque` / `DocRef` に読み替えて返す(§3)。`bytes` は `Bytes` として lossless に往復する。in-memory には firelang 外の型の値は存在しない。
 
 ## 12. スコープ外(MVP)
 

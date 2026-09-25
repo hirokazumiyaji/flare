@@ -166,8 +166,9 @@ fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bo
     })
 }
 
-/// 大小比較は同型のみを規定する(Int / Str / Bool / Timestamp)。
-/// 型が異なる・Nil は常にマッチしない(emulator の Firestore と実用上の
+/// 大小比較は同型のみを規定する(Int / Str / Bool / Timestamp / Bytes)。
+/// Bytes は unsigned byte の辞書順。型が異なる・Nil は常にマッチしない
+/// (emulator の Firestore と実用上の
 /// 挙動を合わせる。異なる型同士の Firestore の型順序は未規定 = spec §13)。
 /// フィルタの文字列値は 1,500 バイト未満に制限されており(emulator の
 /// Firestore と同じ)、有効なフィルタに対しては全文比較でよい(最初の差異
@@ -178,6 +179,7 @@ fn compare_values(a: Option<&Value>, b: &Value, pred: impl Fn(std::cmp::Ordering
         (Some(Value::Str(x)), Value::Str(y)) => pred(x.cmp(y)),
         (Some(Value::Bool(x)), Value::Bool(y)) => pred(x.cmp(y)),
         (Some(Value::Timestamp(x)), Value::Timestamp(y)) => pred(x.seconds.cmp(&y.seconds)),
+        (Some(Value::Bytes(x)), Value::Bytes(y)) => pred(x.cmp(y)),
         _ => false,
     }
 }

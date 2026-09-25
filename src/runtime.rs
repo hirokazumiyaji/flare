@@ -517,6 +517,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "len",
     "now",
     "timestamp",
+    "bytes",
     "server_timestamp",
     "array_union",
     "array_remove",
@@ -538,7 +539,7 @@ type Builtin<F> = fn(
 ) -> Result<Value, Box<dyn Error>>;
 
 /// ビルトインの対応テーブル。
-fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 19] {
+fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 20] {
     [
         ("puts", builtin_puts),
         ("doc", builtin_doc),
@@ -548,6 +549,7 @@ fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 19] {
         ("len", builtin_len),
         ("now", builtin_now),
         ("timestamp", builtin_timestamp),
+        ("bytes", builtin_bytes),
         ("server_timestamp", builtin_server_timestamp),
         ("array_union", builtin_array_union),
         ("array_remove", builtin_array_remove),
@@ -668,6 +670,30 @@ fn builtin_timestamp<F: Firestore>(
     Ok(Value::Timestamp(Timestamp {
         seconds: parse_timestamp_arg(args.first())?,
     }))
+}
+
+fn builtin_bytes<F: Firestore>(
+    _rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    if args.len() != 1 || !kwargs.is_empty() || block.is_some() {
+        return Err("bytes expects one string or an array of integers from 0 to 255".into());
+    }
+    let bytes = match &args[0] {
+        Value::Str(s) => s.as_bytes().to_vec(),
+        Value::Array(items) => items
+            .iter()
+            .map(|value| match value {
+                Value::Int(byte) => u8::try_from(*byte)
+                    .map_err(|_| "bytes array elements must be integers from 0 to 255".to_string()),
+                _ => Err("bytes array elements must be integers from 0 to 255".to_string()),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err("bytes expects one string or an array of integers from 0 to 255".into()),
+    };
+    Ok(Value::Bytes(bytes))
 }
 
 fn builtin_server_timestamp<F: Firestore>(
@@ -1066,21 +1092,25 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
         BinOp::Gt => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a > b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds > b.seconds),
+            (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a > b),
             _ => return Err("unsupported > operands".into()),
         },
         BinOp::Lt => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a < b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds < b.seconds),
+            (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a < b),
             _ => return Err("unsupported < operands".into()),
         },
         BinOp::Ge => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a >= b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds >= b.seconds),
+            (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a >= b),
             _ => return Err("unsupported >= operands".into()),
         },
         BinOp::Le => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a <= b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds <= b.seconds),
+            (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a <= b),
             _ => return Err("unsupported <= operands".into()),
         },
         // `eval_expr` 側で短絡評価するため、ここに来るのは両辺評価済みの場合のみ。

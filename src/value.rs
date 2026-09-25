@@ -14,13 +14,14 @@ pub enum Value {
     Array(Vec<Value>),
     Map(BTreeMap<String, Value>),
     Timestamp(Timestamp),
+    Bytes(Vec<u8>),
     ServerTimestamp,
     ArrayUnion(Vec<Value>),
     ArrayRemove(Vec<Value>),
     DeleteField,
     Increment(i64),
-    /// emulator が読んだ firelang 外の型(double / geo_point / bytes)の
-    /// 表示専用値。スクリプトからは生成できず、書き戻しもできない。
+    /// emulator が読んだ firelang 外の型(double / geo_point)の表示専用値。
+    /// スクリプトからは生成できず、書き戻しもできない。
     Opaque(String),
     DocRef(DocRef),
     CollectionRef(CollectionRef),
@@ -153,15 +154,17 @@ impl Value {
     }
 
     /// クエリ `order_by` 用の全順序。同型は自然順(Int 数値順 / Str 辞書順 /
-    /// Bool `false < true` / Timestamp 秒)、異型は Nil < Bool < Int <
-    /// Timestamp < Str < Array < Map < その他 の型ランクで比べる。
-    /// 両バックエンドの決定性を同じコードで保証するために使う(spec §7)。
+    /// Bool `false < true` / Timestamp 秒 / Bytes の辞書順)、異型は Nil <
+    /// Bool < Int < Timestamp < Str < Bytes < Array < Map < その他の
+    /// 型ランクで比べる。両バックエンドの決定性を同じコードで保証するために
+    /// 使う(spec §7)。
     pub fn cmp_for_order(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
             (Value::Int(x), Value::Int(y)) => x.cmp(y),
             (Value::Str(x), Value::Str(y)) => x.cmp(y),
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
             (Value::Timestamp(x), Value::Timestamp(y)) => x.seconds.cmp(&y.seconds),
+            (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
             _ => type_rank(self).cmp(&type_rank(other)),
         }
     }
@@ -174,9 +177,10 @@ fn type_rank(v: &Value) -> u8 {
         Value::Int(_) => 2,
         Value::Timestamp(_) => 3,
         Value::Str(_) => 4,
-        Value::Array(_) => 5,
-        Value::Map(_) => 6,
-        _ => 7,
+        Value::Bytes(_) => 5,
+        Value::Array(_) => 6,
+        Value::Map(_) => 7,
+        _ => 8,
     }
 }
 
@@ -225,6 +229,7 @@ impl Value {
                 format!("{{{}}}", inner.join(", "))
             }
             Value::Timestamp(ts) => format!("Timestamp({})", ts.seconds),
+            Value::Bytes(bytes) => inspect_bytes(bytes),
             Value::ServerTimestamp => "ServerTimestamp".to_string(),
             Value::ArrayUnion(v) => {
                 let inner: Vec<String> = v.iter().map(|x| x.inspect()).collect();
@@ -246,6 +251,26 @@ impl Value {
             Value::Func(_) => "<func>".to_string(),
         }
     }
+}
+
+const BYTES_INSPECT_LIMIT: usize = 32;
+
+fn inspect_bytes(bytes: &[u8]) -> String {
+    let shown = bytes.len().min(BYTES_INSPECT_LIMIT);
+    let mut out = String::with_capacity(7 + shown.saturating_mul(2));
+    out.push_str("Bytes(");
+    for byte in &bytes[..shown] {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    if let Some(omitted) = bytes.len().checked_sub(shown) {
+        if omitted > 0 {
+            out.push_str(", ");
+            out.push_str(&omitted.to_string());
+            out.push_str(" more bytes");
+        }
+    }
+    out.push(')');
+    out
 }
 
 fn inspect_str(s: &str) -> String {
