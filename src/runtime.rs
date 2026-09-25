@@ -239,28 +239,22 @@ impl<F: Firestore> Runtime<F> {
                 // is reported.  Keyword values are irrelevant for this
                 // pre-check; only their names and arity are needed.
                 validate_unique_keywords(kwargs)?;
-                if receiver.is_none() && lookup_builtin::<F>(name).is_some() {
-                    let keyword_names = kwargs
-                        .iter()
-                        .map(|(key, _)| (key.clone(), Value::Nil))
-                        .collect();
-                    validate_call_contract(
-                        name,
-                        args.len(),
-                        &keyword_names,
-                        block.as_ref(),
-                        builtin_contract(name),
-                    )?;
-                }
-
                 if let Some(receiver_expr) = receiver {
-                    // The receiver determines which method contract applies,
-                    // so evaluate it before validating/evaluating arguments.
+                    // Keyword arguments are not part of any method contract.
+                    // Reject them before evaluating the receiver, which may
+                    // itself contain a staged or immediate write.
+                    if !kwargs.is_empty() {
+                        return Err(unknown_keyword_names(kwargs));
+                    }
+                    if let Some(block) = block.as_ref() {
+                        if name == "each" || name == "map" {
+                            check_block_arity(block, 1)?;
+                        } else {
+                            return Err(format!("method {name} does not take a block").into());
+                        }
+                    }
                     let receiver_value = self.eval_expr(receiver_expr)?;
-                    let keyword_names = kwargs
-                        .iter()
-                        .map(|(key, _)| (key.clone(), Value::Nil))
-                        .collect();
+                    let keyword_names = keyword_names(kwargs);
                     validate_method_call(
                         &receiver_value,
                         name,
@@ -269,7 +263,35 @@ impl<F: Firestore> Runtime<F> {
                         block.as_ref(),
                     )?;
                     let (argv, kw) = self.eval_call_arguments(args, kwargs)?;
-                    return self.eval_method_call(receiver_value, name, argv, kw, block.as_ref());
+                    return self.eval_method_call_unchecked(
+                        receiver_value,
+                        name,
+                        argv,
+                        kw,
+                        block.as_ref(),
+                    );
+                }
+
+                if lookup_builtin::<F>(name).is_some() {
+                    let keyword_names = keyword_names(kwargs);
+                    validate_call_contract(
+                        name,
+                        args.len(),
+                        &keyword_names,
+                        block.as_ref(),
+                        builtin_contract(name),
+                    )?;
+                } else {
+                    let Some(Value::Func(func)) = self.get_var(name) else {
+                        return Err(format!("undefined function: {name}").into());
+                    };
+                    validate_user_call_contract(
+                        name,
+                        &func.params,
+                        args.len(),
+                        kwargs,
+                        block.as_ref(),
+                    )?;
                 }
 
                 let (argv, kw) = self.eval_call_arguments(args, kwargs)?;
@@ -305,8 +327,6 @@ impl<F: Firestore> Runtime<F> {
         args: &[Expr],
         kwargs: &[(String, Expr)],
     ) -> Result<EvaluatedCallArgs, Box<dyn Error>> {
-        validate_unique_keywords(kwargs)?;
-
         let mut argv = Vec::with_capacity(args.len());
         for arg in args {
             argv.push(self.eval_expr(arg)?);
@@ -334,7 +354,6 @@ impl<F: Firestore> Runtime<F> {
         // ビルトインはテーブル駆動で引く。ユーザー定義より優先されるため、
         // 同名の fn 定義は `Stmt::Def` 側でエラーにする(is_builtin_name)。
         if let Some(found) = lookup_builtin(name) {
-            validate_call_contract(name, args.len(), &kwargs, block, builtin_contract(name))?;
             return found(self, args, kwargs, block);
         }
 
@@ -366,6 +385,17 @@ impl<F: Firestore> Runtime<F> {
         block: Option<&Block>,
     ) -> Result<Value, Box<dyn Error>> {
         validate_method_call(&receiver, name, args.len(), &kwargs, block)?;
+        self.eval_method_call_unchecked(receiver, name, args, kwargs, block)
+    }
+
+    fn eval_method_call_unchecked(
+        &mut self,
+        receiver: Value,
+        name: &str,
+        args: Vec<Value>,
+        _kwargs: BTreeMap<String, Value>,
+        block: Option<&Block>,
+    ) -> Result<Value, Box<dyn Error>> {
         match receiver {
             Value::CollectionRef(collection) if name == "doc" => {
                 let id = expect_string(args.first())?;
@@ -533,13 +563,43 @@ impl<F: Firestore> Runtime<F> {
 }
 
 fn validate_unique_keywords(kwargs: &[(String, Expr)]) -> Result<(), Box<dyn Error>> {
-    let mut seen = BTreeSet::new();
+    let mut seen = BTreeSet::<&str>::new();
     for (key, _) in kwargs {
-        if !seen.insert(key.clone()) {
+        if !seen.insert(key.as_str()) {
             return Err(format!("duplicate keyword argument: {key}").into());
         }
     }
     Ok(())
+}
+
+fn keyword_names(kwargs: &[(String, Expr)]) -> BTreeMap<String, Value> {
+    kwargs
+        .iter()
+        .map(|(key, _)| (key.clone(), Value::Nil))
+        .collect()
+}
+
+fn unknown_keyword_names(kwargs: &[(String, Expr)]) -> Box<dyn Error> {
+    let keys: Vec<&str> = kwargs.iter().map(|(key, _)| key.as_str()).collect();
+    format!("unknown keyword arguments: {}", keys.join(", ")).into()
+}
+
+fn validate_user_call_contract(
+    name: &str,
+    params: &[String],
+    positional_len: usize,
+    kwargs: &[(String, Expr)],
+    block: Option<&Block>,
+) -> Result<(), Box<dyn Error>> {
+    if block.is_some() {
+        return Err(format!("{name} does not take a block (block is not allowed)").into());
+    }
+    bind_function_args(
+        params,
+        vec![Value::Nil; positional_len],
+        keyword_names(kwargs),
+    )
+    .map(|_| ())
 }
 
 fn bind_function_args(
@@ -689,7 +749,12 @@ fn validate_call_contract(
                 .into());
             }
             if positional_len > expected {
-                return Err(too_many_positional_error(name, expected, positional_len));
+                return Err(too_many_positional_error(
+                    name,
+                    expected,
+                    positional_len,
+                    true,
+                ));
             }
         }
         PositionalArity::Range(min, max) => {
@@ -700,7 +765,7 @@ fn validate_call_contract(
                 .into());
             }
             if positional_len > max {
-                return Err(too_many_positional_error(name, max, positional_len));
+                return Err(too_many_positional_error(name, max, positional_len, false));
             }
         }
     }
@@ -732,7 +797,12 @@ fn validate_call_contract(
     Ok(())
 }
 
-fn too_many_positional_error(name: &str, expected: usize, actual: usize) -> Box<dyn Error> {
+fn too_many_positional_error(
+    name: &str,
+    expected: usize,
+    actual: usize,
+    exact: bool,
+) -> Box<dyn Error> {
     if expected == 0 {
         // Keep the long-standing array-method wording while making the
         // contract failure explicit for new callers and diagnostics.
@@ -741,8 +811,9 @@ fn too_many_positional_error(name: &str, expected: usize, actual: usize) -> Box<
         )
         .into()
     } else {
+        let expectation = if exact { "exactly" } else { "at most" };
         format!(
-            "too many positional arguments for {name} (expected at most {expected}, got {actual})"
+            "too many positional arguments for {name} (expected {expectation} {expected}, got {actual})"
         )
         .into()
     }
@@ -856,7 +927,14 @@ fn validate_method_call(
         )
         .into());
     }
-    Ok(())
+    Err(match receiver {
+        Value::CollectionRef(_) | Value::CollectionGroupRef(_) | Value::QueryRef(_) => {
+            format!("unknown query method: {name}").into()
+        }
+        Value::Array(_) => format!("unknown array method: {name}").into(),
+        Value::Timestamp(_) => format!("unknown timestamp method: {name}").into(),
+        _ => "unsupported method receiver".into(),
+    })
 }
 
 /// ビルトイン関数名の一覧。`lookup_builtin` のテーブルと対応する。

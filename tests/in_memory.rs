@@ -664,6 +664,39 @@ fn rejected_call_contracts_do_not_evaluate_arguments_or_blocks() {
 }
 
 #[test]
+fn user_and_unknown_call_contracts_validate_before_evaluation() {
+    let prefix =
+        "fn replacement() { set(\"users/user-side-effect\", {written: true})\n{old: 1} }\n";
+    for (source, expected) in [
+        (
+            "fn f(x) { x }\nf(replacement(), 2)",
+            "too many positional args",
+        ),
+        ("missing(replacement())", "undefined function: missing"),
+        (
+            "fn f(x) { x }\nf(1) { set(\"users/user-block-effect\", {written: true}) }",
+            "does not take a block",
+        ),
+        (
+            "[1].unknown(replacement())",
+            "unknown array method: unknown",
+        ),
+    ] {
+        let mut runtime = Runtime::new(InMemoryFirestore::default());
+        let err = run_in(&mut runtime, &format!("{prefix}{source}")).unwrap_err();
+        assert!(err.to_string().contains(expected), "{source}: {err}");
+        assert_eq!(
+            run_in(&mut runtime, "get(\"users/user-side-effect\")").unwrap(),
+            Value::Nil
+        );
+        assert_eq!(
+            run_in(&mut runtime, "get(\"users/user-block-effect\")").unwrap(),
+            Value::Nil
+        );
+    }
+}
+
+#[test]
 fn builtin_and_method_call_contracts_validate_block_policies() {
     for (source, expected) in [
         ("batch()", "requires { ... } block"),
