@@ -58,6 +58,36 @@ fn supports_timestamp_and_query() {
 }
 
 #[test]
+fn where_supports_doc_ref_values_for_reference_operators() {
+    // The in-memory backend can hold DocRef values directly; the emulator
+    // fixture for the same query is seeded through the SDK because its
+    // language-facing write codec intentionally rejects reference writes.
+    let out = run_script(
+        r#"owner = doc("users/owner")
+set("users/ref_eq", {owner: owner, members: [owner], meta: {owner: owner}})
+set("users/ref_in", {owner: owner})
+set("users/ref_array", {members: [owner]})
+set("users/ref_other", {owner: doc("users/other"), members: [doc("users/other")], meta: {owner: doc("users/other")}})
+[
+  col("users").where("owner", "==", owner).get().len(),
+  col("users").where("owner", "in", [owner]).get().len(),
+  col("users").where("members", "array_contains", owner).get().len(),
+  col("users").where("meta", "==", {owner: owner}).get().len(),
+]"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(2),
+            Value::Int(2),
+            Value::Int(2),
+            Value::Int(1),
+        ])
+    );
+}
+
+#[test]
 fn supports_array_union_remove_and_update() {
     let out = run_script(
         "set(\"users/au\", {tags: [\"a\", \"b\"]})\nupdate(\"users/au\", {tags: array_union([\"b\", \"c\"])})\nupdate(\"users/au\", {tags: array_remove([\"a\"])})\nget(\"users/au\")",
