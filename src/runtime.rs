@@ -1022,14 +1022,28 @@ fn lookup_field_path<'a>(
     None
 }
 
+fn checked_array_index(index: i64) -> Option<usize> {
+    array_index_with_limit(index, usize::MAX as u128)
+}
+
+/// `limit` lets tests exercise the same conversion at a simulated narrower
+/// target width on a 64-bit host. Production always passes `usize::MAX`.
+fn array_index_with_limit(index: i64, limit: u128) -> Option<usize> {
+    if index < 0 || index as u128 > limit {
+        return None;
+    }
+    usize::try_from(index).ok()
+}
+
 fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {
     match (base, index) {
         (Value::Map(map), Value::Str(key)) => Ok(map.get(&key).cloned().unwrap_or(Value::Nil)),
         (Value::Array(items), Value::Int(i)) => {
-            if i < 0 {
-                return Ok(Value::Nil);
-            }
-            Ok(items.get(i as usize).cloned().unwrap_or(Value::Nil))
+            let index = match checked_array_index(i) {
+                Some(index) => index,
+                None => return Ok(Value::Nil),
+            };
+            Ok(items.get(index).cloned().unwrap_or(Value::Nil))
         }
         (Value::Map(_), _) => Err("map index must be a string".into()),
         (Value::Array(_), _) => Err("array index must be an int".into()),
@@ -1168,6 +1182,19 @@ impl ExecFlow {
 mod tests {
     use super::*;
     use crate::firestore::InMemoryFirestore;
+
+    #[test]
+    fn array_index_conversion_respects_target_width() {
+        let u32_limit = u32::MAX as u128;
+        assert_eq!(
+            array_index_with_limit(4_294_967_295, u32_limit),
+            Some(4_294_967_295)
+        );
+        assert_eq!(array_index_with_limit(4_294_967_296, u32_limit), None);
+        assert_eq!(array_index_with_limit(4_294_967_297, u32_limit), None);
+        assert_eq!(array_index_with_limit(-1, u32_limit), None);
+        assert_eq!(checked_array_index(0), Some(0));
+    }
 
     #[test]
     fn builtin_table_matches_name_list() {
