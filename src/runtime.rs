@@ -506,6 +506,10 @@ fn bind_function_args(
     Ok(out)
 }
 
+/// `bytes(...)` の引数エラー文言。3 箇所から使うので定数にまとめる。
+const BYTES_USAGE: &str = "bytes expects one string or an array of integers from 0 to 255";
+const BYTES_ELEMENT_ERR: &str = "bytes array elements must be integers from 0 to 255";
+
 /// ビルトイン関数名の一覧。`lookup_builtin` のテーブルと対応する。
 /// 同名の `fn` 定義は `cannot redefine builtin: <name>` エラーになる。
 const BUILTIN_NAMES: &[&str] = &[
@@ -679,23 +683,20 @@ fn builtin_bytes<F: Firestore>(
     block: Option<&Block>,
 ) -> Result<Value, Box<dyn Error>> {
     if args.len() != 1 || !kwargs.is_empty() || block.is_some() {
-        return Err("bytes expects one string or an array of integers from 0 to 255".into());
+        return Err(BYTES_USAGE.into());
     }
-    let value = args
-        .into_iter()
-        .next()
-        .ok_or("bytes expects one string or an array of integers from 0 to 255")?;
-    let bytes = match value {
-        Value::Str(s) => s.into_bytes(),
-        Value::Array(items) => items
+    // `args.len() == 1` は上で保証されているので `next()` は必ず `Some`。
+    // 取り出しを下の `match` にまとめ、到達不能な `ok_or` 分岐を作らない。
+    let bytes = match args.into_iter().next() {
+        Some(Value::Str(s)) => s.into_bytes(),
+        Some(Value::Array(items)) => items
             .into_iter()
             .map(|value| match value {
-                Value::Int(byte) => u8::try_from(byte)
-                    .map_err(|_| "bytes array elements must be integers from 0 to 255".to_string()),
-                _ => Err("bytes array elements must be integers from 0 to 255".to_string()),
+                Value::Int(byte) => u8::try_from(byte).map_err(|_| BYTES_ELEMENT_ERR.to_string()),
+                _ => Err(BYTES_ELEMENT_ERR.to_string()),
             })
             .collect::<Result<Vec<_>, _>>()?,
-        _ => return Err("bytes expects one string or an array of integers from 0 to 255".into()),
+        _ => return Err(BYTES_USAGE.into()),
     };
     Ok(Value::Bytes(bytes))
 }

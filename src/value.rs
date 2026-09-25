@@ -256,18 +256,21 @@ impl Value {
 const BYTES_INSPECT_LIMIT: usize = 32;
 
 fn inspect_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write;
     let shown = bytes.len().min(BYTES_INSPECT_LIMIT);
     let mut out = String::with_capacity(7 + shown.saturating_mul(2));
     out.push_str("Bytes(");
+    // `format!` で 1 バイトごとに使い捨ての String を確保するのを避けて、
+    // 既存のバッファへ直接書き込む(`inspect()` は毎回の文字列表示で動く)。
     for byte in &bytes[..shown] {
-        out.push_str(&format!("{byte:02x}"));
+        // String への書き込みは失敗しない。
+        let _ = write!(out, "{byte:02x}");
     }
-    if let Some(omitted) = bytes.len().checked_sub(shown) {
-        if omitted > 0 {
-            out.push_str(", ");
-            out.push_str(&omitted.to_string());
-            out.push_str(" more bytes");
-        }
+    // `shown = min(len, LIMIT)` なので常に `len >= shown` であり、
+    // `checked_sub` の None 分支には到達しない。
+    let omitted = bytes.len() - shown;
+    if omitted > 0 {
+        let _ = write!(out, ", {omitted} more bytes");
     }
     out.push(')');
     out

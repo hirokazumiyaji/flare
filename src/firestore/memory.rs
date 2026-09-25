@@ -170,9 +170,10 @@ fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bo
 /// Bytes は unsigned byte の辞書順。型が異なる・Nil は常にマッチしない
 /// (emulator の Firestore と実用上の
 /// 挙動を合わせる。異なる型同士の Firestore の型順序は未規定 = spec §13)。
-/// フィルタの文字列値は 1,500 バイト未満に制限されており(emulator の
-/// Firestore と同じ)、有効なフィルタに対しては全文比較でよい(最初の差異
-/// 位置は常にフィルタ自身の長さ以内 = 1,500 バイト未満に収まる)。
+/// フィルタの `Str` / `Bytes` 値は 1,500 バイト未満に制限されており
+/// (`validate_query_filters`、emulator の Firestore と同じ)、有効なフィルタ
+/// に対しては全文比較でよい(最初の差異位置は常にフィルタ自身の長さ以内 =
+/// 1,500 バイト未満に収まる)。
 fn compare_values(a: Option<&Value>, b: &Value, pred: impl Fn(std::cmp::Ordering) -> bool) -> bool {
     match (a, b) {
         (Some(Value::Int(x)), Value::Int(y)) => pred(x.cmp(y)),
