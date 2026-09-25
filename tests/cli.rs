@@ -197,7 +197,9 @@ fn fl_emulator_timeout_rejects_zero_and_malformed_values() {
         assert!(!out.status.success(), "timeout {value} should fail");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
-            stderr.contains("emulator timeout must be") || stderr.contains("positive integer"),
+            stderr.contains("emulator timeout must be")
+                || stderr.contains("positive integer")
+                || stderr.contains("greater than zero"),
             "timeout {value}: {stderr:?}"
         );
     }

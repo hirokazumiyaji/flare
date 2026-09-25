@@ -137,7 +137,7 @@ fn operation_timeout_from_env() -> Result<Duration, Box<dyn Error>> {
     }
 }
 
-fn parse_timeout_ms(value: &str) -> Result<Duration, Box<dyn Error>> {
+pub fn parse_timeout_ms(value: &str) -> Result<Duration, Box<dyn Error>> {
     let millis = value.trim().parse::<u64>().map_err(|_| {
         format!("{OPERATION_TIMEOUT_ENV} must be a positive integer number of milliseconds")
     })?;

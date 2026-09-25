@@ -4,7 +4,8 @@ mod emulator;
 mod memory;
 
 pub use emulator::{
-    FirestoreEmulator, FirestoreEmulatorOptions, DEFAULT_OPERATION_TIMEOUT, OPERATION_TIMEOUT_ENV,
+    parse_timeout_ms, FirestoreEmulator, FirestoreEmulatorOptions, DEFAULT_OPERATION_TIMEOUT,
+    OPERATION_TIMEOUT_ENV,
 };
 pub use memory::InMemoryFirestore;
 

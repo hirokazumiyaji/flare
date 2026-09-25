@@ -5,8 +5,8 @@ use std::io::{IsTerminal, Read};
 use std::time::Duration;
 
 use firelang::{
-    run_script, run_script_with_firestore, FirestoreEmulator, DEFAULT_OPERATION_TIMEOUT,
-    OPERATION_TIMEOUT_ENV,
+    parse_timeout_ms as parse_library_timeout_ms, run_script, run_script_with_firestore,
+    FirestoreEmulator, DEFAULT_OPERATION_TIMEOUT, OPERATION_TIMEOUT_ENV,
 };
 
 fn main() {
@@ -21,6 +21,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut backend = "in-memory";
     let mut emulator_timeout: Option<Duration> = None;
+    let mut emulator_timeout_flag: Option<String> = None;
     let mut paths: Vec<String> = vec![];
     let mut inline: Vec<String> = vec![];
     let mut use_stdin = false;
@@ -44,6 +45,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     .get(i + 1)
                     .ok_or_else(|| format!("{flag} requires a value in milliseconds"))?;
                 emulator_timeout = Some(parse_timeout_ms(value)?);
+                emulator_timeout_flag = Some(flag);
                 i += 2;
             }
             "-e" => {
@@ -69,7 +71,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     if emulator_timeout.is_some() && backend != "emulator" {
-        return Err("--emulator-timeout-ms requires --backend emulator".into());
+        let flag = emulator_timeout_flag
+            .as_deref()
+            .unwrap_or("--emulator-timeout-ms");
+        return Err(format!("{flag} requires --backend emulator").into());
     }
 
     let backend_config = match backend {
@@ -79,10 +84,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .map_err(|_| "FIRESTORE_EMULATOR_HOST must be set when using --backend emulator")?;
             let project_id =
                 env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".to_string());
-            let operation_timeout = match emulator_timeout {
-                Some(timeout) => timeout,
-                None => emulator_timeout_from_env()?,
+            let env_timeout = match env::var(OPERATION_TIMEOUT_ENV) {
+                Ok(value) => Some(value),
+                Err(env::VarError::NotPresent) => None,
+                Err(error) => return Err(error.into()),
             };
+            let operation_timeout =
+                resolve_emulator_timeout(emulator_timeout, env_timeout.as_deref())?;
             Some((host, project_id, operation_timeout))
         }
         other => {
@@ -133,13 +141,9 @@ fn run() -> Result<(), Box<dyn Error>> {
 }
 
 fn parse_timeout_ms(value: &str) -> Result<Duration, Box<dyn Error>> {
-    let millis = value.trim().parse::<u64>().map_err(|_| {
-        "emulator timeout must be a positive integer number of milliseconds".to_string()
-    })?;
-    if millis == 0 {
-        return Err("emulator timeout must be greater than zero".into());
-    }
-    Ok(Duration::from_millis(millis))
+    // Reuse the library parser so the CLI and FirestoreEmulator::from_env
+    // cannot disagree about what a valid timeout is.
+    parse_library_timeout_ms(value)
 }
 
 fn resolve_emulator_timeout(
@@ -152,14 +156,6 @@ fn resolve_emulator_timeout(
             Some(value) => parse_timeout_ms(value),
             None => Ok(DEFAULT_OPERATION_TIMEOUT),
         },
-    }
-}
-
-fn emulator_timeout_from_env() -> Result<Duration, Box<dyn Error>> {
-    match env::var(OPERATION_TIMEOUT_ENV) {
-        Ok(value) => resolve_emulator_timeout(None, Some(&value)),
-        Err(env::VarError::NotPresent) => resolve_emulator_timeout(None, None),
-        Err(error) => Err(error.into()),
     }
 }
 
@@ -183,6 +179,7 @@ fn print_usage() {
         "    --emulator-timeout-ms <ms>  per-RPC timeout (default: {}ms)",
         DEFAULT_OPERATION_TIMEOUT.as_millis()
     );
+    eprintln!("    --timeout-ms <ms>          alias for --emulator-timeout-ms");
     eprintln!("    FIRESTORE_EMULATOR_TIMEOUT_MS  environment override for the default");
 }
 
