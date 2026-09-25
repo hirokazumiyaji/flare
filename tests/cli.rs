@@ -62,6 +62,31 @@ fn fl_puts_uses_to_s() {
 }
 
 #[test]
+fn fl_evaluates_call_receiver_before_arguments() {
+    let source = r#"
+fn receiver() {
+  puts "R"
+  timestamp(0)
+}
+fn argument() {
+  puts "A"
+  1
+}
+receiver().add_seconds(argument())
+"#;
+    let out = run_fl_script("call-order", source);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "R\nA\n=> Timestamp(1)\n"
+    );
+}
+
+#[test]
 fn fl_error_goes_to_stderr_with_position() {
     let out = run_fl_script("error", "a = 1\nundefined_var_here");
     assert!(!out.status.success(), "failing script should exit nonzero");

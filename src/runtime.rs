@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
-use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
+use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
 use crate::error::{FirelangError, Span};
 use crate::firestore::{Firestore, WriteOp};
 use crate::value::{
@@ -228,18 +228,34 @@ impl<F: Firestore> Runtime<F> {
                 receiver,
                 name,
                 args,
-                kwargs,
                 block,
             } => {
+                // A receiver is the first expression in a method call.  Keep
+                // this evaluation here (rather than in `eval_call`) so a
+                // receiver failure is returned before any argument expression
+                // can run.
+                let receiver_value = match receiver.as_deref() {
+                    Some(expr) => Some(self.eval_expr(expr)?),
+                    None => None,
+                };
+                if let Some(value) = receiver_value.as_ref() {
+                    validate_method_receiver(value)?;
+                }
+
+                // `args` is one ordered sequence; splitting it into
+                // positional/keyword collections for binding must not change
+                // the order in which the expressions above are evaluated.
                 let mut argv = vec![];
-                for arg in args {
-                    argv.push(self.eval_expr(arg)?);
-                }
                 let mut kw = BTreeMap::new();
-                for (k, vexpr) in kwargs {
-                    kw.insert(k.clone(), self.eval_expr(vexpr)?);
+                for arg in args {
+                    match arg {
+                        CallArg::Positional(expr) => argv.push(self.eval_expr(expr)?),
+                        CallArg::Keyword { name, value } => {
+                            kw.insert(name.clone(), self.eval_expr(value)?);
+                        }
+                    }
                 }
-                self.eval_call(receiver.as_deref(), name, argv, kw, block.as_ref())
+                self.eval_call(receiver_value, name, argv, kw, block.as_ref())
             }
             Expr::Map(entries) => {
                 let mut out = BTreeMap::new();
@@ -265,14 +281,13 @@ impl<F: Firestore> Runtime<F> {
 
     fn eval_call(
         &mut self,
-        receiver: Option<&Expr>,
+        receiver: Option<Value>,
         name: &str,
         args: Vec<Value>,
         kwargs: BTreeMap<String, Value>,
         block: Option<&Block>,
     ) -> Result<Value, Box<dyn Error>> {
-        if let Some(r) = receiver {
-            let rec = self.eval_expr(r)?;
+        if let Some(rec) = receiver {
             if !kwargs.is_empty() {
                 return Err("keyword args are not supported for method calls yet".into());
             }
@@ -474,6 +489,22 @@ impl<F: Firestore> Runtime<F> {
 
     fn var_exists(&self, name: &str) -> bool {
         self.scopes.iter().rev().any(|s| s.contains_key(name))
+    }
+}
+
+/// Validate the receiver category before evaluating argument expressions.  The
+/// detailed method contract is checked after the arguments have been
+/// evaluated, but an unsupported receiver must not allow argument side effects
+/// to hide the receiver error.
+fn validate_method_receiver(receiver: &Value) -> Result<(), Box<dyn Error>> {
+    match receiver {
+        Value::CollectionRef(_)
+        | Value::CollectionGroupRef(_)
+        | Value::QueryRef(_)
+        | Value::Array(_)
+        | Value::Timestamp(_)
+        | Value::Map(_) => Ok(()),
+        _ => Err("unsupported method receiver".into()),
     }
 }
 
@@ -1239,7 +1270,6 @@ mod tests {
             receiver: None,
             name: "transaction".into(),
             args: vec![],
-            kwargs: vec![],
             block: Some(Block {
                 params: vec![],
                 body: vec![],

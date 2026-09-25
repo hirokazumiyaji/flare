@@ -123,6 +123,118 @@ fn supports_keyword_arguments_like_ruby() {
 }
 
 #[test]
+fn call_evaluation_visits_receiver_before_arguments() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let source = r#"
+fn receiver() {
+  set("effects/receiver", {n: 1})
+  timestamp(0)
+}
+fn argument() {
+  v = get("effects/receiver")
+  if v == nil {
+    set("effects/receiver", {n: 1})
+  } else {
+    set("effects/receiver", {n: v["n"] + 10})
+  }
+  1
+}
+receiver().add_seconds(argument())
+get("effects/receiver")["n"]
+"#;
+    let out = run_in(&mut runtime, source).unwrap();
+    assert_eq!(out, Value::Int(11));
+}
+
+#[test]
+fn positional_and_keyword_arguments_evaluate_in_source_order() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let source = r#"
+fn mark(n) {
+  v = get("effects/arguments")
+  if v == nil {
+    set("effects/arguments", {n: n})
+  } else {
+    set("effects/arguments", {n: v["n"] * 10 + n})
+  }
+  n
+}
+fn pair(b, a) { [b, a] }
+pair(a: mark(1), mark(2))
+get("effects/arguments")["n"]
+"#;
+    let out = run_in(&mut runtime, source).unwrap();
+    assert_eq!(out, Value::Int(12));
+}
+
+#[test]
+fn receiver_error_precedes_argument_side_effects() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let source = r#"
+fn receiver() {
+  undefined_receiver
+  timestamp(0)
+}
+fn argument() {
+  set("effects/argument", {ran: true})
+  1
+}
+receiver().add_seconds(argument())
+"#;
+    let err = run_in(&mut runtime, source).unwrap_err();
+    assert!(
+        format!("{err}").contains("undefined variable: undefined_receiver"),
+        "{err}"
+    );
+    assert_eq!(
+        run_in(&mut runtime, "get(\"effects/argument\")").unwrap(),
+        Value::Nil
+    );
+}
+
+#[test]
+fn invalid_receiver_error_precedes_argument_side_effects() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let source = r#"
+fn argument() {
+  set("effects/argument", {ran: true})
+  1
+}
+1.add_seconds(argument())
+"#;
+    let err = run_in(&mut runtime, source).unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported method receiver"),
+        "{err}"
+    );
+    assert_eq!(
+        run_in(&mut runtime, "get(\"effects/argument\")").unwrap(),
+        Value::Nil
+    );
+}
+
+#[test]
+fn argument_error_is_preserved_after_receiver_side_effect() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let source = r#"
+fn receiver() {
+  set("effects/receiver", {ran: true})
+  timestamp(0)
+}
+receiver().add_seconds(undefined_argument)
+"#;
+    let err = run_in(&mut runtime, source).unwrap_err();
+    assert!(
+        format!("{err}").contains("undefined variable: undefined_argument"),
+        "{err}"
+    );
+    assert_eq!(
+        run_in(&mut runtime, "get(\"effects/receiver\")").unwrap(),
+        map! {"ran" => Value::Bool(true)}
+    );
+}
+
+#[test]
 fn supports_transaction_and_batch_brace_blocks() {
     let out = run_script(
         "transaction { set(\"users/t1\", {n: 1}) }\nbatch { set(\"users/t2\", {n: 2}) }\nget(\"users/t2\")",
