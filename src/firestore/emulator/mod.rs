@@ -30,14 +30,42 @@ pub struct FirestoreEmulator {
     transaction_id: Option<Vec<u8>>,
 }
 
+#[derive(Debug)]
+struct EmulatorConnectionError {
+    host: String,
+    source: Box<dyn Error>,
+}
+
+impl std::fmt::Display for EmulatorConnectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to connect to Firestore emulator at {}: {}",
+            self.host, self.source
+        )
+    }
+}
+
+impl Error for EmulatorConnectionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 impl FirestoreEmulator {
     /// Reads the emulator configuration from the environment.
     ///
-    /// `Ok(None)` means that `FIRESTORE_EMULATOR_HOST` is not set. A value
-    /// that is present but cannot be used (for example, invalid UTF-8, an
-    /// empty value, or an unreachable emulator) is an error instead of a
-    /// second way of saying "not configured".
-    pub fn from_env() -> Result<Option<Self>, Box<dyn Error>> {
+    /// This compatibility constructor preserves the historical `Option` API.
+    /// Call [`Self::try_from_env`] when configuration and connection errors
+    /// must be surfaced to the caller.
+    pub fn from_env() -> Option<Self> {
+        Self::try_from_env().ok().flatten()
+    }
+
+    /// Fallible environment constructor. `Ok(None)` means that
+    /// `FIRESTORE_EMULATOR_HOST` is not set; a configured but invalid or
+    /// unreachable emulator is returned as an error.
+    pub fn try_from_env() -> Result<Option<Self>, Box<dyn Error>> {
         let host = match env::var("FIRESTORE_EMULATOR_HOST") {
             Ok(host) => host,
             Err(VarError::NotPresent) => return Ok(None),
@@ -63,14 +91,12 @@ impl FirestoreEmulator {
         validate_config("FIRESTORE_EMULATOR_HOST", &host)?;
         validate_config("FIRESTORE_PROJECT_ID", &project_id)?;
 
-        let client = match client::connect(&host, &project_id) {
-            Ok(client) => client,
-            Err(error) => {
-                return Err(
-                    format!("failed to connect to Firestore emulator at {host}: {error}").into(),
-                );
-            }
-        };
+        let client = client::connect(&host, &project_id).map_err(|source| {
+            Box::new(EmulatorConnectionError {
+                host: host.clone(),
+                source,
+            }) as Box<dyn Error>
+        })?;
         Ok(Self {
             client,
             transaction_id: None,

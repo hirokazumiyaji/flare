@@ -69,7 +69,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let backend_config = match backend {
         "in-memory" => None,
         "emulator" => Some(
-            FirestoreEmulator::from_env()?
+            FirestoreEmulator::try_from_env()?
                 .ok_or("FIRESTORE_EMULATOR_HOST must be set when using --backend emulator")?,
         ),
         other => {

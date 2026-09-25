@@ -10,7 +10,7 @@ use firelang::run_script_with_firestore;
 use firelang::{FirestoreEmulator, Value};
 
 fn emulator() -> Option<FirestoreEmulator> {
-    match FirestoreEmulator::from_env() {
+    match FirestoreEmulator::try_from_env() {
         Ok(Some(emulator)) => Some(emulator),
         Ok(None) => None,
         Err(error) => {
