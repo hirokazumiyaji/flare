@@ -93,20 +93,94 @@ pub(crate) fn validate_no_overlapping_paths<'a>(
     Ok(())
 }
 
+/// Firestore の 1 セグメントの単純フィールド名
+/// (`[A-Za-z_][A-Za-z0-9_]*`)かどうかを返す。
+fn is_simple_field_name(field: &str) -> bool {
+    let mut chars = field.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// フィールド名を Firestore API の field path 表現へ変換する。単純名だけを
+/// quote せず、それ以外はバッククォートで囲み、内部のバッククォートと
+/// バックスラッシュをエスケープする。
+pub(crate) fn quote_field_name(field: &str) -> String {
+    if is_simple_field_name(field) {
+        return field.to_string();
+    }
+
+    let mut quoted = String::with_capacity(field.len() + 2);
+    quoted.push('`');
+    for ch in field.chars() {
+        if matches!(ch, '`' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('`');
+    quoted
+}
+
+/// write data を通常の値・transform・削除に分ける。update / merge では
+/// Firestore と同じく「削除 → 通常値 → transform」の順に適用する。
+#[derive(Debug)]
+pub(crate) struct WriteValues {
+    pub(crate) plain: BTreeMap<String, Value>,
+    pub(crate) transforms: Vec<(String, Value)>,
+    pub(crate) deletes: Vec<String>,
+}
+
+pub(crate) fn split_write_values(data: &BTreeMap<String, Value>) -> WriteValues {
+    let mut plain = BTreeMap::new();
+    let mut transforms = vec![];
+    let mut deletes = vec![];
+    for (key, value) in data {
+        match value {
+            Value::ArrayUnion(_)
+            | Value::ArrayRemove(_)
+            | Value::ServerTimestamp
+            | Value::Increment(_) => transforms.push((key.clone(), value.clone())),
+            Value::DeleteField => deletes.push(key.clone()),
+            _ => {
+                plain.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    WriteValues {
+        plain,
+        transforms,
+        deletes,
+    }
+}
+
+/// update / merge set 共通の plan。plain と delete は mask に入るため互いに
+/// overlap してはいけないが、Firestore の演算順序を保つため transform とは
+/// overlap してもよい。
+pub(crate) fn plan_update_writes(
+    data: &BTreeMap<String, Value>,
+) -> Result<WriteValues, Box<dyn Error>> {
+    for key in data.keys() {
+        validate_field_path(key)?;
+    }
+
+    let values = split_write_values(data);
+    validate_no_overlapping_paths(
+        values
+            .deletes
+            .iter()
+            .map(String::as_str)
+            .chain(values.plain.keys().map(String::as_str)),
+    )?;
+    Ok(values)
+}
+
 /// update / merge set のキーは `.` 区切りのフィールドパス(Firestore 準拠)。
 /// 各セグメントは Firestore の単純フィールドパス文法
 /// (`[A-Za-z_][A-Za-z0-9_]*`)に従うこと。バッククォートによるエスケープは
 /// 非対応なので、バッククォートや空セグメントを含むキーはエラーにする。
 pub(crate) fn validate_field_path(key: &str) -> Result<(), Box<dyn Error>> {
     for segment in key.split('.') {
-        let valid = match segment.chars().next() {
-            Some(c) => c.is_ascii_alphabetic() || c == '_',
-            None => false,
-        } && segment
-            .chars()
-            .skip(1)
-            .all(|c| c.is_ascii_alphanumeric() || c == '_');
-        if !valid {
+        if !is_simple_field_name(segment) {
             return Err(format!(
                 "invalid field path: {key} (segment {segment:?} must match [A-Za-z_][A-Za-z0-9_]*)"
             )
@@ -175,4 +249,44 @@ pub trait Firestore {
     /// transaction is open. Failures are returned so callers can decide;
     /// `Runtime` ignores them to preserve the original block error.
     fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_field_name_quotes_every_non_simple_name() {
+        assert_eq!(quote_field_name("simple_2"), "simple_2");
+        assert_eq!(quote_field_name("a.b"), r#"`a.b`"#);
+        assert_eq!(quote_field_name("a-b"), r#"`a-b`"#);
+        assert_eq!(quote_field_name("1start_digit"), r#"`1start_digit`"#);
+        assert_eq!(quote_field_name("a`b"), r#"`a\`b`"#);
+        assert_eq!(quote_field_name(r"a\b"), r#"`a\\b`"#);
+    }
+
+    #[test]
+    fn update_plan_rejects_mask_path_overlap() {
+        let err = plan_update_writes(&BTreeMap::from([
+            ("a".to_string(), Value::DeleteField),
+            ("a.b".to_string(), Value::Int(1)),
+        ]))
+        .unwrap_err();
+        assert_eq!(err.to_string(), "overlapping field paths: a and a.b");
+    }
+
+    #[test]
+    fn update_plan_allows_transform_path_overlap_for_ordered_application() {
+        let plan = plan_update_writes(&BTreeMap::from([
+            ("a".to_string(), Value::Int(100)),
+            ("a.b".to_string(), Value::Increment(1)),
+        ]))
+        .unwrap();
+        assert_eq!(plan.plain.get("a"), Some(&Value::Int(100)));
+        assert_eq!(
+            plan.transforms,
+            vec![("a.b".to_string(), Value::Increment(1))]
+        );
+        assert!(plan.deletes.is_empty());
+    }
 }

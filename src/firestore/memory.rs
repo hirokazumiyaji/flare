@@ -186,31 +186,17 @@ fn apply_update_map(
     current: &mut BTreeMap<String, Value>,
     updates: &mut BTreeMap<String, Value>,
 ) -> Result<(), Box<dyn Error>> {
-    for (k, v) in updates.iter() {
-        super::validate_field_path(k)?;
-        reject_nested_sentinels(v, false)?;
+    let super::WriteValues {
+        plain,
+        transforms,
+        deletes,
+    } = super::plan_update_writes(updates)?;
+    for value in updates.values() {
+        reject_nested_sentinels(value, false)?;
     }
+
     // Firestore の挙動に合わせ、1) 削除 2) 通常フィールド更新 3) フィールド変換(increment等)
     // の順序で適用する。
-    let mut deletes = vec![];
-    let mut plain = vec![];
-    let mut transforms = vec![];
-    for (k, v) in updates.iter() {
-        match v {
-            Value::DeleteField => deletes.push(k.clone()),
-            Value::ArrayUnion(_)
-            | Value::ArrayRemove(_)
-            | Value::ServerTimestamp
-            | Value::Increment(_) => transforms.push((k.clone(), v.clone())),
-            _ => plain.push((k.clone(), v.clone())),
-        }
-    }
-    super::validate_no_overlapping_paths(
-        deletes
-            .iter()
-            .map(String::as_str)
-            .chain(plain.iter().map(|(k, _)| k.as_str())),
-    )?;
     for k in &deletes {
         let segments: Vec<&str> = k.split('.').collect();
         remove_at_field_path(current, &segments)?;

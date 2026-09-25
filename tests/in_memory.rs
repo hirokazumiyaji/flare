@@ -867,7 +867,7 @@ fn update_field_paths_require_simple_field_grammar() {
 
 #[test]
 fn replacement_set_resolves_sentinels_against_literal_dotted_keys() {
-    // emulator テスト(emulator_replacement_set_sentinel_with_dotted_key)と
+    // emulator テスト(emulator_replacement_set_non_simple_transform_keys_matches_in_memory)と
     // 同じケース。置換 set ではドット付きキーはリテラルのフィールド名。
     let out =
         run_script("set(\"users/gv2\", {\"a.b\": array_union([1])})\nget(\"users/gv2\")[\"a.b\"]")
@@ -1253,11 +1253,27 @@ fn update_deletes_ancestor_before_descendant_increment() {
 }
 
 #[test]
-fn replacement_set_resolves_increment_under_literal_hyphen_key() {
-    let out =
-        run_script("set(\"users/lit_hyphen\", {\"a-b\": increment(1)})\nget(\"users/lit_hyphen\")")
-            .unwrap();
-    assert_eq!(out.inspect(), "{\"a-b\" => 1}");
+fn replacement_set_resolves_increment_under_literal_field_names() {
+    let out = run_script(
+        r#"set("users/lit_names", {"a-b": 1, "1start_digit": 2, "a`b": 3, "a\\b": 4})
+set("users/lit_names", {"a-b": increment(1), "1start_digit": increment(2), "a`b": increment(3), "a\\b": increment(4)})
+[
+  get("users/lit_names")["a-b"],
+  get("users/lit_names")["1start_digit"],
+  get("users/lit_names")["a`b"],
+  get("users/lit_names")["a\\b"],
+]"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4),
+        ])
+    );
 }
 
 #[test]
