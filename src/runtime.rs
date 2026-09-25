@@ -785,7 +785,12 @@ fn builtin_storage_upload<F: Firestore, S: Storage>(
         (Some(Value::Str(value)), None) => value.as_str(),
         (None, Some(Value::Str(value))) => value.as_str(),
         (None, None) => "application/octet-stream",
-        (Some(_), _) => return Err("storage_upload content_type must be a string".into()),
+        (Some(_), Some(_)) => {
+            return Err(
+                "storage_upload received content_type twice (positional and keyword)".into(),
+            )
+        }
+        (Some(_), None) => return Err("storage_upload content_type must be a string".into()),
         (None, Some(_)) => return Err("storage_upload content_type must be a string".into()),
     };
     validate_storage_path(path)?;

@@ -85,24 +85,28 @@ fn run() -> Result<(), Box<dyn Error>> {
     // up; otherwise Storage remains in-memory. An explicit flag makes the
     // choice visible for Storage-only scripts.
     let storage_config = match storage_backend {
-        "auto" if env::var("FIREBASE_STORAGE_EMULATOR_HOST").is_ok() => {
-            let host = env::var("FIREBASE_STORAGE_EMULATOR_HOST").expect("checked above");
-            let project_id = env::var("FIREBASE_PROJECT_ID")
-                .or_else(|_| env::var("GCLOUD_PROJECT"))
-                .or_else(|_| env::var("FIRESTORE_PROJECT_ID"))
-                .unwrap_or_else(|_| "firelang-test".to_string());
-            Some((host, project_id))
-        }
-        "auto" | "in-memory" => None,
+        // Auto mode is deliberately best-effort. A stale host variable (or
+        // a non-UTF-8 value) must not make Firestore-only scripts fail before
+        // they ever use Storage.
+        "auto" => match env::var("FIREBASE_STORAGE_EMULATOR_HOST") {
+            Ok(host) => Some((host, storage_project_id())),
+            Err(_) => None,
+        },
+        "in-memory" => None,
         "emulator" => {
-            let host = env::var("FIREBASE_STORAGE_EMULATOR_HOST").map_err(|_| {
-                "FIREBASE_STORAGE_EMULATOR_HOST must be set when using --storage-backend emulator"
-            })?;
-            let project_id = env::var("FIREBASE_PROJECT_ID")
-                .or_else(|_| env::var("GCLOUD_PROJECT"))
-                .or_else(|_| env::var("FIRESTORE_PROJECT_ID"))
-                .unwrap_or_else(|_| "firelang-test".to_string());
-            Some((host, project_id))
+            let host = match env::var("FIREBASE_STORAGE_EMULATOR_HOST") {
+                Ok(host) => host,
+                Err(env::VarError::NotPresent) => {
+                    return Err(
+                        "FIREBASE_STORAGE_EMULATOR_HOST must be set when using --storage-backend emulator"
+                            .into(),
+                    );
+                }
+                Err(env::VarError::NotUnicode(_)) => {
+                    return Err("FIREBASE_STORAGE_EMULATOR_HOST must be valid UTF-8".into());
+                }
+            };
+            Some((host, storage_project_id()))
         }
         other => {
             return Err(format!(
@@ -142,33 +146,61 @@ fn run() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     };
 
-    let out = match (firestore_config, storage_config) {
-        (None, None) => run_script_with_backends(
+    let selected_storage = select_storage(storage_backend, storage_config)?;
+    let out = match (firestore_config, selected_storage) {
+        (None, SelectedStorage::Memory) => run_script_with_backends(
             &src,
             InMemoryFirestore::default(),
             InMemoryStorage::default(),
         )?,
-        (Some((host, project_id)), None) => run_script_with_backends(
+        (Some((host, project_id)), SelectedStorage::Memory) => run_script_with_backends(
             &src,
             FirestoreEmulator::new(host, project_id)?,
             InMemoryStorage::default(),
         )?,
-        (None, Some((host, project_id))) => run_script_with_backends(
-            &src,
-            InMemoryFirestore::default(),
-            make_storage(host, project_id)?,
-        )?,
-        (Some((firestore_host, firestore_project)), Some((storage_host, storage_project))) => {
+        (None, SelectedStorage::Emulator(storage)) => {
+            run_script_with_backends(&src, InMemoryFirestore::default(), storage)?
+        }
+        (Some((firestore_host, firestore_project)), SelectedStorage::Emulator(storage)) => {
             run_script_with_backends(
                 &src,
                 FirestoreEmulator::new(firestore_host, firestore_project)?,
-                make_storage(storage_host, storage_project)?,
+                storage,
             )?
         }
     };
 
     println!("=> {}", out.inspect());
     Ok(())
+}
+
+enum SelectedStorage {
+    Memory,
+    Emulator(StorageEmulator),
+}
+
+fn storage_project_id() -> String {
+    env::var("FIREBASE_PROJECT_ID")
+        .or_else(|_| env::var("GCLOUD_PROJECT"))
+        .or_else(|_| env::var("FIRESTORE_PROJECT_ID"))
+        .unwrap_or_else(|_| "firelang-test".to_string())
+}
+
+fn select_storage(
+    mode: &str,
+    config: Option<(String, String)>,
+) -> Result<SelectedStorage, Box<dyn Error>> {
+    let Some((host, project_id)) = config else {
+        return Ok(SelectedStorage::Memory);
+    };
+    match make_storage(host, project_id) {
+        Ok(storage) => Ok(SelectedStorage::Emulator(storage)),
+        Err(error) if mode == "auto" => {
+            eprintln!("warning: storage emulator unavailable ({error}); using in-memory");
+            Ok(SelectedStorage::Memory)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn make_storage(host: String, project_id: String) -> Result<StorageEmulator, Box<dyn Error>> {

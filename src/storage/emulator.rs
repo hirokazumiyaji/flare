@@ -1,0 +1,897 @@
+//! Firebase Storage emulator adapter.
+//!
+//! The Firebase Storage REST emulator API is small enough for the MVP to use
+//! a synchronous, dependency-free HTTP/1.1 transport. `StorageTransport` is a
+//! seam for deterministic fake-transport tests; production/authenticated
+//! Storage is intentionally not wired here.
+
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
+
+use serde_json::Value as JsonValue;
+
+use super::{validate_content_type, validate_storage_path, Storage, StorageError, StorageMetadata};
+
+/// A request made by [`StorageEmulator`]. Paths are already URL escaped and
+/// do not include the emulator host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageRequest {
+    pub method: String,
+    pub target: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl StorageRequest {
+    pub fn new(method: impl Into<String>, target: impl Into<String>, body: Vec<u8>) -> Self {
+        Self {
+            method: method.into(),
+            target: target.into(),
+            headers: vec![],
+            body,
+        }
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// A transport response. The body is kept as bytes because downloads may not
+/// be valid UTF-8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl StorageResponse {
+    pub fn new(status: u16, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status,
+            headers: vec![],
+            body: body.into(),
+        }
+    }
+
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Synchronous transport seam. A fake can implement this without opening a
+/// socket, while the production constructor uses [`HttpStorageTransport`].
+pub trait StorageTransport {
+    fn send(&self, request: &StorageRequest) -> Result<StorageResponse, Box<dyn Error>>;
+}
+
+/// Minimal HTTP transport for `FIREBASE_STORAGE_EMULATOR_HOST` (which is an
+/// HTTP endpoint, normally `127.0.0.1:9199`).
+pub struct HttpStorageTransport {
+    address: String,
+    host_header: String,
+}
+
+impl HttpStorageTransport {
+    pub fn new(host: impl AsRef<str>) -> Result<Self, StorageError> {
+        let raw = host.as_ref().trim();
+        if raw.is_empty() || raw.chars().any(|c| c.is_control()) {
+            return Err(StorageError::backend(
+                "storage emulator host must not be empty",
+            ));
+        }
+        let without_scheme = if let Some(rest) = raw.strip_prefix("http://") {
+            rest
+        } else if raw.starts_with("https://") {
+            return Err(StorageError::backend(
+                "storage emulator host must use http:// (TLS is not supported by the local emulator transport)",
+            ));
+        } else {
+            raw
+        };
+        let without_path = without_scheme.trim_end_matches('/');
+        if without_path.is_empty() || without_path.contains('/') {
+            return Err(StorageError::backend(format!(
+                "invalid storage emulator host: {raw} (expected host:port)"
+            )));
+        }
+        // `TcpStream::connect` accepts the familiar host:port spelling,
+        // including bracketed IPv6 addresses.
+        Ok(Self {
+            address: without_path.to_string(),
+            host_header: without_path.to_string(),
+        })
+    }
+
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// Verify that the configured emulator endpoint accepts TCP connections.
+    /// The actual HTTP request is still deferred until a CRUD operation.
+    pub fn probe(&self) -> Result<(), StorageError> {
+        TcpStream::connect(&self.address).map(|_| ()).map_err(|e| {
+            StorageError::backend(format!(
+                "storage emulator connection failed for {}: {e}",
+                self.address
+            ))
+        })
+    }
+
+    fn send_http(&self, request: &StorageRequest) -> Result<StorageResponse, StorageError> {
+        let mut stream = TcpStream::connect(&self.address).map_err(|e| {
+            StorageError::backend(format!(
+                "storage emulator connection failed for {}: {e}",
+                self.address
+            ))
+        })?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .map_err(|e| {
+                StorageError::backend(format!("storage emulator timeout setup failed: {e}"))
+            })?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(30)))
+            .map_err(|e| {
+                StorageError::backend(format!("storage emulator timeout setup failed: {e}"))
+            })?;
+
+        let mut wire = format!(
+            "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+            request.method, request.target, self.host_header
+        );
+        for (name, value) in &request.headers {
+            if name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("connection") {
+                continue;
+            }
+            wire.push_str(name);
+            wire.push_str(": ");
+            wire.push_str(value);
+            wire.push_str("\r\n");
+        }
+        if !request
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        {
+            wire.push_str("Content-Length: ");
+            wire.push_str(&request.body.len().to_string());
+            wire.push_str("\r\n");
+        }
+        wire.push_str("\r\n");
+        stream
+            .write_all(wire.as_bytes())
+            .and_then(|_| stream.write_all(&request.body))
+            .map_err(|e| StorageError::backend(format!("storage emulator request failed: {e}")))?;
+
+        let mut raw = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = stream.read(&mut buffer).map_err(|e| {
+                StorageError::backend(format!("storage emulator response read failed: {e}"))
+            })?;
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&buffer[..read]);
+            // A response with Content-Length can be decoded before the peer
+            // closes the socket. This also avoids waiting for keep-alive peers.
+            if let Ok((_, complete)) = parse_http_response(&raw) {
+                if complete {
+                    break;
+                }
+            }
+        }
+        let (response, _) = parse_http_response(&raw)?;
+        Ok(response)
+    }
+}
+
+impl StorageTransport for HttpStorageTransport {
+    fn send(&self, request: &StorageRequest) -> Result<StorageResponse, Box<dyn Error>> {
+        self.send_http(request).map_err(Into::into)
+    }
+}
+
+/// Storage emulator backend. `T` is replaceable to make the REST contract
+/// testable without requiring Firebase CLI in every unit-test environment.
+pub struct StorageEmulator<T = HttpStorageTransport> {
+    transport: T,
+    project_id: String,
+    bucket: String,
+    auth_token: Option<String>,
+}
+
+impl StorageEmulator<HttpStorageTransport> {
+    /// Build a client for the local Storage emulator. The TCP endpoint is
+    /// checked immediately, while the HTTP CRUD request remains lazy.
+    pub fn new(host: impl AsRef<str>, project_id: impl Into<String>) -> Result<Self, StorageError> {
+        let transport = HttpStorageTransport::new(host)?;
+        let client = Self::with_transport(project_id, transport)?;
+        client.transport.probe()?;
+        Ok(client)
+    }
+
+    /// Read `FIREBASE_STORAGE_EMULATOR_HOST` and a project ID. The project
+    /// ID lookup intentionally supports the Firebase CLI's common variable
+    /// names, with the same local-test default as Firestore.
+    pub fn from_env() -> Option<Self> {
+        Self::try_from_env().ok().flatten()
+    }
+
+    pub fn try_from_env() -> Result<Option<Self>, Box<dyn Error>> {
+        let Some(host) = std::env::var("FIREBASE_STORAGE_EMULATOR_HOST").ok() else {
+            return Ok(None);
+        };
+        let project_id = std::env::var("FIREBASE_PROJECT_ID")
+            .or_else(|_| std::env::var("GCLOUD_PROJECT"))
+            .or_else(|_| std::env::var("FIRESTORE_PROJECT_ID"))
+            .unwrap_or_else(|_| "firelang-test".to_string());
+        let mut client = Self::new(host, project_id)?;
+        if let Ok(bucket) = std::env::var("FIREBASE_STORAGE_BUCKET") {
+            client = client.with_bucket(bucket)?;
+        }
+        if let Ok(token) = std::env::var("FIREBASE_STORAGE_AUTH_TOKEN") {
+            client = client.with_auth_token(token)?;
+        }
+        Ok(Some(client))
+    }
+}
+
+impl<T: StorageTransport> StorageEmulator<T> {
+    pub fn with_transport(
+        project_id: impl Into<String>,
+        transport: T,
+    ) -> Result<Self, StorageError> {
+        let project_id = project_id.into();
+        if project_id.trim().is_empty()
+            || project_id.contains('/')
+            || project_id
+                .chars()
+                .any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(StorageError::backend(format!(
+                "invalid storage project id: {project_id:?}"
+            )));
+        }
+        let bucket = format!("{project_id}.appspot.com");
+        Ok(Self {
+            transport,
+            project_id,
+            bucket,
+            auth_token: None,
+        })
+    }
+
+    pub fn new_with_transport(
+        project_id: impl Into<String>,
+        transport: T,
+    ) -> Result<Self, StorageError> {
+        Self::with_transport(project_id, transport)
+    }
+
+    pub fn from_transport(
+        project_id: impl Into<String>,
+        transport: T,
+    ) -> Result<Self, StorageError> {
+        Self::with_transport(project_id, transport)
+    }
+
+    /// Override the emulator bucket. Normally it is `{project_id}.appspot.com`.
+    pub fn with_bucket(mut self, bucket: impl Into<String>) -> Result<Self, StorageError> {
+        let bucket = bucket.into();
+        if bucket.trim().is_empty()
+            || bucket.contains('/')
+            || bucket.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err(StorageError::backend(format!(
+                "invalid storage bucket: {bucket:?}"
+            )));
+        }
+        self.bucket = bucket;
+        Ok(self)
+    }
+
+    /// Supply an emulator bearer token when a rules test needs an auth
+    /// identity. With no token, the request is deliberately unauthenticated
+    /// and the local rules decide the result. This is not a production auth
+    /// client and does not discover Firebase ID tokens.
+    pub fn with_auth_token(mut self, token: impl Into<String>) -> Result<Self, StorageError> {
+        let token = token.into();
+        if !token.is_ascii()
+            || token.trim().is_empty()
+            || token != token.trim()
+            || token.chars().any(|c| c.is_control())
+        {
+            return Err(StorageError::backend(
+                "storage emulator auth token must be a non-empty header-safe string",
+            ));
+        }
+        self.auth_token = Some(token);
+        Ok(self)
+    }
+
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub fn transport(&self) -> &T {
+        &self.transport
+    }
+
+    fn object_target(&self, path: &str, media: bool) -> String {
+        let mut target = format!(
+            "/v0/b/{}/o/{}",
+            percent_encode(&self.bucket),
+            percent_encode(path)
+        );
+        if media {
+            target.push_str("?alt=media");
+        }
+        target
+    }
+
+    fn upload_target(&self, path: &str) -> String {
+        format!(
+            "/v0/b/{}/o?uploadType=media&name={}",
+            percent_encode(&self.bucket),
+            percent_encode(path)
+        )
+    }
+
+    fn request_headers(&self, content_type: Option<&str>) -> Vec<(String, String)> {
+        let mut headers = vec![
+            ("Accept".to_string(), "application/json".to_string()),
+            ("X-Goog-Upload-Protocol".to_string(), "raw".to_string()),
+        ];
+        if let Some(content_type) = content_type {
+            headers.push(("Content-Type".to_string(), content_type.to_string()));
+        }
+        if let Some(token) = &self.auth_token {
+            let value = if token.starts_with("Bearer ") {
+                token.clone()
+            } else {
+                format!("Bearer {token}")
+            };
+            headers.push(("Authorization".to_string(), value));
+        }
+        headers
+    }
+
+    fn send_checked(
+        &self,
+        request: &StorageRequest,
+        path: &str,
+    ) -> Result<StorageResponse, Box<dyn Error>> {
+        let response = self.transport.send(request)?;
+        if (200..300).contains(&response.status) {
+            return Ok(response);
+        }
+        if response.status == 404 {
+            return Err(StorageError::not_found(path).into());
+        }
+        if response.status == 413 {
+            return Err(StorageError::invalid_data(format!(
+                "storage object exceeds the emulator size limit: {}",
+                String::from_utf8_lossy(&response.body).trim()
+            ))
+            .into());
+        }
+        if response.status == 415 {
+            let detail = String::from_utf8_lossy(&response.body);
+            return Err(StorageError::invalid_content_type(detail.trim()).into());
+        }
+        let detail = String::from_utf8_lossy(&response.body);
+        let detail = if detail.trim().is_empty() {
+            String::new()
+        } else {
+            format!(": {}", detail.trim())
+        };
+        Err(StorageError::backend(format!(
+            "storage emulator request failed with HTTP {}{detail}",
+            response.status
+        ))
+        .into())
+    }
+}
+
+impl<T: StorageTransport> Storage for StorageEmulator<T> {
+    fn upload(
+        &mut self,
+        path: &str,
+        data: &[u8],
+        content_type: &str,
+    ) -> Result<StorageMetadata, Box<dyn Error>> {
+        validate_storage_path(path)?;
+        validate_content_type(content_type)?;
+        let request = StorageRequest {
+            method: "POST".to_string(),
+            target: self.upload_target(path),
+            headers: self.request_headers(Some(content_type)),
+            body: data.to_vec(),
+        };
+        let response = self.send_checked(&request, path)?;
+        parse_metadata(
+            &response.body,
+            path,
+            &self.bucket,
+            Some(data.len() as u64),
+            Some(content_type),
+        )
+    }
+
+    fn download(&self, path: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+        validate_storage_path(path)?;
+        let request = StorageRequest {
+            method: "GET".to_string(),
+            target: self.object_target(path, true),
+            headers: self.request_headers(None),
+            body: vec![],
+        };
+        Ok(self.send_checked(&request, path)?.body)
+    }
+
+    fn metadata(&self, path: &str) -> Result<StorageMetadata, Box<dyn Error>> {
+        validate_storage_path(path)?;
+        let request = StorageRequest {
+            method: "GET".to_string(),
+            target: self.object_target(path, false),
+            headers: self.request_headers(None),
+            body: vec![],
+        };
+        let response = self.send_checked(&request, path)?;
+        parse_metadata(&response.body, path, &self.bucket, None, None)
+    }
+
+    fn delete(&mut self, path: &str) -> Result<(), Box<dyn Error>> {
+        validate_storage_path(path)?;
+        let request = StorageRequest {
+            method: "DELETE".to_string(),
+            target: self.object_target(path, false),
+            headers: self.request_headers(None),
+            body: vec![],
+        };
+        self.send_checked(&request, path)?;
+        Ok(())
+    }
+}
+
+fn parse_metadata(
+    body: &[u8],
+    path: &str,
+    bucket: &str,
+    expected_size: Option<u64>,
+    expected_content_type: Option<&str>,
+) -> Result<StorageMetadata, Box<dyn Error>> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Err(StorageError::invalid_metadata(
+            "invalid storage metadata: response body is empty",
+        )
+        .into());
+    }
+    let json: JsonValue = serde_json::from_slice(body).map_err(|e| {
+        StorageError::invalid_metadata(format!("invalid storage metadata JSON: {e}"))
+    })?;
+    let Some(object) = json.as_object() else {
+        return Err(StorageError::invalid_metadata(
+            "invalid storage metadata: expected a JSON object",
+        )
+        .into());
+    };
+    for required in ["name", "contentType", "size"] {
+        if object.get(required).is_none() || object.get(required) == Some(&JsonValue::Null) {
+            return Err(StorageError::invalid_metadata(format!(
+                "invalid storage metadata: missing field {required}"
+            ))
+            .into());
+        }
+    }
+
+    let name =
+        optional_json_string(object.get("name"), "name")?.unwrap_or_else(|| path.to_string());
+    if name != path {
+        return Err(StorageError::invalid_metadata(format!(
+            "storage metadata name mismatch: requested {path}, got {name}"
+        ))
+        .into());
+    }
+    let content_type = optional_json_string(object.get("contentType"), "contentType")?
+        .or_else(|| expected_content_type.map(str::to_string))
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    if let Some(expected) = expected_content_type {
+        if content_type != expected {
+            return Err(StorageError::invalid_metadata(format!(
+                "storage content type mismatch for {path}: expected {expected}, got {content_type}"
+            ))
+            .into());
+        }
+    }
+    let size = match object.get("size") {
+        Some(value) => parse_size(value, "size")?,
+        None => expected_size.unwrap_or(0),
+    };
+    if size > i64::MAX as u64 {
+        return Err(StorageError::invalid_metadata(format!(
+            "storage metadata size for {path} exceeds the script Int range"
+        ))
+        .into());
+    }
+    if let Some(expected) = expected_size {
+        if size != expected {
+            return Err(StorageError::invalid_metadata(format!(
+                "storage metadata size mismatch for {path}: expected {expected}, got {size}"
+            ))
+            .into());
+        }
+    }
+    let generation = optional_json_string(object.get("generation"), "generation")?
+        .unwrap_or_else(|| "0".to_string());
+    let metageneration = optional_json_string(object.get("metageneration"), "metageneration")?
+        .unwrap_or_else(|| "1".to_string());
+    let custom_metadata = match object.get("metadata") {
+        None | Some(JsonValue::Null) => BTreeMap::new(),
+        Some(JsonValue::Object(values)) => {
+            let mut out = BTreeMap::new();
+            for (key, value) in values {
+                let value =
+                    optional_json_string(Some(value), "metadata value")?.ok_or_else(|| {
+                        StorageError::invalid_metadata(format!(
+                            "invalid storage metadata value for {key:?}"
+                        ))
+                    })?;
+                out.insert(key.clone(), value);
+            }
+            out
+        }
+        Some(_) => {
+            return Err(StorageError::invalid_metadata(
+                "invalid storage metadata: metadata must be an object",
+            )
+            .into())
+        }
+    };
+    Ok(StorageMetadata {
+        name,
+        bucket: optional_json_string(object.get("bucket"), "bucket")?
+            .unwrap_or_else(|| bucket.to_string()),
+        content_type,
+        size,
+        generation,
+        metageneration,
+        time_created: optional_json_string(object.get("timeCreated"), "timeCreated")?,
+        updated: optional_json_string(object.get("updated"), "updated")?,
+        md5_hash: optional_json_string(object.get("md5Hash"), "md5Hash")?,
+        crc32c: optional_json_string(object.get("crc32c"), "crc32c")?,
+        etag: optional_json_string(object.get("etag"), "etag")?,
+        cache_control: optional_json_string(object.get("cacheControl"), "cacheControl")?,
+        content_disposition: optional_json_string(
+            object.get("contentDisposition"),
+            "contentDisposition",
+        )?,
+        metadata: custom_metadata,
+    })
+}
+
+fn parse_size(value: &JsonValue, field: &str) -> Result<u64, Box<dyn Error>> {
+    match value {
+        JsonValue::Number(number) => number.as_u64().ok_or_else(|| {
+            StorageError::invalid_metadata(format!(
+                "invalid storage metadata {field}: expected a non-negative integer"
+            ))
+            .into()
+        }),
+        JsonValue::String(text) => text.parse::<u64>().map_err(|e| {
+            StorageError::invalid_metadata(format!("invalid storage metadata {field}: {e}")).into()
+        }),
+        _ => Err(StorageError::invalid_metadata(format!(
+            "invalid storage metadata {field}: expected a number"
+        ))
+        .into()),
+    }
+}
+
+fn optional_json_string(
+    value: Option<&JsonValue>,
+    field: &str,
+) -> Result<Option<String>, Box<dyn Error>> {
+    match value {
+        None | Some(JsonValue::Null) => Ok(None),
+        Some(JsonValue::String(value)) => Ok(Some(value.clone())),
+        Some(JsonValue::Number(value)) => Ok(Some(value.to_string())),
+        Some(_) => Err(StorageError::invalid_metadata(format!(
+            "invalid storage metadata {field}: expected string"
+        ))
+        .into()),
+    }
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+fn parse_http_response(raw: &[u8]) -> Result<(StorageResponse, bool), StorageError> {
+    let Some(header_end) = find_bytes(raw, b"\r\n\r\n") else {
+        return Err(StorageError::backend(
+            "invalid storage emulator response: missing HTTP header terminator",
+        ));
+    };
+    let header_text = std::str::from_utf8(&raw[..header_end]).map_err(|e| {
+        StorageError::backend(format!("invalid storage emulator response headers: {e}"))
+    })?;
+    let mut lines = header_text.split("\r\n");
+    let status_line = lines.next().unwrap_or_default();
+    let mut status_parts = status_line.splitn(3, ' ');
+    let version = status_parts.next().unwrap_or_default();
+    if !version.starts_with("HTTP/") {
+        return Err(StorageError::backend(format!(
+            "invalid storage emulator response status line: {status_line:?}"
+        )));
+    }
+    let status = status_parts
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(|| {
+            StorageError::backend(format!(
+                "invalid storage emulator response status line: {status_line:?}"
+            ))
+        })?;
+    let mut headers = vec![];
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(StorageError::backend(format!(
+                "invalid storage emulator response header: {line:?}"
+            )));
+        };
+        headers.push((name.trim().to_string(), value.trim().to_string()));
+    }
+    let body = &raw[header_end + 4..];
+    let chunked = headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("transfer-encoding") && value.contains("chunked")
+    });
+    if chunked {
+        let (decoded, complete) = decode_chunked_body(body)?;
+        return Ok((
+            StorageResponse {
+                status,
+                headers,
+                body: decoded,
+            },
+            complete,
+        ));
+    }
+    let content_length = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| {
+            value.parse::<usize>().map_err(|e| {
+                StorageError::backend(format!(
+                    "invalid storage emulator Content-Length header: {e}"
+                ))
+            })
+        });
+    match content_length {
+        Some(Ok(length)) => {
+            if body.len() < length {
+                return Ok((
+                    StorageResponse {
+                        status,
+                        headers,
+                        body: body.to_vec(),
+                    },
+                    false,
+                ));
+            }
+            Ok((
+                StorageResponse {
+                    status,
+                    headers,
+                    body: body[..length].to_vec(),
+                },
+                true,
+            ))
+        }
+        Some(Err(error)) => Err(error),
+        None => Ok((
+            StorageResponse {
+                status,
+                headers,
+                body: body.to_vec(),
+            },
+            false,
+        )),
+    }
+}
+
+fn decode_chunked_body(mut body: &[u8]) -> Result<(Vec<u8>, bool), StorageError> {
+    let mut out = Vec::new();
+    loop {
+        let Some(line_end) = find_bytes(body, b"\r\n") else {
+            return Ok((out, false));
+        };
+        let line = std::str::from_utf8(&body[..line_end]).map_err(|e| {
+            StorageError::backend(format!("invalid storage emulator chunk header: {e}"))
+        })?;
+        let size_text = line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_text, 16).map_err(|e| {
+            StorageError::backend(format!("invalid storage emulator chunk size: {e}"))
+        })?;
+        body = &body[line_end + 2..];
+        if size == 0 {
+            return Ok((out, true));
+        }
+        if body.len() < size {
+            return Ok((out, false));
+        }
+        out.extend_from_slice(&body[..size]);
+        body = &body[size..];
+        if body.len() < 2 || &body[..2] != b"\r\n" {
+            return Err(StorageError::backend(
+                "invalid storage emulator chunk terminator",
+            ));
+        }
+        body = &body[2..];
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    struct FakeTransport {
+        requests: RefCell<Vec<StorageRequest>>,
+        responses: RefCell<Vec<StorageResponse>>,
+    }
+
+    impl FakeTransport {
+        fn new(responses: Vec<StorageResponse>) -> Self {
+            Self {
+                requests: RefCell::new(vec![]),
+                responses: RefCell::new(responses),
+            }
+        }
+    }
+
+    impl StorageTransport for FakeTransport {
+        fn send(&self, request: &StorageRequest) -> Result<StorageResponse, Box<dyn Error>> {
+            self.requests.borrow_mut().push(request.clone());
+            let mut responses = self.responses.borrow_mut();
+            if responses.is_empty() {
+                return Err("fake transport ran out of responses".into());
+            }
+            Ok(responses.remove(0))
+        }
+    }
+
+    fn metadata_body() -> Vec<u8> {
+        br#"{"name":"avatars/a.png","bucket":"p.appspot.com","contentType":"image/png","size":3,"generation":"7","metageneration":"1"}"#.to_vec()
+    }
+
+    #[test]
+    fn new_fails_fast_without_emulator() {
+        let result = StorageEmulator::new("127.0.0.1:9", "p");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn fake_transport_preserves_binary_and_builds_crud_requests() {
+        let transport = FakeTransport::new(vec![
+            StorageResponse::new(200, metadata_body()),
+            StorageResponse::new(200, vec![0x00, 0xff, 0x80]),
+            StorageResponse::new(200, metadata_body()),
+            StorageResponse::new(204, vec![]),
+        ]);
+        let mut emulator = StorageEmulator::with_transport("p", transport).unwrap();
+        let data = [0x00, 0xff, 0x80];
+        let metadata = emulator
+            .upload("avatars/a.png", &data, "image/png")
+            .unwrap();
+        assert_eq!(metadata.size, 3);
+        assert_eq!(emulator.download("avatars/a.png").unwrap(), data);
+        assert_eq!(emulator.metadata("avatars/a.png").unwrap().generation, "7");
+        emulator.delete("avatars/a.png").unwrap();
+        let requests = emulator.transport().requests.borrow();
+        assert_eq!(requests[0].method, "POST");
+        assert!(requests[0].target.contains("uploadType=media"));
+        assert!(requests[0].target.contains("name=avatars%2Fa.png"));
+        assert_eq!(requests[0].body, data);
+        assert_eq!(requests[0].header("Content-Type"), Some("image/png"));
+        assert_eq!(requests[1].method, "GET");
+        assert!(requests[1].target.ends_with("?alt=media"));
+        assert_eq!(requests[2].method, "GET");
+        assert!(!requests[2].target.contains("alt=media"));
+        assert_eq!(requests[3].method, "DELETE");
+    }
+
+    #[test]
+    fn auth_header_is_only_sent_when_explicitly_configured() {
+        let transport = FakeTransport::new(vec![StorageResponse::new(200, metadata_body())]);
+        let mut emulator = StorageEmulator::with_transport("p", transport)
+            .unwrap()
+            .with_auth_token("owner")
+            .unwrap();
+        emulator
+            .upload("avatars/a.png", &[0, 1, 2], "image/png")
+            .unwrap();
+        assert_eq!(
+            emulator.transport().requests.borrow()[0].header("Authorization"),
+            Some("Bearer owner")
+        );
+    }
+
+    #[test]
+    fn http_404_is_a_storage_not_found_error() {
+        let transport = FakeTransport::new(vec![StorageResponse::new(404, b"missing")]);
+        let emulator = StorageEmulator::with_transport("p", transport).unwrap();
+        let err = emulator.download("missing").unwrap_err();
+        assert!(
+            format!("{err}").contains("storage object not found"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn metadata_size_and_name_mismatches_are_rejected() {
+        let transport = FakeTransport::new(vec![StorageResponse::new(
+            200,
+            br#"{"name":"wrong","size":99,"contentType":"image/png"}"#,
+        )]);
+        let mut emulator = StorageEmulator::with_transport("p", transport).unwrap();
+        let err = emulator
+            .upload("avatars/a.png", &[0, 1, 2], "image/png")
+            .unwrap_err();
+        assert!(format!("{err}").contains("metadata name mismatch"), "{err}");
+    }
+
+    #[test]
+    fn metadata_size_mismatch_is_rejected() {
+        let transport = FakeTransport::new(vec![StorageResponse::new(
+            200,
+            br#"{"name":"avatars/a.png","contentType":"image/png","size":99}"#,
+        )]);
+        let mut emulator = StorageEmulator::with_transport("p", transport).unwrap();
+        let err = emulator
+            .upload("avatars/a.png", &[0, 1, 2], "image/png")
+            .unwrap_err();
+        assert!(format!("{err}").contains("size mismatch"), "{err}");
+    }
+
+    #[test]
+    fn percent_encoding_preserves_unicode_and_slash_separation() {
+        assert_eq!(percent_encode("a/b c"), "a%2Fb%20c");
+        assert_eq!(percent_encode("é"), "%C3%A9");
+    }
+}

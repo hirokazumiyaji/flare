@@ -142,6 +142,9 @@ fn reject_storage_bytes(value: &Value) -> Result<(), Box<dyn Error>> {
     match value {
         Value::Bytes(_) => Err("Bytes values are only supported by Storage".into()),
         Value::Array(items) => items.iter().try_for_each(reject_storage_bytes),
+        Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
+            items.iter().try_for_each(reject_storage_bytes)
+        }
         Value::Map(map) => reject_storage_bytes_map(map),
         _ => Ok(()),
     }

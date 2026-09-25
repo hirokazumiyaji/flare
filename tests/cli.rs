@@ -223,6 +223,22 @@ fn fl_storage_backend_requires_storage_emulator_host() {
 }
 
 #[test]
+fn fl_auto_storage_falls_back_when_emulator_is_unavailable() {
+    let out = Command::new(FL_EXE)
+        .args(["-e", "1"])
+        .env("FIREBASE_STORAGE_EMULATOR_HOST", "127.0.0.1:1")
+        .output()
+        .expect("spawn fl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "=> 1\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("using in-memory"));
+}
+
+#[test]
 fn fl_in_memory_storage_crud_is_available_by_default() {
     let out = Command::new(FL_EXE)
         .args([
