@@ -676,9 +676,47 @@ fn function_params_may_shadow_globals() {
 }
 
 #[test]
+fn newlines_before_operators_and_postfix_inside_delimiters_parse() {
+    // 演算子・`.`・`[]` の前後にある改行は delimiter 内では無視される。
+    let out = run_script("[1\n+ 2, 1\n< 2, true\n&& false]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(3), Value::Bool(true), Value::Bool(false)])
+    );
+
+    let out = run_script("fn add(a, b) { a + b }\nadd(1\n+ 2, 4)").unwrap();
+    assert_eq!(out, Value::Int(7));
+
+    let out = run_script("m = {value: {items: [10, 20]}}\n[m\n.value\n.items\n[1]]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(20)]));
+
+    let out = run_script("m = {value: 1}\n[m.\nvalue]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1)]));
+
+    // ネストしたメソッドチェーンも同じ式として読む。
+    let out = run_script("[\n  timestamp(100)\n  .add_seconds(1)\n  .to_unix()\n]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(101)]));
+
+    // An outer delimiter must not change the statement semantics inside a
+    // brace block: the newline before `+` still starts a new statement.
+    assert!(run_script("[[1].map { |x| x\n+ 1 }]").is_err());
+}
+
+#[test]
+fn newlines_before_postfix_outside_delimiters_keep_statement_boundaries() {
+    // `a` と配列リテラルは別の文。delimiter 外では `a[1]` に連結しない。
+    let out = run_script("a = [10, 20]\na\n[1]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1)]));
+
+    let out = run_script("a = [10, 20]\na[1]\n[0]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(0)]));
+}
+
+#[test]
 fn semicolons_are_not_treated_as_newlines_inside_delimiters() {
     // `;` は文の区切りのまま。delimiter の内側ではエラーになる。
     assert!(run_script("[;1]").is_err());
+    assert!(run_script("[1; 2]").is_err());
     assert!(run_script("{;}").is_err());
     assert!(run_script("fn f(a) { a }\nf(;)").is_err());
     assert!(run_script("m = [1]\nm[;0]").is_err());
