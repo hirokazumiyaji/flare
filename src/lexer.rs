@@ -129,11 +129,11 @@ impl<'a> Lexer<'a> {
     /// wrapper を通し、補間内を含む token 数を一貫して制限する。
     fn next_token(&mut self) -> Result<Option<SpannedToken>, Box<dyn Error>> {
         let result = self.next_token_inner()?;
-        if result.is_some() {
+        if let Some(token) = &result {
             self.tokens_emitted = self.tokens_emitted.saturating_add(1);
             if let Some(max) = self.limits.max_tokens {
                 if self.tokens_emitted > max {
-                    let span = self.span();
+                    let span = token.span;
                     return Err(FirelangError::lex(
                         format!("token limit exceeded (max {max})"),
                         span.line,
