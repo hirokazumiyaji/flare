@@ -74,6 +74,7 @@ fn firestore_keeps_its_bytes_fields_read_only() {
         "set(\"users/a\", {data: bytes([1])})",
         "set(\"users/a\", {data: array_union([bytes([1])])})",
         "set(\"users/a\", {data: array_remove([bytes([1])])})",
+        "col(\"users\").where(\"data\", \"==\", bytes([1])).get()",
     ] {
         let err = run_script(script).unwrap_err();
         assert!(

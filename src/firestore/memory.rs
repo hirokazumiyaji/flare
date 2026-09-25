@@ -26,6 +26,9 @@ impl Firestore for InMemoryFirestore {
 
     fn run_query(&self, query: &QueryRef) -> Result<super::QueryCandidates, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
+        for filter in &query.filters {
+            reject_storage_bytes(&filter.value)?;
+        }
         Ok(self
             .candidates(&query.source)
             .filter(|(_, doc)| matches_filters(doc, &query.filters))
