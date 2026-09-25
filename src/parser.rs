@@ -91,14 +91,7 @@ impl Parser {
     /// トップレベル文と各文の開始位置を返す。runtime のエラーに文単位の
     /// 位置を付与するために使う。
     pub fn parse_program_with_spans(&mut self) -> Result<(Vec<Stmt>, Vec<Span>), Box<dyn Error>> {
-        if let Some(max) = self.limits.max_tokens {
-            // EOF is a synthetic token and is not charged to the source budget.
-            let eof = if self.at(&Token::Eof) { 1 } else { 0 };
-            let count = self.tokens.len().saturating_sub(eof);
-            if count > max {
-                return Err(self.parse_err(format!("token limit exceeded (max {max})")));
-            }
-        }
+        self.check_token_budget()?;
         let mut out = Vec::new();
         let mut spans = Vec::new();
         self.skip_separators();
@@ -526,6 +519,11 @@ impl Parser {
 
     /// 補間の中身(トークン列、末尾 Eof 付き)を単一の式として読む。
     /// 前後の改行・`;` は許すが、文が 2 つ以上あるとエラー。
+    ///
+    /// ここでは `max_tokens` を再検査しない。`parse_program_with_spans` の
+    /// `check_token_budget` が `count_source_tokens` で補間内のトークンまで
+    /// 含めて数えるため、ここで同じ budget を掛けると二重計上になる。
+    /// 構文の深さ(`max_depth`)は補間ごとに独立した経路なので別途検査する。
     fn parse_embedded_tokens(
         tokens: Vec<SpannedToken>,
         limits: ParserLimits,
@@ -572,6 +570,19 @@ impl Parser {
         Ok(block.body)
     }
     fn parse_brace_block_with_params(&mut self) -> Result<(Block, Option<Span>), Box<dyn Error>> {
+        // ブロック (`if` / `while` / `fn` / call block) も再帰して parse_stmt に
+        // 戻るため、式の production と同じくここで深さを制限する。これをしないと
+        // `max_tokens` に遠く及ばない深い `if 1 { if 1 { ... } }` が
+        // ガードに届く前にスタックを枯渇させる。
+        self.enter_nesting()?;
+        let result = self.parse_brace_block_with_params_active();
+        self.leave_nesting();
+        result
+    }
+
+    fn parse_brace_block_with_params_active(
+        &mut self,
+    ) -> Result<(Block, Option<Span>), Box<dyn Error>> {
         self.expect(Token::LBrace)?;
         // `{\n|x| ... }` のようにパラメータリストの直前に改行が置けるようにする。
         self.skip_newlines();
@@ -652,6 +663,25 @@ impl Parser {
             self.bump();
         }
     }
+    /// `max_tokens` を検査する。
+    ///
+    /// 補間(`StrPart::Interp`)の中のトークンも source budget に含まれる。
+    /// lexer はそれらを `tokens_emitted` に数えるが、`Parser::new` /
+    /// `from_spanned` を直接使う呼び出し側では lexer の budget を通らない
+    /// ため、Parser 側でも同じ数え方を強制する。
+    fn check_token_budget(&self) -> Result<(), Box<dyn Error>> {
+        let Some(max) = self.limits.max_tokens else {
+            return Ok(());
+        };
+        // 末尾の EOF は合成トークンなので source budget に計上しない。
+        let eof = if self.at(&Token::Eof) { 1 } else { 0 };
+        let count = count_source_tokens(self.tokens.as_slice()).saturating_sub(eof);
+        if count > max {
+            return Err(self.parse_err(format!("token limit exceeded (max {max})")));
+        }
+        Ok(())
+    }
+
     fn enter_nesting(&mut self) -> Result<(), Box<dyn Error>> {
         if let Some(max) = self.limits.max_depth {
             if self.nesting >= max {
@@ -693,30 +723,35 @@ impl Parser {
         let mut stack = vec![(stmt, 0usize)];
         while let Some((stmt, depth)) = stack.pop() {
             if depth > max {
-                return Err(self.parse_err(format!("parser nesting limit exceeded (max {max})")));
+                return Err(self.parse_err(format!(
+                    "parser nesting limit exceeded (max {max}, observed {depth})"
+                )));
             }
+            // 式は guard される nesting の一部ではないので、現在の深さを
+            // そのまま使う(`enter_nesting` と同じ基準: 最外の構築物が 0)。
+            //  Statements の本体だけが一階層深く入る。
             match stmt {
-                Stmt::Expr(expr) => self.validate_expr_depth(expr, depth + 1, max)?,
-                Stmt::Assign { value, .. } => self.validate_expr_depth(value, depth + 1, max)?,
+                Stmt::Expr(expr) => self.validate_expr_depth(expr, depth, max)?,
+                Stmt::Assign { value, .. } => self.validate_expr_depth(value, depth, max)?,
                 Stmt::Def { body, .. } => {
                     for child in body {
                         stack.push((child, depth + 1));
                     }
                 }
-                Stmt::Return(Some(expr)) => self.validate_expr_depth(expr, depth + 1, max)?,
+                Stmt::Return(Some(expr)) => self.validate_expr_depth(expr, depth, max)?,
                 Stmt::Return(None) => {}
                 Stmt::If {
                     cond,
                     then_body,
                     else_body,
                 } => {
-                    self.validate_expr_depth(cond, depth + 1, max)?;
+                    self.validate_expr_depth(cond, depth, max)?;
                     for child in then_body.iter().chain(else_body) {
                         stack.push((child, depth + 1));
                     }
                 }
                 Stmt::While { cond, body } => {
-                    self.validate_expr_depth(cond, depth + 1, max)?;
+                    self.validate_expr_depth(cond, depth, max)?;
                     for child in body {
                         stack.push((child, depth + 1));
                     }
@@ -744,7 +779,9 @@ impl Parser {
         let mut stack = vec![(expr, initial_depth)];
         while let Some((expr, depth)) = stack.pop() {
             if depth > max {
-                return Err(self.parse_err(format!("parser nesting limit exceeded (max {max})")));
+                return Err(self.parse_err(format!(
+                    "parser nesting limit exceeded (max {max}, observed {depth})"
+                )));
             }
             let child_depth = depth.saturating_add(1);
             match expr {
@@ -879,5 +916,104 @@ impl Parser {
             }
             t => Err(self.parse_err(format!("expected ident, got {t:?}"))),
         }
+    }
+}
+
+/// ソース上のトークン数を数える(補間内のトークンも含めて再帰的に数える)。
+///
+/// `max_tokens` は「補間のトークンを含めた source token 数」なので、
+/// 最上位の `Vec<Token>` の長さだけでは数え切れない。補間の入れ子は
+/// 文字列リテラルの深さと同じなので、補間がネストしてもこの再帰は
+/// source のネスト数以内で終わる。
+fn count_source_tokens(tokens: &[Token]) -> usize {
+    let mut count = 0usize;
+    for token in tokens {
+        count = count.saturating_add(1);
+        if let Token::Str(parts) = token {
+            for part in parts {
+                if let StrPart::Interp(inner) = part {
+                    count = count.saturating_add(count_spanned_source_tokens(inner));
+                }
+            }
+        }
+    }
+    count
+}
+
+/// 補間内のトークン列を数える。合成された末尾 `Eof` は数えない。
+fn count_spanned_source_tokens(tokens: &[SpannedToken]) -> usize {
+    let mut count = 0usize;
+    for spanned in tokens {
+        if spanned.token == Token::Eof {
+            continue;
+        }
+        count = count.saturating_add(1);
+        if let Token::Str(parts) = &spanned.token {
+            for part in parts {
+                if let StrPart::Interp(inner) = part {
+                    count = count.saturating_add(count_spanned_source_tokens(inner));
+                }
+            }
+        }
+    }
+    count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::limits::ParserLimits;
+
+    fn parse_with_depth(source: &str, max_depth: usize) -> Result<Vec<Stmt>, Box<dyn Error>> {
+        let tokens = crate::lexer::lex(source)?;
+        let limits = ParserLimits {
+            max_tokens: None,
+            max_depth: Some(max_depth),
+            ..ParserLimits::default()
+        };
+        Parser::new_with_limits(tokens, limits).parse_program()
+    }
+
+    #[test]
+    fn deeply_nested_blocks_are_rejected_by_the_depth_guard() {
+        // `max_tokens` に遠く及ばない深さなので、token budget では防げない。
+        // block の再帰に depth guard が無いとスタックを枯渇させる。
+        let source = "if 1 {\n".repeat(64) + "1\n" + &"}\n".repeat(64);
+        let err = parse_with_depth(&source, 8).unwrap_err();
+        assert!(format!("{err}").contains("nesting limit exceeded"), "{err}");
+    }
+
+    #[test]
+    fn shallow_blocks_within_the_depth_limit_still_parse() {
+        let source = "if 1 {\n".repeat(3) + "1\n" + &"}\n".repeat(3);
+        let program = parse_with_depth(&source, 8).unwrap();
+        // 入れ子の `if` は外側の 1 つの Stmt::If になり、本体は内側に畳まれる。
+        assert_eq!(program.len(), 1);
+        assert!(matches!(program[0], Stmt::If { .. }));
+    }
+
+    #[test]
+    fn flat_program_is_allowed_at_depth_zero() {
+        // 最外の構築物が depth 0 なので、guard の基準と post-parse walk の
+        // 基準が一致していなければ `max_depth = 0` で平坦なコードまで落ちる。
+        parse_with_depth("x = 1\ny = 2\n", 0).unwrap();
+    }
+
+    #[test]
+    fn count_source_tokens_includes_interpolation_tokens() {
+        // 補間の中身が source token budget に含まれることの確認。
+        let tokens = crate::lexer::lex("\"a#{1 + 2}b\"").unwrap();
+        let counted = count_source_tokens(&tokens);
+        let interp: usize = tokens
+            .iter()
+            .filter_map(|t| match t {
+                Token::Str(parts) => Some(parts.len()),
+                _ => None,
+            })
+            .sum();
+        assert!(
+            counted > interp + 1,
+            "counted {counted} should exceed the single outer string token"
+        );
     }
 }

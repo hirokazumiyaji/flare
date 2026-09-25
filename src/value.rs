@@ -135,17 +135,23 @@ pub struct UserFunc {
 /// parser-generated literals is not sufficient.  The root has depth zero;
 /// nested arrays/maps increase the depth by one.
 pub fn validate_value_depth(value: &Value, max_depth: usize) -> Result<(), Box<dyn Error>> {
-    validate_value_limits(value, Some(max_depth), None)
+    validate_value_limits(value, Some(max_depth), None).map(|_| ())
 }
 
-/// Validate both nesting and total node count of a runtime value.
+/// Validate both nesting and total node count of a runtime value in a single
+/// pass and return the observed maximum depth.
+///
+/// The node budget is enforced *while enqueuing* children, so a wide
+/// backend-supplied value cannot allocate an unbounded `Vec` before the limit
+/// has a chance to fire.
 pub fn validate_value_limits(
     value: &Value,
     max_depth: Option<usize>,
     max_nodes: Option<usize>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<usize, Box<dyn Error>> {
     let mut stack = vec![(value, 0usize)];
     let mut nodes = 0usize;
+    let mut observed_depth = 0usize;
 
     while let Some((value, depth)) = stack.pop() {
         if let Some(max) = max_depth {
@@ -159,16 +165,24 @@ pub fn validate_value_limits(
                 return Err(format!("value node limit exceeded (max {max})").into());
             }
         }
+        observed_depth = observed_depth.max(depth);
+
+        let child_depth = depth.saturating_add(1);
+        if let Some(max) = max_depth {
+            if child_depth > max {
+                return Err(format!("value nesting limit exceeded (max {max})").into());
+            }
+        }
 
         match value {
             Value::Array(items) | Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
                 for item in items {
-                    stack.push((item, depth + 1));
+                    stack.push((item, child_depth));
                 }
             }
             Value::Map(map) => {
                 for item in map.values() {
-                    stack.push((item, depth + 1));
+                    stack.push((item, child_depth));
                 }
             }
             // Function bodies are ASTs and are checked by the parser.  Other
@@ -177,31 +191,7 @@ pub fn validate_value_limits(
             _ => {}
         }
     }
-    Ok(())
-}
-
-/// Return the maximum nesting depth of a value.  This iterative form is safe
-/// to call on values received from an untrusted backend.
-pub fn value_depth(value: &Value) -> usize {
-    let mut stack = vec![(value, 0usize)];
-    let mut max = 0usize;
-    while let Some((value, depth)) = stack.pop() {
-        max = max.max(depth);
-        match value {
-            Value::Array(items) | Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
-                for item in items {
-                    stack.push((item, depth + 1));
-                }
-            }
-            Value::Map(map) => {
-                for item in map.values() {
-                    stack.push((item, depth + 1));
-                }
-            }
-            _ => {}
-        }
-    }
-    max
+    Ok(observed_depth)
 }
 
 impl Timestamp {

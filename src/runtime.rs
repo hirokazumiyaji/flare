@@ -103,7 +103,7 @@ impl<F: Firestore> Runtime<F> {
     }
 
     pub fn eval_program(&mut self, stmts: &[Stmt]) -> Result<Value, Box<dyn Error>> {
-        self.start_execution();
+        self.start_execution()?;
         let result = self
             .check_wall_clock()
             .and_then(|_| self.eval_block(stmts).map(ExecFlow::into_value));
@@ -119,7 +119,7 @@ impl<F: Firestore> Runtime<F> {
         stmts: &[Stmt],
         spans: &[Span],
     ) -> Result<Value, Box<dyn Error>> {
-        self.start_execution();
+        self.start_execution()?;
         let result = self
             .check_wall_clock()
             .and_then(|_| self.eval_program_with_spans_active(stmts, spans));
@@ -147,7 +147,7 @@ impl<F: Firestore> Runtime<F> {
     /// ソースを字句解析・構文解析・評価する一連の処理。`lib.rs` の
     /// エントリポイントとテストの共有ヘルパー。
     pub fn run(&mut self, source: &str) -> Result<Value, Box<dyn Error>> {
-        self.start_execution();
+        self.start_execution()?;
         let result = self.run_active(source);
         self.finish_execution();
         result
@@ -166,11 +166,23 @@ impl<F: Firestore> Runtime<F> {
         self.eval_program_with_spans_active(&program, &spans)
     }
 
-    fn start_execution(&mut self) {
+    /// 実行を開始し、budget の起点を記録する。
+    ///
+    /// 公開エントリポイント (`run` / `eval_program*`) は再入を許さない。
+    /// 許すと `start_execution` が実行中の `usage` / `started_at` を静かに
+    /// リセットし、step / value / wall-clock の budget が実質無効になる。
+    fn start_execution(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.execution_active {
+            return Err(FirelangError::runtime(
+                "run() / eval_program() is already executing on this Runtime",
+            )
+            .into());
+        }
         self.usage = RuntimeUsage::default();
         self.call_depth = 0;
         self.started_at = Some(Instant::now());
         self.execution_active = true;
+        Ok(())
     }
 
     fn finish_execution(&mut self) {
@@ -245,25 +257,26 @@ impl<F: Firestore> Runtime<F> {
         self.call_depth = self.call_depth.saturating_sub(1);
     }
 
+    /// 検証と depth 観測を 1 パスで行う。
+    ///
+    /// スカラー(数値・文字列・真偽値など)은子が無いため、走査せず
+    /// そのまま depth 0 を返す。`value_depth` のような別の全走査は行わない
+    /// ので、式評価のたびに値が二重に走査されることがない。
     fn check_value(&mut self, value: &Value) -> Result<(), Box<dyn Error>> {
-        let max_depth = value::value_depth(value);
-        if self
-            .limits
-            .max_value_depth
-            .is_some_and(|max| max_depth > max)
-        {
-            return Err(FirelangError::runtime(format!(
-                "value nesting limit exceeded (max {})",
-                self.limits.max_value_depth.expect("checked above")
-            ))
-            .into());
+        if !matches!(
+            value,
+            Value::Array(_) | Value::ArrayUnion(_) | Value::ArrayRemove(_) | Value::Map(_)
+        ) {
+            // スカラー値には子が無いので depth 0 相当。観測した最大値は
+            // 既に 0 以上なので usage を更新する必要はない。
+            return Ok(());
         }
-        value::validate_value_limits(
+        let observed_depth = value::validate_value_limits(
             value,
             self.limits.max_value_depth,
             self.limits.max_value_nodes,
         )?;
-        self.usage.max_value_depth = self.usage.max_value_depth.max(max_depth);
+        self.usage.max_value_depth = self.usage.max_value_depth.max(observed_depth);
         Ok(())
     }
 
@@ -770,8 +783,13 @@ impl<F: Firestore> Runtime<F> {
     }
 }
 
+/// 予算を診断文に出すための表記。
+///
+/// ミリ秒固定だと 500µs のような sub-millisecond 予算が "max 0ms" と
+/// 誤表示され、単位も分からない。`Duration` の `Debug` 表現は設定した
+/// 単位に合わせて出るため、予算と診断文がずれない。
 fn format_duration(duration: Duration) -> String {
-    format!("{}ms", duration.as_millis())
+    format!("{duration:?}")
 }
 
 fn bind_function_args(
@@ -1097,8 +1115,11 @@ fn builtin_batch<F: Firestore>(
     let (flow, writes) = rt.run_staged_block(ExecCtx::Batch { writes: vec![] }, &stmts.body);
     let flow = flow?;
     rt.check_wall_clock()?;
+    // `apply` は永続書き込みなので、ここでは wall-clock を再検査しない。
+    // 書き込み後の timeout 判定は「成功したはずの write」を失敗として返し、
+    // 呼び出し側の再試行と重なって二重書き込みを招く。実際の RPC には
+    // `Runtime::with_limits` が設定した backend deadline が効く。
     rt.fs.apply(writes).map_err(backend_err)?;
-    rt.check_wall_clock()?;
     Ok(flow.into_value())
 }
 
@@ -1119,7 +1140,13 @@ fn builtin_transaction<F: Firestore>(
     }
     rt.check_wall_clock()?;
     rt.fs.begin_transaction().map_err(backend_err)?;
-    rt.check_wall_clock()?;
+    // `begin_transaction` は遅いことがあるため、budget 超過を begin 後に
+    // 検出したら必ず abort する。さもないと server transaction が開き続け、
+    // 以降の `begin_transaction` が "already in transaction" で失敗する。
+    if let Err(e) = rt.check_wall_clock() {
+        let _ = rt.fs.abort_transaction();
+        return Err(e);
+    }
     let (flow, writes) = rt.run_staged_block(ExecCtx::Transaction { writes: vec![] }, &stmts.body);
     match flow {
         Ok(flow) => {
@@ -1128,7 +1155,9 @@ fn builtin_transaction<F: Firestore>(
                 let _ = rt.fs.abort_transaction();
                 return Err(backend_err(e));
             }
-            rt.check_wall_clock()?;
+            // commit 後も wall-clock を再検査しない。batch と同じく、
+            // 永続化済みの操作を timeout として返すと再試行が二重書き込みに
+            // つながる。commit 自体の deadline は backend timeout が担保する。
             Ok(flow.into_value())
         }
         Err(e) => {
@@ -1470,6 +1499,34 @@ impl ExecFlow {
 mod tests {
     use super::*;
     use crate::firestore::InMemoryFirestore;
+
+    #[test]
+    fn execution_state_is_cleared_after_run() {
+        // 正常終了後に再入 guard が残っていると、2 回目以降の run が
+        // すべて「already executing」で失敗してしまう。
+        let mut rt = Runtime::new(InMemoryFirestore::default());
+        rt.run("1 + 1").unwrap();
+        assert!(!rt.execution_active);
+        rt.run("2 + 2").unwrap();
+    }
+
+    #[test]
+    fn execution_state_is_cleared_after_a_failed_run() {
+        let mut rt = Runtime::new(InMemoryFirestore::default());
+        assert!(rt.run("(").is_err());
+        assert!(!rt.execution_active);
+        rt.run("1").unwrap();
+    }
+
+    #[test]
+    fn reentrant_execution_is_rejected() {
+        // 再入を許すと start_execution が実行中の usage をリセットし、
+        // step / wall-clock の budget が実質無効になる。
+        let mut rt = Runtime::new(InMemoryFirestore::default());
+        rt.execution_active = true;
+        let err = rt.run("1").unwrap_err();
+        assert!(format!("{err}").contains("already executing"), "{err}");
+    }
 
     #[test]
     fn builtin_table_matches_name_list() {
