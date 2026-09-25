@@ -138,8 +138,11 @@ impl Firestore for FirestoreEmulator {
         // Validate before consuming the local transaction id. A rejected write
         // must still be abortable so the server transaction is rolled back.
         super::validate_writes(&writes)?;
-        let tid = self.transaction_id.take().ok_or("not in transaction")?;
+        // Build the SDK payload before consuming the id: field-path and
+        // transform conversion can also fail, and the runtime must still be
+        // able to issue Rollback for the live server transaction.
         let sdk_writes = writes::write_ops_to_sdk_writes(&self.client.project_id, &writes)?;
+        let tid = self.transaction_id.take().ok_or("not in transaction")?;
         writes::commit_writes(&self.client.db, &self.client.runtime, sdk_writes, tid)
     }
 
