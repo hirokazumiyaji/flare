@@ -681,12 +681,16 @@ fn builtin_bytes<F: Firestore>(
     if args.len() != 1 || !kwargs.is_empty() || block.is_some() {
         return Err("bytes expects one string or an array of integers from 0 to 255".into());
     }
-    let bytes = match &args[0] {
-        Value::Str(s) => s.as_bytes().to_vec(),
+    let value = args
+        .into_iter()
+        .next()
+        .ok_or("bytes expects one string or an array of integers from 0 to 255")?;
+    let bytes = match value {
+        Value::Str(s) => s.into_bytes(),
         Value::Array(items) => items
-            .iter()
+            .into_iter()
             .map(|value| match value {
-                Value::Int(byte) => u8::try_from(*byte)
+                Value::Int(byte) => u8::try_from(byte)
                     .map_err(|_| "bytes array elements must be integers from 0 to 255".to_string()),
                 _ => Err("bytes array elements must be integers from 0 to 255".to_string()),
             })
