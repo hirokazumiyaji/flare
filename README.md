@@ -17,10 +17,26 @@ puts "found #{rows}"
 - [リリースチェックリスト](docs/release-checklist.md)
 - [過去の MVP 計画資料(アーカイブ)](docs/archive/mvp/)
 
+## 再現可能なビルド
+
+Rust は [`rust-toolchain.toml`](rust-toolchain.toml) で **1.98.1** に固定されています。
+依存関係を更新しない限り、Cargo の依存解決を変更するコマンドには `--locked` を付けてください。CI と CD は同じ toolchain と `Cargo.lock` を使います。
+
+Firestore エミュレータの CI は Node **24.11.0**、Temurin Java **21.0.8**、Firebase CLI **15.31.0** を使い、ジョブログに各バージョンを表示します。
+ローカルでも同じ Firebase CLI を使う場合は、明示的にインストールして `firebase --version` で確認してください。
+
+```bash
+npm install --global firebase-tools@15.31.0
+firebase --version  # 15.31.0 と表示されること
+```
+
+GitHub Actions は full commit SHA で固定されています。
+更新は [Dependabot](.github/dependabot.yml) が Rust 依存関係と Action 更新を別々の pull request で提案します。
+
 ## 使い方
 
 ```bash
-cargo run --bin fl -- path/to/script.fl
+cargo run --locked --bin fl -- path/to/script.fl
 ```
 
 デフォルトは in-memory バックエンドです。Firestore エミュレータに接続する場合(`FIRESTORE_EMULATOR_HOST` が必須。プロジェクト ID は省略時 `firelang-test`):
@@ -28,14 +44,14 @@ cargo run --bin fl -- path/to/script.fl
 ```bash
 export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080
 export FIRESTORE_PROJECT_ID=firelang-test
-cargo run --bin fl -- --backend emulator path/to/script.fl
+cargo run --locked --bin fl -- --backend emulator path/to/script.fl
 ```
 
 エミュレータは Firebase CLI で起動します(別ターミナルで `firebase emulators:start --only firestore` など)。リポジトリ直下の `firebase.json` を使ってワンショットで試す例:
 
 ```bash
 firebase emulators:exec --only firestore --project demo-firelang \
-  'FIRESTORE_PROJECT_ID=demo-firelang cargo test --test firestore_emulator -- --nocapture'
+  'FIRESTORE_PROJECT_ID=demo-firelang cargo test --locked --test firestore_emulator -- --nocapture'
 ```
 
 本番 Firestore(認証付き)は非対応です。詳細は [仕様の 11-12 章](docs/spec.md#11-バックエンド) を参照してください。
@@ -43,22 +59,22 @@ firebase emulators:exec --only firestore --project demo-firelang \
 ## テスト
 
 ```bash
-cargo test                          # ユニット + in-memory テスト
-cargo test --test example_scripts   # サンプルスクリプト一括実行
-cargo test --test cli               # CLI スモークテスト
+cargo test --locked                          # ユニット + in-memory テスト
+cargo test --locked --test example_scripts   # サンプルスクリプト一括実行
+cargo test --locked --test cli               # CLI スモークテスト
 ```
 
 エミュレータ統合テストは `FIRESTORE_EMULATOR_HOST` が未設定なら早期 return でスキップされます。実際に叩くには上記の `firebase emulators:exec` を使うか、エミュレータ起動後に環境変数を設定して:
 
 ```bash
-cargo test --test firestore_emulator -- --nocapture
+cargo test --locked --test firestore_emulator -- --nocapture
 ```
 
 ## CI / CD (GitHub Actions)
 
-- **`test` ジョブ**: `cargo fmt --check`, `cargo test --all-targets`, `cargo build --release --bin fl`
-- **`integration-emulator` ジョブ**: Firestore エミュレータを起動して `cargo test --test firestore_emulator` を実行
-- **`CD`**: `v*` タグ push で `fl` の Linux バイナリをビルドして GitHub Release に添付
+- **`test` ジョブ**: 固定された Rust toolchain と `Cargo.lock` で `cargo fmt --check`, `cargo clippy --locked`, `cargo test --locked`, `cargo build --locked` を実行
+- **`integration-emulator` ジョブ**: Firebase CLI 15.31.0 の Firestore エミュレータを起動し、tool version をログに出力してから `cargo test --locked --test firestore_emulator` を実行
+- **`CD`**: `v*` タグ push で `fl` の Linux バイナリをビルドし、Rust/Cargo と `Cargo.lock` の hash、CI 用 Firebase CLI version を `tool-versions.txt` として GitHub Release に添付
 
 ## ライセンス
 

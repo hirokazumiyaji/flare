@@ -1,0 +1,5 @@
+# Keep this version in sync with the explicit toolchain input in CI and CD.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
