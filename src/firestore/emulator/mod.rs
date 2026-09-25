@@ -264,15 +264,31 @@ impl Firestore for FirestoreEmulator {
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
-        let tid = self.transaction_id.take().ok_or("not in transaction")?;
+        // transaction id は結果が決まるまで `self` に残す。
+        // 先に take() すると、SDK 変換の失敗や commit の timeout で
+        // server 側の transaction が孤児になり、`abort_transaction` も
+        // 空振りして以後の `begin_transaction` が "already in transaction"
+        // で失敗し続ける。timeout の場合は commit が server 側で適用済み
+        // かもしれないので、その tx id を失うと結果の曖昧さを解消できない。
+        let tid = self.transaction_id.clone().ok_or("not in transaction")?;
         let sdk_writes = writes::write_ops_to_sdk_writes(&self.client.project_id, &writes)?;
-        writes::commit_writes(
+        let result = writes::commit_writes(
             &self.client.db,
             &self.client.runtime,
             self.client.operation_timeout,
             sdk_writes,
             tid,
-        )
+        );
+        // 成功、または決定的な失敗では server 側の transaction は閉じている。
+        // timeout のときだけは commit が server 側で適用済みかもしれないので、
+        // Rollback で「未適用」と確定させてから local state を捨てる。
+        // (結果不明のまま tx id を失うと、呼び出し側の再試行が二重適用に
+        // つながる。Rollback の成否自体は元の timeout を壊さないので無視。)
+        if matches!(&result, Err(e) if client::is_timeout_error(e.as_ref())) {
+            let _ = self.abort_transaction();
+        }
+        self.transaction_id = None;
+        result
     }
 
     fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {

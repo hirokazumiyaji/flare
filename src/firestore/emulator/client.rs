@@ -86,6 +86,15 @@ fn timeout_error(operation: &str, elapsed: Duration, timeout: Duration) -> Box<d
     .into()
 }
 
+/// このエラーが「操作の成否が不明な timeout」由来かどうか。
+///
+/// timeout は future を drop するので、server 側が commit を適用したかを
+/// 知ることができない。決定的な失敗と区別することで、呼び出し側が Rollback
+/// で状態を確定させ、再試行による二重適用を避けられる。
+pub(super) fn is_timeout_error(error: &dyn Error) -> bool {
+    error.to_string().contains("timed out")
+}
+
 fn sdk_options(host: &str, project_id: &str) -> FirestoreDbOptions {
     FirestoreDbOptions::new(project_id.to_string()).with_firebase_api_url(ensure_url_scheme(host))
 }
@@ -178,5 +187,21 @@ mod tests {
             7
         });
         assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn timeout_errors_are_distinguishable_from_definitive_failures() {
+        // `commit_transaction` は timeout(結果不明)Rollback で状態を確定
+        // させるので、timeout を決定的な失敗と区別できる必要がある。
+        let timed_out: Box<dyn Error> = FirelangError::backend(
+            "Firestore emulator operation 'transaction_commit' timed out: elapsed 10ms exceeded timeout 5ms",
+        )
+        .into();
+        assert!(is_timeout_error(timed_out.as_ref()));
+
+        let definitive: Box<dyn Error> =
+            FirelangError::backend("Firestore emulator operation 'transaction_commit' failed")
+                .into();
+        assert!(!is_timeout_error(definitive.as_ref()));
     }
 }
