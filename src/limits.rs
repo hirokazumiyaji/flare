@@ -23,6 +23,11 @@ pub const DEFAULT_BACKEND_TIMEOUT_MS: u64 = 5_000;
 /// to `run`/`eval_program` and are reset at the beginning of the next run.
 /// A step is one evaluated statement; a loop iteration is one pass through a
 /// `while`, `each`, or `map` body.
+///
+/// `RuntimeLimits` is the only name for this type. There are deliberately no
+/// aliases (`RuntimeConfig` / `ExecutionLimits` / `Budgets`): several names
+/// for one type make it unclear which is the real API surface while adding no
+/// behaviour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeLimits {
     /// Maximum nested call depth.  Calls include built-ins and user functions.
@@ -32,6 +37,14 @@ pub struct RuntimeLimits {
     /// Maximum number of loop-body iterations (shared by all loops in a run).
     pub max_loop_iterations: Option<u64>,
     /// Maximum elapsed time for parsing and evaluation.
+    ///
+    /// **協調的な phase 境界の deadline**: 評価ステップの開始時、lex/parse
+    /// の前後、backend 呼び出しの前後など、処理の区切りでだけ評価する。
+    /// したがって 1 つの巨大な配列/map リテラルを組み立てるような区間では、
+    /// 実際の経過がこの予算を超えてから検出することがある。
+    /// 厳密な強制が要るなら source / token / value-node の各予算を併せて
+    /// 設定すること（それらは構文・評価の途中で必ず検査される）。
+    /// 実際の RPC には `backend_timeout` が別途効く。
     pub max_wall_clock: Option<Duration>,
     /// Maximum parser/AST nesting depth.
     pub max_parser_depth: Option<usize>,
@@ -111,10 +124,6 @@ impl RuntimeLimits {
         self
     }
 
-    pub fn with_call_depth(self, limit: usize) -> Self {
-        self.with_max_call_depth(limit)
-    }
-
     pub fn with_max_steps(mut self, limit: u64) -> Self {
         self.max_steps = Some(limit);
         self
@@ -140,26 +149,14 @@ impl RuntimeLimits {
         self
     }
 
-    pub fn with_parser_depth(self, limit: usize) -> Self {
-        self.with_max_parser_depth(limit)
-    }
-
     pub fn with_max_value_depth(mut self, limit: usize) -> Self {
         self.max_value_depth = Some(limit);
         self
     }
 
-    pub fn with_value_depth(self, limit: usize) -> Self {
-        self.with_max_value_depth(limit)
-    }
-
     pub fn with_max_query_results(mut self, limit: usize) -> Self {
         self.max_query_results = Some(limit);
         self
-    }
-
-    pub fn with_query_result_limit(self, limit: usize) -> Self {
-        self.with_max_query_results(limit)
     }
 
     pub fn with_max_source_bytes(mut self, limit: usize) -> Self {
@@ -248,11 +245,6 @@ impl ParserLimits {
         self
     }
 }
-
-/// Compatibility aliases for embedders that prefer configuration terminology.
-pub type RuntimeConfig = RuntimeLimits;
-pub type ExecutionLimits = RuntimeLimits;
-pub type Budgets = RuntimeLimits;
 
 /// A snapshot of budget consumption after a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -59,11 +59,6 @@ impl<F: Firestore> Runtime<F> {
         Self::with_limits(fs, RuntimeLimits::unlimited())
     }
 
-    /// Alias for [`Runtime::with_limits`] using configuration terminology.
-    pub fn with_config(fs: F, config: RuntimeLimits) -> Self {
-        Self::with_limits(fs, config)
-    }
-
     pub fn limits(&self) -> RuntimeLimits {
         self.limits
     }
@@ -88,11 +83,6 @@ impl<F: Firestore> Runtime<F> {
             .map(|start| start.elapsed())
             .unwrap_or_default();
         usage
-    }
-
-    /// Alias for [`Runtime::usage`] for callers that think in terms of budgets.
-    pub fn budget_usage(&self) -> RuntimeUsage {
-        self.usage()
     }
 
     pub fn reset_usage(&mut self) {

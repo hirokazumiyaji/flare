@@ -13,9 +13,7 @@ use runtime::Runtime;
 
 pub use error::{ErrorKind, FirelangError, Span};
 pub use firestore::{Firestore, FirestoreEmulator, InMemoryFirestore};
-pub use limits::{
-    Budgets, ExecutionLimits, ParserLimits, RuntimeConfig, RuntimeLimits, RuntimeUsage,
-};
+pub use limits::{ParserLimits, RuntimeLimits, RuntimeUsage};
 pub use value::Value;
 
 pub fn run_script(source: &str) -> Result<Value, Box<dyn Error>> {
@@ -44,13 +42,4 @@ pub fn run_script_with_firestore_and_limits<F: Firestore>(
     limits: RuntimeLimits,
 ) -> Result<Value, Box<dyn Error>> {
     Runtime::with_limits(firestore, limits).run(source)
-}
-
-/// Alias using configuration terminology.
-pub fn run_script_with_config<F: Firestore>(
-    source: &str,
-    firestore: F,
-    config: RuntimeConfig,
-) -> Result<Value, Box<dyn Error>> {
-    run_script_with_firestore_and_limits(source, firestore, config)
 }
