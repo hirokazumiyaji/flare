@@ -15,6 +15,15 @@ enum ExecCtx {
     Transaction { writes: Vec<WriteOp> },
 }
 
+enum MethodReceiver {
+    Collection(CollectionRef),
+    CollectionGroup(CollectionGroupRef),
+    Query(QueryRef),
+    Array(Vec<Value>),
+    Timestamp(Timestamp),
+    Map(BTreeMap<String, Value>),
+}
+
 pub struct Runtime<F: Firestore> {
     scopes: Vec<HashMap<String, Value>>,
     fs: F,
@@ -235,12 +244,9 @@ impl<F: Firestore> Runtime<F> {
                 // receiver failure is returned before any argument expression
                 // can run.
                 let receiver_value = match receiver.as_deref() {
-                    Some(expr) => Some(self.eval_expr(expr)?),
+                    Some(expr) => Some(into_method_receiver(self.eval_expr(expr)?)?),
                     None => None,
                 };
-                if let Some(value) = receiver_value.as_ref() {
-                    validate_method_receiver(value)?;
-                }
 
                 // `args` is one ordered sequence; splitting it into
                 // positional/keyword collections for binding must not change
@@ -281,7 +287,7 @@ impl<F: Firestore> Runtime<F> {
 
     fn eval_call(
         &mut self,
-        receiver: Option<Value>,
+        receiver: Option<MethodReceiver>,
         name: &str,
         args: Vec<Value>,
         kwargs: BTreeMap<String, Value>,
@@ -321,13 +327,13 @@ impl<F: Firestore> Runtime<F> {
 
     fn eval_method_call(
         &mut self,
-        receiver: Value,
+        receiver: MethodReceiver,
         name: &str,
         args: Vec<Value>,
         block: Option<&Block>,
     ) -> Result<Value, Box<dyn Error>> {
         match receiver {
-            Value::CollectionRef(collection) if name == "doc" => {
+            MethodReceiver::Collection(collection) if name == "doc" => {
                 let id = expect_string(args.first())?;
                 if id.is_empty() || id.contains('/') {
                     return Err(format!("invalid document id: {id}").into());
@@ -336,15 +342,15 @@ impl<F: Firestore> Runtime<F> {
                     path: format!("{}/{}", collection.path, id),
                 }))
             }
-            Value::CollectionRef(collection) => {
+            MethodReceiver::Collection(collection) => {
                 self.eval_query_method(collection.to_query(), name, args)
             }
-            Value::CollectionGroupRef(group) => {
+            MethodReceiver::CollectionGroup(group) => {
                 self.eval_query_method(group.to_query(), name, args)
             }
-            Value::QueryRef(query) => self.eval_query_method(query, name, args),
-            Value::Array(items) => self.eval_array_method(items, name, args, block),
-            Value::Timestamp(ts) => match name {
+            MethodReceiver::Query(query) => self.eval_query_method(query, name, args),
+            MethodReceiver::Array(items) => self.eval_array_method(items, name, args, block),
+            MethodReceiver::Timestamp(ts) => match name {
                 "to_unix" => Ok(Value::Int(ts.seconds)),
                 "to_rfc3339" => Ok(Value::Str(ts.to_rfc3339()?)),
                 "add_seconds" => Ok(Value::Timestamp(Timestamp {
@@ -352,7 +358,7 @@ impl<F: Firestore> Runtime<F> {
                 })),
                 _ => Err(format!("unknown timestamp method: {name}").into()),
             },
-            Value::Map(map) => {
+            MethodReceiver::Map(map) => {
                 // Map レシーバは `m.key` 形式のキーアクセス(Ruby の OpenStruct 風)のみ。
                 // 引数を取るメソッドは持たないので、Args がある場合はエラーにする。
                 if !args.is_empty() {
@@ -360,7 +366,6 @@ impl<F: Firestore> Runtime<F> {
                 }
                 Ok(map.get(name).cloned().unwrap_or(Value::Nil))
             }
-            _ => Err("unsupported method receiver".into()),
         }
     }
 
@@ -492,18 +497,17 @@ impl<F: Firestore> Runtime<F> {
     }
 }
 
-/// Validate the receiver category before evaluating argument expressions.  The
-/// detailed method contract is checked after the arguments have been
-/// evaluated, but an unsupported receiver must not allow argument side effects
-/// to hide the receiver error.
-fn validate_method_receiver(receiver: &Value) -> Result<(), Box<dyn Error>> {
-    match receiver {
-        Value::CollectionRef(_)
-        | Value::CollectionGroupRef(_)
-        | Value::QueryRef(_)
-        | Value::Array(_)
-        | Value::Timestamp(_)
-        | Value::Map(_) => Ok(()),
+/// Convert an evaluated receiver into the exhaustive set accepted by method
+/// dispatch.  Keeping this conversion next to the dispatch match prevents a
+/// new receiver from being accepted by one path but rejected by the other.
+fn into_method_receiver(value: Value) -> Result<MethodReceiver, Box<dyn Error>> {
+    match value {
+        Value::CollectionRef(value) => Ok(MethodReceiver::Collection(value)),
+        Value::CollectionGroupRef(value) => Ok(MethodReceiver::CollectionGroup(value)),
+        Value::QueryRef(value) => Ok(MethodReceiver::Query(value)),
+        Value::Array(value) => Ok(MethodReceiver::Array(value)),
+        Value::Timestamp(value) => Ok(MethodReceiver::Timestamp(value)),
+        Value::Map(value) => Ok(MethodReceiver::Map(value)),
         _ => Err("unsupported method receiver".into()),
     }
 }
