@@ -45,30 +45,34 @@ fn main() {
 
     let started = Instant::now();
     for _ in 0..ITERATIONS {
-        black_box(firestore.count_query(&count_query).unwrap());
+        let count = black_box(firestore.count_query(&count_query).unwrap());
+        assert_eq!(count, DOCUMENT_COUNT as i64);
     }
     let optimized_count = started.elapsed();
 
     let started = Instant::now();
     for _ in 0..ITERATIONS {
-        black_box(firestore.run_query(&count_query).unwrap().len());
+        let rows = black_box(firestore.run_query(&count_query).unwrap());
+        assert_eq!(rows.len(), DOCUMENT_COUNT);
     }
     let fallback_count = started.elapsed();
 
     let started = Instant::now();
     for _ in 0..ITERATIONS {
-        black_box(firestore.run_query_page(&page_query).unwrap());
+        let rows = black_box(firestore.run_query_page(&page_query).unwrap());
+        assert_eq!(rows.len(), 1);
     }
     let optimized_page = started.elapsed();
 
     let started = Instant::now();
     for _ in 0..ITERATIONS {
-        black_box(firestore.run_query(&page_query).unwrap());
+        let rows = black_box(firestore.run_query(&page_query).unwrap());
+        assert_eq!(rows.len(), 1);
     }
     let fallback_page = started.elapsed();
 
-    let payload_mib = DOCUMENT_COUNT * PAYLOAD_BYTES / 1024 / 1024;
-    println!("{payload_mib} MiB of document payload, {ITERATIONS} iterations");
+    let payload_mib = DOCUMENT_COUNT as f64 * PAYLOAD_BYTES as f64 / 1024.0 / 1024.0;
+    println!("{payload_mib:.2} MiB of document payload, {ITERATIONS} iterations");
     println!("count direct:      {optimized_count:?}");
     println!("count fallback:    {fallback_count:?}");
     println!("limit(1) direct:   {optimized_page:?}");

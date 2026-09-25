@@ -35,22 +35,13 @@ impl Firestore for InMemoryFirestore {
 
     fn run_query_page(&self, query: &QueryRef) -> Result<super::QueryCandidates, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
-        let mut rows: Vec<_> = self
-            .candidates(&query.source)
-            .filter(|(_, doc)| matches_filters(doc, &query.filters))
-            .collect();
-        if query.order_by.is_empty() {
-            rows.sort_by(|a, b| a.0.cmp(b.0));
-        } else {
-            rows.retain(|(path, doc)| super::candidate_has_order_fields(path, doc, query));
-            rows.sort_by(|a, b| super::compare_query_candidates(a.0, a.1, b.0, b.1, query));
-        }
-        let skip = query.offset.unwrap_or(0);
-        let limit = query.limit.unwrap_or(usize::MAX);
+        let rows = super::page_borrowed_candidates(
+            self.candidates(&query.source)
+                .filter(|(_, doc)| matches_filters(doc, &query.filters)),
+            query,
+        );
         Ok(rows
             .into_iter()
-            .skip(skip)
-            .take(limit)
             .map(|(path, doc)| (path.clone(), doc.clone()))
             .collect())
     }

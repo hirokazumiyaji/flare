@@ -85,10 +85,6 @@ impl Firestore for FirestoreEmulator {
 
     fn run_query_page(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
-        if query.limit == Some(0) {
-            return Ok(vec![]);
-        }
-
         let (parent, mut sq) = match &query.source {
             QuerySource::Collection(path) => {
                 let (parent, collection_id) = path::split_collection_path(path)?;
@@ -99,6 +95,9 @@ impl Firestore for FirestoreEmulator {
             }
             QuerySource::CollectionGroup(id) => (None, structured_query(id, true, &query.filters)?),
         };
+        if query.limit == Some(0) {
+            return Ok(vec![]);
+        }
         let parent = parent.as_deref();
 
         if can_push_path_page(query) {
@@ -127,9 +126,10 @@ impl Firestore for FirestoreEmulator {
         if let Some(count) = run_count_aggregation(self, parent.as_deref(), aggregation)? {
             return Ok(count);
         }
-        // 古い emulator が aggregation RPC を実装しない場合は、意味が同じ
-        // unshaped query へ戻す。ページと順序は builder 自体へ入れていない。
-        Ok(self.run_query(query)?.len() as i64)
+        // 古い emulator が aggregation RPC を実装しない場合は、__name__ だけを
+        // 返す projection query へフォールバックし、全フィールドを materialize
+        // せずに件数を取得する。
+        run_count_fallback(self, query)
     }
 
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
@@ -221,14 +221,15 @@ fn can_push_path_page(query: &QueryRef) -> bool {
     let has_order_requiring_filter = query.filters.iter().any(|filter| {
         matches!(
             filter.op,
-            QueryOp::Gt | QueryOp::Ge | QueryOp::Lt | QueryOp::Le
+            QueryOp::Gt | QueryOp::Ge | QueryOp::Lt | QueryOp::Le | QueryOp::Ne | QueryOp::NotIn
         )
     });
     has_page
+        && matches!(query.source, QuerySource::Collection(_))
         && query.order_by.is_empty()
         && !has_order_requiring_filter
         && query.offset.unwrap_or(0) <= i32::MAX as usize
-        && query.limit.map_or(true, |limit| limit <= i32::MAX as usize)
+        && query.limit.is_none_or(|limit| limit <= i32::MAX as usize)
 }
 
 fn push_path_page(
@@ -291,9 +292,16 @@ fn run_count_aggregation(
         };
         let mut stream = response.into_inner();
         let mut values = vec![];
-        while let Some(row) = stream.message().await? {
-            if let Some(result) = row.result {
-                values.extend(result.aggregate_fields.into_values());
+        loop {
+            match stream.message().await {
+                Ok(Some(row)) => {
+                    if let Some(result) = row.result {
+                        values.extend(result.aggregate_fields.into_values());
+                    }
+                }
+                Ok(None) => break,
+                Err(status) if status.code() == Code::Unimplemented => return Ok(vec![]),
+                Err(status) => return Err(status),
             }
         }
         Ok::<_, gcloud_sdk::tonic::Status>(values)
@@ -346,6 +354,49 @@ fn run_query_candidates(
         out.push((rel, fields));
     }
     Ok(out)
+}
+
+fn run_count_fallback(fs: &FirestoreEmulator, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
+    let (parent, mut sq) = match &query.source {
+        QuerySource::Collection(path) => {
+            let (parent, collection_id) = path::split_collection_path(path)?;
+            (
+                parent,
+                structured_query(collection_id, false, &query.filters)?,
+            )
+        }
+        QuerySource::CollectionGroup(id) => (None, structured_query(id, true, &query.filters)?),
+    };
+    sq.select = Some(structured_query::Projection {
+        fields: vec![structured_query::FieldReference {
+            field_path: "__name__".to_string(),
+        }],
+    });
+    let db = &fs.client.db;
+    let parent = path::parent_path(&fs.client.project_id, parent.as_deref());
+    let count = fs.client.runtime.block_on(async move {
+        let response = db
+            .client()
+            .get()
+            .run_query(Request::new(RunQueryRequest {
+                parent,
+                explain_options: None,
+                query_type: Some(run_query_request::QueryType::StructuredQuery(sq)),
+                consistency_selector: None,
+            }))
+            .await?;
+        let mut stream = response.into_inner();
+        let mut count = 0_i64;
+        while let Some(row) = stream.message().await? {
+            if row.document.is_some() {
+                count = count.checked_add(1).ok_or_else(|| {
+                    gcloud_sdk::tonic::Status::resource_exhausted("query count overflow")
+                })?;
+            }
+        }
+        Ok::<_, gcloud_sdk::tonic::Status>(count)
+    })?;
+    Ok(count)
 }
 
 fn structured_query(

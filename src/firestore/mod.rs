@@ -6,7 +6,6 @@ mod memory;
 pub use emulator::FirestoreEmulator;
 pub use memory::InMemoryFirestore;
 
-use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -178,16 +177,32 @@ pub(crate) fn apply_query_shape(mut rows: QueryCandidates, query: &QueryRef) -> 
     rows
 }
 
+pub(crate) fn page_borrowed_candidates<'a>(
+    candidates: impl Iterator<Item = (&'a String, &'a BTreeMap<String, Value>)>,
+    query: &QueryRef,
+) -> Vec<(&'a String, &'a BTreeMap<String, Value>)> {
+    let mut rows: Vec<_> = candidates.collect();
+    if query.order_by.is_empty() {
+        rows.sort_by(|a, b| a.0.cmp(b.0));
+    } else {
+        rows.retain(|(path, doc)| candidate_has_order_fields(path, doc, query));
+        rows.sort_by(|a, b| compare_query_candidates(a.0, a.1, b.0, b.1, query));
+    }
+    let skip = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(usize::MAX);
+    rows.into_iter().skip(skip).take(limit).collect()
+}
+
 /// 注文対象を持つ候補だけを順序付け・ページング対象へ残す。
 pub(crate) fn candidate_has_order_fields(
-    path: &str,
+    _path: &str,
     doc: &BTreeMap<String, Value>,
     query: &QueryRef,
 ) -> bool {
     query
         .order_by
         .iter()
-        .all(|(field, _)| query_field_value(path, doc, field).is_some())
+        .all(|(field, _)| field == "__name__" || query_field_value(doc, field).is_some())
 }
 
 /// 共通比較器で 2 候補を比較する。
@@ -200,11 +215,21 @@ pub(crate) fn compare_query_candidates(
     query: &QueryRef,
 ) -> Ordering {
     for (field, direction) in &query.order_by {
-        let a = query_field_value(a_path, a_doc, field)
-            .expect("candidates missing order fields are filtered before sorting");
-        let b = query_field_value(b_path, b_doc, field)
-            .expect("candidates missing order fields are filtered before sorting");
-        let mut ordering = a.cmp_for_order(&b);
+        let mut ordering = if field == "__name__" {
+            a_path.cmp(b_path)
+        } else {
+            let (Some(a), Some(b)) = (
+                query_field_value(a_doc, field),
+                query_field_value(b_doc, field),
+            ) else {
+                debug_assert!(
+                    false,
+                    "candidates missing order fields are filtered before sorting"
+                );
+                return a_path.cmp(b_path);
+            };
+            a.cmp_for_order(b)
+        };
         if *direction == Direction::Desc {
             ordering = ordering.reverse();
         }
@@ -215,31 +240,18 @@ pub(crate) fn compare_query_candidates(
     a_path.cmp(b_path)
 }
 
-fn query_field_value<'a>(
-    path: &'a str,
-    doc: &'a BTreeMap<String, Value>,
-    field: &str,
-) -> Option<Cow<'a, Value>> {
-    if field == "__name__" {
-        return Some(Cow::Owned(Value::Str(path.to_string())));
-    }
-    lookup_field_path(Some(doc), &field.split('.').collect::<Vec<_>>()).map(Cow::Borrowed)
-}
-
-fn lookup_field_path<'a>(
-    map: Option<&'a BTreeMap<String, Value>>,
-    segments: &[&str],
-) -> Option<&'a Value> {
-    let mut current = map?;
-    for (index, segment) in segments.iter().enumerate() {
-        let value = current.get(*segment)?;
-        if index == segments.len() - 1 {
+fn query_field_value<'a>(doc: &'a BTreeMap<String, Value>, field: &str) -> Option<&'a Value> {
+    let mut current = doc;
+    let mut segments = field.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let value = current.get(segment)?;
+        if segments.peek().is_none() {
             return Some(value);
         }
-        match value {
-            Value::Map(map) => current = map,
+        current = match value {
+            Value::Map(inner) => inner,
             _ => return None,
-        }
+        };
     }
     None
 }
