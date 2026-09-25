@@ -323,6 +323,50 @@ col("users/{run}/docs").where("s", "==", "{}x").get().len()"#,
 }
 
 #[test]
+fn emulator_where_validates_nested_filter_string_sizes() {
+    // Same equality, membership, and array_contains cases as the in-memory
+    // `where_validates_nested_filter_string_sizes` test.
+    let valid = "x".repeat(1499);
+    let invalid = "x".repeat(1500);
+    let run = unique("nested_filter");
+    let make_script = |op: &str, value: &str| {
+        format!(r#"col("users/{run}/docs").where("payload", "{op}", {value}).get()"#)
+    };
+
+    let valid_cases = [
+        make_script("==", &format!(r#"["{valid}"]"#)),
+        make_script("in", &format!(r#"[["{valid}"]]"#)),
+        make_script("array_contains", &format!(r#"["{valid}"]"#)),
+    ];
+    for script in valid_cases {
+        let Some(fs) = emulator() else {
+            eprintln!("skip: no emulator");
+            return;
+        };
+        let out = run_script_with_firestore(&script, fs).unwrap();
+        assert_eq!(out, Value::Array(vec![]));
+    }
+
+    let invalid_cases = [
+        make_script("==", &format!(r#"{{s: "{invalid}"}}"#)),
+        make_script("in", &format!(r#"[{{s: "{invalid}"}}]"#)),
+        make_script("array_contains", &format!(r#"{{s: "{invalid}"}}"#)),
+        make_script("==", &format!(r#"{{s: ["{invalid}"]}}"#)),
+    ];
+    for script in invalid_cases {
+        let Some(fs) = emulator() else {
+            eprintln!("skip: no emulator");
+            return;
+        };
+        let err = run_script_with_firestore(&script, fs).unwrap_err();
+        assert!(
+            format!("{err}").contains("value for payload is too large to be used in a query"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
 fn emulator_update_field_paths_match_in_memory_validation() {
     // Same case as in-memory `update_field_paths_require_simple_field_grammar`.
     // Sentinel (transform) keys are validated too: Firestore's field_transforms

@@ -1007,6 +1007,40 @@ fn where_rejects_large_string_filter_values() {
 }
 
 #[test]
+fn where_validates_nested_filter_string_sizes() {
+    // 1,499 bytes are valid; 1,500 bytes are rejected for equality,
+    // membership, and array_contains filters, including nested Map / Array
+    // combinations.
+    let valid = "x".repeat(1499);
+    let invalid = "x".repeat(1500);
+    let make_script =
+        |op: &str, value: &str| format!(r#"col("users").where("payload", "{op}", {value}).get()"#);
+
+    let valid_cases = [
+        make_script("==", &format!(r#"["{valid}"]"#)),
+        make_script("in", &format!(r#"[["{valid}"]]"#)),
+        make_script("array_contains", &format!(r#"["{valid}"]"#)),
+    ];
+    for script in valid_cases {
+        assert_eq!(run_script(&script).unwrap(), Value::Array(vec![]));
+    }
+
+    let invalid_cases = [
+        make_script("==", &format!(r#"{{s: "{invalid}"}}"#)),
+        make_script("in", &format!(r#"[{{s: "{invalid}"}}]"#)),
+        make_script("array_contains", &format!(r#"{{s: "{invalid}"}}"#)),
+        make_script("==", &format!(r#"{{s: ["{invalid}"]}}"#)),
+    ];
+    for script in invalid_cases {
+        let err = run_script(&script).unwrap_err();
+        assert!(
+            format!("{err}").contains("value for payload is too large to be used in a query"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
 fn logical_operators_return_operand_with_short_circuit() {
     // `!` は Bool に正規化、`&&` / `||` は Ruby と同じくオペランドそのものを返す。
     let out = run_script("[!true, !false, !nil, !0, !\"\", !!\"x\"]").unwrap();
