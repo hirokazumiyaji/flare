@@ -9,6 +9,9 @@ use crate::ast::Stmt;
 pub enum Value {
     Int(i64),
     Str(String),
+    /// UTF-8 ではないデータも失わず保持するバイナリ値。
+    /// `bytes([0, 255])` で生成し、Storage の内容として往返する。
+    Bytes(Vec<u8>),
     Bool(bool),
     Nil,
     Array(Vec<Value>),
@@ -19,8 +22,9 @@ pub enum Value {
     ArrayRemove(Vec<Value>),
     DeleteField,
     Increment(i64),
-    /// emulator が読んだ firelang 外の型(double / geo_point / bytes)の
-    /// 表示専用値。スクリプトからは生成できず、書き戻しもできない。
+    /// Firestore emulator が読んだ firelang 外の型(double / geo_point /
+    /// Firestore bytes)の表示専用値。Storage の `Bytes` とは別で、
+    /// スクリプトからは生成できず、書き戻しもできない。
     Opaque(String),
     DocRef(DocRef),
     CollectionRef(CollectionRef),
@@ -154,12 +158,13 @@ impl Value {
 
     /// クエリ `order_by` 用の全順序。同型は自然順(Int 数値順 / Str 辞書順 /
     /// Bool `false < true` / Timestamp 秒)、異型は Nil < Bool < Int <
-    /// Timestamp < Str < Array < Map < その他 の型ランクで比べる。
+    /// Timestamp < Str < Bytes < Array < Map < その他 の型ランクで比べる。
     /// 両バックエンドの決定性を同じコードで保証するために使う(spec §7)。
     pub fn cmp_for_order(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
             (Value::Int(x), Value::Int(y)) => x.cmp(y),
             (Value::Str(x), Value::Str(y)) => x.cmp(y),
+            (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
             (Value::Timestamp(x), Value::Timestamp(y)) => x.seconds.cmp(&y.seconds),
             _ => type_rank(self).cmp(&type_rank(other)),
@@ -174,9 +179,10 @@ fn type_rank(v: &Value) -> u8 {
         Value::Int(_) => 2,
         Value::Timestamp(_) => 3,
         Value::Str(_) => 4,
-        Value::Array(_) => 5,
-        Value::Map(_) => 6,
-        _ => 7,
+        Value::Bytes(_) => 5,
+        Value::Array(_) => 6,
+        Value::Map(_) => 7,
+        _ => 8,
     }
 }
 
@@ -211,6 +217,10 @@ impl Value {
         match self {
             Value::Int(i) => i.to_string(),
             Value::Str(s) => inspect_str(s),
+            Value::Bytes(bytes) => {
+                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                format!("Bytes({hex})")
+            }
             Value::Bool(b) => b.to_string(),
             Value::Nil => "nil".to_string(),
             Value::Array(items) => {

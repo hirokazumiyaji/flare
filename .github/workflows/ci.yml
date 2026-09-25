@@ -31,7 +31,7 @@ jobs:
       - name: Build release binary
         run: cargo build --release --bin fl
 
-  # Firestore emulator integration tests (Task 06). Uses firebase-tools + Java.
+  # Firestore and Storage emulator integration tests. Uses firebase-tools + Java.
   integration-emulator:
     runs-on: ubuntu-latest
     steps:
@@ -58,7 +58,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Run integration tests with Firestore emulator
+      - name: Run integration tests with Firestore and Storage emulators
         run: |
-          firebase emulators:exec --only firestore --project demo-firelang \
-            'FIRESTORE_PROJECT_ID=demo-firelang cargo test --test firestore_emulator -- --nocapture'
+          firebase emulators:exec --only firestore,storage --project demo-firelang \
+            'FIRESTORE_PROJECT_ID=demo-firelang FIREBASE_PROJECT_ID=demo-firelang cargo test --test firestore_emulator --test storage_emulator -- --nocapture'

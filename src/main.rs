@@ -3,7 +3,10 @@ use std::error::Error;
 use std::fs;
 use std::io::{IsTerminal, Read};
 
-use firelang::{run_script, run_script_with_firestore, FirestoreEmulator};
+use firelang::{
+    run_script_with_backends, FirestoreEmulator, InMemoryFirestore, InMemoryStorage,
+    StorageEmulator,
+};
 
 fn main() {
     if let Err(e) = run() {
@@ -16,6 +19,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
 
     let mut backend = "in-memory";
+    let mut storage_backend = "auto";
     let mut paths: Vec<String> = vec![];
     let mut inline: Vec<String> = vec![];
     let mut use_stdin = false;
@@ -31,6 +35,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                     .get(i + 1)
                     .ok_or("--backend requires in-memory or emulator")?;
                 backend = b.as_str();
+                i += 2;
+            }
+            "--storage-backend" => {
+                let b = args
+                    .get(i + 1)
+                    .ok_or("--storage-backend requires auto, in-memory, or emulator")?;
+                storage_backend = b.as_str();
                 i += 2;
             }
             "-e" => {
@@ -55,7 +66,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let backend_config = match backend {
+    let firestore_config = match backend {
         "in-memory" => None,
         "emulator" => {
             let host = env::var("FIRESTORE_EMULATOR_HOST")
@@ -66,6 +77,38 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         other => {
             return Err(format!("unknown backend: {other} (use in-memory or emulator)").into());
+        }
+    };
+
+    // `auto` keeps the existing Firestore-only emulator workflow backward
+    // compatible: when Firebase CLI also starts Storage, its host is picked
+    // up; otherwise Storage remains in-memory. An explicit flag makes the
+    // choice visible for Storage-only scripts.
+    let storage_config = match storage_backend {
+        "auto" if env::var("FIREBASE_STORAGE_EMULATOR_HOST").is_ok() => {
+            let host = env::var("FIREBASE_STORAGE_EMULATOR_HOST").expect("checked above");
+            let project_id = env::var("FIREBASE_PROJECT_ID")
+                .or_else(|_| env::var("GCLOUD_PROJECT"))
+                .or_else(|_| env::var("FIRESTORE_PROJECT_ID"))
+                .unwrap_or_else(|_| "firelang-test".to_string());
+            Some((host, project_id))
+        }
+        "auto" | "in-memory" => None,
+        "emulator" => {
+            let host = env::var("FIREBASE_STORAGE_EMULATOR_HOST").map_err(|_| {
+                "FIREBASE_STORAGE_EMULATOR_HOST must be set when using --storage-backend emulator"
+            })?;
+            let project_id = env::var("FIREBASE_PROJECT_ID")
+                .or_else(|_| env::var("GCLOUD_PROJECT"))
+                .or_else(|_| env::var("FIRESTORE_PROJECT_ID"))
+                .unwrap_or_else(|_| "firelang-test".to_string());
+            Some((host, project_id))
+        }
+        other => {
+            return Err(format!(
+                "unknown storage backend: {other} (use auto, in-memory, or emulator)"
+            )
+            .into());
         }
     };
 
@@ -99,10 +142,28 @@ fn run() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     };
 
-    let out = match backend_config {
-        None => run_script(&src)?,
-        Some((host, project_id)) => {
-            run_script_with_firestore(&src, FirestoreEmulator::new(host, project_id)?)?
+    let out = match (firestore_config, storage_config) {
+        (None, None) => run_script_with_backends(
+            &src,
+            InMemoryFirestore::default(),
+            InMemoryStorage::default(),
+        )?,
+        (Some((host, project_id)), None) => run_script_with_backends(
+            &src,
+            FirestoreEmulator::new(host, project_id)?,
+            InMemoryStorage::default(),
+        )?,
+        (None, Some((host, project_id))) => run_script_with_backends(
+            &src,
+            InMemoryFirestore::default(),
+            make_storage(host, project_id)?,
+        )?,
+        (Some((firestore_host, firestore_project)), Some((storage_host, storage_project))) => {
+            run_script_with_backends(
+                &src,
+                FirestoreEmulator::new(firestore_host, firestore_project)?,
+                make_storage(storage_host, storage_project)?,
+            )?
         }
     };
 
@@ -110,8 +171,21 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn make_storage(host: String, project_id: String) -> Result<StorageEmulator, Box<dyn Error>> {
+    let mut storage = StorageEmulator::new(host, project_id)?;
+    if let Ok(bucket) = env::var("FIREBASE_STORAGE_BUCKET") {
+        storage = storage.with_bucket(bucket)?;
+    }
+    if let Ok(token) = env::var("FIREBASE_STORAGE_AUTH_TOKEN") {
+        storage = storage.with_auth_token(token)?;
+    }
+    Ok(storage)
+}
+
 fn print_usage() {
-    eprintln!("usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)");
+    eprintln!(
+        "usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] (<script-file> | - | -e <script>)"
+    );
     eprintln!();
     eprintln!("  Script source (exactly one):");
     eprintln!("    <script-file>  run a script file");
@@ -122,6 +196,11 @@ fn print_usage() {
     eprintln!("  Backends:");
     eprintln!("    in-memory   (default) use the in-memory Firestore stub");
     eprintln!("    emulator    use FIRESTORE_EMULATOR_HOST and optional FIRESTORE_PROJECT_ID");
+    eprintln!();
+    eprintln!("  Storage backends:");
+    eprintln!("    auto       use the Storage emulator when FIREBASE_STORAGE_EMULATOR_HOST is set");
+    eprintln!("    in-memory  (default when auto has no host) use the in-memory Storage stub");
+    eprintln!("    emulator   require FIREBASE_STORAGE_EMULATOR_HOST");
 }
 
 fn read_stdin() -> Result<String, Box<dyn Error>> {

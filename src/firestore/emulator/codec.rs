@@ -41,6 +41,7 @@ pub(super) fn encode_field_value(v: &Value) -> Result<SdkValue, Box<dyn Error>> 
             Value::Map(m) => value::ValueType::MapValue(MapValue {
                 fields: encode_fields(m)?,
             }),
+            Value::Bytes(_) => return Err("Bytes values are only supported by Storage".into()),
             _ => return Err(format!("unsupported value in emulator write: {v:?}").into()),
         }),
     })

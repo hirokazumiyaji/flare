@@ -96,6 +96,12 @@ fn apply_write_to_docs(
     docs: &mut HashMap<String, BTreeMap<String, Value>>,
     op: WriteOp,
 ) -> Result<(), Box<dyn Error>> {
+    match &op {
+        WriteOp::Set { data, .. } | WriteOp::Update { data, .. } => {
+            reject_storage_bytes_map(data)?;
+        }
+        WriteOp::Delete { .. } => {}
+    }
     match op {
         WriteOp::Set {
             path,
@@ -122,6 +128,22 @@ fn apply_write_to_docs(
             docs.remove(&path);
             Ok(())
         }
+    }
+}
+
+fn reject_storage_bytes_map(map: &BTreeMap<String, Value>) -> Result<(), Box<dyn Error>> {
+    for value in map.values() {
+        reject_storage_bytes(value)?;
+    }
+    Ok(())
+}
+
+fn reject_storage_bytes(value: &Value) -> Result<(), Box<dyn Error>> {
+    match value {
+        Value::Bytes(_) => Err("Bytes values are only supported by Storage".into()),
+        Value::Array(items) => items.iter().try_for_each(reject_storage_bytes),
+        Value::Map(map) => reject_storage_bytes_map(map),
+        _ => Ok(()),
     }
 }
 
