@@ -155,7 +155,9 @@ pub(crate) fn split_write_values(data: &BTreeMap<String, Value>) -> WriteValues 
 
 /// update / merge set 共通の plan。plain と delete は mask に入るため互いに
 /// overlap してはいけない。transform 同士も targets が曖昧になるため
-/// overlap を拒否し、plain との適用順序は Firestore 契約として残す。
+/// overlap を拒否する。transform と mask の重なりは仕様 §6 の順序
+/// (delete → plain → transform)を両 backend で適用するため許可し、
+/// emulator 互換の parity テストで結果を確認する。
 pub(crate) fn plan_update_writes(
     data: &BTreeMap<String, Value>,
 ) -> Result<WriteValues, Box<dyn Error>> {
