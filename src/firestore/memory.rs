@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
-use super::{Firestore, WriteOp};
+use super::{validate_write_op, Firestore, WriteOp};
 use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value};
 
 #[derive(Default)]
@@ -96,14 +96,7 @@ fn apply_write_to_docs(
     docs: &mut HashMap<String, BTreeMap<String, Value>>,
     op: WriteOp,
 ) -> Result<(), Box<dyn Error>> {
-    // in-memory と emulator が同じ値を、同じ順序・同じメッセージで
-    // 検証してから State を変更する。
-    match &op {
-        WriteOp::Set { data, .. } | WriteOp::Update { data, .. } => {
-            super::validate_firestore_fields(data)?
-        }
-        WriteOp::Delete { .. } => {}
-    }
+    validate_write_op(&op)?;
     match op {
         WriteOp::Set {
             path,

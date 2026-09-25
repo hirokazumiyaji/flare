@@ -8,22 +8,15 @@ use gcloud_sdk::google::firestore::v1::{value, ArrayValue, Document, MapValue, V
 use prost_types::{NullValue, Timestamp as ProtoTimestamp};
 
 use super::path::relative_document_name;
-use crate::firestore::{
-    validate_firestore_array_items, validate_firestore_fields, validate_firestore_value,
-};
 use crate::value::{DocRef, Timestamp, Value};
 
 pub(super) fn encode_array_items(items: &[Value]) -> Result<Vec<SdkValue>, Box<dyn Error>> {
-    // 各要素だけを検証すると「配列の中に配列」という情報を失うため、
-    // 配列要素として共通 validator に渡す。
-    validate_firestore_array_items(items)?;
     items.iter().map(encode_field_value).collect()
 }
 
 pub(super) fn encode_fields(
     map: &BTreeMap<String, Value>,
 ) -> Result<HashMap<String, SdkValue>, Box<dyn Error>> {
-    validate_firestore_fields(map)?;
     let mut out = HashMap::new();
     for (k, v) in map {
         out.insert(k.clone(), encode_field_value(v)?);
@@ -32,7 +25,6 @@ pub(super) fn encode_fields(
 }
 
 pub(super) fn encode_field_value(v: &Value) -> Result<SdkValue, Box<dyn Error>> {
-    validate_firestore_value(v)?;
     Ok(SdkValue {
         value_type: Some(match v {
             Value::Str(s) => value::ValueType::StringValue(s.clone()),
@@ -233,6 +225,25 @@ mod tests {
             m.get("score"),
             Some(&Value::Opaque("Double(4.5)".to_string()))
         );
+    }
+
+    #[test]
+    fn shared_validation_rejects_nested_arrays_but_allows_map_boundaries() {
+        use crate::firestore::{validate_firestore_fields, validate_firestore_value};
+
+        let nested = Value::Array(vec![Value::Array(vec![Value::Int(1)])]);
+        assert!(validate_firestore_value(&nested).is_err());
+
+        let indirect = Value::Array(vec![Value::Map(BTreeMap::from([(
+            "inner".to_string(),
+            Value::Array(vec![Value::Int(1)]),
+        )]))]);
+        assert!(validate_firestore_value(&indirect).is_ok());
+        assert!(validate_firestore_fields(&BTreeMap::from([(
+            "__name__".to_string(),
+            Value::Int(1),
+        )]))
+        .is_err());
     }
 
     #[test]

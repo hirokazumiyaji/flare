@@ -13,9 +13,7 @@ use tokio::runtime::Runtime;
 
 use super::codec::encode_fields;
 use super::path::document_name;
-use crate::firestore::{
-    insert_at_field_path, validate_field_path, validate_firestore_fields, WriteOp,
-};
+use crate::firestore::{insert_at_field_path, validate_field_path, validate_write_op, WriteOp};
 use crate::value::Value;
 
 pub(super) fn commit_writes(
@@ -101,12 +99,7 @@ pub(super) fn write_ops_to_sdk_writes(
 fn build_write(project_id: &str, op: &WriteOp) -> Result<Write, Box<dyn Error>> {
     // in-memory と同じ共有 validator を RPC 前に通す。検証に失敗した
     // write は emulator に到達しないため、後続 write も送信されない。
-    match op {
-        WriteOp::Set { data, .. } | WriteOp::Update { data, .. } => {
-            validate_firestore_fields(data)?
-        }
-        WriteOp::Delete { .. } => {}
-    }
+    validate_write_op(op)?;
     match op {
         WriteOp::Set { path, data, merge } => {
             if *merge {
@@ -510,6 +503,29 @@ mod tests {
             transform.transform_type,
             Some(document_transform::field_transform::TransformType::SetToServerValue(_))
         ));
+    }
+
+    #[test]
+    fn invalid_write_is_rejected_before_sdk_writes_are_built() {
+        let cases = [
+            BTreeMap::from([("__name__".to_string(), Value::Int(1))]),
+            BTreeMap::from([(
+                "items".to_string(),
+                Value::Array(vec![Value::Array(vec![Value::Int(1)])]),
+            )]),
+        ];
+        for data in cases {
+            let err = write_ops_to_sdk_writes(
+                "p",
+                &[WriteOp::Set {
+                    path: "users/invalid".to_string(),
+                    data,
+                    merge: false,
+                }],
+            )
+            .unwrap_err();
+            assert!(!err.to_string().is_empty());
+        }
     }
 
     #[test]

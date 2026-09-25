@@ -71,6 +71,18 @@ pub(crate) fn validate_firestore_fields(
     Ok(())
 }
 
+/// 1 つの `WriteOp` に対する検証 dispatch。in-memory と emulator は
+/// 同じ helper を使い、variant を追加したときの検証漏れを防ぐ。
+pub(crate) fn validate_write_op(op: &WriteOp) -> Result<(), Box<dyn Error>> {
+    match op {
+        WriteOp::Set { data, .. } | WriteOp::Update { data, .. } => {
+            validate_firestore_fields(data)?;
+        }
+        WriteOp::Delete { .. } => {}
+    }
+    Ok(())
+}
+
 /// Firestore の MapValue / Document.fields のキーとして使える名前か検証する。
 /// 予約名は `__.*__`、空文字列は禁止。フィールド名は UTF-8 1,500 バイトまで。
 pub(crate) fn validate_firestore_field_name(name: &str) -> Result<(), Box<dyn Error>> {
