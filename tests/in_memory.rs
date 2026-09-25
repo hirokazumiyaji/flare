@@ -1307,6 +1307,13 @@ fn timestamp_comparison_diff_and_rfc3339() {
     // if 条件にも使える。
     let out = run_script("if timestamp(200) > timestamp(100) { 1 } else { 2 }").unwrap();
     assert_eq!(out, Value::Int(1));
+    // add_seconds の加算は i64 の境界で panic / wraparound しない。
+    let err = run_script("timestamp(9223372036854775807).add_seconds(1)").unwrap_err();
+    assert!(format!("{err}").contains("integer overflow"), "{err}");
+    let err = run_script("timestamp(-9223372036854775807 - 1).add_seconds(-1)").unwrap_err();
+    assert!(format!("{err}").contains("integer overflow"), "{err}");
+    let out = run_script("timestamp(-9223372036854775807 - 1).add_seconds(1).to_unix()").unwrap();
+    assert_eq!(out, Value::Int(-9223372036854775807));
 }
 
 #[test]

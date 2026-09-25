@@ -333,7 +333,10 @@ impl<F: Firestore> Runtime<F> {
                 "to_unix" => Ok(Value::Int(ts.seconds)),
                 "to_rfc3339" => Ok(Value::Str(ts.to_rfc3339()?)),
                 "add_seconds" => Ok(Value::Timestamp(Timestamp {
-                    seconds: ts.seconds + expect_int(args.first())?,
+                    seconds: ts
+                        .seconds
+                        .checked_add(expect_int(args.first())?)
+                        .ok_or("integer overflow")?,
                 })),
                 _ => Err(format!("unknown timestamp method: {name}").into()),
             },
