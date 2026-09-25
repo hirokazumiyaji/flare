@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
-use super::{lookup_field_path, matches_filters_with_name, Firestore, WriteOp};
+use super::{lookup_field_path_split, matches_filters_with_name, Firestore, WriteOp};
 use crate::value::{QueryRef, QuerySource, Timestamp, Value};
 
 #[derive(Default)]
@@ -164,7 +164,7 @@ fn apply_update_map(
     }
     for (k, v) in transforms {
         let segments: Vec<&str> = k.split('.').collect();
-        let base = lookup_field_path(Some(current), &segments);
+        let base = lookup_field_path_split(Some(current), &k);
         let resolved = match v {
             Value::ArrayUnion(values) => {
                 let mut arr = match base {
@@ -210,8 +210,7 @@ fn resolve_sentinel_map(
 ) -> Result<(), Box<dyn Error>> {
     for (k, v) in map.clone() {
         reject_nested_sentinels(&v, false)?;
-        let segments: Vec<&str> = k.split('.').collect();
-        let base = || lookup_field_path(current, &segments);
+        let base = || lookup_field_path_split(current, &k);
         let resolved = match v {
             Value::ArrayUnion(values) => {
                 let mut arr = match base() {

@@ -32,6 +32,36 @@ fn firestore_global_functions_with_emulator() {
 }
 
 #[test]
+fn emulator_document_name_filters_match_relative_paths() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let id = unique("name_filter");
+    let a = format!("users/{id}_a");
+    let b = format!("users/{id}_b");
+    let script = format!(
+        r#"set("{a}", {{n: 1}})
+set("{b}", {{n: 2}})
+[
+  col("users").where("__name__", "==", "{a}").get().map {{ |r| r["__name__"] }},
+  col("users").where("__name__", "!=", "{a}").get().map {{ |r| r["__name__"] }},
+  col("users").where("__name__", "in", ["{a}", "{b}"]).get().map {{ |r| r["__name__"] }},
+  col("users").where("__name__", ">", "{a}").get()
+]"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    let Value::Array(rows) = out else {
+        panic!("expected array");
+    };
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0], Value::Array(vec![Value::Str(a.clone())]));
+    assert_eq!(rows[1], Value::Array(vec![Value::Str(b.clone())]));
+    assert_eq!(rows[2], Value::Array(vec![Value::Str(a), Value::Str(b)]));
+    assert_eq!(rows[3], Value::Array(vec![]));
+}
+
+#[test]
 fn emulator_merge_set() {
     let Some(fs) = emulator() else {
         eprintln!("skip: no emulator");

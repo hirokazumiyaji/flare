@@ -223,12 +223,25 @@ fn server_filters(filters: &[QueryFilter]) -> Vec<QueryFilter> {
     filters
         .iter()
         .filter(|f| is_server_filter(f))
-        .take(1)
+        // Only one clause is sent (more would require a composite index), but
+        // prefer equality/array clauses over ranges: ranges are usually much
+        // less selective and turn the server query into a near-full scan.
+        .min_by_key(|f| match f.op {
+            QueryOp::Gt | QueryOp::Ge | QueryOp::Lt | QueryOp::Le => 1,
+            _ => 0,
+        })
         .cloned()
+        .into_iter()
         .collect()
 }
 
 fn is_server_filter(filter: &QueryFilter) -> bool {
+    // `__name__` is evaluated structurally against the relative path by the
+    // shared matcher. Firestore's server-side `__name__` uses document-ID
+    // semantics and rejects array/inequality operators, so never push it down.
+    if super::is_document_name_field(&filter.field) {
+        return false;
+    }
     if super::validate_field_path(&filter.field).is_err() {
         return false;
     }
@@ -284,13 +297,11 @@ fn build_where(
     filters: &[QueryFilter],
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
     let mut parts = vec![];
+    debug_assert!(
+        filters.iter().all(is_server_filter),
+        "build_where receives only server-expressible filters"
+    );
     for f in filters {
-        // Keep this guard here as well as in `server_filters`: callers of the
-        // query builder must not accidentally reintroduce a predicate that
-        // Firestore cannot express with firelang's semantics.
-        if !is_server_filter(f) {
-            continue;
-        }
         let op = match f.op {
             QueryOp::Eq => structured_query::field_filter::Operator::Equal,
             QueryOp::Ne => structured_query::field_filter::Operator::NotEqual,

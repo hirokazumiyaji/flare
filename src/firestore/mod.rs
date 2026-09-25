@@ -61,6 +61,11 @@ fn check_element_size(field: &str, v: &Value) -> Result<(), Box<dyn Error>> {
     }
 }
 
+/// `__name__` is a synthetic relative-path field, not a stored Firestore field.
+pub(crate) fn is_document_name_field(field: &str) -> bool {
+    field == "__name__"
+}
+
 /// Apply the firelang query semantics to one decoded document.
 ///
 /// The emulator intentionally re-evaluates every filter after fetching
@@ -73,7 +78,7 @@ pub(crate) fn matches_filters_with_name(
     filters: &[QueryFilter],
 ) -> bool {
     filters.iter().all(|f| {
-        if f.field == "__name__" {
+        if is_document_name_field(&f.field) {
             return matches_document_name_filter(path, f);
         }
         // `!=` / `in` / `not-in` require the field to exist.  `order_by`'s
@@ -145,26 +150,6 @@ fn compare_values(a: Option<&Value>, b: &Value, pred: impl Fn(std::cmp::Ordering
         (Some(Value::Timestamp(x)), Value::Timestamp(y)) => pred(x.seconds.cmp(&y.seconds)),
         _ => false,
     }
-}
-
-/// Look up a dot-separated field path.  A missing path and a non-map
-/// intermediate node are both treated as a missing field.
-pub(crate) fn lookup_field_path<'a>(
-    map: Option<&'a BTreeMap<String, Value>>,
-    segments: &[&str],
-) -> Option<&'a Value> {
-    let mut cur = map?;
-    for (i, seg) in segments.iter().enumerate() {
-        let v = cur.get(*seg)?;
-        if i == segments.len() - 1 {
-            return Some(v);
-        }
-        match v {
-            Value::Map(m) => cur = m,
-            _ => return None,
-        }
-    }
-    None
 }
 
 /// Look up a field path without allocating a segment vector per document.
@@ -282,7 +267,9 @@ pub enum WriteOp {
 }
 
 /// クエリ候補: フィルタに一致した (相対ドキュメントパス, フィールド) の列。
-/// 順序・offset/limit・`__name__` は未適用(runtime が付ける)。
+/// 順序・offset/limit と結果行への `__name__` 付与は未適用(runtime が行う)。
+/// ただし `__name__` を対象とする filter 自体は backend の共有 matcher が
+/// 相対パスに対して評価する。
 pub type QueryCandidates = Vec<(String, BTreeMap<String, Value>)>;
 
 pub trait Firestore {
@@ -290,8 +277,9 @@ pub trait Firestore {
     /// Apply writes atomically: either all writes persist or none do.
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>>;
     /// Returns filter-matching candidates as (relative path, document fields).
-    /// Ordering, offset/limit, and `__name__` are NOT applied here; the runtime
-    /// applies them uniformly for both backends (spec §7).
+    /// Ordering, offset/limit, and insertion of the synthetic `__name__` field
+    /// are applied by the runtime. A filter on `__name__` itself is evaluated
+    /// against the relative path by the shared backend matcher (spec §7).
     fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>>;
 
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>>;

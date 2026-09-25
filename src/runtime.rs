@@ -3,7 +3,7 @@ use std::error::Error;
 
 use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
 use crate::error::{FirelangError, Span};
-use crate::firestore::{Firestore, WriteOp};
+use crate::firestore::{lookup_field_path_split, Firestore, WriteOp};
 use crate::value::{
     CollectionGroupRef, CollectionRef, Direction, DocRef, QueryFilter, QueryOp, QueryRef,
     Timestamp, UserFunc, Value,
@@ -993,30 +993,11 @@ fn wrap_doc(path: &str, doc: &BTreeMap<String, Value>) -> Value {
 }
 
 fn get_field_value(path: &str, doc: &BTreeMap<String, Value>, field: &str) -> Option<Value> {
-    if field == "__name__" {
+    if crate::firestore::is_document_name_field(field) {
         Some(Value::Str(path.to_string()))
     } else {
-        let segments: Vec<&str> = field.split('.').collect();
-        lookup_field_path(Some(doc), &segments).cloned()
+        lookup_field_path_split(Some(doc), field).cloned()
     }
-}
-
-fn lookup_field_path<'a>(
-    map: Option<&'a BTreeMap<String, Value>>,
-    segments: &[&str],
-) -> Option<&'a Value> {
-    let mut cur = map?;
-    for (i, seg) in segments.iter().enumerate() {
-        let v = cur.get(*seg)?;
-        if i == segments.len() - 1 {
-            return Some(v);
-        }
-        match v {
-            Value::Map(m) => cur = m,
-            _ => return None,
-        }
-    }
-    None
 }
 
 fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {

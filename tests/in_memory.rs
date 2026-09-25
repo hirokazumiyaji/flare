@@ -58,6 +58,26 @@ fn supports_timestamp_and_query() {
 }
 
 #[test]
+fn document_name_filters_match_relative_paths() {
+    let out = run_script(
+        "set(doc(\"users/a\"), {n: 1})\nset(doc(\"users/b\"), {n: 2})\n[\n  col(\"users\").where(\"__name__\", \"==\", \"users/a\").get().map { |r| r[\"__name__\"] },\n  col(\"users\").where(\"__name__\", \"!=\", \"users/a\").get().map { |r| r[\"__name__\"] },\n  col(\"users\").where(\"__name__\", \"in\", [\"users/a\", \"users/b\"]).get().map { |r| r[\"__name__\"] },\n  col(\"users\").where(\"__name__\", \">\", \"users/a\").get()\n]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Array(vec![Value::Str("users/a".to_string())]),
+            Value::Array(vec![Value::Str("users/b".to_string())]),
+            Value::Array(vec![
+                Value::Str("users/a".to_string()),
+                Value::Str("users/b".to_string()),
+            ]),
+            Value::Array(vec![]),
+        ])
+    );
+}
+
+#[test]
 fn supports_array_union_remove_and_update() {
     let out = run_script(
         "set(\"users/au\", {tags: [\"a\", \"b\"]})\nupdate(\"users/au\", {tags: array_union([\"b\", \"c\"])})\nupdate(\"users/au\", {tags: array_remove([\"a\"])})\nget(\"users/au\")",
