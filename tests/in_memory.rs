@@ -929,9 +929,20 @@ set("users/qfp2", {"a-b": 9, "a.b": 8, profile: {age: 1}})
             Value::Str("users/qfp1".to_string()),
             Value::Int(1),
             Value::Int(1),
-            Value::Str("users/qfp2".to_string()),
+            Value::Str("users/qfp1".to_string()),
         ])
     );
+}
+
+#[test]
+fn document_name_filter_values_require_valid_paths() {
+    for source in [
+        r#"col("users").where("__name__", "in", ["users/a", "bad"]).get()"#,
+        r#"col("users").where("__name__", "not-in", ["users/a", "users/b/c"]).get()"#,
+    ] {
+        let err = run_script(source).unwrap_err();
+        assert!(err.to_string().contains("invalid document path"), "{err}");
+    }
 }
 
 #[test]

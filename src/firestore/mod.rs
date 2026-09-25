@@ -236,6 +236,9 @@ fn invalid_query_field_path(path: &str, reason: &str) -> Box<dyn Error> {
 /// - `in` / `not-in` / `array_contains_any` の値は Array で要素は最大 10 個
 pub(crate) fn validate_query_filters(filters: &[QueryFilter]) -> Result<(), Box<dyn Error>> {
     for f in filters {
+        if f.field == "__name__" {
+            validate_document_id_filter_value(&f.value)?;
+        }
         if let Value::Str(s) = &f.value {
             if s.len() >= 1500 {
                 return Err(
@@ -264,6 +267,33 @@ pub(crate) fn validate_query_filters(filters: &[QueryFilter]) -> Result<(), Box<
                 check_element_size(&f.field, &f.value)?;
             }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_document_id_filter_value(value: &Value) -> Result<(), Box<dyn Error>> {
+    match value {
+        Value::Str(path) => validate_document_filter_path(path),
+        Value::DocRef(reference) => validate_document_filter_path(&reference.path),
+        Value::Array(items) => items.iter().try_for_each(validate_document_id_filter_value),
+        Value::Map(map) => map.values().try_for_each(validate_document_id_filter_value),
+        _ => Ok(()),
+    }
+}
+
+fn validate_document_filter_path(path: &str) -> Result<(), Box<dyn Error>> {
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.is_empty() || !segments.len().is_multiple_of(2) {
+        return Err(format!("invalid document path: {path}").into());
+    }
+    for (index, segment) in segments.iter().enumerate() {
+        let reserved_document_id = index % 2 == 1
+            && segment.len() >= 4
+            && segment.starts_with("__")
+            && segment.ends_with("__");
+        if segment.is_empty() || *segment == "." || *segment == ".." || reserved_document_id {
+            return Err(format!("invalid document path: {path}").into());
         }
     }
     Ok(())

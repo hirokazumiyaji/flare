@@ -32,9 +32,19 @@ impl Firestore for InMemoryFirestore {
             .iter()
             .map(|filter| parse_query_field_path(&filter.field))
             .collect::<Result<Vec<_>, _>>()?;
+        let normalized_values = query
+            .filters
+            .iter()
+            .zip(&field_paths)
+            .map(|(filter, field_path)| {
+                field_path
+                    .is_document_id()
+                    .then(|| normalize_document_id_filter_value(&filter.value))
+            })
+            .collect::<Vec<_>>();
         let mut out = Vec::new();
         for (path, doc) in self.candidates(&query.source) {
-            if matches_filters(path, doc, &query.filters, &field_paths) {
+            if matches_filters(path, doc, &query.filters, &field_paths, &normalized_values) {
                 out.push((path.clone(), doc.clone()));
             }
         }
@@ -138,51 +148,51 @@ fn matches_filters(
     doc: &BTreeMap<String, Value>,
     filters: &[QueryFilter],
     field_paths: &[QueryFieldPath],
+    normalized_values: &[Option<Value>],
 ) -> bool {
-    filters.iter().zip(field_paths).all(|(filter, field_path)| {
-        // `!=` / `in` / `not-in` はフィールドの存在を要求する(存在しなければ
-        // マッチしない)。`order_by` 対象の存在チェックは sort 側で行う。
-        let name_value = field_path
-            .is_document_id()
-            .then(|| Value::Str(path.to_string()));
-        let actual = name_value.as_ref().or_else(|| field_path.lookup(doc));
-        let normalized_value = field_path
-            .is_document_id()
-            .then(|| normalize_document_id_filter_value(&filter.value));
-        let value = normalized_value.as_ref().unwrap_or(&filter.value);
-        match filter.op {
-            QueryOp::Eq => actual == Some(value),
-            QueryOp::Ne => actual.is_some_and(|v| v != value),
-            QueryOp::Gt => compare_values(actual, value, |o| o.is_gt()),
-            QueryOp::Ge => compare_values(actual, value, |o| o.is_ge()),
-            QueryOp::Lt => compare_values(actual, value, |o| o.is_lt()),
-            QueryOp::Le => compare_values(actual, value, |o| o.is_le()),
-            QueryOp::In => match (value, actual) {
-                (Value::Array(list), Some(v)) => list.contains(v),
-                _ => false,
-            },
-            QueryOp::NotIn => match (value, actual) {
-                (Value::Array(list), Some(v)) => {
-                    if list.contains(&Value::Nil) {
-                        false
-                    } else {
-                        !list.contains(v)
+    filters.iter().zip(field_paths).zip(normalized_values).all(
+        |((filter, field_path), normalized_value)| {
+            // `!=` / `in` / `not-in` はフィールドの存在を要求する(存在しなければ
+            // マッチしない)。`order_by` 対象の存在チェックは sort 側で行う。
+            let name_value = field_path
+                .is_document_id()
+                .then(|| Value::Str(path.to_string()));
+            let actual = name_value.as_ref().or_else(|| field_path.lookup(doc));
+            let value = normalized_value.as_ref().unwrap_or(&filter.value);
+            match filter.op {
+                QueryOp::Eq => actual == Some(value),
+                QueryOp::Ne => actual.is_some_and(|v| v != value),
+                QueryOp::Gt => compare_values(actual, value, |o| o.is_gt()),
+                QueryOp::Ge => compare_values(actual, value, |o| o.is_ge()),
+                QueryOp::Lt => compare_values(actual, value, |o| o.is_lt()),
+                QueryOp::Le => compare_values(actual, value, |o| o.is_le()),
+                QueryOp::In => match (value, actual) {
+                    (Value::Array(list), Some(v)) => list.contains(v),
+                    _ => false,
+                },
+                QueryOp::NotIn => match (value, actual) {
+                    (Value::Array(list), Some(v)) => {
+                        if list.contains(&Value::Nil) {
+                            false
+                        } else {
+                            !list.contains(v)
+                        }
                     }
-                }
-                _ => false,
-            },
-            QueryOp::ArrayContains => match actual {
-                Some(Value::Array(arr)) => arr.contains(value),
-                _ => false,
-            },
-            QueryOp::ArrayContainsAny => match (value, actual) {
-                (Value::Array(list), Some(Value::Array(arr))) => {
-                    arr.iter().any(|x| list.contains(x))
-                }
-                _ => false,
-            },
-        }
-    })
+                    _ => false,
+                },
+                QueryOp::ArrayContains => match actual {
+                    Some(Value::Array(arr)) => arr.contains(value),
+                    _ => false,
+                },
+                QueryOp::ArrayContainsAny => match (value, actual) {
+                    (Value::Array(list), Some(Value::Array(arr))) => {
+                        arr.iter().any(|x| list.contains(x))
+                    }
+                    _ => false,
+                },
+            }
+        },
+    )
 }
 
 /// 大小比較は同型のみを規定する(Int / Str / Bool / Timestamp)。
