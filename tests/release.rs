@@ -82,11 +82,41 @@ mod unix {
         assert_success(&output);
         assert!(String::from_utf8_lossy(&output.stdout).contains("matches Cargo package version"));
 
-        let mismatch = format!("v{}-mismatch", env!("CARGO_PKG_VERSION"));
-        let output = run_script("validate-release-tag.sh", &[&mismatch]);
+        for invalid in ["v", "release", "v1.2", "v1.2.3-rc1", "v../1.2.3"] {
+            let output = run_script("validate-release-tag.sh", &[invalid]);
+            assert!(!output.status.success(), "{invalid} should be rejected");
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .contains("release tag must have the form vX.Y.Z"));
+        }
+
+        let mismatch = if env!("CARGO_PKG_VERSION") == "0.0.0" {
+            "v0.0.1"
+        } else {
+            "v0.0.0"
+        };
+        let output = run_script("validate-release-tag.sh", &[mismatch]);
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr)
             .contains("does not match Cargo package version"));
+    }
+
+    #[test]
+    fn release_package_rejects_non_semver_tags_before_creating_paths() {
+        let temp = TestDir::new();
+        let output_dir = temp.path().join("dist");
+        let binary = PathBuf::from(env!("CARGO_BIN_EXE_fl"));
+        let output = run_script(
+            "package-release.sh",
+            &[
+                "v../1.2.3",
+                binary.to_str().expect("binary path should be UTF-8"),
+                output_dir.to_str().expect("output path should be UTF-8"),
+            ],
+        );
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr)
+            .contains("release package tag must have the form vX.Y.Z"));
+        assert!(!output_dir.exists(), "invalid tag must not create output paths");
     }
 
     #[test]

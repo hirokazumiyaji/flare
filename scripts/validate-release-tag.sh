@@ -10,7 +10,7 @@ if [[ -z "$tag" ]]; then
   echo "usage: $0 <vX.Y.Z>" >&2
   exit 2
 fi
-if [[ "$tag" != v* || "$tag" == "v" ]]; then
+if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "release tag must have the form vX.Y.Z: $tag" >&2
   exit 2
 fi

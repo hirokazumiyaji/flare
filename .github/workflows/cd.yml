@@ -11,6 +11,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   quality-gate:
     name: Required CI checks
@@ -22,12 +26,15 @@ jobs:
   validate-version:
     name: Validate release tag
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
-        run: rustup default stable
+        run: rustup default 1.98.1
 
       - name: Validate tag against Cargo metadata
         # validate-release-tag.sh compares the tag with the package version
@@ -44,18 +51,30 @@ jobs:
     permissions:
       contents: write
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
         run: |
-          rustup default stable
+          rustup default 1.98.1
           rustup component add rustfmt clippy
 
       # The quality-gate job above has already run this build.  Rebuilding here
       # keeps the release job self-contained while retaining the gate's result
       # as a hard dependency.
+      - name: Cache Cargo registry and release build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-rust-1.98.1-${{ hashFiles('Cargo.lock') }}
+
       - name: Build release binary
         run: cargo build --release --bin fl --locked
 
@@ -97,7 +116,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish GitHub Release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@d5382d3e6f2fa7bd53cb749d33091853d4985daf # v2.3.0
         with:
           tag_name: ${{ github.ref_name }}
           files: |
