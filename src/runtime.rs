@@ -154,14 +154,13 @@ impl<F: Firestore> Runtime<F> {
         // batch / transaction は呼び出し元を読める字句的な子スコープで
         // 評価する。ブロック内で定義した変数・関数は外へ漏れず、成功・
         // ランタイムエラー/backend エラーのどちらでも同じスコープを片付ける。
-        // Save the complete stack rather than only its depth: a failed nested
-        // function binding can remove caller-local frames before returning.
-        // Restoring the snapshot makes staged-block cleanup unconditional even
-        // when an inner evaluator has partially rearranged the stack.
-        let saved_scopes = self.scopes.clone();
+        // Scope frames are balanced by eval_call/call_block before any
+        // fallible work is performed. Record only the caller's depth instead
+        // of deep-cloning every global and local value for each staged block.
+        let caller_scope_depth = self.scopes.len();
         self.scopes.push(HashMap::new());
         let flow = self.eval_block(body);
-        self.scopes = saved_scopes;
+        self.scopes.truncate(caller_scope_depth);
         let writes = match std::mem::replace(&mut self.exec, prev) {
             ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => writes,
             ExecCtx::Normal => unreachable!("exec ctx changed inside batch/transaction"),
@@ -334,12 +333,17 @@ impl<F: Firestore> Runtime<F> {
         };
         let bound = bind_function_args(&func.params, args, kwargs)?;
         // 関数はグローバルスコープと仮引数のみを見える(静的スコープ)。
-        // 呼び出し元のローカル変数・呼び出された関数自身のローカルは隠す。
-        let mut saved = self.scopes.split_off(1);
-        self.scopes.push(HashMap::new());
+        // 呼び出し元のローカル変数・呼び出された関数自身のローカスは隠す。
+        // フレームを積む前に全仮引数を検証して、途中エラーでスコープを
+        // 取り残さないようにし、呼び出し元を深い clone せず最小の深さだけ復元する。
+        let mut function_scope = HashMap::new();
         for (param, value) in bound {
-            self.set_var(&param, value)?;
+            if function_scope.insert(param.clone(), value).is_some() {
+                return Err(format!("reassignment is not allowed: {param}").into());
+            }
         }
+        let mut saved = self.scopes.split_off(1);
+        self.scopes.push(function_scope);
         let res = self.eval_block(&func.body);
         self.scopes.pop();
         self.scopes.append(&mut saved);
@@ -437,10 +441,13 @@ impl<F: Firestore> Runtime<F> {
 
     fn call_block(&mut self, block: &Block, args: Vec<Value>) -> Result<Value, Box<dyn Error>> {
         check_block_arity(block, args.len())?;
-        self.scopes.push(HashMap::new());
+        let mut block_scope = HashMap::new();
         for (param, value) in block.params.iter().cloned().zip(args) {
-            self.set_var(&param, value)?;
+            if block_scope.insert(param.clone(), value).is_some() {
+                return Err(format!("reassignment is not allowed: {param}").into());
+            }
         }
+        self.scopes.push(block_scope);
         let res = self.eval_block(&block.body);
         self.scopes.pop();
         Ok(res?.into_value())
