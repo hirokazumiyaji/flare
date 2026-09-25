@@ -13,7 +13,9 @@ use tokio::runtime::Runtime;
 
 use super::codec::encode_fields;
 use super::path::document_name;
-use crate::firestore::{insert_at_field_path, validate_field_path, WriteOp};
+use crate::firestore::{
+    insert_at_field_path, validate_field_path, validate_firestore_fields, WriteOp,
+};
 use crate::value::Value;
 
 pub(super) fn commit_writes(
@@ -97,6 +99,14 @@ pub(super) fn write_ops_to_sdk_writes(
 }
 
 fn build_write(project_id: &str, op: &WriteOp) -> Result<Write, Box<dyn Error>> {
+    // in-memory と同じ共有 validator を RPC 前に通す。検証に失敗した
+    // write は emulator に到達しないため、後続 write も送信されない。
+    match op {
+        WriteOp::Set { data, .. } | WriteOp::Update { data, .. } => {
+            validate_firestore_fields(data)?
+        }
+        WriteOp::Delete { .. } => {}
+    }
     match op {
         WriteOp::Set { path, data, merge } => {
             if *merge {

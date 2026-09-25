@@ -96,6 +96,14 @@ fn apply_write_to_docs(
     docs: &mut HashMap<String, BTreeMap<String, Value>>,
     op: WriteOp,
 ) -> Result<(), Box<dyn Error>> {
+    // in-memory と emulator が同じ値を、同じ順序・同じメッセージで
+    // 検証してから State を変更する。
+    match &op {
+        WriteOp::Set { data, .. } | WriteOp::Update { data, .. } => {
+            super::validate_firestore_fields(data)?
+        }
+        WriteOp::Delete { .. } => {}
+    }
     match op {
         WriteOp::Set {
             path,
@@ -186,9 +194,8 @@ fn apply_update_map(
     current: &mut BTreeMap<String, Value>,
     updates: &mut BTreeMap<String, Value>,
 ) -> Result<(), Box<dyn Error>> {
-    for (k, v) in updates.iter() {
+    for k in updates.keys() {
         super::validate_field_path(k)?;
-        reject_nested_sentinels(v, false)?;
     }
     // Firestore の挙動に合わせ、1) 削除 2) 通常フィールド更新 3) フィールド変換(increment等)
     // の順序で適用する。
@@ -266,7 +273,6 @@ fn resolve_sentinel_map(
     current: Option<&BTreeMap<String, Value>>,
 ) -> Result<(), Box<dyn Error>> {
     for (k, v) in map.clone() {
-        reject_nested_sentinels(&v, false)?;
         let segments: Vec<&str> = k.split('.').collect();
         let base = || lookup_field_path(current, &segments);
         let resolved = match v {
@@ -308,35 +314,6 @@ fn resolve_sentinel_map(
             other => other,
         };
         map.insert(k, resolved);
-    }
-    Ok(())
-}
-
-fn reject_nested_sentinels(value: &Value, nested: bool) -> Result<(), Box<dyn Error>> {
-    if nested
-        && matches!(
-            value,
-            Value::ArrayUnion(_)
-                | Value::ArrayRemove(_)
-                | Value::ServerTimestamp
-                | Value::Increment(_)
-                | Value::DeleteField
-        )
-    {
-        return Err("field transforms cannot be nested".into());
-    }
-    match value {
-        Value::Array(items) | Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
-            for item in items {
-                reject_nested_sentinels(item, true)?;
-            }
-        }
-        Value::Map(map) => {
-            for item in map.values() {
-                reject_nested_sentinels(item, true)?;
-            }
-        }
-        _ => {}
     }
     Ok(())
 }

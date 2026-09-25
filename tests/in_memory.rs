@@ -1206,6 +1206,45 @@ fn increment_adds_to_numeric_fields() {
 }
 
 #[test]
+fn firestore_value_validation_rejects_invalid_shapes_and_preserves_indirect_arrays() {
+    // Firestore の制限は「直接の」配列入れ子だけ。Array -> Map -> Array は
+    // 許可されるため、共有 validator がその境界を保持することを確認する。
+    let err = run_script("set(\"users/v1\", {values: [[1]]})").unwrap_err();
+    assert!(format!("{err}").contains("Nested arrays"), "{err}");
+
+    let out = run_script(
+        "set(\"users/v2\", {rows: [{values: [1, 2]}, {values: [3]}]})\nget(\"users/v2\")",
+    )
+    .unwrap();
+    assert_eq!(
+        out.inspect(),
+        "{\"rows\" => [{\"values\" => [1, 2]}, {\"values\" => [3]}]}"
+    );
+
+    for (name, source, expected) in [
+        ("empty", "set(\"users/v3\", {\"\": 1})", "empty string"),
+        (
+            "reserved",
+            "set(\"users/v4\", {\"__name__\": 1})",
+            "reserved",
+        ),
+        (
+            "nested-empty",
+            "set(\"users/v5\", {outer: [{\"\": 1}]})",
+            "empty string",
+        ),
+    ] {
+        let err = run_script(source).unwrap_err();
+        assert!(format!("{err}").contains(expected), "{name}: {err}");
+    }
+
+    let err =
+        run_script("set(\"users/v6\", {})\nupdate(\"users/v6\", {\"profile.__secret__\": 1})")
+            .unwrap_err();
+    assert!(format!("{err}").contains("reserved"), "{err}");
+}
+
+#[test]
 fn nested_sentinels_are_rejected() {
     let err = run_script("set(\"users/ns1\", {nested: {n: increment(1)}})").unwrap_err();
     assert!(
