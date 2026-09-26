@@ -732,6 +732,27 @@ fn newlines_before_postfix_outside_delimiters_keep_statement_boundaries() {
 }
 
 #[test]
+fn newlines_before_operators_outside_delimiters_keep_statement_boundaries() {
+    // 演算子の前にある改行も delimiter 外では文の区切りのまま。postfix 側と
+    // 並べて固定し、depth ゲートが無条件にならないようにする。
+    for (source, token) in [
+        ("a = 1\n+ 2", "Plus"),
+        ("a = 1\n* 2", "Star"),
+        ("a = true\n&& false", "AndAnd"),
+    ] {
+        let err = run_script(source).unwrap_err();
+        assert!(
+            format!("{err}").contains(&format!("unexpected token: {token}")),
+            "{source}: {err}"
+        );
+    }
+
+    // `-` は二項演算子として続行せず、单項の新しい文になる。
+    let out = run_script("a = 1\n- 2").unwrap();
+    assert_eq!(out, Value::Int(-2));
+}
+
+#[test]
 fn semicolons_are_not_treated_as_newlines_inside_delimiters() {
     // `;` は文の区切りのまま。delimiter の内側ではエラーになる。
     assert!(run_script("[;1]").is_err());
