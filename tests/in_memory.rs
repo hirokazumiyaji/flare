@@ -698,8 +698,27 @@ fn newlines_before_operators_and_postfix_inside_delimiters_parse() {
     assert_eq!(out, Value::Array(vec![Value::Int(101)]));
 
     // An outer delimiter must not change the statement semantics inside a
-    // brace block: the newline before `+` still starts a new statement.
-    assert!(run_script("[[1].map { |x| x\n+ 1 }]").is_err());
+    // brace block: the newline before `[` starts a new statement instead of
+    // indexing `x`, so every element maps to `[0]`. Asserting the value keeps
+    // the case honest — a newline-transparent parse would yield `[10, 10]`.
+    let out = run_script("[[10, 20].map { |x| x\n[0] }]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Array(vec![
+            Value::Array(vec![Value::Int(0)]),
+            Value::Array(vec![Value::Int(0)]),
+        ])])
+    );
+
+    // ...while delimiters nested inside such a block stay newline-transparent.
+    let out = run_script("[[1].map { |x| [\n  x,\n  x + 1\n] }]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Array(vec![Value::Array(vec![
+            Value::Int(1),
+            Value::Int(2)
+        ])])])
+    );
 }
 
 #[test]
