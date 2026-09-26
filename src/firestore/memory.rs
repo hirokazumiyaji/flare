@@ -53,6 +53,13 @@ impl Firestore for InMemoryFirestore {
         // example, an update of a missing document) must not consume the
         // transaction state: the runtime needs to be able to abort it and a
         // direct caller may retry after correcting the writes.
+        if writes.is_empty() {
+            // Nothing can fail, so the snapshot can be moved instead of
+            // cloned; this keeps `transaction { ... }` with no staged write
+            // from copying the whole store.
+            self.docs = self.tx_snapshot.take().ok_or("not in transaction")?;
+            return Ok(());
+        }
         let mut next = self
             .tx_snapshot
             .as_ref()
