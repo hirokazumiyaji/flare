@@ -55,7 +55,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             Some(s) if s.starts_with('-') => {
                 return Err(format!("unknown option: {s}").into());
             }
-            _ => {
+            // Anything that is not a recognised option is a script path. This
+            // deliberately includes a non-UTF-8 argument (`to_str()` is
+            // `None`), because such an argument is exactly the path this CLI
+            // must accept rather than reject.
+            Some(_) | None => {
                 paths.push(PathBuf::from(&args[i]));
                 i += 1;
             }

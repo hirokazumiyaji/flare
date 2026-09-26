@@ -22,9 +22,35 @@ fn fl_unknown_backend_fails() {
     assert!(!status.success(), "invalid --backend should fail");
 }
 
+/// Create a temp script exclusively. The name is derived from the pid plus a
+/// nanosecond stamp so concurrent runs do not collide, and `create_new` means a
+/// pre-existing entry (notably a symlink) fails the test loudly instead of
+/// being followed and truncated.
+fn create_temp_script(name: &str, source: &[u8]) -> std::path::PathBuf {
+    use std::io::Write;
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "fl-test-{}-{}-{name}.fl",
+        std::process::id(),
+        stamp
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("create temp script {}: {e}", path.display()));
+    file.write_all(source)
+        .unwrap_or_else(|e| panic!("write temp script {}: {e}", path.display()));
+    drop(file);
+    path
+}
+
 fn run_fl_script(name: &str, source: &str) -> std::process::Output {
-    let path = std::env::temp_dir().join(format!("fl-test-{}-{}.fl", std::process::id(), name));
-    std::fs::write(&path, source).expect("write temp script");
+    let path = create_temp_script(name, source.as_bytes());
     let out = Command::new(FL_EXE).arg(&path).output().expect("spawn fl");
     let _ = std::fs::remove_file(&path);
     out
@@ -38,13 +64,11 @@ fn run_fl_script(name: &str, source: &str) -> std::process::Output {
 #[test]
 fn fl_handles_script_with_non_utf8_path() {
     use std::ffi::OsString;
-    use std::io::Write;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
-    // PID plus a nanosecond stamp keeps concurrent runs from colliding.
-    // The name is predictable, so the fixture is created with `create_new`
-    // instead of `fs::write`: a pre-existing entry (notably a symlink) makes
-    // the call fail loudly rather than being followed and truncated.
+    // Same exclusive-creation contract as create_temp_script, but the name
+    // carries a raw 0xff byte, so it cannot go through that helper's name
+    // formatting.
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before unix epoch")
@@ -211,8 +235,7 @@ fn fl_no_args_with_piped_stdin_reads_stdin() {
 
 #[test]
 fn fl_rejects_combined_script_sources() {
-    let path = std::env::temp_dir().join(format!("fl-test-{}-combo.fl", std::process::id()));
-    std::fs::write(&path, "1").expect("write temp script");
+    let path = create_temp_script("combo", b"1");
     let out = Command::new(FL_EXE)
         .args(["-e", "1", path.to_str().expect("utf8 path")])
         .output()
