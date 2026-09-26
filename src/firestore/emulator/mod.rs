@@ -157,16 +157,15 @@ impl Firestore for FirestoreEmulator {
     }
 
     fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
-        // Do not discard the id before Rollback returns successfully.  A
-        // transient rollback failure must leave enough state for a later
-        // retry; a successful rollback (or an already-idle backend) clears
-        // the local transaction state.
+        // Do not discard the id before Rollback returns.  A transient rollback
+        // failure must leave enough state for a later retry; a successful
+        // rollback (or an already-idle backend) clears the local state.
         let Some(tid) = self.transaction_id.clone() else {
             return Ok(());
         };
         let db = &self.client.db;
         let database = db.get_database_path().clone();
-        self.client.runtime.block_on(async move {
+        let result = self.client.runtime.block_on(async move {
             db.client()
                 .get()
                 .rollback(Request::new(RollbackRequest {
@@ -175,7 +174,19 @@ impl Firestore for FirestoreEmulator {
                 }))
                 .await?;
             Ok::<_, gcloud_sdk::tonic::Status>(())
-        })?;
+        });
+        match result {
+            Ok(()) => {}
+            // NOT_FOUND means the server no longer holds this transaction:
+            // it was already committed (a commit whose response was lost), or
+            // already rolled back, or never existed.  That is terminal, not
+            // retryable, so the local state must be dropped.  Propagating it
+            // would wedge `Runtime::pending_rollback` and make every later
+            // `transaction` block fail with "already in transaction" forever.
+            // This mirrors how `get` above normalises the same status.
+            Err(status) if status.code() == Code::NotFound => {}
+            Err(status) => return Err(status.into()),
+        }
         self.transaction_id = None;
         Ok(())
     }
