@@ -30,40 +30,52 @@ fn run_fl_script(name: &str, source: &str) -> std::process::Output {
     out
 }
 
-#[cfg(unix)]
+// macOS/AFS rejects non-UTF-8 file names outright (`EILSEQ`), so the fixture
+// can only be created on a file system that accepts arbitrary bytes. CI runs
+// Linux, which is where this contract is actually exercised; on macOS the test
+// would fail at setup no matter how `fl` behaves.
+#[cfg(target_os = "linux")]
 #[test]
 fn fl_handles_script_with_non_utf8_path() {
     use std::ffi::OsString;
+    use std::io::Write;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
-    let base = std::env::temp_dir().join(format!("fl-test-{}-non-utf8", std::process::id()));
+    // PID plus a nanosecond stamp keeps concurrent runs from colliding.
+    // The name is predictable, so the fixture is created with `create_new`
+    // instead of `fs::write`: a pre-existing entry (notably a symlink) makes
+    // the call fail loudly rather than being followed and truncated.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_nanos();
+    let base =
+        std::env::temp_dir().join(format!("fl-test-{}-{}-non-utf8", std::process::id(), stamp));
     let mut path_bytes = base.as_os_str().as_bytes().to_vec();
     path_bytes.push(0xff);
     path_bytes.extend_from_slice(b".fl");
     let path = std::path::PathBuf::from(OsString::from_vec(path_bytes));
-    let script_created = std::fs::write(&path, "1").is_ok();
+    // A setup failure must not silently downgrade the test: without the
+    // fixture, the non-UTF-8 path contract would go untested.
+    let mut script = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("create non-UTF-8 temp script");
+    script.write_all(b"1").expect("write non-UTF-8 temp script");
+    drop(script);
 
     let out = Command::new(FL_EXE).arg(&path).output().expect("spawn fl");
     let _ = std::fs::remove_file(&path);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
-    if script_created {
-        assert!(
-            out.status.success(),
-            "fl should execute a non-UTF-8 path; status: {:?}, stderr: {stderr}",
-            out.status
-        );
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "=> 1\n");
-    } else {
-        assert_eq!(
-            out.status.code(),
-            Some(1),
-            "fl should report a controlled error for a non-UTF-8 path; status: {:?}, stderr: {stderr}",
-            out.status
-        );
-        assert!(stderr.starts_with("error: "), "stderr: {stderr:?}");
-        assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
-    }
+    assert!(
+        out.status.success(),
+        "fl should execute a non-UTF-8 path; status: {:?}, stderr: {stderr}",
+        out.status
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "=> 1\n");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
 }
 
 #[cfg(unix)]
