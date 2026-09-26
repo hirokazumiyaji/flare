@@ -372,9 +372,13 @@ fn array_index_conversion_is_checked_at_integer_boundaries() {
     .unwrap();
     assert_eq!(out, Value::Array(vec![Value::Nil, Value::Nil]));
 
-    // `usize::MAX + 1` is an i64 on narrower targets, but not on 64-bit.
-    let first_unrepresentable = (usize::MAX as u128) + 1;
-    if let Ok(index) = i64::try_from(first_unrepresentable) {
+    // `usize::MAX + 1` only fits in an i64 on targets narrower than 64 bits,
+    // so this case is compiled out on the 64-bit CI runner rather than
+    // silently skipped by a runtime branch.
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        let first_unrepresentable = (usize::MAX as u128) + 1;
+        let index = i64::try_from(first_unrepresentable).expect("fits in i64 below 64 bits");
         let out = run_script(&format!("[\"zero\", \"one\"][{index}]")).unwrap();
         assert_eq!(out, Value::Nil);
     }

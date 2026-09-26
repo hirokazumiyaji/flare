@@ -1026,8 +1026,11 @@ fn checked_array_index(index: i64) -> Option<usize> {
     array_index_with_limit(index, usize::MAX as u128)
 }
 
-/// `limit` lets tests exercise the same conversion at a simulated narrower
-/// target width on a 64-bit host. Production always passes `usize::MAX`.
+/// `limit` exists so a test can exercise the same conversion at a simulated
+/// narrower target width on a 64-bit host. Production always passes
+/// `usize::MAX as u128`, where the bound is redundant with `usize::try_from`
+/// but harmless — keeping both in one function means the simulated-width test
+/// and `eval_index` share a single code path.
 fn array_index_with_limit(index: i64, limit: u128) -> Option<usize> {
     if index < 0 || index as u128 > limit {
         return None;
