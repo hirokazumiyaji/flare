@@ -30,9 +30,20 @@ pub struct FirestoreEmulator {
     transaction_id: Option<Vec<u8>>,
 }
 
+/// A validated emulator configuration. Holding this costs nothing and opens no
+/// socket, so it can be obtained before the CLI blocks on script input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmulatorConfig {
+    pub host: String,
+    pub project_id: String,
+}
+
+/// Public so a library consumer can `downcast_ref` a connection failure out of
+/// the `Box<dyn Error>` returned by [`FirestoreEmulator::new`] instead of
+/// string-matching the message.
 #[derive(Debug)]
-struct EmulatorConnectionError {
-    host: String,
+pub struct EmulatorConnectionError {
+    pub host: String,
     source: Box<dyn Error>,
 }
 
@@ -66,6 +77,20 @@ impl FirestoreEmulator {
     /// `FIRESTORE_EMULATOR_HOST` is not set; a configured but invalid or
     /// unreachable emulator is returned as an error.
     pub fn try_from_env() -> Result<Option<Self>, Box<dyn Error>> {
+        match Self::config_from_env()? {
+            None => Ok(None),
+            Some(config) => Ok(Some(Self::new(config.host, config.project_id)?)),
+        }
+    }
+
+    /// Parse and validate the emulator configuration from the environment
+    /// without opening a connection.
+    ///
+    /// This is deliberately separate from [`FirestoreEmulator::try_from_env`]:
+    /// validation is pure and instant, so a CLI can reject a misconfiguration
+    /// before it blocks on reading a script from stdin, while the actual
+    /// network connect is deferred until the client is first needed.
+    pub fn config_from_env() -> Result<Option<EmulatorConfig>, Box<dyn Error>> {
         let host = match env::var("FIRESTORE_EMULATOR_HOST") {
             Ok(host) => host,
             Err(VarError::NotPresent) => return Ok(None),
@@ -73,6 +98,10 @@ impl FirestoreEmulator {
                 return Err("FIRESTORE_EMULATOR_HOST must be valid UTF-8".into());
             }
         };
+        // Validate both variables here, not in `new`: this is the pure,
+        // instant half of the setup, and the CLI relies on it to reject every
+        // misconfiguration before it blocks on script input. `new` re-validates
+        // so it stays safe for direct callers.
         validate_config("FIRESTORE_EMULATOR_HOST", &host)?;
 
         let project_id = match env::var("FIRESTORE_PROJECT_ID") {
@@ -82,8 +111,9 @@ impl FirestoreEmulator {
                 return Err("FIRESTORE_PROJECT_ID must be valid UTF-8".into());
             }
         };
+        validate_config("FIRESTORE_PROJECT_ID", &project_id)?;
 
-        Ok(Some(Self::new(host, project_id)?))
+        Ok(Some(EmulatorConfig { host, project_id }))
     }
 
     /// 接続を確立して作る。emulator に届かない場合はエラーを返す。
@@ -91,12 +121,12 @@ impl FirestoreEmulator {
         validate_config("FIRESTORE_EMULATOR_HOST", &host)?;
         validate_config("FIRESTORE_PROJECT_ID", &project_id)?;
 
-        let client = client::connect(&host, &project_id).map_err(|source| {
-            Box::new(EmulatorConnectionError {
-                host: host.clone(),
-                source,
-            }) as Box<dyn Error>
-        })?;
+        let client = match client::connect(&host, &project_id) {
+            Ok(client) => client,
+            Err(source) => {
+                return Err(Box::new(EmulatorConnectionError { host, source }));
+            }
+        };
         Ok(Self {
             client,
             transaction_id: None,

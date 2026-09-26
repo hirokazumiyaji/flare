@@ -66,10 +66,15 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // Validate the backend configuration before reading the script, so a
+    // misconfiguration fails immediately. Only parsing and validation happen
+    // here: connecting opens a socket and can block on the OS connect timeout,
+    // which would stall stdin, so it is deferred until after the script is
+    // read.
     let backend_config = match backend {
         "in-memory" => None,
         "emulator" => Some(
-            FirestoreEmulator::try_from_env()?
+            FirestoreEmulator::config_from_env()?
                 .ok_or("FIRESTORE_EMULATOR_HOST must be set when using --backend emulator")?,
         ),
         other => {
@@ -109,7 +114,10 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let out = match backend_config {
         None => run_script(&src)?,
-        Some(firestore) => run_script_with_firestore(&src, firestore)?,
+        Some(config) => {
+            let firestore = FirestoreEmulator::new(config.host, config.project_id)?;
+            run_script_with_firestore(&src, firestore)?
+        }
     };
 
     println!("=> {}", out.inspect());
