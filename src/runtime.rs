@@ -515,8 +515,13 @@ impl<F: Firestore> Runtime<F> {
     fn call_block(&mut self, block: &Block, args: Vec<Value>) -> Result<ExecFlow, Box<dyn Error>> {
         check_block_arity(block, args.len())?;
         let scope = ScopeGuard::block(self);
-        for (param, value) in block.params.iter().cloned().zip(args) {
-            scope.runtime.set_var(&param, value)?;
+        // `ast::Block` is public with public fields, so a hand-built Block (via
+        // the public `eval_program`) can carry duplicate params even though the
+        // parser now rejects them. Without this, the only remaining path into
+        // duplicates reported a misleading "reassignment is not allowed: <name>".
+        validate_unique_params(&block.params, "block")?;
+        for (param, value) in block.params.iter().zip(args) {
+            scope.runtime.set_var(param, value)?;
         }
         // `call_block` propagates Return to its caller (unlike `eval_call`,
         // which consumes it): the `each`/`map` dispatch decides per item.

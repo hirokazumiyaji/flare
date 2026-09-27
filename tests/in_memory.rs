@@ -711,7 +711,15 @@ fn block_param_must_match_yielded_argument_count() {
 
 #[test]
 fn duplicate_block_params_are_rejected_at_parse() {
+    use firelang::{ErrorKind, FirelangError};
+
     let err = run_script("[1].map { |item, item| item }").unwrap_err();
+    // Pin the phase, not just the wording: validate_unique_params produces the
+    // same text, so a runtime check added later would otherwise pass this.
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("duplicate block parameter should be a FirelangError");
+    assert_eq!(ferr.kind, ErrorKind::Parse, "{ferr}");
     assert!(
         format!("{err}").contains("duplicate block parameter: item"),
         "{err}"
@@ -947,7 +955,15 @@ fn duplicate_function_params_are_rejected_at_definition() {
         format!("{err}").contains("duplicate function parameter: a"),
         "{err}"
     );
+    // `a` was never bound: the definition failed before any argument binding.
     assert!(run_in(&mut runtime, "a").is_err());
+    // The rejected definition must not have installed a callable `f`, otherwise
+    // the redefinition below would fail for the wrong reason.
+    let leftover = run_in(&mut runtime, "f").unwrap_err();
+    assert!(
+        format!("{leftover}").contains("undefined variable: f"),
+        "{leftover}"
+    );
     assert_eq!(
         run_in(&mut runtime, "fn f(a) { a }\nf(2)").unwrap(),
         Value::Int(2)
@@ -997,7 +1013,13 @@ fn failed_function_call_restores_scope_for_runtime_reuse() {
     .unwrap_err();
     assert!(format!("{err}").contains("undefined variable"), "{err}");
     assert_eq!(run_in(&mut runtime, "outer").unwrap(), Value::Int(10));
-    assert!(run_in(&mut runtime, "param").is_err());
+    // Assert the diagnostic, not just any failure: a bare is_err() would
+    // also pass if the scope cleanup regressed into a different error.
+    let leaked = run_in(&mut runtime, "param").unwrap_err();
+    assert!(
+        format!("{leaked}").contains("undefined variable: param"),
+        "{leaked}"
+    );
 }
 
 #[test]
@@ -1010,7 +1032,13 @@ fn failed_block_call_restores_scope_for_runtime_reuse() {
     .unwrap_err();
     assert!(format!("{err}").contains("undefined variable"), "{err}");
     assert_eq!(run_in(&mut runtime, "outer").unwrap(), Value::Int(10));
-    assert!(run_in(&mut runtime, "item").is_err());
+    // Assert the diagnostic, not just any failure: a bare is_err() would
+    // also pass if the scope cleanup regressed into a different error.
+    let leaked = run_in(&mut runtime, "item").unwrap_err();
+    assert!(
+        format!("{leaked}").contains("undefined variable: item"),
+        "{leaked}"
+    );
 }
 
 #[test]
