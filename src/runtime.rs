@@ -1022,14 +1022,23 @@ fn lookup_field_path<'a>(
     None
 }
 
+/// Convert an array index to the host index type. Generic over `T` so a test
+/// can instantiate a narrower target width on a 64-bit host and exercise the
+/// real `TryFrom` conversion rather than a test-only limit check. Production
+/// always uses `usize`.
+fn checked_array_index<T: TryFrom<i64>>(index: i64) -> Option<T> {
+    T::try_from(index).ok()
+}
+
 fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {
     match (base, index) {
         (Value::Map(map), Value::Str(key)) => Ok(map.get(&key).cloned().unwrap_or(Value::Nil)),
         (Value::Array(items), Value::Int(i)) => {
-            if i < 0 {
-                return Ok(Value::Nil);
-            }
-            Ok(items.get(i as usize).cloned().unwrap_or(Value::Nil))
+            let index = match checked_array_index::<usize>(i) {
+                Some(index) => index,
+                None => return Ok(Value::Nil),
+            };
+            Ok(items.get(index).cloned().unwrap_or(Value::Nil))
         }
         (Value::Map(_), _) => Err("map index must be a string".into()),
         (Value::Array(_), _) => Err("array index must be an int".into()),
@@ -1168,6 +1177,28 @@ impl ExecFlow {
 mod tests {
     use super::*;
     use crate::firestore::InMemoryFirestore;
+
+    #[test]
+    fn array_index_conversion_respects_target_width() {
+        // A 64-bit host would accept 2^32 as a usize index, so instantiate the
+        // conversion at the narrower width to prove the narrowing is rejected
+        // by a real `TryFrom` and not only by a host-specific bound.
+        assert_eq!(
+            checked_array_index::<u32>(4_294_967_295),
+            Some(4_294_967_295)
+        );
+        assert_eq!(checked_array_index::<u32>(4_294_967_296), None);
+        assert_eq!(checked_array_index::<u32>(4_294_967_297), None);
+        assert_eq!(checked_array_index::<u32>(-1), None);
+        assert_eq!(checked_array_index::<u16>(65_536), None);
+        assert_eq!(checked_array_index::<usize>(0), Some(0));
+        // The host width still accepts the full i64 range that fits it.
+        assert_eq!(
+            checked_array_index::<usize>(i64::MAX),
+            Some(i64::MAX as usize)
+        );
+        assert_eq!(checked_array_index::<usize>(-1), None);
+    }
 
     #[test]
     fn builtin_table_matches_name_list() {

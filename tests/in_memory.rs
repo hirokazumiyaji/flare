@@ -364,6 +364,27 @@ fn missing_keys_and_out_of_range_indices_return_nil() {
 }
 
 #[test]
+fn array_index_conversion_is_checked_at_integer_boundaries() {
+    let max_i64 = i64::MAX;
+    let out = run_script(&format!(
+        "a = [\"zero\", \"one\"]\n[a[{max_i64}], a[4294967297]]"
+    ))
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Nil, Value::Nil]));
+
+    // `usize::MAX + 1` only fits in an i64 on targets narrower than 64 bits,
+    // so this case is compiled out on the 64-bit CI runner rather than
+    // silently skipped by a runtime branch.
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        let first_unrepresentable = (usize::MAX as u128) + 1;
+        let index = i64::try_from(first_unrepresentable).expect("fits in i64 below 64 bits");
+        let out = run_script(&format!("[\"zero\", \"one\"][{index}]")).unwrap();
+        assert_eq!(out, Value::Nil);
+    }
+}
+
+#[test]
 fn index_type_mismatch_is_an_error() {
     let err = run_script("[1, 2][\"a\"]").unwrap_err();
     assert!(
