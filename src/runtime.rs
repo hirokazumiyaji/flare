@@ -160,6 +160,14 @@ impl<F: Firestore> Runtime<F> {
         let caller_scope_depth = self.scopes.len();
         self.scopes.push(HashMap::new());
         let flow = self.eval_block(body);
+        // `truncate` would silently discard a frame leaked by a nested call,
+        // so assert the balance explicitly. This only runs in debug builds,
+        // which is where the test suite executes.
+        debug_assert_eq!(
+            self.scopes.len(),
+            caller_scope_depth + 1,
+            "staged block must leave the scope stack balanced"
+        );
         self.scopes.truncate(caller_scope_depth);
         let writes = match std::mem::replace(&mut self.exec, prev) {
             ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => writes,
@@ -443,16 +451,13 @@ impl<F: Firestore> Runtime<F> {
     fn call_block(&mut self, block: &Block, args: Vec<Value>) -> Result<Value, Box<dyn Error>> {
         check_block_arity(block, args.len())?;
         let mut block_scope = HashMap::new();
-        for (param, value) in block.params.iter().zip(args) {
-            // Clone once: the key is needed for the map and, on the error path,
-            // for the message. Inserting first and cloning afterwards allocated a
-            // second String on every block invocation, which is the hot path for
-            // `each` / `map`.
-            let param = param.clone();
-            if block_scope.contains_key(&param) {
+        for (param, value) in block.params.iter().cloned().zip(args) {
+            // Single lookup: `check_block_arity` above guarantees exactly one
+            // param per invocation here, so the guard never fires on this path,
+            // but keep it in the same form as `call_function` for symmetry.
+            if block_scope.insert(param.clone(), value).is_some() {
                 return Err(format!("reassignment is not allowed: {param}").into());
             }
-            block_scope.insert(param, value);
         }
         self.scopes.push(block_scope);
         let res = self.eval_block(&block.body);

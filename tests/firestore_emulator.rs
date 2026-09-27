@@ -486,6 +486,14 @@ fn emulator_failed_transaction_aborts_and_restarts() {
         ),
     );
     assert!(failing.is_err());
+    // The comment above claims the failed transaction's local does not
+    // survive: verify it directly. A scope-cleanup regression would leave
+    // `tx_local` defined here instead of erroring.
+    let leaked = run_on_shared_runtime(&mut rt, "tx_local").unwrap_err();
+    assert!(
+        format!("{leaked}").contains("undefined variable: tx_local"),
+        "{leaked}"
+    );
     let out = run_on_shared_runtime(
         &mut rt,
         &format!(
