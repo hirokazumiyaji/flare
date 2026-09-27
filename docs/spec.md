@@ -347,7 +347,7 @@ transaction {
 | `timestamp("2026-02-01T00:00:00+09:00")` | RFC3339 文字列から生成。オフセットは `Z` または `±HH:MM`。小数秒は非対応 |
 | `ts.to_unix()` | Int(Unix 秒)を返す |
 | `ts.to_rfc3339()` | RFC3339 文字列(UTC、`+00:00`)を返す |
-| `ts.add_seconds(n)` | n 秒後の**新しい** Timestamp を返す |
+| `ts.add_seconds(n)` | n 秒後の**新しい** Timestamp を返す。範囲外は `integer overflow` エラー |
 | `t1 > t2` / `<` / `>=` / `<=` / `==` / `!=` | Timestamp 同士の比較(秒で比較) |
 | `t2 - t1` | 秒差を Int で返す。範囲外は `integer overflow` エラー |
 
