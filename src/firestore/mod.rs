@@ -11,20 +11,16 @@ use std::error::Error;
 
 use crate::value::{QueryFilter, QueryOp, QueryRef, Value};
 
+const MAX_QUERY_STRING_BYTES: usize = 1500;
+
 /// クエリフィルタ値の共有検証。in-memory / emulator のクエリ実行前に
 /// 両バックエンドが呼び、同じエラーを同じメッセージで返す。
-/// - 文字列フィルタ値は 1,500 UTF-8 バイト未満(Firestore 準拠。`in` 等の
-///   配列要素・`array_contains` の要素も含む)
+/// - 文字列フィルタ値は 1,500 UTF-8 バイト未満(Firestore 準拠。Map / Array
+///   の中にネストされた文字列も含めて再帰的に検証する)
 /// - `in` / `not-in` / `array_contains_any` の値は Array で要素は最大 10 個
 pub(crate) fn validate_query_filters(filters: &[QueryFilter]) -> Result<(), Box<dyn Error>> {
     for f in filters {
-        if let Value::Str(s) = &f.value {
-            if s.len() >= 1500 {
-                return Err(
-                    format!("value for {} is too large to be used in a query", f.field).into(),
-                );
-            }
-        }
+        check_query_value_size(&f.field, &f.value)?;
         match f.op {
             QueryOp::In | QueryOp::NotIn | QueryOp::ArrayContainsAny => {
                 let op_name = match f.op {
@@ -38,12 +34,6 @@ pub(crate) fn validate_query_filters(filters: &[QueryFilter]) -> Result<(), Box<
                 if items.len() > 10 {
                     return Err(format!("{op_name} filters support at most 10 elements").into());
                 }
-                for item in items {
-                    check_element_size(&f.field, item)?;
-                }
-            }
-            QueryOp::ArrayContains => {
-                check_element_size(&f.field, &f.value)?;
             }
             _ => {}
         }
@@ -51,13 +41,73 @@ pub(crate) fn validate_query_filters(filters: &[QueryFilter]) -> Result<(), Box<
     Ok(())
 }
 
-fn check_element_size(field: &str, v: &Value) -> Result<(), Box<dyn Error>> {
-    match v {
-        Value::Str(s) if s.len() >= 1500 => {
-            Err(format!("value for {field} is too large to be used in a query").into())
+/// 値の中の文字列を葉としてたどり、各文字列がクエリの上限未満であることを
+/// 確認する。Firestore の制限は文字数ではなく UTF-8 バイト数で判定される。
+fn check_query_value_size(field: &str, value: &Value) -> Result<(), Box<dyn Error>> {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Str(s) if s.len() >= MAX_QUERY_STRING_BYTES => {
+                return Err(format!("value for {field} is too large to be used in a query").into());
+            }
+            Value::Array(items) => pending.extend(items.iter()),
+            Value::Map(fields) => pending.extend(fields.values()),
+            _ => {}
         }
-        Value::Array(items) => items.iter().try_for_each(|x| check_element_size(field, x)),
-        _ => Ok(()),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map_array(value: &str) -> Value {
+        Value::Map(BTreeMap::from([(
+            "outer".to_string(),
+            Value::Array(vec![Value::Map(BTreeMap::from([(
+                "inner".to_string(),
+                Value::Str(value.to_string()),
+            )]))]),
+        )]))
+    }
+
+    fn array_map(value: &str) -> Value {
+        Value::Array(vec![Value::Map(BTreeMap::from([(
+            "outer".to_string(),
+            Value::Map(BTreeMap::from([(
+                "inner".to_string(),
+                Value::Str(value.to_string()),
+            )])),
+        )]))])
+    }
+
+    #[test]
+    fn query_filter_string_limit_is_recursive_and_byte_based() {
+        let valid = "界".repeat(499) + "ab";
+        let invalid = "界".repeat(500);
+        assert_eq!(valid.len(), 1499);
+        assert_eq!(invalid.len(), 1500);
+
+        for make_value in [map_array as fn(&str) -> Value, array_map] {
+            assert!(validate_query_filters(&[QueryFilter {
+                field: "payload".to_string(),
+                op: QueryOp::Eq,
+                value: make_value(&valid),
+            }])
+            .is_ok());
+
+            let err = validate_query_filters(&[QueryFilter {
+                field: "payload".to_string(),
+                op: QueryOp::Eq,
+                value: make_value(&invalid),
+            }])
+            .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "value for payload is too large to be used in a query"
+            );
+        }
     }
 }
 
