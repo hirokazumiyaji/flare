@@ -142,15 +142,33 @@ impl<F: Firestore> Runtime<F> {
         Ok(ExecFlow::Value(last))
     }
 
-    /// `exec` をステージング用 ctx に差し替えてブロックを評価し、元の ctx に
-    /// 戻してステージされた writes を返す。ブロックの成否にかかわらず復元する。
+    /// `exec` をステージング用 ctx に差し替え、子スコープでブロックを評価する。
+    /// ブロックの成否にかかわらず元の ctx とスコープへ戻し、ステージされた
+    /// writes を返す。
     fn run_staged_block(
         &mut self,
         ctx: ExecCtx,
         body: &[Stmt],
     ) -> (Result<ExecFlow, Box<dyn Error>>, Vec<WriteOp>) {
         let prev = std::mem::replace(&mut self.exec, ctx);
+        // batch / transaction は呼び出し元を読める字句的な子スコープで
+        // 評価する。ブロック内で定義した変数・関数は外へ漏れず、成功・
+        // ランタイムエラー/backend エラーのどちらでも同じスコープを片付ける。
+        // Scope frames are balanced by eval_call/call_block before any
+        // fallible work is performed. Record only the caller's depth instead
+        // of deep-cloning every global and local value for each staged block.
+        let caller_scope_depth = self.scopes.len();
+        self.scopes.push(HashMap::new());
         let flow = self.eval_block(body);
+        // `truncate` would silently discard a frame leaked by a nested call,
+        // so assert the balance explicitly. This only runs in debug builds,
+        // which is where the test suite executes.
+        debug_assert_eq!(
+            self.scopes.len(),
+            caller_scope_depth + 1,
+            "staged block must leave the scope stack balanced"
+        );
+        self.scopes.truncate(caller_scope_depth);
         let writes = match std::mem::replace(&mut self.exec, prev) {
             ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => writes,
             ExecCtx::Normal => unreachable!("exec ctx changed inside batch/transaction"),
@@ -323,12 +341,18 @@ impl<F: Firestore> Runtime<F> {
         };
         let bound = bind_function_args(&func.params, args, kwargs)?;
         // 関数はグローバルスコープと仮引数のみを見える(静的スコープ)。
-        // 呼び出し元のローカル変数・呼び出された関数自身のローカルは隠す。
-        let mut saved = self.scopes.split_off(1);
-        self.scopes.push(HashMap::new());
+        // 呼び出し元のローカル変数・呼び出された関数自身のローカスは隠す。
+        // フレームを積む前に全仮引数を検証して、途中エラーでスコープを
+        // 取り残さないようにし、呼び出し元を深い clone せず最小の深さだけ復元する。
+        let mut function_scope = HashMap::new();
         for (param, value) in bound {
-            self.set_var(&param, value)?;
+            // One clone for the key and the error message, as in `call_block`.
+            if function_scope.insert(param.clone(), value).is_some() {
+                return Err(format!("reassignment is not allowed: {param}").into());
+            }
         }
+        let mut saved = self.scopes.split_off(1);
+        self.scopes.push(function_scope);
         let res = self.eval_block(&func.body);
         self.scopes.pop();
         self.scopes.append(&mut saved);
@@ -426,10 +450,16 @@ impl<F: Firestore> Runtime<F> {
 
     fn call_block(&mut self, block: &Block, args: Vec<Value>) -> Result<Value, Box<dyn Error>> {
         check_block_arity(block, args.len())?;
-        self.scopes.push(HashMap::new());
+        let mut block_scope = HashMap::new();
         for (param, value) in block.params.iter().cloned().zip(args) {
-            self.set_var(&param, value)?;
+            // Single lookup: `check_block_arity` above guarantees exactly one
+            // param per invocation here, so the guard never fires on this path,
+            // but keep it in the same form as `call_function` for symmetry.
+            if block_scope.insert(param.clone(), value).is_some() {
+                return Err(format!("reassignment is not allowed: {param}").into());
+            }
         }
+        self.scopes.push(block_scope);
         let res = self.eval_block(&block.body);
         self.scopes.pop();
         Ok(res?.into_value())
