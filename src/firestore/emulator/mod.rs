@@ -19,6 +19,13 @@ use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Value};
 
 pub struct FirestoreEmulator {
     client: client::EmulatorClient,
+    // `Some` means the server-side transaction is still eligible for
+    // rollback. It is cleared only after commit or rollback succeeds.
+    //
+    // State transitions:
+    //   None --begin--> Some --commit/abort success--> None
+    //   Some --preparation/commit/abort failure--> Some
+    //   None --abort--> None
     transaction_id: Option<Vec<u8>>,
 }
 
@@ -135,18 +142,30 @@ impl Firestore for FirestoreEmulator {
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
-        let tid = self.transaction_id.take().ok_or("not in transaction")?;
+        // Keep the transaction id until the whole commit succeeds.  In
+        // particular, write preparation can fail before the Commit RPC is
+        // sent, and the runtime will call abort_transaction for that error.
+        // Taking the id here would make that rollback a no-op and leave the
+        // server-side transaction open.
+        let tid = self.transaction_id.clone().ok_or("not in transaction")?;
         let sdk_writes = writes::write_ops_to_sdk_writes(&self.client.project_id, &writes)?;
-        writes::commit_writes(&self.client.db, &self.client.runtime, sdk_writes, tid)
+        let result = writes::commit_writes(&self.client.db, &self.client.runtime, sdk_writes, tid);
+        if result.is_ok() {
+            self.transaction_id = None;
+        }
+        result
     }
 
     fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
-        let Some(tid) = self.transaction_id.take() else {
+        // Do not discard the id before Rollback returns.  A transient rollback
+        // failure must leave enough state for a later retry; a successful
+        // rollback (or an already-idle backend) clears the local state.
+        let Some(tid) = self.transaction_id.clone() else {
             return Ok(());
         };
         let db = &self.client.db;
         let database = db.get_database_path().clone();
-        self.client.runtime.block_on(async move {
+        let result = self.client.runtime.block_on(async move {
             db.client()
                 .get()
                 .rollback(Request::new(RollbackRequest {
@@ -155,7 +174,20 @@ impl Firestore for FirestoreEmulator {
                 }))
                 .await?;
             Ok::<_, gcloud_sdk::tonic::Status>(())
-        })?;
+        });
+        match result {
+            Ok(()) => {}
+            // NOT_FOUND means the server no longer holds this transaction:
+            // it was already committed (a commit whose response was lost), or
+            // already rolled back, or never existed.  That is terminal, not
+            // retryable, so the local state must be dropped.  Propagating it
+            // would wedge `Runtime::pending_rollback` and make every later
+            // `transaction` block fail with "already in transaction" forever.
+            // This mirrors how `get` above normalises the same status.
+            Err(status) if status.code() == Code::NotFound => {}
+            Err(status) => return Err(status.into()),
+        }
+        self.transaction_id = None;
         Ok(())
     }
 }
