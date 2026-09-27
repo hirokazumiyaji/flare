@@ -158,7 +158,15 @@ fn print_usage() {
     eprintln!();
     eprintln!("  Backends:");
     eprintln!("    in-memory   (default) use the in-memory Firestore stub");
-    eprintln!("    emulator    (requires --features emulator) use FIRESTORE_EMULATOR_HOST and optional FIRESTORE_PROJECT_ID");
+    // Keep the help honest about this build's own capabilities: a binary
+    // compiled with the feature enabled does accept --backend emulator, and
+    // telling its users otherwise makes --help contradict the artifact.
+    #[cfg(feature = "emulator")]
+    eprintln!("    emulator    use FIRESTORE_EMULATOR_HOST and optional FIRESTORE_PROJECT_ID");
+    #[cfg(not(feature = "emulator"))]
+    eprintln!(
+        "    emulator    ({EMULATOR_FEATURE_ERROR}) use FIRESTORE_EMULATOR_HOST and optional FIRESTORE_PROJECT_ID"
+    );
 }
 
 fn read_stdin() -> Result<String, Box<dyn Error>> {

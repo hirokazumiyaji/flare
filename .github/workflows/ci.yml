@@ -40,6 +40,16 @@ jobs:
         run: |
           set -euo pipefail
           test "$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["features"].get("default", []))')" = "[]"
+          # The main acceptance criterion is that an in-memory-only build does
+          # not link the emulator SDK. Assert the resolved dependency graph, not
+          # just the declared feature list: re-declaring firestore / gcloud-sdk
+          # / prost-types as non-optional would leave the line above green while
+          # restoring the resolution, compile-time and binary-size costs.
+          if cargo tree --prefix none --edges normal --no-default-features \
+            | grep -E '^(firestore|gcloud-sdk|prost-types) v'; then
+            echo "emulator SDK must not be in the default dependency graph" >&2
+            exit 1
+          fi
 
       - name: Build release binary
         run: cargo build --release --bin fl
@@ -57,6 +67,11 @@ jobs:
         include:
           - name: default
             cargo_args: ""
+          # Issue #99 asks for this leg explicitly. Today `default = []`, so it
+          # is a no-op -- but the moment a default feature appears, the default
+          # leg keeps passing while minimal consumers hit an unverified build.
+          - name: no-default-features
+            cargo_args: "--no-default-features"
           - name: emulator
             cargo_args: "--features emulator"
     steps:
