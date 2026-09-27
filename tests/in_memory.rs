@@ -606,6 +606,71 @@ fn each_returns_nil_and_map_returns_transformed_array() {
 }
 
 #[test]
+fn return_inside_a_block_returns_from_the_enclosing_function() {
+    // Iteration stops and the value becomes the function's result, rather than
+    // the block's last value.
+    let out = run_script("fn f() { [1, 2].map { |x| return x } }\nf()").unwrap();
+    assert_eq!(out, Value::Int(1));
+
+    // A return raised in a nested block belongs to the enclosing function.
+    let out = run_script("fn f() { [1, 2].map { |x| [3, 4].each { |y| return y } } }\nf()").unwrap();
+    assert_eq!(out, Value::Int(3));
+}
+
+#[test]
+fn return_inside_a_block_stops_later_statements() {
+    // Statements after the block in the same function must not run.
+    let out = run_script(
+        "fn f() {
+           [1, 2].each { |x| set(\"users/stop_seen\", {n: x})\nreturn }
+           set(\"users/stop_after\", {n: 9})
+         }
+         f()
+         [get(\"users/stop_seen\"), get(\"users/stop_after\")]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![map! {"n" => Value::Int(1)}, Value::Nil])
+    );
+}
+
+#[test]
+fn staged_blocks_commit_writes_and_then_propagate_return() {
+    // A return inside a batch/transaction block still commits: it exits the
+    // enclosing function *after* the staged writes are applied, and the call
+    // itself never yields a value.
+    let out = run_script(
+        "fn f() { batch { set(\"users/b\", {n: 1})\nreturn 5 } }
+         [f(), get(\"users/b\")]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(5), map! {"n" => Value::Int(1)}]));
+
+    let out = run_script(
+        "fn f() { transaction { set(\"users/t\", {n: 1})\nreturn 5 } }
+         [f(), get(\"users/t\")]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(5), map! {"n" => Value::Int(1)}]));
+}
+
+#[test]
+fn return_inside_a_block_at_top_level_stops_the_program() {
+    // Outside any fn, a return raised from inside a block terminates the
+    // remaining top-level statements and the program yields its value.
+    let out = run_script(
+        "set(\"users/tl_before\", {n: 1})
+         [1].each { |x| return 7 }
+         set(\"users/tl_after\", {n: 2})",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(7));
+    let out = run_script("get(\"users/tl_after\")").unwrap();
+    assert_eq!(out, Value::Nil, "statements after the return must not run");
+}
+
+#[test]
 fn map_extracts_fields_from_query_rows() {
     let out = run_script(
         "set(\"users/mp1\", {n: 1})\nset(\"users/mp2\", {n: 2})\ncol(\"users\").get().map { |row| row[\"n\"] }",
