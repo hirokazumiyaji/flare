@@ -22,12 +22,108 @@ fn fl_unknown_backend_fails() {
     assert!(!status.success(), "invalid --backend should fail");
 }
 
+/// Create a temp script exclusively. The name is derived from the pid plus a
+/// nanosecond stamp so concurrent runs do not collide, and `create_new` means a
+/// pre-existing entry (notably a symlink) fails the test loudly instead of
+/// being followed and truncated.
+fn create_temp_script(name: &str, source: &[u8]) -> std::path::PathBuf {
+    use std::io::Write;
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "fl-test-{}-{}-{name}.fl",
+        std::process::id(),
+        stamp
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("create temp script {}: {e}", path.display()));
+    file.write_all(source)
+        .unwrap_or_else(|e| panic!("write temp script {}: {e}", path.display()));
+    drop(file);
+    path
+}
+
 fn run_fl_script(name: &str, source: &str) -> std::process::Output {
-    let path = std::env::temp_dir().join(format!("fl-test-{}-{}.fl", std::process::id(), name));
-    std::fs::write(&path, source).expect("write temp script");
+    let path = create_temp_script(name, source.as_bytes());
     let out = Command::new(FL_EXE).arg(&path).output().expect("spawn fl");
     let _ = std::fs::remove_file(&path);
     out
+}
+
+// macOS/AFS rejects non-UTF-8 file names outright (`EILSEQ`), so the fixture
+// can only be created on a file system that accepts arbitrary bytes. CI runs
+// Linux, which is where this contract is actually exercised; on macOS the test
+// would fail at setup no matter how `fl` behaves.
+#[cfg(target_os = "linux")]
+#[test]
+fn fl_handles_script_with_non_utf8_path() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    // Same exclusive-creation contract as create_temp_script, but the name
+    // carries a raw 0xff byte, so it cannot go through that helper's name
+    // formatting.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_nanos();
+    let base =
+        std::env::temp_dir().join(format!("fl-test-{}-{}-non-utf8", std::process::id(), stamp));
+    let mut path_bytes = base.as_os_str().as_bytes().to_vec();
+    path_bytes.push(0xff);
+    path_bytes.extend_from_slice(b".fl");
+    let path = std::path::PathBuf::from(OsString::from_vec(path_bytes));
+    // A setup failure must not silently downgrade the test: without the
+    // fixture, the non-UTF-8 path contract would go untested.
+    let mut script = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("create non-UTF-8 temp script");
+    script.write_all(b"1").expect("write non-UTF-8 temp script");
+    drop(script);
+
+    let out = Command::new(FL_EXE).arg(&path).output().expect("spawn fl");
+    let _ = std::fs::remove_file(&path);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        out.status.success(),
+        "fl should execute a non-UTF-8 path; status: {:?}, stderr: {stderr}",
+        out.status
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "=> 1\n");
+    assert!(!stderr.contains("panicked"), "stderr: {stderr:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn fl_rejects_non_utf8_option_values_without_panicking() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let value = OsString::from_vec(vec![0xff]);
+    for (option, expected_error) in [
+        ("--backend", "--backend value must be valid UTF-8"),
+        ("-e", "-e value must be valid UTF-8"),
+    ] {
+        let out = Command::new(FL_EXE)
+            .arg(option)
+            .arg(&value)
+            .output()
+            .expect("spawn fl");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        assert_eq!(out.status.code(), Some(1), "{option}: {stderr:?}");
+        assert!(stderr.contains(expected_error), "{option}: {stderr:?}");
+        assert!(!stderr.contains("panicked"), "{option}: {stderr:?}");
+    }
 }
 
 #[test]
@@ -139,8 +235,7 @@ fn fl_no_args_with_piped_stdin_reads_stdin() {
 
 #[test]
 fn fl_rejects_combined_script_sources() {
-    let path = std::env::temp_dir().join(format!("fl-test-{}-combo.fl", std::process::id()));
-    std::fs::write(&path, "1").expect("write temp script");
+    let path = create_temp_script("combo", b"1");
     let out = Command::new(FL_EXE)
         .args(["-e", "1", path.to_str().expect("utf8 path")])
         .output()

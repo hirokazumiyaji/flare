@@ -1,7 +1,9 @@
 use std::env;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{IsTerminal, Read};
+use std::path::PathBuf;
 
 use firelang::{run_script, run_script_with_firestore, FirestoreEmulator};
 
@@ -13,43 +15,52 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
 
     let mut backend = "in-memory";
-    let mut paths: Vec<String> = vec![];
+    let mut paths: Vec<PathBuf> = vec![];
     let mut inline: Vec<String> = vec![];
     let mut use_stdin = false;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--help" | "-h" => {
+        match args[i].to_str() {
+            Some("--help" | "-h") => {
                 print_usage();
                 return Ok(());
             }
-            "--backend" => {
+            Some("--backend") => {
                 let b = args
                     .get(i + 1)
                     .ok_or("--backend requires in-memory or emulator")?;
-                backend = b.as_str();
+                backend = b.to_str().ok_or("--backend value must be valid UTF-8")?;
                 i += 2;
             }
-            "-e" => {
+            Some("-e") => {
                 let script = args.get(i + 1).ok_or("-e requires a script argument")?;
-                inline.push(script.clone());
+                inline.push(
+                    script
+                        .to_str()
+                        .ok_or("-e value must be valid UTF-8")?
+                        .to_string(),
+                );
                 i += 2;
             }
-            "-" => {
+            Some("-") => {
                 if use_stdin {
                     return Err("stdin script given more than once".into());
                 }
                 use_stdin = true;
                 i += 1;
             }
-            s if s.starts_with('-') => {
+            Some(s) if s.starts_with('-') => {
                 return Err(format!("unknown option: {s}").into());
             }
-            _ => {
-                paths.push(args[i].clone());
+            // Anything that is not a recognised option is a script path. This
+            // deliberately includes a non-UTF-8 argument (`to_str()` is
+            // `None`), because such an argument is exactly the path this CLI
+            // must accept rather than reject.
+            Some(_) | None => {
+                paths.push(PathBuf::from(&args[i]));
                 i += 1;
             }
         }
