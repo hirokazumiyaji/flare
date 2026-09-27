@@ -172,6 +172,20 @@ transaction {
         format!("{err}").contains("undefined variable: read"),
         "{err}"
     );
+
+    // spec §8 says a staged block's variables *and functions* do not escape.
+    // `fn` declarations live in the same scope frames as variables, so a
+    // regression that leaked the body into the caller scope would leak both.
+    for source in [
+        "batch { fn leaked() { 1 } }\nleaked()",
+        "transaction { fn leaked() { 1 } }\nleaked()",
+    ] {
+        let err = run_in(&mut runtime, source).unwrap_err();
+        assert!(
+            format!("{err}").contains("undefined function: leaked"),
+            "{source}: {err}"
+        );
+    }
 }
 
 #[test]

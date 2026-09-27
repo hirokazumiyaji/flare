@@ -338,6 +338,7 @@ impl<F: Firestore> Runtime<F> {
         // 取り残さないようにし、呼び出し元を深い clone せず最小の深さだけ復元する。
         let mut function_scope = HashMap::new();
         for (param, value) in bound {
+            // One clone for the key and the error message, as in `call_block`.
             if function_scope.insert(param.clone(), value).is_some() {
                 return Err(format!("reassignment is not allowed: {param}").into());
             }
@@ -442,10 +443,16 @@ impl<F: Firestore> Runtime<F> {
     fn call_block(&mut self, block: &Block, args: Vec<Value>) -> Result<Value, Box<dyn Error>> {
         check_block_arity(block, args.len())?;
         let mut block_scope = HashMap::new();
-        for (param, value) in block.params.iter().cloned().zip(args) {
-            if block_scope.insert(param.clone(), value).is_some() {
+        for (param, value) in block.params.iter().zip(args) {
+            // Clone once: the key is needed for the map and, on the error path,
+            // for the message. Inserting first and cloning afterwards allocated a
+            // second String on every block invocation, which is the hot path for
+            // `each` / `map`.
+            let param = param.clone();
+            if block_scope.contains_key(&param) {
                 return Err(format!("reassignment is not allowed: {param}").into());
             }
+            block_scope.insert(param, value);
         }
         self.scopes.push(block_scope);
         let res = self.eval_block(&block.body);
