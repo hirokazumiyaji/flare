@@ -529,8 +529,11 @@ impl<F: Firestore> Runtime<F> {
         }
         self.scopes.push(block_scope);
         let res = self.eval_block(&block.body);
+        // Pop before propagating, so the block's scope is restored on the error
+        // path too. Returning `res` directly keeps the error path and the scope
+        // restore on the same statement.
         self.scopes.pop();
-        Ok(res?)
+        res
     }
 
     fn eval_query_method(

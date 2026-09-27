@@ -613,7 +613,8 @@ fn return_inside_a_block_returns_from_the_enclosing_function() {
     assert_eq!(out, Value::Int(1));
 
     // A return raised in a nested block belongs to the enclosing function.
-    let out = run_script("fn f() { [1, 2].map { |x| [3, 4].each { |y| return y } } }\nf()").unwrap();
+    let out =
+        run_script("fn f() { [1, 2].map { |x| [3, 4].each { |y| return y } } }\nf()").unwrap();
     assert_eq!(out, Value::Int(3));
 }
 
@@ -645,14 +646,20 @@ fn staged_blocks_commit_writes_and_then_propagate_return() {
          [f(), get(\"users/b\")]",
     )
     .unwrap();
-    assert_eq!(out, Value::Array(vec![Value::Int(5), map! {"n" => Value::Int(1)}]));
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(5), map! {"n" => Value::Int(1)}])
+    );
 
     let out = run_script(
         "fn f() { transaction { set(\"users/t\", {n: 1})\nreturn 5 } }
          [f(), get(\"users/t\")]",
     )
     .unwrap();
-    assert_eq!(out, Value::Array(vec![Value::Int(5), map! {"n" => Value::Int(1)}]));
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(5), map! {"n" => Value::Int(1)}])
+    );
 }
 
 #[test]
