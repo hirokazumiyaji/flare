@@ -72,7 +72,7 @@ impl<F: Firestore> Runtime<F> {
 
     fn eval_stmt(&mut self, stmt: &Stmt) -> Result<ExecFlow, Box<dyn Error>> {
         match stmt {
-            Stmt::Expr(e) => Ok(ExecFlow::Value(self.eval_expr(e)?)),
+            Stmt::Expr(e) => self.eval_expr(e),
             Stmt::Assign { name, value } => {
                 // ビルトイン関数名と同じ名前の変数定義(例: set = 5)は許可する。
                 // 呼び出し時(Expr::Call)はビルトインディスパッチが常に優先され、
@@ -82,7 +82,11 @@ impl<F: Firestore> Runtime<F> {
                 if self.var_exists(name) {
                     return Err(format!("reassignment is not allowed: {name}").into());
                 }
-                let v = self.eval_expr(value)?;
+                let flow = self.eval_expr(value)?;
+                let v = match flow {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                };
                 self.set_var(name, v.clone())?;
                 Ok(ExecFlow::Value(v))
             }
@@ -102,25 +106,38 @@ impl<F: Firestore> Runtime<F> {
                 )?;
                 Ok(ExecFlow::Value(Value::Nil))
             }
-            Stmt::Return(e) => Ok(ExecFlow::Return(match e {
-                Some(e) => self.eval_expr(e)?,
-                None => Value::Nil,
-            })),
+            Stmt::Return(e) => {
+                let value = match e {
+                    Some(e) => match self.eval_expr(e)? {
+                        ExecFlow::Value(v) => v,
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    },
+                    None => Value::Nil,
+                };
+                Ok(ExecFlow::Return(value))
+            }
             Stmt::If {
                 cond,
                 then_body,
                 else_body,
             } => {
-                let body = if self.eval_expr(cond)?.truthy() {
-                    then_body
-                } else {
-                    else_body
+                let cond = match self.eval_expr(cond)? {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
                 };
+                let body = if cond.truthy() { then_body } else { else_body };
                 self.eval_block(body)
             }
             Stmt::While { cond, body } => {
                 let mut last = Value::Nil;
-                while self.eval_expr(cond)?.truthy() {
+                loop {
+                    let cond = match self.eval_expr(cond)? {
+                        ExecFlow::Value(v) => v,
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    };
+                    if !cond.truthy() {
+                        break;
+                    }
                     match self.eval_block(body)? {
                         ExecFlow::Value(v) => last = v,
                         ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
@@ -220,60 +237,75 @@ impl<F: Firestore> Runtime<F> {
         }
     }
 
-    fn eval_expr(&mut self, expr: &Expr) -> Result<Value, Box<dyn Error>> {
+    fn eval_expr(&mut self, expr: &Expr) -> Result<ExecFlow, Box<dyn Error>> {
         match expr {
-            Expr::Int(i) => Ok(Value::Int(*i)),
-            Expr::Str(s) => Ok(Value::Str(s.clone())),
+            Expr::Int(i) => Ok(ExecFlow::Value(Value::Int(*i))),
+            Expr::Str(s) => Ok(ExecFlow::Value(Value::Str(s.clone()))),
             Expr::StrInterp(pieces) => {
                 let mut out = String::new();
                 for piece in pieces {
                     match piece {
                         StrPiece::Lit(s) => out.push_str(s),
                         StrPiece::Expr(e) => {
-                            let v = self.eval_expr(e)?;
+                            let v = match self.eval_expr(e)? {
+                                ExecFlow::Value(v) => v,
+                                flow @ ExecFlow::Return(_) => return Ok(flow),
+                            };
                             out.push_str(&v.to_string());
                         }
                     }
                 }
-                Ok(Value::Str(out))
+                Ok(ExecFlow::Value(Value::Str(out)))
             }
-            Expr::Bool(b) => Ok(Value::Bool(*b)),
-            Expr::Nil => Ok(Value::Nil),
+            Expr::Bool(b) => Ok(ExecFlow::Value(Value::Bool(*b))),
+            Expr::Nil => Ok(ExecFlow::Value(Value::Nil)),
             Expr::Var(name) => self
                 .get_var(name)
                 .cloned()
+                .map(ExecFlow::Value)
                 .ok_or_else(|| format!("undefined variable: {name}").into()),
             Expr::Binary { left, op, right } => {
+                let l = match self.eval_expr(left)? {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                };
                 // `&&` / `||` は短絡評価し、Ruby と同じくオペランドそのものを返す。
                 match op {
                     BinOp::And => {
-                        let l = self.eval_expr(left)?;
                         if !l.truthy() {
-                            Ok(l)
+                            Ok(ExecFlow::Value(l))
                         } else {
                             self.eval_expr(right)
                         }
                     }
                     BinOp::Or => {
-                        let l = self.eval_expr(left)?;
                         if l.truthy() {
-                            Ok(l)
+                            Ok(ExecFlow::Value(l))
                         } else {
                             self.eval_expr(right)
                         }
                     }
-                    _ => eval_binary(self.eval_expr(left)?, *op, self.eval_expr(right)?),
+                    _ => {
+                        let r = match self.eval_expr(right)? {
+                            ExecFlow::Value(v) => v,
+                            flow @ ExecFlow::Return(_) => return Ok(flow),
+                        };
+                        eval_binary(l, *op, r).map(ExecFlow::Value)
+                    }
                 }
             }
             Expr::Unary { op, expr } => {
-                let v = self.eval_expr(expr)?;
-                Ok(match op {
+                let v = match self.eval_expr(expr)? {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                };
+                Ok(ExecFlow::Value(match op {
                     UnOp::Not => Value::Bool(!v.truthy()),
                     UnOp::Neg => match v {
                         Value::Int(i) => Value::Int(i.checked_neg().ok_or("integer overflow")?),
                         _ => return Err("unsupported unary - operand".into()),
                     },
-                })
+                }))
             }
             Expr::Call {
                 receiver,
@@ -284,32 +316,54 @@ impl<F: Firestore> Runtime<F> {
             } => {
                 let mut argv = vec![];
                 for arg in args {
-                    argv.push(self.eval_expr(arg)?);
+                    match self.eval_expr(arg)? {
+                        ExecFlow::Value(v) => argv.push(v),
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    }
                 }
                 let mut kw = BTreeMap::new();
                 for (k, vexpr) in kwargs {
-                    kw.insert(k.clone(), self.eval_expr(vexpr)?);
+                    match self.eval_expr(vexpr)? {
+                        ExecFlow::Value(v) => {
+                            kw.insert(k.clone(), v);
+                        }
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    }
                 }
                 self.eval_call(receiver.as_deref(), name, argv, kw, block.as_ref())
             }
             Expr::Map(entries) => {
                 let mut out = BTreeMap::new();
                 for (k, expr) in entries {
-                    out.insert(k.clone(), self.eval_expr(expr)?);
+                    match self.eval_expr(expr)? {
+                        ExecFlow::Value(v) => {
+                            out.insert(k.clone(), v);
+                        }
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    }
                 }
-                Ok(Value::Map(out))
+                Ok(ExecFlow::Value(Value::Map(out)))
             }
             Expr::Array(items) => {
                 let mut out = vec![];
                 for item in items {
-                    out.push(self.eval_expr(item)?);
+                    match self.eval_expr(item)? {
+                        ExecFlow::Value(v) => out.push(v),
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    }
                 }
-                Ok(Value::Array(out))
+                Ok(ExecFlow::Value(Value::Array(out)))
             }
             Expr::Index { base, index } => {
-                let base = self.eval_expr(base)?;
-                let index = self.eval_expr(index)?;
-                eval_index(base, index)
+                let base = match self.eval_expr(base)? {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                };
+                let index = match self.eval_expr(index)? {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                };
+                eval_index(base, index).map(ExecFlow::Value)
             }
         }
     }
@@ -321,9 +375,12 @@ impl<F: Firestore> Runtime<F> {
         args: Vec<Value>,
         kwargs: BTreeMap<String, Value>,
         block: Option<&Block>,
-    ) -> Result<Value, Box<dyn Error>> {
+    ) -> Result<ExecFlow, Box<dyn Error>> {
         if let Some(r) = receiver {
-            let rec = self.eval_expr(r)?;
+            let rec = match self.eval_expr(r)? {
+                ExecFlow::Value(v) => v,
+                flow @ ExecFlow::Return(_) => return Ok(flow),
+            };
             if !kwargs.is_empty() {
                 return Err("keyword args are not supported for method calls yet".into());
             }
@@ -356,9 +413,10 @@ impl<F: Firestore> Runtime<F> {
         let res = self.eval_block(&func.body);
         self.scopes.pop();
         self.scopes.append(&mut saved);
-        Ok(match res? {
-            ExecFlow::Value(v) | ExecFlow::Return(v) => v,
-        })
+        // 関数呼び出しは制御フロー境界。関数本体(または本体内のブロック)からの
+        // Return は、この関数の戻り値として消費する。外側のブロックへ伝播するのは
+        // call_block や batch/transaction のブロックから直接来た Return だけ。
+        Ok(ExecFlow::Value(res?.into_value()))
     }
 
     fn eval_method_call(
@@ -367,34 +425,36 @@ impl<F: Firestore> Runtime<F> {
         name: &str,
         args: Vec<Value>,
         block: Option<&Block>,
-    ) -> Result<Value, Box<dyn Error>> {
+    ) -> Result<ExecFlow, Box<dyn Error>> {
         match receiver {
             Value::CollectionRef(collection) if name == "doc" => {
                 let id = expect_string(args.first())?;
                 if id.is_empty() || id.contains('/') {
                     return Err(format!("invalid document id: {id}").into());
                 }
-                Ok(Value::DocRef(DocRef {
+                Ok(ExecFlow::Value(Value::DocRef(DocRef {
                     path: format!("{}/{}", collection.path, id),
-                }))
+                })))
             }
-            Value::CollectionRef(collection) => {
-                self.eval_query_method(collection.to_query(), name, args)
-            }
-            Value::CollectionGroupRef(group) => {
-                self.eval_query_method(group.to_query(), name, args)
-            }
-            Value::QueryRef(query) => self.eval_query_method(query, name, args),
+            Value::CollectionRef(collection) => self
+                .eval_query_method(collection.to_query(), name, args)
+                .map(ExecFlow::Value),
+            Value::CollectionGroupRef(group) => self
+                .eval_query_method(group.to_query(), name, args)
+                .map(ExecFlow::Value),
+            Value::QueryRef(query) => self
+                .eval_query_method(query, name, args)
+                .map(ExecFlow::Value),
             Value::Array(items) => self.eval_array_method(items, name, args, block),
             Value::Timestamp(ts) => match name {
-                "to_unix" => Ok(Value::Int(ts.seconds)),
-                "to_rfc3339" => Ok(Value::Str(ts.to_rfc3339()?)),
-                "add_seconds" => Ok(Value::Timestamp(Timestamp {
+                "to_unix" => Ok(ExecFlow::Value(Value::Int(ts.seconds))),
+                "to_rfc3339" => Ok(ExecFlow::Value(Value::Str(ts.to_rfc3339()?))),
+                "add_seconds" => Ok(ExecFlow::Value(Value::Timestamp(Timestamp {
                     seconds: ts
                         .seconds
                         .checked_add(expect_int(args.first())?)
                         .ok_or("integer overflow")?,
-                })),
+                }))),
                 _ => Err(format!("unknown timestamp method: {name}").into()),
             },
             Value::Map(map) => {
@@ -403,7 +463,9 @@ impl<F: Firestore> Runtime<F> {
                 if !args.is_empty() {
                     return Err(format!("unknown map method: {name}").into());
                 }
-                Ok(map.get(name).cloned().unwrap_or(Value::Nil))
+                Ok(ExecFlow::Value(
+                    map.get(name).cloned().unwrap_or(Value::Nil),
+                ))
             }
             _ => Err("unsupported method receiver".into()),
         }
@@ -415,7 +477,7 @@ impl<F: Firestore> Runtime<F> {
         name: &str,
         args: Vec<Value>,
         block: Option<&Block>,
-    ) -> Result<Value, Box<dyn Error>> {
+    ) -> Result<ExecFlow, Box<dyn Error>> {
         if !args.is_empty() {
             return Err(format!("array method {name} does not take arguments").into());
         }
@@ -428,9 +490,12 @@ impl<F: Firestore> Runtime<F> {
                 // ループの前にブロック引数の個数を検証する。
                 check_block_arity(block, 1)?;
                 for item in items {
-                    self.call_block(block, vec![item])?;
+                    match self.call_block(block, vec![item])? {
+                        ExecFlow::Value(_) => {}
+                        ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
+                    }
                 }
-                Ok(Value::Nil)
+                Ok(ExecFlow::Value(Value::Nil))
             }
             "map" => {
                 let Some(block) = block else {
@@ -439,16 +504,19 @@ impl<F: Firestore> Runtime<F> {
                 check_block_arity(block, 1)?;
                 let mut out = vec![];
                 for item in items {
-                    out.push(self.call_block(block, vec![item])?);
+                    match self.call_block(block, vec![item])? {
+                        ExecFlow::Value(v) => out.push(v),
+                        ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
+                    }
                 }
-                Ok(Value::Array(out))
+                Ok(ExecFlow::Value(Value::Array(out)))
             }
-            "len" => Ok(Value::Int(items.len() as i64)),
+            "len" => Ok(ExecFlow::Value(Value::Int(items.len() as i64))),
             _ => Err(format!("unknown array method: {name}").into()),
         }
     }
 
-    fn call_block(&mut self, block: &Block, args: Vec<Value>) -> Result<Value, Box<dyn Error>> {
+    fn call_block(&mut self, block: &Block, args: Vec<Value>) -> Result<ExecFlow, Box<dyn Error>> {
         check_block_arity(block, args.len())?;
         let mut block_scope = HashMap::new();
         for (param, value) in block.params.iter().cloned().zip(args) {
@@ -461,8 +529,11 @@ impl<F: Firestore> Runtime<F> {
         }
         self.scopes.push(block_scope);
         let res = self.eval_block(&block.body);
+        // Pop before propagating, so the block's scope is restored on the error
+        // path too. Returning `res` directly keeps the error path and the scope
+        // restore on the same statement.
         self.scopes.pop();
-        Ok(res?.into_value())
+        res
     }
 
     fn eval_query_method(
@@ -601,7 +672,7 @@ type Builtin<F> = fn(
     Vec<Value>,
     BTreeMap<String, Value>,
     Option<&Block>,
-) -> Result<Value, Box<dyn Error>>;
+) -> Result<ExecFlow, Box<dyn Error>>;
 
 /// ビルトインの対応テーブル。
 fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 19] {
@@ -645,11 +716,11 @@ fn builtin_puts<F: Firestore>(
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     for v in args {
         println!("{v}");
     }
-    Ok(Value::Nil)
+    Ok(ExecFlow::Value(Value::Nil))
 }
 
 fn builtin_doc<F: Firestore>(
@@ -657,12 +728,12 @@ fn builtin_doc<F: Firestore>(
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_string(args.first())?;
     validate_doc_path(path)?;
-    Ok(Value::DocRef(DocRef {
+    Ok(ExecFlow::Value(Value::DocRef(DocRef {
         path: path.to_string(),
-    }))
+    })))
 }
 
 fn builtin_col<F: Firestore>(
@@ -670,12 +741,12 @@ fn builtin_col<F: Firestore>(
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_string(args.first())?;
     validate_collection_path(path)?;
-    Ok(Value::CollectionRef(CollectionRef {
+    Ok(ExecFlow::Value(Value::CollectionRef(CollectionRef {
         path: path.to_string(),
-    }))
+    })))
 }
 
 fn builtin_col_group<F: Firestore>(
@@ -683,14 +754,14 @@ fn builtin_col_group<F: Firestore>(
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let id = expect_string(args.first())?;
     if id.is_empty() || id.contains('/') {
         return Err(format!("invalid collection group id: {id}").into());
     }
-    Ok(Value::CollectionGroupRef(CollectionGroupRef {
-        id: id.to_string(),
-    }))
+    Ok(ExecFlow::Value(Value::CollectionGroupRef(
+        CollectionGroupRef { id: id.to_string() },
+    )))
 }
 
 fn builtin_array<F: Firestore>(
@@ -698,8 +769,8 @@ fn builtin_array<F: Firestore>(
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::Array(args))
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::Array(args)))
 }
 
 fn builtin_len<F: Firestore>(
@@ -707,11 +778,11 @@ fn builtin_len<F: Firestore>(
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     match args.first() {
-        Some(Value::Array(a)) => Ok(Value::Int(a.len() as i64)),
-        Some(Value::Map(m)) => Ok(Value::Int(m.len() as i64)),
-        Some(Value::Str(s)) => Ok(Value::Int(s.chars().count() as i64)),
+        Some(Value::Array(a)) => Ok(ExecFlow::Value(Value::Int(a.len() as i64))),
+        Some(Value::Map(m)) => Ok(ExecFlow::Value(Value::Int(m.len() as i64))),
+        Some(Value::Str(s)) => Ok(ExecFlow::Value(Value::Int(s.chars().count() as i64))),
         _ => Err("len expects array, map, or string".into()),
     }
 }
@@ -721,8 +792,8 @@ fn builtin_now<F: Firestore>(
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::Timestamp(Timestamp::now()?))
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::Timestamp(Timestamp::now()?)))
 }
 
 fn builtin_timestamp<F: Firestore>(
@@ -730,10 +801,10 @@ fn builtin_timestamp<F: Firestore>(
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::Timestamp(Timestamp {
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::Timestamp(Timestamp {
         seconds: parse_timestamp_arg(args.first())?,
-    }))
+    })))
 }
 
 fn builtin_server_timestamp<F: Firestore>(
@@ -741,8 +812,8 @@ fn builtin_server_timestamp<F: Firestore>(
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::ServerTimestamp)
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::ServerTimestamp))
 }
 
 fn builtin_array_union<F: Firestore>(
@@ -750,8 +821,10 @@ fn builtin_array_union<F: Firestore>(
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::ArrayUnion(expect_array(args.first())?.clone()))
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::ArrayUnion(
+        expect_array(args.first())?.clone(),
+    )))
 }
 
 fn builtin_array_remove<F: Firestore>(
@@ -759,8 +832,10 @@ fn builtin_array_remove<F: Firestore>(
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::ArrayRemove(expect_array(args.first())?.clone()))
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::ArrayRemove(
+        expect_array(args.first())?.clone(),
+    )))
 }
 
 fn builtin_delete_field<F: Firestore>(
@@ -768,8 +843,8 @@ fn builtin_delete_field<F: Firestore>(
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::DeleteField)
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::DeleteField))
 }
 
 fn builtin_increment<F: Firestore>(
@@ -777,8 +852,8 @@ fn builtin_increment<F: Firestore>(
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::Increment(expect_int(args.first())?))
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::Increment(expect_int(args.first())?)))
 }
 
 fn builtin_get<F: Firestore>(
@@ -786,7 +861,7 @@ fn builtin_get<F: Firestore>(
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_doc_path(args.first())?;
     let v = match &rt.exec {
         ExecCtx::Batch { .. } => {
@@ -802,7 +877,7 @@ fn builtin_get<F: Firestore>(
             .unwrap_or(Value::Nil),
         ExecCtx::Normal => rt.fs.get(path).map_err(backend_err)?.unwrap_or(Value::Nil),
     };
-    Ok(v)
+    Ok(ExecFlow::Value(v))
 }
 
 fn builtin_set<F: Firestore>(
@@ -810,7 +885,7 @@ fn builtin_set<F: Firestore>(
     args: Vec<Value>,
     kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_doc_path(args.first())?.to_string();
     let data = expect_map(args.get(1))?.clone();
     let merge = match (args.get(2), kwargs.get("merge")) {
@@ -820,7 +895,7 @@ fn builtin_set<F: Firestore>(
         _ => return Err("set merge must be bool".into()),
     };
     rt.dispatch_write(WriteOp::Set { path, data, merge })?;
-    Ok(Value::Nil)
+    Ok(ExecFlow::Value(Value::Nil))
 }
 
 fn builtin_update<F: Firestore>(
@@ -828,11 +903,11 @@ fn builtin_update<F: Firestore>(
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_doc_path(args.first())?.to_string();
     let data = expect_map(args.get(1))?.clone();
     rt.dispatch_write(WriteOp::Update { path, data })?;
-    Ok(Value::Nil)
+    Ok(ExecFlow::Value(Value::Nil))
 }
 
 fn builtin_delete<F: Firestore>(
@@ -840,10 +915,10 @@ fn builtin_delete<F: Firestore>(
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_doc_path(args.first())?.to_string();
     rt.dispatch_write(WriteOp::Delete { path })?;
-    Ok(Value::Nil)
+    Ok(ExecFlow::Value(Value::Nil))
 }
 
 fn builtin_batch<F: Firestore>(
@@ -851,7 +926,7 @@ fn builtin_batch<F: Firestore>(
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let Some(stmts) = block else {
         return Err("batch requires { ... } block".into());
     };
@@ -864,7 +939,7 @@ fn builtin_batch<F: Firestore>(
     let (flow, writes) = rt.run_staged_block(ExecCtx::Batch { writes: vec![] }, &stmts.body);
     let flow = flow?;
     rt.fs.apply(writes).map_err(backend_err)?;
-    Ok(flow.into_value())
+    Ok(flow)
 }
 
 fn builtin_transaction<F: Firestore>(
@@ -872,7 +947,7 @@ fn builtin_transaction<F: Firestore>(
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let Some(stmts) = block else {
         return Err("transaction requires { ... } block".into());
     };
@@ -894,7 +969,7 @@ fn builtin_transaction<F: Firestore>(
                 rt.abort_transaction_best_effort();
                 return Err(backend_err(e));
             }
-            Ok(flow.into_value())
+            Ok(flow)
         }
         Err(e) => {
             // Preserve the block error if rollback also fails.
