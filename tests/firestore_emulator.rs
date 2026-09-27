@@ -406,7 +406,17 @@ fn emulator_delete_field_and_increment_match_in_memory() {
         "set(\"users/{run}\", {{name: \"a\", age: 1, visits: 10}})\nupdate(\"users/{run}\", {{age: delete_field(), visits: increment(5)}})\nget(\"users/{run}\")"
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    assert_eq!(out, map! {"visits" => Value::Int(15)});
+    // The expected value omitted `name`, which the script sets, so this could
+    // never pass wherever the emulator actually ran - it only looked green
+    // because the suite skips without FIRESTORE_EMULATOR_HOST. Both backends
+    // remove `age` and keep `name`; this now matches the sibling in-memory test.
+    assert_eq!(
+        out,
+        map! {
+            "name" => Value::Str("a".to_string()),
+            "visits" => Value::Int(15)
+        }
+    );
 }
 
 #[test]
