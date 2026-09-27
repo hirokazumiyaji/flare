@@ -3,7 +3,7 @@
 mod emulator;
 mod memory;
 
-pub use emulator::FirestoreEmulator;
+pub use emulator::{EmulatorConfig, EmulatorConnectionError, FirestoreEmulator};
 pub use memory::InMemoryFirestore;
 
 use std::collections::BTreeMap;

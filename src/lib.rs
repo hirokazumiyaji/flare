@@ -11,6 +11,7 @@ use std::error::Error;
 use runtime::Runtime;
 
 pub use error::{ErrorKind, FirelangError, Span};
+pub use firestore::{EmulatorConfig, EmulatorConnectionError};
 pub use firestore::{Firestore, FirestoreEmulator, InMemoryFirestore};
 pub use value::Value;
 

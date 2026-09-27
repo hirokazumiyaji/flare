@@ -1,6 +1,7 @@
 //! Integration tests against the Firestore emulator (`FIRESTORE_EMULATOR_HOST`).
-//! Locally: start the emulator or skip when unset. CI: see `.github/workflows/ci.yml`
-//! (`firebase emulators:exec` sets the host automatically).
+//! Locally: start the emulator or skip when the host is unset. A configured
+//! but invalid or unreachable emulator is a test failure, not a skip. CI: see
+//! `.github/workflows/ci.yml` (`firebase emulators:exec` sets the host automatically).
 
 #[macro_use]
 mod common;
@@ -9,7 +10,13 @@ use firelang::run_script_with_firestore;
 use firelang::{FirestoreEmulator, Value};
 
 fn emulator() -> Option<FirestoreEmulator> {
-    FirestoreEmulator::from_env()
+    match FirestoreEmulator::try_from_env() {
+        Ok(Some(emulator)) => Some(emulator),
+        Ok(None) => None,
+        Err(error) => {
+            panic!("FIRESTORE_EMULATOR_HOST is configured, but emulator setup failed: {error}")
+        }
+    }
 }
 fn unique(prefix: &str) -> String {
     let n = std::time::SystemTime::now()
@@ -34,7 +41,7 @@ fn firestore_global_functions_with_emulator() {
 #[test]
 fn emulator_merge_set() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let p = unique("merge");
@@ -50,7 +57,7 @@ fn emulator_merge_set() {
 #[test]
 fn emulator_query_where_and_limit() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let id = unique("q");
@@ -79,7 +86,7 @@ col("users").where("age", ">=", 20).limit(2).get()"#
 #[test]
 fn emulator_collection_group_query() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let id = unique("cg");
@@ -100,7 +107,7 @@ col_group("members").where("active", "==", true).get()"#
 #[test]
 fn emulator_nested_map_roundtrip() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let p = unique("nest");
@@ -116,7 +123,7 @@ get("{path}")"#
 #[test]
 fn emulator_server_timestamp_resolves() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let p = unique("st");
@@ -132,7 +139,7 @@ fn emulator_server_timestamp_resolves() {
 #[test]
 fn emulator_batch_atomic_commit() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let a = unique("ba");
@@ -151,7 +158,7 @@ get("users/{b}")"#
 #[test]
 fn emulator_transaction_read_then_write() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let p = unique("tx");
@@ -171,7 +178,7 @@ get("{path}")"#
 #[test]
 fn emulator_transaction_multiple_gets_before_write() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let p = unique("mg");
@@ -194,7 +201,7 @@ get("{path_a}")"#
 #[test]
 fn emulator_update_missing_fails() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let p = unique("nom");
@@ -213,7 +220,7 @@ fn emulator_where_compare_matches_in_memory_semantics() {
     // Fixtures live in a per-run subcollection so the collection-scoped
     // queries stay repeatable against a long-lived local emulator.
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let run = unique("cmp");
@@ -237,7 +244,7 @@ set("users/{run}/rows/{run}_2", {{name: "bob", created: timestamp(200), active: 
 fn emulator_dotted_field_path_update_matches_in_memory() {
     // Same case as in-memory `update_supports_dotted_field_path_like_firestore`.
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let p = unique("fp");
@@ -268,7 +275,7 @@ fn emulator_replacement_set_sentinel_with_dotted_key_matches_in_memory() {
     // a replacement `set` treats dotted keys as literal field names, so the
     // transform must be sent with a backtick-escaped path.
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let run = unique("gv");
@@ -301,7 +308,7 @@ fn emulator_where_rejects_large_string_filter_values() {
 col("users/{run}/docs").where("s", "==", "{p}").get()"#
     );
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let err = run_script_with_firestore(&script, fs).unwrap_err();
@@ -315,7 +322,7 @@ col("users/{run}/docs").where("s", "==", "{}x").get().len()"#,
         "x".repeat(1498)
     );
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let out = run_script_with_firestore(&script, fs).unwrap();
@@ -382,7 +389,7 @@ fn emulator_update_field_paths_match_in_memory_validation() {
         format!(r#"set("users/{run}/docs/d1", {{"a..b": array_union([1])}}, merge: true)"#),
     ] {
         let Some(fs) = emulator() else {
-            eprintln!("skip: no emulator");
+            eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
             return;
         };
         let err = run_script_with_firestore(&script, fs).unwrap_err();
@@ -398,7 +405,7 @@ fn emulator_delete_field_and_increment_match_in_memory() {
     // Same cases as in-memory `delete_field_removes_fields_via_update_and_merge_set`
     // and `increment_adds_to_numeric_fields`.
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let run = unique("sent");
@@ -425,7 +432,7 @@ fn emulator_extended_query_matches_in_memory() {
     // Fixtures live in a per-run subcollection so the collection-scoped
     // queries stay repeatable against a long-lived local emulator.
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let run = unique("xq");
@@ -474,7 +481,7 @@ fn emulator_failed_transaction_aborts_and_restarts() {
     // 残らない。同じ接続で新しい transaction を開始できる
     // ("already in transaction" にならない)。
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let mut rt = firelang::runtime::Runtime::new(fs);
