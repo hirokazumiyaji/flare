@@ -191,13 +191,21 @@ transaction {
 #[test]
 fn staged_blocks_restore_scopes_after_nested_binding_error() {
     let mut runtime = Runtime::new(InMemoryFirestore::default());
+    // Duplicate params are now rejected at definition time with the precise
+    // diagnostic, so the call inside `batch` is never reached. The runtime
+    // must still be reusable afterwards and must not have leaked `x`.
     let err = run_in(&mut runtime, "fn f(x, x) { x }\nbatch { f(1, 2) }").unwrap_err();
     assert!(
-        format!("{err}").contains("reassignment is not allowed: x"),
+        format!("{err}").contains("duplicate function parameter: x"),
         "{err}"
     );
     let err = run_in(&mut runtime, "x").unwrap_err();
     assert!(format!("{err}").contains("undefined variable: x"), "{err}");
+    // A well-formed definition still calls cleanly inside a staged block.
+    assert_eq!(
+        run_in(&mut runtime, "fn f(x) { x }\nbatch { f(1) }").unwrap(),
+        Value::Int(1)
+    );
 }
 
 #[test]
@@ -710,6 +718,23 @@ fn block_param_must_match_yielded_argument_count() {
 }
 
 #[test]
+fn duplicate_block_params_are_rejected_at_parse() {
+    use firelang::{ErrorKind, FirelangError};
+
+    let err = run_script("[1].map { |item, item| item }").unwrap_err();
+    // Pin the phase, not just the wording: validate_unique_params produces the
+    // same text, so a runtime check added later would otherwise pass this.
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("duplicate block parameter should be a FirelangError");
+    assert_eq!(ferr.kind, ErrorKind::Parse, "{ferr}");
+    assert!(
+        format!("{err}").contains("duplicate block parameter: item"),
+        "{err}"
+    );
+}
+
+#[test]
 fn each_and_map_require_block() {
     let err = run_script("[1].each()").unwrap_err();
     assert!(
@@ -931,6 +956,29 @@ fn newlines_before_operators_and_postfix_inside_delimiters_parse() {
 }
 
 #[test]
+fn duplicate_function_params_are_rejected_at_definition() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(&mut runtime, "fn f(a, a) { a }\nf(1, 2)").unwrap_err();
+    assert!(
+        format!("{err}").contains("duplicate function parameter: a"),
+        "{err}"
+    );
+    // `a` was never bound: the definition failed before any argument binding.
+    assert!(run_in(&mut runtime, "a").is_err());
+    // The rejected definition must not have installed a callable `f`, otherwise
+    // the redefinition below would fail for the wrong reason.
+    let leftover = run_in(&mut runtime, "f").unwrap_err();
+    assert!(
+        format!("{leftover}").contains("undefined variable: f"),
+        "{leftover}"
+    );
+    assert_eq!(
+        run_in(&mut runtime, "fn f(a) { a }\nf(2)").unwrap(),
+        Value::Int(2)
+    );
+}
+
+#[test]
 fn newlines_before_postfix_outside_delimiters_keep_statement_boundaries() {
     // `a` と配列リテラルは別の文。delimiter 外では `a[1]` に連結しない。
     let out = run_script("a = [10, 20]\na\n[1]").unwrap();
@@ -959,6 +1007,44 @@ fn newlines_before_operators_outside_delimiters_keep_statement_boundaries() {
     // `-` は二項演算子として続行せず、单項の新しい文になる。
     let out = run_script("a = 1\n- 2").unwrap();
     assert_eq!(out, Value::Int(-2));
+}
+
+#[test]
+fn failed_function_call_restores_scope_for_runtime_reuse() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(
+        &mut runtime,
+        "outer = 10\nfn f(param) { undefined_inside }\nf(1)",
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("undefined variable"), "{err}");
+    assert_eq!(run_in(&mut runtime, "outer").unwrap(), Value::Int(10));
+    // Assert the diagnostic, not just any failure: a bare is_err() would
+    // also pass if the scope cleanup regressed into a different error.
+    let leaked = run_in(&mut runtime, "param").unwrap_err();
+    assert!(
+        format!("{leaked}").contains("undefined variable: param"),
+        "{leaked}"
+    );
+}
+
+#[test]
+fn failed_block_call_restores_scope_for_runtime_reuse() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(
+        &mut runtime,
+        "outer = 10\n[1].map { |item| undefined_inside }",
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("undefined variable"), "{err}");
+    assert_eq!(run_in(&mut runtime, "outer").unwrap(), Value::Int(10));
+    // Assert the diagnostic, not just any failure: a bare is_err() would
+    // also pass if the scope cleanup regressed into a different error.
+    let leaked = run_in(&mut runtime, "item").unwrap_err();
+    assert!(
+        format!("{leaked}").contains("undefined variable: item"),
+        "{leaked}"
+    );
 }
 
 #[test]

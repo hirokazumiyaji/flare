@@ -170,6 +170,7 @@ a = 2   # エラー: reassignment is not allowed: a
 - 変数は再代入不可。関数定義名も同じ名前空間を使い、再定義不可。
 - ビルトイン関数(`puts` `get` `set` `update` `delete` `batch` `transaction` `doc` `col` `col_group` `array` `len` `now` `timestamp` `server_timestamp` `array_union` `array_remove` `delete_field` `increment`)と同名の関数定義はエラー(`cannot redefine builtin: <name>`)。ビルトイン呼び出しが常に優先されるため。
 - 関数本体内でも外側スコープに見える名前への代入はエラー(シャドーイング不可)。ただし**関数の仮引数**は外側の名前と重なってもよい。
+- 関数とブロックの仮引数名は、それぞれ同じ定義内で重複できない。重複した仮引数は parse / definition エラーになる。
 
 ### スコープ規則(静的スコープ)
 
