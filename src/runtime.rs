@@ -1565,6 +1565,7 @@ mod tests {
         runtime.fs.abort_transaction().unwrap();
         assert!(!runtime.fs.in_tx);
         runtime.fs.begin_transaction().unwrap();
+    }
 
     struct PanicQueryFirestore;
 

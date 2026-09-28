@@ -191,13 +191,21 @@ transaction {
 #[test]
 fn staged_blocks_restore_scopes_after_nested_binding_error() {
     let mut runtime = Runtime::new(InMemoryFirestore::default());
+    // Duplicate params are now rejected at definition time with the precise
+    // diagnostic, so the call inside `batch` is never reached. The runtime
+    // must still be reusable afterwards and must not have leaked `x`.
     let err = run_in(&mut runtime, "fn f(x, x) { x }\nbatch { f(1, 2) }").unwrap_err();
     assert!(
-        format!("{err}").contains("reassignment is not allowed: x"),
+        format!("{err}").contains("duplicate function parameter: x"),
         "{err}"
     );
     let err = run_in(&mut runtime, "x").unwrap_err();
     assert!(format!("{err}").contains("undefined variable: x"), "{err}");
+    // A well-formed definition still calls cleanly inside a staged block.
+    assert_eq!(
+        run_in(&mut runtime, "fn f(x) { x }\nbatch { f(1) }").unwrap(),
+        Value::Int(1)
+    );
 }
 
 #[test]
@@ -969,8 +977,6 @@ fn duplicate_function_params_are_rejected_at_definition() {
         Value::Int(2)
     );
 }
-
-#[test]
 
 #[test]
 fn newlines_before_postfix_outside_delimiters_keep_statement_boundaries() {
