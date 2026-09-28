@@ -11,8 +11,9 @@ use std::error::Error;
 use runtime::Runtime;
 
 pub use error::{ErrorKind, FirelangError, Span};
-pub use firestore::{EmulatorConfig, EmulatorConnectionError};
-pub use firestore::{Firestore, FirestoreEmulator, InMemoryFirestore};
+#[cfg(feature = "emulator")]
+pub use firestore::{EmulatorConfig, EmulatorConnectionError, FirestoreEmulator};
+pub use firestore::{Firestore, InMemoryFirestore};
 pub use value::Value;
 
 pub fn run_script(source: &str) -> Result<Value, Box<dyn Error>> {

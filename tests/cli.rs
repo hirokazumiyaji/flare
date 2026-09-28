@@ -1,6 +1,9 @@
 //! Smoke tests for the `fl` binary.
 
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(feature = "emulator")]
+use std::process::{Child, ExitStatus};
+use std::process::{Command, Stdio};
+#[cfg(feature = "emulator")]
 use std::time::{Duration, Instant};
 
 const FL_EXE: &str = env!("CARGO_BIN_EXE_fl");
@@ -196,6 +199,10 @@ fn run_fl_with_piped_stdin(args: &[&str], stdin_text: &str) -> std::process::Out
 /// the write and surface as a spurious timeout. Every test here asserts on
 /// small, bounded diagnostics from a process that is expected to exit
 /// immediately, so that ceiling is not reached in practice.
+///
+/// Emulator-only for now: the only remaining callers are the gated
+/// `reject_emulator_config_before_stdin` tests below.
+#[cfg(feature = "emulator")]
 fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -211,6 +218,7 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
     }
 }
 
+#[cfg(feature = "emulator")]
 fn read_child_output(child: &mut Child) -> std::process::Output {
     use std::io::Read;
     let mut stdout = Vec::new();
@@ -313,6 +321,23 @@ fn fl_inline_script_accepts_help_argument_without_triggering_usage() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "=> -5\n");
 }
 
+#[cfg(not(feature = "emulator"))]
+#[test]
+fn fl_emulator_backend_reports_missing_feature() {
+    let out = Command::new(FL_EXE)
+        .args(["--backend", "emulator", "-e", "1"])
+        .env("FIRESTORE_EMULATOR_HOST", "127.0.0.1:9")
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("emulator backend requires the `emulator` Cargo feature"),
+        "stderr should explain how to enable the feature, got {stderr:?}"
+    );
+    assert!(stderr.contains("--features emulator"), "stderr: {stderr:?}");
+}
+
 #[test]
 fn fl_validates_backend_before_reading_stdin() {
     // 未知のバックエンド指定で stdin を要求した場合、stdin を読み取ることなく即時失敗すること
@@ -326,7 +351,14 @@ fn fl_validates_backend_before_reading_stdin() {
         stderr.contains("unknown backend: unknown-backend"),
         "{stderr:?}"
     );
+}
 
+// The emulator validation messages only exist in the `emulator` build: without
+// the feature every `--backend emulator` invocation fails first with the
+// feature error, so this assertion can only run there.
+#[cfg(feature = "emulator")]
+#[test]
+fn fl_validates_emulator_backend_before_reading_stdin() {
     // FIRESTORE_EMULATOR_HOST 未設定で emulator バックエンド + stdin の場合も即時失敗すること
     let out = Command::new(FL_EXE)
         .args(["--backend", "emulator", "-"])
@@ -341,6 +373,10 @@ fn fl_validates_backend_before_reading_stdin() {
     );
 }
 
+// The emulator validation messages only exist in the `emulator` build: without
+// the feature every `--backend emulator` invocation fails first with the
+// feature error, so these assertions can only run there.
+#[cfg(feature = "emulator")]
 #[test]
 fn fl_rejects_empty_emulator_host_before_reading_stdin() {
     let (status, out) = reject_emulator_config_before_stdin(
@@ -355,6 +391,10 @@ fn fl_rejects_empty_emulator_host_before_reading_stdin() {
     );
 }
 
+// The emulator validation messages only exist in the `emulator` build: without
+// the feature every `--backend emulator` invocation fails first with the
+// feature error, so these assertions can only run there.
+#[cfg(feature = "emulator")]
 #[test]
 fn fl_rejects_empty_emulator_project_id_before_reading_stdin() {
     // A valid host is required, otherwise the missing-host error would fire
@@ -377,6 +417,10 @@ fn fl_rejects_empty_emulator_project_id_before_reading_stdin() {
 /// Run `fl --backend emulator -` with exactly the given emulator environment
 /// and stdin held open, and require the process to exit without reading stdin.
 /// Returns the exit status and captured output.
+///
+/// Emulator-only, like its callers: without the feature the validation
+/// messages under test do not exist.
+#[cfg(feature = "emulator")]
 fn reject_emulator_config_before_stdin(
     expected: &str,
     env: &[(&str, &str)],
@@ -405,6 +449,10 @@ fn reject_emulator_config_before_stdin(
 }
 
 #[cfg(unix)]
+// The emulator validation messages only exist in the `emulator` build: without
+// the feature every `--backend emulator` invocation fails first with the
+// feature error, so these assertions can only run there.
+#[cfg(feature = "emulator")]
 #[test]
 fn fl_rejects_non_utf8_emulator_host_before_reading_stdin() {
     use std::ffi::OsString;

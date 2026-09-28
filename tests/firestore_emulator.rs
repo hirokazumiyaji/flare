@@ -1,7 +1,8 @@
 //! Integration tests against the Firestore emulator (`FIRESTORE_EMULATOR_HOST`).
-//! Locally: start the emulator or skip when the host is unset. A configured
-//! but invalid or unreachable emulator is a test failure, not a skip. CI: see
-//! `.github/workflows/ci.yml` (`firebase emulators:exec` sets the host automatically).
+//! Locally: build with `--features emulator`, start the emulator, or skip when
+//! the host is unset. A configured but invalid or unreachable emulator is a
+//! test failure, not a skip. CI: see `.github/workflows/ci.yml`
+//! (`firebase emulators:exec` sets the host automatically).
 
 #[macro_use]
 mod common;
