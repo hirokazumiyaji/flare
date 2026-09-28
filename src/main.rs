@@ -97,10 +97,6 @@ fn run() -> Result<(), Box<dyn Error>> {
             return Err(format!("unknown backend: {other} (use in-memory or emulator)").into());
         }
     };
-        other => {
-            return Err(format!("unknown backend: {other} (use in-memory or emulator)").into());
-        }
-    };
 
     let src = if !inline.is_empty() {
         if !paths.is_empty() || use_stdin {
