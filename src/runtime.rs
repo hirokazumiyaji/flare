@@ -827,6 +827,10 @@ fn bind_function_args(
     Ok(out)
 }
 
+/// `bytes(...)` の引数エラー文言。3 箇所から使うので定数にまとめる。
+const BYTES_USAGE: &str = "bytes expects one string or an array of integers from 0 to 255";
+const BYTES_ELEMENT_ERR: &str = "bytes array elements must be integers from 0 to 255";
+
 /// The positional part of a call contract.
 #[derive(Clone, Copy)]
 enum PositionalArity {
@@ -1019,8 +1023,8 @@ fn unknown_keyword_arguments(kwargs: &BTreeMap<String, Value>) -> Box<dyn Error>
 fn builtin_contract(name: &str) -> CallContract {
     match name {
         "puts" | "array" => CallContract::any(),
-        "doc" | "col" | "col_group" | "len" | "timestamp" | "array_union" | "array_remove"
-        | "get" | "delete" => CallContract::exact(1),
+        "doc" | "col" | "col_group" | "len" | "timestamp" | "bytes" | "array_union"
+        | "array_remove" | "get" | "delete" => CallContract::exact(1),
         "increment" => CallContract::exact(1).with_missing_hint("expected int argument"),
         "update" => CallContract::exact(2),
         "now" | "server_timestamp" | "delete_field" => CallContract::exact(0),
@@ -1138,6 +1142,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "len",
     "now",
     "timestamp",
+    "bytes",
     "server_timestamp",
     "array_union",
     "array_remove",
@@ -1159,7 +1164,7 @@ type Builtin<F> = fn(
 ) -> Result<ExecFlow, Box<dyn Error>>;
 
 /// ビルトインの対応テーブル。
-fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 19] {
+fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 20] {
     [
         ("puts", builtin_puts),
         ("doc", builtin_doc),
@@ -1169,6 +1174,7 @@ fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 19] {
         ("len", builtin_len),
         ("now", builtin_now),
         ("timestamp", builtin_timestamp),
+        ("bytes", builtin_bytes),
         ("server_timestamp", builtin_server_timestamp),
         ("array_union", builtin_array_union),
         ("array_remove", builtin_array_remove),
@@ -1289,6 +1295,31 @@ fn builtin_timestamp<F: Firestore>(
     Ok(ExecFlow::Value(Value::Timestamp(Timestamp {
         seconds: parse_timestamp_arg(args.first())?,
     })))
+}
+
+fn builtin_bytes<F: Firestore>(
+    _rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    if args.len() != 1 || !kwargs.is_empty() || block.is_some() {
+        return Err(BYTES_USAGE.into());
+    }
+    // `args.len() == 1` は上で保証されているので `next()` は必ず `Some`。
+    // 取り出しを下の `match` にまとめ、到達不能な `ok_or` 分岐を作らない。
+    let bytes = match args.into_iter().next() {
+        Some(Value::Str(s)) => s.into_bytes(),
+        Some(Value::Array(items)) => items
+            .into_iter()
+            .map(|value| match value {
+                Value::Int(byte) => u8::try_from(byte).map_err(|_| BYTES_ELEMENT_ERR.to_string()),
+                _ => Err(BYTES_ELEMENT_ERR.to_string()),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(BYTES_USAGE.into()),
+    };
+    Ok(ExecFlow::Value(Value::Bytes(bytes)))
 }
 
 fn builtin_server_timestamp<F: Firestore>(
@@ -1702,21 +1733,25 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
         BinOp::Gt => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a > b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds > b.seconds),
+            (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a > b),
             _ => return Err("unsupported > operands".into()),
         },
         BinOp::Lt => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a < b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds < b.seconds),
+            (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a < b),
             _ => return Err("unsupported < operands".into()),
         },
         BinOp::Ge => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a >= b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds >= b.seconds),
+            (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a >= b),
             _ => return Err("unsupported >= operands".into()),
         },
         BinOp::Le => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a <= b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds <= b.seconds),
+            (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a <= b),
             _ => return Err("unsupported <= operands".into()),
         },
         // `eval_expr` 側で短絡評価するため、ここに来るのは両辺評価済みの場合のみ。

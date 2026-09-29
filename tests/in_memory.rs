@@ -114,6 +114,105 @@ fn parses_timestamp_from_rfc3339_string() {
 }
 
 #[test]
+fn bytes_constructor_comparison_and_interpolation_contract() {
+    let out = run_script(
+        r#"
+a = bytes("fire")
+b = bytes([102, 105, 114, 101])
+[
+  a == b,
+  a != bytes("flame"),
+  bytes([0, 255]) < bytes([1, 0]),
+  bytes([1, 0]) <= bytes([1, 0]),
+  bytes([2]) > bytes([1, 255]),
+  "payload=#{bytes([0, 255])}",
+]
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Str("payload=Bytes(00ff)".to_string()),
+        ])
+    );
+
+    let values = (0u8..40)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let out = run_script(&format!("bytes([{values}])")).unwrap();
+    let prefix = (0u8..32).map(|n| format!("{n:02x}")).collect::<String>();
+    assert_eq!(out.inspect(), format!("Bytes({prefix}, 8 more bytes)"));
+    assert!(out.inspect().len() < 128);
+
+    for source in [
+        "bytes()",
+        "bytes([0, 256])",
+        "bytes([-1])",
+        "bytes([\"ff\"])",
+        "bytes(\"a\", \"b\")",
+        "bytes(value: 1)",
+    ] {
+        assert!(run_script(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn bytes_roundtrip_in_maps_arrays_and_queries() {
+    let out = run_script(
+        r#"
+set("files/a", {
+  data: bytes([0, 255]),
+  parts: [bytes("hi"), bytes([128])],
+  meta: {checksum: bytes([1, 2])},
+})
+set("files/b", {data: bytes([1, 0])})
+set("files/c", {data: bytes([0, 255, 1])})
+[
+  get("files/a"),
+  col("files").where("data", "==", bytes([0, 255])).get().map { |row| row["__name__"] },
+  col("files").where("data", ">", bytes([0, 255])).get().map { |row| row["__name__"] },
+  col("files").order_by("data", "asc").get().map { |row| row["__name__"] },
+]
+"#,
+    )
+    .unwrap();
+    let expected = Value::Array(vec![
+        Value::Map(
+            [
+                ("data".to_string(), Value::Bytes(vec![0, 255])),
+                (
+                    "parts".to_string(),
+                    Value::Array(vec![Value::Bytes(b"hi".to_vec()), Value::Bytes(vec![128])]),
+                ),
+                (
+                    "meta".to_string(),
+                    Value::Map([("checksum".to_string(), Value::Bytes(vec![1, 2]))].into()),
+                ),
+            ]
+            .into(),
+        ),
+        Value::Array(vec![Value::Str("files/a".to_string())]),
+        Value::Array(vec![
+            Value::Str("files/b".to_string()),
+            Value::Str("files/c".to_string()),
+        ]),
+        Value::Array(vec![
+            Value::Str("files/a".to_string()),
+            Value::Str("files/c".to_string()),
+            Value::Str("files/b".to_string()),
+        ]),
+    ]);
+    assert_eq!(out, expected);
+}
+
+#[test]
 fn supports_keyword_arguments_like_ruby() {
     let out = run_script(
         "fn add(a,b) { a + b }\nv = add(a: 10, b: 20)\nset(\"users/kw\", {count: 1})\nset(\"users/kw\", {count: 2}, merge: true)\nv",

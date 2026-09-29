@@ -44,13 +44,19 @@ pub(crate) fn validate_query_filters(filters: &[QueryFilter]) -> Result<(), Box<
     Ok(())
 }
 
-/// 値の中の文字列を葉としてたどり、各文字列がクエリの上限未満であることを
-/// 確認する。Firestore の制限は文字数ではなく UTF-8 バイト数で判定される。
+/// 値の中の文字列・バイト列を葉としてたどり、各値がクエリの上限未満で
+/// あることを確認する。Firestore の制限は文字数ではなくバイト数で判定
+/// される。`Str` だけでなく `Bytes` にも同じ上限を課す。Firestore の順序
+/// 比較は比較対象の先頭しか見ないため、上限なしの値を渡すと emulator と
+/// in-memory の結果がずれる(in-memory は全文比較するため)。
 fn check_query_value_size(field: &str, value: &Value) -> Result<(), Box<dyn Error>> {
     let mut pending = vec![value];
     while let Some(value) = pending.pop() {
         match value {
             Value::Str(s) if s.len() >= MAX_QUERY_STRING_BYTES => {
+                return Err(format!("value for {field} is too large to be used in a query").into());
+            }
+            Value::Bytes(b) if b.len() >= MAX_QUERY_STRING_BYTES => {
                 return Err(format!("value for {field} is too large to be used in a query").into());
             }
             Value::Array(items) => pending.extend(items.iter()),
@@ -397,6 +403,14 @@ pub trait Firestore {
 mod tests {
     use super::*;
 
+    fn filter(op: QueryOp, value: Value) -> QueryFilter {
+        QueryFilter {
+            field: "b".to_string(),
+            op,
+            value,
+        }
+    }
+
     fn map_array(value: &str) -> Value {
         Value::Map(BTreeMap::from([(
             "outer".to_string(),
@@ -443,6 +457,34 @@ mod tests {
                 "value for payload is too large to be used in a query"
             );
         }
+    }
+
+    #[test]
+    fn filter_values_are_bounded_for_str_and_bytes() {
+        let big_bytes = Value::Bytes(vec![0u8; MAX_QUERY_STRING_BYTES]);
+        // ちょうど 1,500 バイトの Str / Bytes はどちらも却下する。
+        let err = validate_query_filters(&[filter(QueryOp::Eq, Value::Str("x".repeat(1500)))])
+            .unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        let err = validate_query_filters(&[filter(QueryOp::Eq, big_bytes)]).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn filter_values_below_the_bound_are_accepted() {
+        let just_under = Value::Bytes(vec![0u8; MAX_QUERY_STRING_BYTES - 1]);
+        validate_query_filters(&[filter(QueryOp::Eq, just_under)]).unwrap();
+    }
+
+    #[test]
+    fn element_size_check_applies_inside_in_operands() {
+        // `in` の配列要素も同じ上限の対象になる。
+        let operand = Value::Array(vec![
+            Value::Int(1),
+            Value::Bytes(vec![0u8; MAX_QUERY_STRING_BYTES]),
+        ]);
+        let err = validate_query_filters(&[filter(QueryOp::In, operand)]).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
     }
 
     #[test]
