@@ -85,6 +85,31 @@ col("users").where("age", ">=", 20).limit(2).get()"#
 }
 
 #[test]
+fn emulator_document_name_filters_match_relative_paths() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let id = unique("name");
+    let first = format!("users/{id}_1");
+    let second = format!("users/{id}_2");
+    let script = format!(
+        r#"set("{first}", {{n: 1}})
+set("{second}", {{n: 2}})
+[
+  col("users").where("__name__", "==", "{first}").get().len(),
+  col("users").where("__name__", "!=", "{first}").get().len(),
+  col("users").where("__name__", "in", ["{first}", "{second}"]).get().len()
+]"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(1), Value::Int(1), Value::Int(2)])
+    );
+}
+
+#[test]
 fn emulator_collection_group_query() {
     let Some(fs) = emulator() else {
         eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
@@ -239,6 +264,88 @@ set("users/{run}/rows/{run}_2", {{name: "bob", created: timestamp(200), active: 
         out,
         Value::Array(vec![Value::Int(2), Value::Int(1), Value::Int(1)])
     );
+}
+
+#[test]
+fn emulator_where_cross_type_comparison_contract_is_shared() {
+    // Same contract as in-memory
+    // `where_cross_type_comparison_contract_is_shared`. The local matcher is
+    // authoritative even when Firestore's server-side type ordering is active.
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let run = unique("wherecmp");
+    let collection = format!("users/{run}/rows");
+    let setup = format!(
+        r#"set("{collection}/int", {{v: 1}})
+set("{collection}/str", {{v: "b"}})
+set("{collection}/bool", {{v: true}})
+set("{collection}/timestamp", {{v: timestamp(200)}})
+set("{collection}/nil", {{v: nil}})
+set("{collection}/array", {{v: [1]}})
+set("{collection}/map", {{v: {{a: 1}}}})
+set("{collection}/missing", {{other: 1}})"#,
+    );
+    let cases: &[(&str, &str, &str)] = &[
+        (">", "0", "int"),
+        (">=", "0", "int"),
+        ("<", "2", "int"),
+        ("<=", "2", "int"),
+        (">", "\"a\"", "str"),
+        (">=", "\"a\"", "str"),
+        ("<", "\"c\"", "str"),
+        ("<=", "\"c\"", "str"),
+        (">", "false", "bool"),
+        (">=", "false", "bool"),
+        ("<", "true", ""),
+        ("<=", "true", "bool"),
+        (">", "timestamp(100)", "timestamp"),
+        (">=", "timestamp(100)", "timestamp"),
+        ("<", "timestamp(300)", "timestamp"),
+        ("<=", "timestamp(300)", "timestamp"),
+        (">", "nil", ""),
+        (">=", "nil", ""),
+        ("<", "nil", ""),
+        ("<=", "nil", ""),
+        (">", "[0]", ""),
+        (">=", "[0]", ""),
+        ("<", "[2]", ""),
+        ("<=", "[2]", ""),
+        (">", "{a: 0}", ""),
+        (">=", "{a: 0}", ""),
+        ("<", "{a: 2}", ""),
+        ("<=", "{a: 2}", ""),
+    ];
+    let mut queries = Vec::new();
+    let mut expected = Vec::new();
+    for &(op, filter, suffix) in cases {
+        queries.push(format!(
+            "col(\"{collection}\").where(\"v\", \"{op}\", {filter}).get().map {{ |r| r[\"__name__\"] }}"
+        ));
+        let rows = if suffix.is_empty() {
+            Vec::new()
+        } else {
+            vec![Value::Str(format!("{collection}/{suffix}"))]
+        };
+        expected.push(Value::Array(rows));
+    }
+    queries.push(format!(
+        "col(\"{collection}\").where(\"v\", \"==\", nil).get().len()"
+    ));
+    queries.push(format!(
+        "col(\"{collection}\").where(\"v\", \"!=\", nil).get().len()"
+    ));
+    expected.push(Value::Int(1));
+    expected.push(Value::Int(6));
+    queries.push(format!(
+        "col(\"{collection}\").where(\"v\", \">\", \"a\").count()"
+    ));
+    expected.push(Value::Int(1));
+
+    let script = format!("{setup}\n[\n{}\n]", queries.join(",\n"));
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(out, Value::Array(expected));
 }
 
 #[test]

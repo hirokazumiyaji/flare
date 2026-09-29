@@ -172,15 +172,19 @@ impl Firestore for FirestoreEmulator {
 
     fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
+        // Firestore の server filter は候補を減らすためだけに使ってよい。
+        // 最終的な一致判定は必ず共通の local matcher で行う(特に異型の
+        // 大小比較を Firestore の型順序に委ねない)。
+        let server_filters = server_prefilters(&query.filters);
         match &query.source {
             QuerySource::Collection(path) => {
                 let (parent, collection_id) = path::split_collection_path(path)?;
-                let sq = structured_query(collection_id, false, &query.filters)?;
-                run_query_candidates(self, parent.as_deref(), sq)
+                let sq = structured_query(collection_id, false, &server_filters)?;
+                run_query_candidates(self, parent.as_deref(), sq, &query.filters)
             }
             QuerySource::CollectionGroup(id) => {
-                let sq = structured_query(id, true, &query.filters)?;
-                run_query_candidates(self, None, sq)
+                let sq = structured_query(id, true, &server_filters)?;
+                run_query_candidates(self, None, sq, &query.filters)
             }
         }
     }
@@ -297,9 +301,11 @@ fn run_query_candidates(
     fs: &FirestoreEmulator,
     parent: Option<&str>,
     query: StructuredQuery,
+    filters: &[QueryFilter],
 ) -> Result<QueryCandidates, Box<dyn Error>> {
     let db = &fs.client.db;
     let parent = path::parent_path(&fs.client.project_id, parent);
+    let filters = filters.to_vec();
     let docs = fs.client.runtime.block_on(async move {
         let response = db
             .client()
@@ -328,10 +334,56 @@ fn run_query_candidates(
         let Value::Map(fields) = codec::decode_document(&doc, resource_root)? else {
             return Err("query result must be a map".into());
         };
-        out.push((rel, fields));
+        if super::matches_filters(&rel, &fields, &filters) {
+            out.push((rel, fields));
+        }
     }
     Ok(out)
 }
+
+/// Server へ渡す候補絞り込みを、最大一つの安全な predicate だけにする。
+///
+/// Firestore の server filter は候補を減らす最適化であり、firelang の
+/// `where` 契約の source of truth ではない。複数の server filter を組むと
+/// Firestore 固有の複合制約でリクエスト全体が失敗し得るので、local matcher
+/// と結果が一致する一つだけを送る。異型 / Nil / Array / Map の大小比較は
+/// そもそも server へ送らず、すべての候補を local で判定する。
+fn server_prefilters(filters: &[QueryFilter]) -> Vec<QueryFilter> {
+    filters
+        .iter()
+        .find(|filter| is_server_prefilter_safe(filter))
+        .cloned()
+        .into_iter()
+        .collect()
+}
+
+fn is_server_prefilter_safe(filter: &QueryFilter) -> bool {
+    // `__name__` の equality には Firestore の完全リソース名が必要で、
+    // relative path を scalar string として送ると server が候補を除外する。
+    if filter.field == "__name__" {
+        return false;
+    }
+    match filter.op {
+        // equality は構造比較そのものなので、encode 可能な scalar だけ使う。
+        QueryOp::Eq => matches!(
+            &filter.value,
+            Value::Int(_) | Value::Str(_) | Value::Bool(_) | Value::Timestamp(_)
+        ),
+        // primitive の range だけ同じ型の一致を server 側から除外しない。
+        QueryOp::Gt | QueryOp::Ge | QueryOp::Lt | QueryOp::Le => matches!(
+            &filter.value,
+            Value::Int(_) | Value::Str(_) | Value::Bool(_) | Value::Timestamp(_)
+        ),
+        // Nil / Array / Map の順序比較、membership、!= 系は server 依存に
+        // しないため、候補をすべて取得して local matcher に渡す。
+        QueryOp::Ne
+        | QueryOp::In
+        | QueryOp::NotIn
+        | QueryOp::ArrayContains
+        | QueryOp::ArrayContainsAny => false,
+    }
+}
+
 
 fn structured_query(
     collection_id: &str,
@@ -354,6 +406,8 @@ fn structured_query(
     })
 }
 
+// `filters` is the deliberately small, server-safe subset selected by
+// `server_prefilters`; all original filters are checked again locally.
 fn build_where(
     filters: &[QueryFilter],
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {

@@ -8,6 +8,7 @@ mod memory;
 pub use emulator::{EmulatorConfig, EmulatorConnectionError, FirestoreEmulator};
 pub use memory::InMemoryFirestore;
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::error::Error;
 
@@ -58,6 +59,101 @@ fn check_query_value_size(field: &str, value: &Value) -> Result<(), Box<dyn Erro
         }
     }
     Ok(())
+}
+
+/// `where` の最終判定。in-memory と emulator がこの関数を共有し、
+/// Firestore server の型順序や Opaque 値の扱いに依存しない。
+///
+/// 比較演算子は `Value::cmp_for_where` が規定する同型比較だけを受け付ける。
+/// `order_by` の全順序 (`Value::cmp_for_order`) とは別の契約である。
+pub(crate) fn matches_filters(
+    path: &str,
+    doc: &BTreeMap<String, Value>,
+    filters: &[QueryFilter],
+) -> bool {
+    filters.iter().all(|filter| {
+        // `__name__` は保存された field ではなく相対ドキュメントパス。
+        if filter.field == "__name__" {
+            return matches_document_name_filter(path, filter);
+        }
+        let actual = query_field_value(doc, &filter.field);
+        match filter.op {
+            QueryOp::Eq => actual == Some(&filter.value),
+            QueryOp::Ne => actual.is_some_and(|value| value != &filter.value),
+            QueryOp::Gt => compare_where_values(actual, &filter.value, Ordering::is_gt),
+            QueryOp::Ge => compare_where_values(actual, &filter.value, Ordering::is_ge),
+            QueryOp::Lt => compare_where_values(actual, &filter.value, Ordering::is_lt),
+            QueryOp::Le => compare_where_values(actual, &filter.value, Ordering::is_le),
+            QueryOp::In => match (&filter.value, actual) {
+                (Value::Array(list), Some(value)) => list.contains(value),
+                _ => false,
+            },
+            QueryOp::NotIn => match (&filter.value, actual) {
+                (Value::Array(list), Some(value))
+                    if !list.iter().any(|item| matches!(item, Value::Nil)) =>
+                {
+                    !list.contains(value)
+                }
+                _ => false,
+            },
+            QueryOp::ArrayContains => match actual {
+                Some(Value::Array(items)) => items.contains(&filter.value),
+                _ => false,
+            },
+            QueryOp::ArrayContainsAny => match (&filter.value, actual) {
+                (Value::Array(candidates), Some(Value::Array(items))) => {
+                    items.iter().any(|item| candidates.contains(item))
+                }
+                _ => false,
+            },
+        }
+    })
+}
+
+fn query_field_value<'a>(doc: &'a BTreeMap<String, Value>, field: &str) -> Option<&'a Value> {
+    let mut current = doc;
+    let mut segments = field.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let value = current.get(segment)?;
+        if segments.peek().is_none() {
+            return Some(value);
+        }
+        current = match value {
+            Value::Map(inner) => inner,
+            _ => return None,
+        };
+    }
+    None
+}
+
+fn matches_document_name_filter(path: &str, filter: &QueryFilter) -> bool {
+    let is_path = |value: &Value| matches!(value, Value::Str(actual) if actual == path);
+    match filter.op {
+        QueryOp::Eq => is_path(&filter.value),
+        QueryOp::Ne => !is_path(&filter.value),
+        QueryOp::In => match &filter.value {
+            Value::Array(values) => values.iter().any(is_path),
+            _ => false,
+        },
+        QueryOp::NotIn => match &filter.value {
+            Value::Array(values) if !values.iter().any(|value| matches!(value, Value::Nil)) => {
+                !values.iter().any(is_path)
+            }
+            _ => false,
+        },
+        QueryOp::ArrayContains | QueryOp::ArrayContainsAny => false,
+        QueryOp::Gt | QueryOp::Ge | QueryOp::Lt | QueryOp::Le => false,
+    }
+}
+
+fn compare_where_values(
+    actual: Option<&Value>,
+    filter: &Value,
+    predicate: fn(std::cmp::Ordering) -> bool,
+) -> bool {
+    actual
+        .and_then(|value| value.cmp_for_where(filter))
+        .is_some_and(predicate)
 }
 
 pub(crate) fn paths_overlap(a: &str, b: &str) -> bool {

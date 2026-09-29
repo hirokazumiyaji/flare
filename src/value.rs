@@ -165,6 +165,21 @@ impl Value {
             _ => type_rank(self).cmp(&type_rank(other)),
         }
     }
+
+    /// クエリ `where` の大小比較。同じ順序関係を持つ型だけが比較可能。
+    ///
+    /// `order_by` の全順序とは別の契約である。Nil / Array / Map は
+    /// `where` の大小比較では順序付けられず、異型も比較結果にならない。
+    /// emulator の Firestore 型順序に依存しないための共通実装。
+    pub fn cmp_for_where(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
+            (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
+            (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+            (Value::Timestamp(x), Value::Timestamp(y)) => Some(x.seconds.cmp(&y.seconds)),
+            _ => None,
+        }
+    }
 }
 
 fn type_rank(v: &Value) -> u8 {

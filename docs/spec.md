@@ -301,15 +301,15 @@ col("users").doc("1")       # doc("users/1") と同等
 
 - `where(field, op, value)` — op は `"=="` `"!="` `">"` `">="` `"<"` `"<="` `"in"` `"not-in"` `"array_contains"` `"array_contains_any"` の 10 種。複数 `where` は AND。
   - 未対応の op を渡すと `where()` 呼び出し時に即エラー(`unsupported query op: ...`)。
-  - `==` は任意の値の構造比較。大小比較(`>` 等)は**同型のフィールド同士のみ**マッチ:Int は数値順、Str は辞書順、Bool は `false < true`、Timestamp は秒。型が異なる・Nil・存在しないフィールドはマッチしない。
-  - `!=` はフィールドが存在し、値が構造比較で異なる場合にマッチ(存在しないフィールドはマッチしない。型が異なる値は不一致とみなす。emulator バックエンドでは Double と Int の数値比較や Opaque 値の扱いとの整合のため、`!=` はサーバ RPC では絞り込まずクライアント側で評価される)。
+  - `==` は任意の値の構造比較。`>` `>=` `<` `<=` は **Int / Str / Bool / Timestamp の同型同士だけ**を比較する:Int は数値順、Str は辞書順、Bool は `false < true`、Timestamp は秒。異型、Nil、Array、Map は大小比較ではマッチしない(Array / Map は同じ型同士でも `where` の順序付けを持たない)。存在しないフィールドもマッチしない。
+  - `!=` はフィールドが存在し、値が構造比較で異なる場合にマッチする。フィールド値が `nil` の場合は `!= nil` にマッチしないが、`== nil` にはマッチする。存在しないフィールドはマッチしない。emulator バックエンドでは Double と Int の数値比較や Opaque 値の扱いとの整合のため、`!=` はサーバ RPC では絞り込まずクライアント側で評価される。
   - `in` / `not-in` — `value` は Array(要素は最大 10 個)。`in` はフィールド値がいずれかの要素と等しい場合、`not-in` はフィールドが存在し、どの要素とも等しくない場合にマッチ(ただし Firestore 仕様に準拠し、比較配列に `nil` が含まれる `not-in` は何もマッチしない)。空配列の `in` は何もマッチせず、空配列の `not-in` はフィールドを持つ全ドキュメントにマッチする。Array でない値を渡すとクエリ実行時にエラー。
   - `array_contains` — フィールドが Array で `value` を要素に含む場合にマッチ。`array_contains_any` — `value` は Array(要素は最大 10 個)で、フィールドの Array と 1 つ以上共通の要素を持つ場合にマッチ(空配列は何もマッチしない)。Array でない値を渡すとクエリ実行時にエラー。
   - **文字列フィルタ値のサイズ制限**: Firestore と同様に、`where` の文字列フィルタ値は **1,500 UTF-8 バイト未満**であること(`in` 等の配列要素・`array_contains` の要素・Map / Array のネストを含む。1,500 バイト以上のフィルタ値はクエリ実行時にエラー:`value for {field} is too large to be used in a query`)。**保存値には長さ制限がない**。有効なフィルタ(< 1,500 バイト)に対しては、保存値との最初の差異位置が常にフィルタ自身の長さ以内に収まるため、全文比較で Firestore と同じ結果になる。in-memory / emulator は同じ検証をクエリ実行時に行う。
-  - `where` の値には `doc("users/1")` などの `DocRef` も指定可能(同一データベース内の参照型フィールドに対する `==` や `in`、`array_contains` 等のクエリ。emulator バックエンドでは同一プロジェクト・同一データベースの完全リソース名へエンコードされて実行される)。
-  - 異なる型同士の比較は未規定(§13)。in-memory ではマッチしない。
+  - `where` の値には `doc("users/1")` などの `DocRef` も指定可能(同一データベース内の参照型フィールドに対する `==` や `in`、`array_contains` 等のクエリ。emulator では相対パス表現に正規化し、共通 matcher で判定する)。
+  - emulator は Firestore の server filter を候補を絞るためにだけ使用できるが、`where` の最終判定は in-memory と共通の実装をクライアント側で行う。したがって Firestore の異型大小比較の型順序は firelang の結果に影響せず、in-memory / emulator は同じ結果を返す。
   - フィールドが存在しないドキュメントはマッチしない(`!=` / `not-in` を含む)。
-- `order_by(field, dir)` — `dir` は `"asc"` / `"desc"`(それ以外は呼び出し時にエラー)。複数回呼ぶと順に適用される。対象フィールドを持たないドキュメントは結果から除外される(`__name__` は全ドキュメントが持つ)。同値は firelang 相対ドキュメントパス文字列の辞書順でタイブレークする。同型の値は where と同じ順序(Int 数値順 / Str 辞書順 / Bool `false < true` / Timestamp 秒)で比べ、型が異なる値同士は Nil < Bool < Int < Timestamp < Str < Array < Map の順に並べる(両バックエンド共通)。順序付けは取得後に両バックエンド共通の比較器で適用するため、サーバ側の複合インデックス制約は受けない。
+- `order_by(field, dir)` — `dir` は `"asc"` / `"desc"`(それ以外は呼び出し時にエラー)。複数回呼ぶと順に適用される。対象フィールドを持たないドキュメントは結果から除外される(`__name__` は全ドキュメントが持つ)。同値は firelang 相対ドキュメントパス文字列の辞書順でタイブレークする。`order_by` 専用の順序では、Int / Str / Bool / Timestamp の同型は自然な順序(Int 数値順 / Str 辞書順 / Bool `false < true` / Timestamp 秒)、異型は Nil < Bool < Int < Timestamp < Str < Array < Map の順に並べる(Array / Map 内の値自体には順序を定義しない)。これは `where` の同型比較契約とは独立しており、両バックエンド共通の比較器で取得後に適用するため、サーバ側の複合インデックス制約は受けない。
 - `limit(n)` — 件数上限。後勝ち(複数回呼ぶと最後の値)。`n` は 0 以上で、負数はエラー(`limit must be >= 0`)。
 - `offset(n)` — 先頭から `n` 件を飛ばす。後勝ち。`n` は 0 以上で、負数はエラー(`offset must be >= 0`)。件数を超える offset は空結果になる。
 - `get()` — 実行して `Array<Map>` を返す。各 Map には `__name__` キーで**相対ドキュメントパス**(例 `"users/1"`)が入る。
@@ -427,8 +427,6 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 
 ## 13. 既知の制限・実装メモ
 
-実装済みコードから確認された、仕様としては保証しない・将来直す予定の挙動。
-
-| 項目 | 現状の挙動 | 予定 |
-|------|-----------|------|
-| `where` の異なる型同士の大小比較 | in-memory ではマッチしない。emulator では Firestore の型順序で比較される(§7 は同型のみを規定) | backlog |
+現在、§7 の `where` 異型比較（含める Nil / Array / Map / 欠損フィールドの扱い）
+について未解決の制限はない。emulator では Firestore の server filter を候補絞りに
+利用しても、最終判定は §7 の共通 client-side matcher が行う。
