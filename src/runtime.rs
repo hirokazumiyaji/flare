@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 
 use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
@@ -315,6 +315,85 @@ impl<F: Firestore> Runtime<F> {
                 kwargs,
                 block,
             } => {
+                // Validate the call shape before evaluating argument
+                // expressions.  Invalid calls must not be able to perform
+                // writes (or other side effects) before their contract error
+                // is reported.  Keyword values are irrelevant for this
+                // pre-check; only their names and arity are needed.
+                validate_unique_keywords(kwargs)?;
+                if let Some(receiver_expr) = receiver {
+                    // Keyword arguments are not part of any method contract.
+                    // Reject them before evaluating the receiver, which may
+                    // itself contain a staged or immediate write.
+                    if !kwargs.is_empty() {
+                        return Err(unknown_keyword_names(kwargs));
+                    }
+                    if let Some(block) = block.as_ref() {
+                        if name == "each" || name == "map" {
+                            check_block_arity(block, 1)?;
+                        } else {
+                            return Err(format!("method {name} does not take a block").into());
+                        }
+                    }
+                    let receiver_value = match self.eval_expr(receiver_expr)? {
+                        ExecFlow::Value(v) => v,
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    };
+                    let keyword_names = keyword_names(kwargs);
+                    validate_method_call(
+                        &receiver_value,
+                        name,
+                        args.len(),
+                        &keyword_names,
+                        block.as_ref(),
+                    )?;
+                    let mut argv = vec![];
+                    for arg in args {
+                        match self.eval_expr(arg)? {
+                            ExecFlow::Value(v) => argv.push(v),
+                            flow @ ExecFlow::Return(_) => return Ok(flow),
+                        }
+                    }
+                    let mut kw = BTreeMap::new();
+                    for (k, vexpr) in kwargs {
+                        match self.eval_expr(vexpr)? {
+                            ExecFlow::Value(v) => {
+                                kw.insert(k.clone(), v);
+                            }
+                            flow @ ExecFlow::Return(_) => return Ok(flow),
+                        }
+                    }
+                    return self.eval_method_call_unchecked(
+                        receiver_value,
+                        name,
+                        argv,
+                        kw,
+                        block.as_ref(),
+                    );
+                }
+
+                if lookup_builtin::<F>(name).is_some() {
+                    let keyword_names = keyword_names(kwargs);
+                    validate_call_contract(
+                        name,
+                        args.len(),
+                        &keyword_names,
+                        block.as_ref(),
+                        builtin_contract(name),
+                    )?;
+                } else {
+                    let Some(Value::Func(func)) = self.get_var(name).cloned() else {
+                        return Err(format!("undefined function: {name}").into());
+                    };
+                    validate_user_call_contract(
+                        name,
+                        &func.params,
+                        args.len(),
+                        kwargs,
+                        block.as_ref(),
+                    )?;
+                }
+
                 let mut argv = vec![];
                 for arg in args {
                     match self.eval_expr(arg)? {
@@ -331,7 +410,7 @@ impl<F: Firestore> Runtime<F> {
                         flow @ ExecFlow::Return(_) => return Ok(flow),
                     }
                 }
-                self.eval_call(receiver.as_deref(), name, argv, kw, block.as_ref())
+                self.eval_call(None, name, argv, kw, block.as_ref())
             }
             Expr::Map(entries) => {
                 let mut out = BTreeMap::new();
@@ -382,10 +461,7 @@ impl<F: Firestore> Runtime<F> {
                 ExecFlow::Value(v) => v,
                 flow @ ExecFlow::Return(_) => return Ok(flow),
             };
-            if !kwargs.is_empty() {
-                return Err("keyword args are not supported for method calls yet".into());
-            }
-            return self.eval_method_call(rec, name, args, block);
+            return self.eval_method_call(rec, name, args, kwargs, block);
         }
 
         // ビルトインはテーブル駆動で引く。ユーザー定義より優先されるため、
@@ -420,6 +496,19 @@ impl<F: Firestore> Runtime<F> {
         receiver: Value,
         name: &str,
         args: Vec<Value>,
+        kwargs: BTreeMap<String, Value>,
+        block: Option<&Block>,
+    ) -> Result<ExecFlow, Box<dyn Error>> {
+        validate_method_call(&receiver, name, args.len(), &kwargs, block)?;
+        self.eval_method_call_unchecked(receiver, name, args, kwargs, block)
+    }
+
+    fn eval_method_call_unchecked(
+        &mut self,
+        receiver: Value,
+        name: &str,
+        args: Vec<Value>,
+        _kwargs: BTreeMap<String, Value>,
         block: Option<&Block>,
     ) -> Result<ExecFlow, Box<dyn Error>> {
         match receiver {
@@ -608,6 +697,16 @@ impl<F: Firestore> Runtime<F> {
     }
 }
 
+fn validate_unique_keywords(kwargs: &[(String, Expr)]) -> Result<(), Box<dyn Error>> {
+    let mut seen = BTreeSet::<&str>::new();
+    for (key, _) in kwargs {
+        if !seen.insert(key.as_str()) {
+            return Err(format!("duplicate keyword argument: {key}").into());
+        }
+    }
+    Ok(())
+}
+
 /// Scope cleanup guard for function and block calls.
 ///
 /// A function temporarily hides all caller-local scopes while keeping the
@@ -663,6 +762,36 @@ fn validate_unique_params(params: &[String], kind: &str) -> Result<(), Box<dyn E
     Ok(())
 }
 
+fn keyword_names(kwargs: &[(String, Expr)]) -> BTreeMap<String, Value> {
+    kwargs
+        .iter()
+        .map(|(key, _)| (key.clone(), Value::Nil))
+        .collect()
+}
+
+fn unknown_keyword_names(kwargs: &[(String, Expr)]) -> Box<dyn Error> {
+    let keys: Vec<&str> = kwargs.iter().map(|(key, _)| key.as_str()).collect();
+    format!("unknown keyword arguments: {}", keys.join(", ")).into()
+}
+
+fn validate_user_call_contract(
+    name: &str,
+    params: &[String],
+    positional_len: usize,
+    kwargs: &[(String, Expr)],
+    block: Option<&Block>,
+) -> Result<(), Box<dyn Error>> {
+    if block.is_some() {
+        return Err(format!("{name} does not take a block (block is not allowed)").into());
+    }
+    bind_function_args(
+        params,
+        vec![Value::Nil; positional_len],
+        keyword_names(kwargs),
+    )
+    .map(|_| ())
+}
+
 fn bind_function_args(
     params: &[String],
     positional: Vec<Value>,
@@ -675,6 +804,12 @@ fn bind_function_args(
     let mut idx = 0;
     for param in params {
         if idx < positional.len() {
+            if kwargs.contains_key(param) {
+                return Err(format!(
+                    "duplicate argument {param}: specified both positionally and as a keyword"
+                )
+                .into());
+            }
             out.push((param.clone(), positional[idx].clone()));
             idx += 1;
             continue;
@@ -690,6 +825,306 @@ fn bind_function_args(
         return Err(format!("unknown keyword arguments: {}", keys.join(", ")).into());
     }
     Ok(out)
+}
+
+/// The positional part of a call contract.
+#[derive(Clone, Copy)]
+enum PositionalArity {
+    Exact(usize),
+    Range(usize, usize),
+    Any,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockPolicy {
+    Forbidden,
+    Required,
+}
+
+/// Runtime validation shared by builtin functions and built-in methods.
+///
+/// `keywords` is intentionally small: the language's builtin API is
+/// positional except for `set(..., merge: true)`.  `array` and `puts` use
+/// `PositionalArity::Any` because their variable-arity behavior is part of
+/// the API.
+#[derive(Clone, Copy)]
+struct CallContract {
+    positional: PositionalArity,
+    keywords: &'static [&'static str],
+    block: BlockPolicy,
+    /// Keywords that occupy the same slot as a positional argument.
+    positional_keyword_conflicts: &'static [(&'static str, usize)],
+    /// Optional compatibility/detail hint for a missing argument.
+    missing_hint: Option<&'static str>,
+}
+
+impl CallContract {
+    fn exact(positional: usize) -> Self {
+        Self {
+            positional: PositionalArity::Exact(positional),
+            keywords: &[],
+            block: BlockPolicy::Forbidden,
+            positional_keyword_conflicts: &[],
+            missing_hint: None,
+        }
+    }
+
+    fn range(min: usize, max: usize) -> Self {
+        Self {
+            positional: PositionalArity::Range(min, max),
+            ..Self::exact(0)
+        }
+    }
+
+    fn any() -> Self {
+        Self {
+            positional: PositionalArity::Any,
+            ..Self::exact(0)
+        }
+    }
+
+    fn with_keywords(mut self, keywords: &'static [&'static str]) -> Self {
+        self.keywords = keywords;
+        self
+    }
+
+    fn with_positional_keyword_conflicts(
+        mut self,
+        conflicts: &'static [(&'static str, usize)],
+    ) -> Self {
+        self.positional_keyword_conflicts = conflicts;
+        self
+    }
+
+    fn with_missing_hint(mut self, hint: &'static str) -> Self {
+        self.missing_hint = Some(hint);
+        self
+    }
+
+    fn requiring_block(mut self) -> Self {
+        self.block = BlockPolicy::Required;
+        self
+    }
+}
+
+fn validate_call_contract(
+    name: &str,
+    positional_len: usize,
+    kwargs: &BTreeMap<String, Value>,
+    block: Option<&Block>,
+    contract: CallContract,
+) -> Result<(), Box<dyn Error>> {
+    // Check this before arity/type checks so a call which supplies the same
+    // option in two ways always gets the actionable duplicate-argument error.
+    for (keyword, position) in contract.positional_keyword_conflicts {
+        if positional_len > *position && kwargs.contains_key(*keyword) {
+            return Err(format!(
+                "duplicate argument {keyword}: specified both positionally and as a keyword"
+            )
+            .into());
+        }
+    }
+
+    match contract.positional {
+        PositionalArity::Any => {}
+        PositionalArity::Exact(expected) => {
+            if positional_len < expected {
+                let hint = contract
+                    .missing_hint
+                    .map(|hint| format!(" ({hint})"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "{name} is missing positional arguments: expected {expected}, got {positional_len}{hint}"
+                )
+                .into());
+            }
+            if positional_len > expected {
+                return Err(too_many_positional_error(
+                    name,
+                    expected,
+                    positional_len,
+                    true,
+                ));
+            }
+        }
+        PositionalArity::Range(min, max) => {
+            if positional_len < min {
+                return Err(format!(
+                    "{name} expects at least {min} positional arguments, got {positional_len}"
+                )
+                .into());
+            }
+            if positional_len > max {
+                return Err(too_many_positional_error(name, max, positional_len, false));
+            }
+        }
+    }
+
+    let unknown: Vec<&str> = kwargs
+        .keys()
+        .filter(|key| {
+            !contract
+                .keywords
+                .iter()
+                .any(|allowed| allowed == &key.as_str())
+        })
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!("unknown keyword arguments: {}", unknown.join(", ")).into());
+    }
+
+    match (contract.block, block) {
+        (BlockPolicy::Forbidden, Some(_)) => {
+            return Err(format!("{name} does not take a block (block is not allowed)").into());
+        }
+        (BlockPolicy::Required, None) => {
+            return Err(format!("{name} requires {{ ... }} block").into());
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn too_many_positional_error(
+    name: &str,
+    expected: usize,
+    actual: usize,
+    exact: bool,
+) -> Box<dyn Error> {
+    if expected == 0 {
+        // Keep the long-standing array-method wording while making the
+        // contract failure explicit for new callers and diagnostics.
+        format!(
+            "{name} does not take arguments: too many positional arguments (expected 0, got {actual})"
+        )
+        .into()
+    } else {
+        let expectation = if exact { "exactly" } else { "at most" };
+        format!(
+            "too many positional arguments for {name} (expected {expectation} {expected}, got {actual})"
+        )
+        .into()
+    }
+}
+
+fn unknown_keyword_arguments(kwargs: &BTreeMap<String, Value>) -> Box<dyn Error> {
+    let keys: Vec<&str> = kwargs.keys().map(String::as_str).collect();
+    format!("unknown keyword arguments: {}", keys.join(", ")).into()
+}
+
+/// Contracts for all global builtins.  This is intentionally kept separate
+/// from the dispatch functions so the callable API is visible in one table.
+fn builtin_contract(name: &str) -> CallContract {
+    match name {
+        "puts" | "array" => CallContract::any(),
+        "doc" | "col" | "col_group" | "len" | "timestamp" | "array_union" | "array_remove"
+        | "get" | "delete" => CallContract::exact(1),
+        "increment" => CallContract::exact(1).with_missing_hint("expected int argument"),
+        "update" => CallContract::exact(2),
+        "now" | "server_timestamp" | "delete_field" => CallContract::exact(0),
+        "set" => CallContract::range(2, 3)
+            .with_keywords(&["merge"])
+            .with_positional_keyword_conflicts(&[("merge", 2)]),
+        "batch" | "transaction" => CallContract::exact(0).requiring_block(),
+        _ => unreachable!("unknown builtin contract: {name}"),
+    }
+}
+
+fn query_method_contract(name: &str) -> Option<CallContract> {
+    match name {
+        "where" => Some(CallContract::exact(3)),
+        "order_by" => Some(CallContract::exact(2)),
+        "limit" | "offset" => Some(CallContract::exact(1)),
+        "count" | "get" => Some(CallContract::exact(0)),
+        _ => None,
+    }
+}
+
+fn array_method_contract(name: &str) -> Option<CallContract> {
+    match name {
+        "each" => Some(CallContract::exact(0).requiring_block()),
+        "map" => Some(CallContract::exact(0).requiring_block()),
+        "len" => Some(CallContract::exact(0)),
+        _ => None,
+    }
+}
+
+fn timestamp_method_contract(name: &str) -> Option<CallContract> {
+    match name {
+        "to_unix" | "to_rfc3339" => Some(CallContract::exact(0)),
+        "add_seconds" => Some(CallContract::exact(1)),
+        _ => None,
+    }
+}
+
+fn method_contract(receiver: &Value, name: &str) -> Option<CallContract> {
+    match receiver {
+        Value::CollectionRef(_) if name == "doc" => Some(CallContract::exact(1)),
+        Value::CollectionRef(_) | Value::CollectionGroupRef(_) | Value::QueryRef(_) => {
+            query_method_contract(name)
+        }
+        Value::Array(_) => array_method_contract(name),
+        Value::Timestamp(_) => timestamp_method_contract(name),
+        // `m.key` is map key access rather than a fixed set of methods.  It
+        // still has a strict zero-argument/no-block contract.
+        Value::Map(_) => Some(CallContract::exact(0)),
+        _ => None,
+    }
+}
+
+fn method_call_label(receiver: &Value, name: &str) -> String {
+    match receiver {
+        Value::CollectionRef(_) if name == "doc" => format!("collection method {name}"),
+        Value::CollectionRef(_) | Value::CollectionGroupRef(_) | Value::QueryRef(_) => {
+            format!("query method {name}")
+        }
+        Value::Array(_) => format!("array method {name}"),
+        Value::Timestamp(_) => format!("timestamp method {name}"),
+        Value::Map(_) => format!("map key access {name}"),
+        _ => format!("method {name}"),
+    }
+}
+
+fn validate_method_call(
+    receiver: &Value,
+    name: &str,
+    positional_len: usize,
+    kwargs: &BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(contract) = method_contract(receiver, name) {
+        return validate_call_contract(
+            &method_call_label(receiver, name),
+            positional_len,
+            kwargs,
+            block,
+            contract,
+        );
+    }
+
+    // Even an unknown method must not silently accept keyword arguments or a
+    // block.  The eventual dispatch error (unknown method / unsupported
+    // receiver) is returned only after these contract-level mistakes.
+    if !kwargs.is_empty() {
+        return Err(unknown_keyword_arguments(kwargs));
+    }
+    if block.is_some() {
+        return Err(format!(
+            "{} does not take a block (block is not allowed)",
+            method_call_label(receiver, name)
+        )
+        .into());
+    }
+    Err(match receiver {
+        Value::CollectionRef(_) | Value::CollectionGroupRef(_) | Value::QueryRef(_) => {
+            format!("unknown query method: {name}").into()
+        }
+        Value::Array(_) => format!("unknown array method: {name}").into(),
+        Value::Timestamp(_) => format!("unknown timestamp method: {name}").into(),
+        _ => "unsupported method receiver".into(),
+    })
 }
 
 /// ビルトイン関数名の一覧。`lookup_builtin` のテーブルと対応する。

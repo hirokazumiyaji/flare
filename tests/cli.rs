@@ -174,6 +174,33 @@ fn fl_error_goes_to_stderr_with_position() {
     assert!(stderr.contains("undefined variable"), "{stderr:?}");
 }
 
+#[test]
+fn fl_reports_builtin_keyword_contract_errors_with_position() {
+    let out = run_fl_script(
+        "builtin-contract-keyword",
+        "set(\"users/1\", {old: 1})\nset(\"users/1\", {new: 2}, mearge: true)",
+    );
+    assert!(!out.status.success(), "invalid builtin call should fail");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.starts_with("error: 2:1: "), "{stderr:?}");
+    assert!(
+        stderr.contains("unknown keyword arguments: mearge"),
+        "{stderr:?}"
+    );
+}
+
+#[test]
+fn fl_reports_excess_arguments_and_disallowed_blocks() {
+    let out = run_fl_script("builtin-contract-args", "now(1)");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("too many positional arguments"));
+
+    let out = run_fl_script("builtin-contract-block", "col(\"users\").get() {}");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("block"));
+}
+
 fn run_fl_with_piped_stdin(args: &[&str], stdin_text: &str) -> std::process::Output {
     use std::io::Write;
     let mut child = Command::new(FL_EXE)

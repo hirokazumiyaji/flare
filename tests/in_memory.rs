@@ -809,6 +809,185 @@ fn array_methods_reject_positional_arguments() {
 }
 
 #[test]
+fn builtin_call_contracts_reject_excess_arguments_and_keywords() {
+    for (source, expected) in [
+        ("get()", "missing positional arguments"),
+        (
+            "col(\"users\").where(\"x\", \"==\")",
+            "missing positional arguments",
+        ),
+        ("timestamp(1).add_seconds()", "missing positional arguments"),
+        (
+            "set(\"users/1\")",
+            "expects at least 2 positional arguments",
+        ),
+        ("get(\"users/1\", 99)", "too many positional arguments"),
+        ("now(1)", "too many positional arguments"),
+        ("batch(1) {}", "too many positional arguments"),
+        ("col(\"users\").get(99)", "too many positional arguments"),
+        (
+            "col(\"users\").where(\"x\", \"==\", 1, 2)",
+            "too many positional arguments",
+        ),
+        ("timestamp(1).to_unix(2)", "too many positional arguments"),
+        (
+            "timestamp(1).add_seconds(1, 2)",
+            "too many positional arguments",
+        ),
+        ("[1].len(2)", "too many positional arguments"),
+        ("{a: 1}.a(2)", "too many positional arguments"),
+        (
+            "set(\"users/1\", {}, mearge: true)",
+            "unknown keyword arguments: mearge",
+        ),
+        (
+            "get(\"users/1\", nope: true)",
+            "unknown keyword arguments: nope",
+        ),
+        (
+            "col(\"users\").get(nope: true)",
+            "unknown keyword arguments: nope",
+        ),
+        (
+            "[1].map(nope: true) { |x| x }",
+            "unknown keyword arguments: nope",
+        ),
+        (
+            "timestamp(1).to_unix(nope: true)",
+            "unknown keyword arguments: nope",
+        ),
+        ("{a: 1}.a(nope: true)", "unknown keyword arguments: nope"),
+    ] {
+        let err = run_script(source).unwrap_err();
+        assert!(format!("{err}").contains(expected), "{source}: {err}");
+    }
+
+    let out = run_script("set(\"users/1\", {ok: true}, true)").unwrap();
+    assert_eq!(out, Value::Nil);
+}
+
+#[test]
+fn builtin_call_contracts_reject_duplicate_keywords() {
+    for (source, expected) in [
+        (
+            "set(\"users/1\", {}, merge: true, merge: false)",
+            "duplicate keyword argument: merge",
+        ),
+        (
+            "fn f(a) { a }\nf(1, a: 2)",
+            "duplicate argument a: specified both positionally and as a keyword",
+        ),
+        (
+            "col(\"users\").get(nope: true, nope: false)",
+            "duplicate keyword argument: nope",
+        ),
+    ] {
+        let err = run_script(source).unwrap_err();
+        assert!(format!("{err}").contains(expected), "{source}: {err}");
+    }
+
+    let err = run_script("set(\"users/1\", {}, false, merge: true)").unwrap_err();
+    assert!(
+        format!("{err}").contains("duplicate argument merge"),
+        "{err}"
+    );
+}
+
+#[test]
+fn rejected_call_contracts_do_not_evaluate_arguments_or_blocks() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(
+        &mut runtime,
+        "fn replacement() { set(\"users/side-effect\", {written: true})\n{old: 1} }\nset(\"users/contract\", replacement(), mearge: true)",
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("unknown keyword arguments: mearge"));
+    assert_eq!(
+        run_in(&mut runtime, "get(\"users/side-effect\")").unwrap(),
+        Value::Nil
+    );
+
+    let err = run_in(
+        &mut runtime,
+        "get(\"users/1\") { set(\"users/block-side-effect\", {written: true}) }",
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("block"));
+    assert_eq!(
+        run_in(&mut runtime, "get(\"users/block-side-effect\")").unwrap(),
+        Value::Nil
+    );
+}
+
+#[test]
+fn user_and_unknown_call_contracts_validate_before_evaluation() {
+    let prefix =
+        "fn replacement() { set(\"users/user-side-effect\", {written: true})\n{old: 1} }\n";
+    for (source, expected) in [
+        (
+            "fn f(x) { x }\nf(replacement(), 2)",
+            "too many positional args",
+        ),
+        ("missing(replacement())", "undefined function: missing"),
+        (
+            "fn f(x) { x }\nf(1) { set(\"users/user-block-effect\", {written: true}) }",
+            "does not take a block",
+        ),
+        (
+            "[1].unknown(replacement())",
+            "unknown array method: unknown",
+        ),
+    ] {
+        let mut runtime = Runtime::new(InMemoryFirestore::default());
+        let err = run_in(&mut runtime, &format!("{prefix}{source}")).unwrap_err();
+        assert!(err.to_string().contains(expected), "{source}: {err}");
+        assert_eq!(
+            run_in(&mut runtime, "get(\"users/user-side-effect\")").unwrap(),
+            Value::Nil
+        );
+        assert_eq!(
+            run_in(&mut runtime, "get(\"users/user-block-effect\")").unwrap(),
+            Value::Nil
+        );
+    }
+}
+
+#[test]
+fn builtin_and_method_call_contracts_validate_block_policies() {
+    for (source, expected) in [
+        ("batch()", "requires { ... } block"),
+        ("transaction()", "requires { ... } block"),
+        ("array(1) {}", "does not take a block"),
+        (
+            "col(\"users\").where(\"x\", \"==\", 1) {}",
+            "does not take a block",
+        ),
+        ("timestamp(1).add_seconds(1) {}", "does not take a block"),
+        ("now() {}", "does not take a block"),
+        ("get(\"users/1\") {}", "does not take a block"),
+        ("set(\"users/1\", {}) {}", "does not take a block"),
+        ("[1].len() {}", "does not take a block"),
+        ("{a: 1}.a {}", "does not take a block"),
+    ] {
+        let err = run_script(source).unwrap_err();
+        assert!(format!("{err}").contains(expected), "{source}: {err}");
+    }
+}
+
+#[test]
+fn array_builtin_keeps_variable_arity() {
+    let out = run_script("[array(), array(1, 2, 3), array(4)]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Array(vec![]),
+            Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            Value::Array(vec![Value::Int(4)]),
+        ])
+    );
+}
+
+#[test]
 fn multiline_map_literal_parses() {
     let out = run_script(
         "set(\"users/ml\", {\n  name: \"a\",\n  age: 20,\n})\nget(\"users/ml\")[\"age\"]",
