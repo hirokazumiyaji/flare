@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::error::Error;
 
 use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
@@ -30,7 +31,7 @@ pub struct Parser {
     /// `{ ... }` と区別するため)。
     suppress_block_calls: usize,
     /// マップ / 配列リテラル・引数リスト・グループ化・添字・仮引数リストの
-    /// 内側で 1 以上。内側では改行をトークンとして透過的に無視する。
+    /// 内側で 1 以上。式中の改行を透過的に無視する。
     depth: usize,
 }
 
@@ -102,7 +103,10 @@ impl Parser {
         let mut params = vec![];
         if self.at(&Token::LParen) {
             self.bump();
-            let parsed = self.parse_comma_separated(Token::RParen, |p| p.expect_ident());
+            let mut seen = HashSet::new();
+            let parsed = self.parse_comma_separated(Token::RParen, |p| {
+                p.parse_unique_param(&mut seen, "function")
+            });
             params = parsed?;
             self.expect(Token::RParen)?;
         }
@@ -158,6 +162,7 @@ impl Parser {
     }
     fn parse_or(&mut self) -> Result<Expr, Box<dyn Error>> {
         let mut left = self.parse_and()?;
+        self.skip_newlines_inside_delimiter();
         while self.at(&Token::OrOr) {
             self.bump();
             let right = self.parse_and()?;
@@ -166,11 +171,13 @@ impl Parser {
                 op: BinOp::Or,
                 right: Box::new(right),
             };
+            self.skip_newlines_inside_delimiter();
         }
         Ok(left)
     }
     fn parse_and(&mut self) -> Result<Expr, Box<dyn Error>> {
         let mut left = self.parse_comparison()?;
+        self.skip_newlines_inside_delimiter();
         while self.at(&Token::AndAnd) {
             self.bump();
             let right = self.parse_comparison()?;
@@ -179,6 +186,7 @@ impl Parser {
                 op: BinOp::And,
                 right: Box::new(right),
             };
+            self.skip_newlines_inside_delimiter();
         }
         Ok(left)
     }
@@ -193,6 +201,7 @@ impl Parser {
         } else {
             self.parse_unary()?
         };
+        self.skip_newlines_inside_delimiter();
         while let Some(op) = BINARY_LEVELS[level]
             .iter()
             .find(|(t, _)| self.at(t))
@@ -208,14 +217,13 @@ impl Parser {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
-            }
+            };
+            self.skip_newlines_inside_delimiter();
         }
         Ok(left)
     }
     fn parse_unary(&mut self) -> Result<Expr, Box<dyn Error>> {
-        if self.depth > 0 {
-            self.skip_newlines();
-        }
+        self.skip_newlines_inside_delimiter();
         if self.at(&Token::Bang) {
             self.bump();
             let expr = self.parse_unary()?;
@@ -237,8 +245,10 @@ impl Parser {
     fn parse_call(&mut self) -> Result<Expr, Box<dyn Error>> {
         let mut expr = self.parse_primary()?;
         loop {
+            self.skip_newlines_inside_delimiter();
             if self.at(&Token::Dot) {
                 self.bump();
+                self.skip_newlines_inside_delimiter();
                 let name = self.expect_ident()?;
                 let (args, kwargs) = self.parse_args()?;
                 expr = Expr::Call {
@@ -253,9 +263,9 @@ impl Parser {
                 self.depth += 1;
                 self.skip_newlines();
                 let index = self.parse_expr();
+                self.skip_newlines();
                 self.depth -= 1;
                 let index = index?;
-                self.skip_newlines();
                 self.expect(Token::RBracket)?;
                 expr = Expr::Index {
                     base: Box::new(expr),
@@ -315,9 +325,9 @@ impl Parser {
                 self.depth += 1;
                 self.skip_newlines();
                 let out = self.parse_expr();
+                self.skip_newlines();
                 self.depth -= 1;
                 let out = out?;
-                self.skip_newlines();
                 self.expect(Token::RParen)?;
                 Ok(out)
             }
@@ -523,6 +533,18 @@ impl Parser {
         Ok(block.body)
     }
     fn parse_brace_block_with_params(&mut self) -> Result<(Block, Option<Span>), Box<dyn Error>> {
+        // A brace block is a statement sequence, even when it appears inside
+        // an array/map/argument delimiter. Save the expression depth so an
+        // outer delimiter cannot make a newline in this block join operators
+        // or postfix expressions from adjacent statements.
+        let saved_depth = self.depth;
+        self.depth = 0;
+        let result = self.parse_brace_block_contents();
+        self.depth = saved_depth;
+        result
+    }
+
+    fn parse_brace_block_contents(&mut self) -> Result<(Block, Option<Span>), Box<dyn Error>> {
         self.expect(Token::LBrace)?;
         // `{\n|x| ... }` のようにパラメータリストの直前に改行が置けるようにする。
         self.skip_newlines();
@@ -560,8 +582,9 @@ impl Parser {
             self.bump();
             return Ok(params);
         }
+        let mut seen = HashSet::new();
         loop {
-            params.push(self.expect_ident()?);
+            params.push(self.parse_unique_param(&mut seen, "block")?);
             self.skip_newlines();
             if self.at(&Token::Comma) {
                 self.bump();
@@ -575,6 +598,20 @@ impl Parser {
         }
         self.expect(Token::Pipe)?;
         Ok(params)
+    }
+    fn parse_unique_param(
+        &mut self,
+        seen: &mut HashSet<String>,
+        kind: &str,
+    ) -> Result<String, Box<dyn Error>> {
+        let span = self.peek_span();
+        let name = self.expect_ident()?;
+        if !seen.insert(name.clone()) {
+            return Err(
+                FirelangError::parse(format!("duplicate {kind} parameter: {name}"), span).into(),
+            );
+        }
+        Ok(name)
     }
     fn is_arg_start(&self) -> bool {
         matches!(
@@ -594,6 +631,13 @@ impl Parser {
     fn skip_separators(&mut self) {
         while self.at(&Token::Newline) || self.at(&Token::Semicolon) {
             self.bump();
+        }
+    }
+    /// delimiter の内側だけで式中の改行を透過的に無視する。delimiter の外側では
+    /// 改行を文の区切りとして残す。
+    fn skip_newlines_inside_delimiter(&mut self) {
+        if self.depth > 0 {
+            self.skip_newlines();
         }
     }
     /// delimiter(リテラル・引数リスト・仮引数リスト等)の内側の改行だけを

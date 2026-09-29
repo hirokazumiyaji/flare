@@ -1,5 +1,7 @@
 //! Integration tests against the Firestore emulator (`FIRESTORE_EMULATOR_HOST`).
-//! Locally: start the emulator or skip when unset. CI: see `.github/workflows/ci.yml`
+//! Locally: build with `--features emulator`, start the emulator, or skip when
+//! the host is unset. A configured but invalid or unreachable emulator is a
+//! test failure, not a skip. CI: see `.github/workflows/ci.yml`
 //! (`firebase emulators:exec` sets the host automatically).
 
 #[macro_use]
@@ -9,7 +11,13 @@ use firelang::run_script_with_firestore;
 use firelang::{FirestoreEmulator, Value};
 
 fn emulator() -> Option<FirestoreEmulator> {
-    FirestoreEmulator::from_env()
+    match FirestoreEmulator::try_from_env() {
+        Ok(Some(emulator)) => Some(emulator),
+        Ok(None) => None,
+        Err(error) => {
+            panic!("FIRESTORE_EMULATOR_HOST is configured, but emulator setup failed: {error}")
+        }
+    }
 }
 fn unique(prefix: &str) -> String {
     let n = std::time::SystemTime::now()
@@ -34,7 +42,7 @@ fn firestore_global_functions_with_emulator() {
 #[test]
 fn emulator_merge_set() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let p = unique("merge");
@@ -50,7 +58,7 @@ fn emulator_merge_set() {
 #[test]
 fn emulator_query_where_and_limit() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let id = unique("q");
@@ -104,7 +112,7 @@ set("{second}", {{n: 2}})
 #[test]
 fn emulator_collection_group_query() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let id = unique("cg");
@@ -125,7 +133,7 @@ col_group("members").where("active", "==", true).get()"#
 #[test]
 fn emulator_nested_map_roundtrip() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let p = unique("nest");
@@ -141,7 +149,7 @@ get("{path}")"#
 #[test]
 fn emulator_server_timestamp_resolves() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let p = unique("st");
@@ -157,7 +165,7 @@ fn emulator_server_timestamp_resolves() {
 #[test]
 fn emulator_batch_atomic_commit() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let a = unique("ba");
@@ -176,7 +184,7 @@ get("users/{b}")"#
 #[test]
 fn emulator_transaction_read_then_write() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let p = unique("tx");
@@ -196,7 +204,7 @@ get("{path}")"#
 #[test]
 fn emulator_transaction_multiple_gets_before_write() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let p = unique("mg");
@@ -219,7 +227,7 @@ get("{path_a}")"#
 #[test]
 fn emulator_update_missing_fails() {
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let p = unique("nom");
@@ -238,7 +246,7 @@ fn emulator_where_compare_matches_in_memory_semantics() {
     // Fixtures live in a per-run subcollection so the collection-scoped
     // queries stay repeatable against a long-lived local emulator.
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let run = unique("cmp");
@@ -344,7 +352,7 @@ set("{collection}/missing", {{other: 1}})"#,
 fn emulator_dotted_field_path_update_matches_in_memory() {
     // Same case as in-memory `update_supports_dotted_field_path_like_firestore`.
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let p = unique("fp");
@@ -369,27 +377,65 @@ get("{path}")"#
 }
 
 #[test]
-fn emulator_replacement_set_sentinel_with_dotted_key_matches_in_memory() {
-    // Same case as in-memory
-    // `replacement_set_resolves_sentinels_against_literal_dotted_keys`:
-    // a replacement `set` treats dotted keys as literal field names, so the
-    // transform must be sent with a backtick-escaped path.
+fn emulator_overlapping_update_and_merge_set_paths_match_in_memory() {
+    let run = unique("ov");
+    for script in [
+        format!(
+            r#"set("users/{run}/docs/update", {{}})
+update("users/{run}/docs/update", {{a: delete_field(), "a.b": 1}})"#
+        ),
+        format!(
+            r#"set("users/{run}/docs/merge", {{}})
+set("users/{run}/docs/merge", {{a: 1, "a.b": 2}}, merge: true)"#
+        ),
+    ] {
+        let Some(fs) = emulator() else {
+            eprintln!("skip: no emulator");
+            return;
+        };
+        let err = run_script_with_firestore(&script, fs).unwrap_err();
+        assert!(
+            format!("{err}").contains("overlapping field paths: a and a.b"),
+            "{script}: {err}"
+        );
+    }
+}
+
+#[test]
+fn emulator_replacement_set_non_simple_transform_keys_match_in_memory() {
+    // A replacement `set` treats every map key as one literal field name.
+    // Every non-simple transform target therefore needs a quoted API path,
+    // including dotted, hyphenated, digit-leading, and backtick-containing keys.
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let run = unique("gv");
     let script = format!(
-        r#"set("users/{run}/docs/d1", {{"a.b": array_union([1])}})
-set("users/{run}/docs/d2", {{"x.y": ["a"]}})
-set("users/{run}/docs/d2", {{"x.y": array_remove(["a"])}})
-[get("users/{run}/docs/d1")["a.b"], get("users/{run}/docs/d2")["x.y"]]"#
+        r#"set("users/{run}/docs/names", {{"a-b": 1, "1start_digit": 2, "a`b": 3, "a\\b": 4}})
+set("users/{run}/docs/names", {{"a-b": increment(1), "1start_digit": increment(2), "a`b": increment(3), "a\\b": increment(4)}})
+set("users/{run}/docs/dotted", {{"a.b": [1]}})
+set("users/{run}/docs/dotted", {{"a.b": array_union([2])}})
+set("users/{run}/docs/remove", {{"x.y": ["a"]}})
+set("users/{run}/docs/remove", {{"x.y": array_remove(["a"])}})
+[
+  get("users/{run}/docs/names")["a-b"],
+  get("users/{run}/docs/names")["1start_digit"],
+  get("users/{run}/docs/names")["a`b"],
+  get("users/{run}/docs/names")["a\\b"],
+  get("users/{run}/docs/dotted")["a.b"],
+  get("users/{run}/docs/remove")["x.y"],
+]"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
     assert_eq!(
         out,
         Value::Array(vec![
-            Value::Array(vec![Value::Int(1)]),
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4),
+            Value::Array(vec![Value::Int(2)]),
             Value::Array(vec![]),
         ])
     );
@@ -408,7 +454,7 @@ fn emulator_where_rejects_large_string_filter_values() {
 col("users/{run}/docs").where("s", "==", "{p}").get()"#
     );
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let err = run_script_with_firestore(&script, fs).unwrap_err();
@@ -422,11 +468,55 @@ col("users/{run}/docs").where("s", "==", "{}x").get().len()"#,
         "x".repeat(1498)
     );
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let out = run_script_with_firestore(&script, fs).unwrap();
     assert_eq!(out, Value::Int(0));
+}
+
+#[test]
+fn emulator_where_validates_nested_filter_string_sizes() {
+    // Same equality, membership, and array_contains cases as the in-memory
+    // `where_validates_nested_filter_string_sizes` test.
+    let valid = "x".repeat(1499);
+    let invalid = "x".repeat(1500);
+    let run = unique("nested_filter");
+    let make_script = |op: &str, value: &str| {
+        format!(r#"col("users/{run}/docs").where("payload", "{op}", {value}).get()"#)
+    };
+
+    let valid_cases = [
+        make_script("==", &format!(r#"["{valid}"]"#)),
+        make_script("in", &format!(r#"[["{valid}"]]"#)),
+        make_script("array_contains", &format!(r#"["{valid}"]"#)),
+    ];
+    for script in valid_cases {
+        let Some(fs) = emulator() else {
+            eprintln!("skip: no emulator");
+            return;
+        };
+        let out = run_script_with_firestore(&script, fs).unwrap();
+        assert_eq!(out, Value::Array(vec![]));
+    }
+
+    let invalid_cases = [
+        make_script("==", &format!(r#"{{s: "{invalid}"}}"#)),
+        make_script("in", &format!(r#"[{{s: "{invalid}"}}]"#)),
+        make_script("array_contains", &format!(r#"{{s: "{invalid}"}}"#)),
+        make_script("==", &format!(r#"{{s: ["{invalid}"]}}"#)),
+    ];
+    for script in invalid_cases {
+        let Some(fs) = emulator() else {
+            eprintln!("skip: no emulator");
+            return;
+        };
+        let err = run_script_with_firestore(&script, fs).unwrap_err();
+        assert!(
+            format!("{err}").contains("value for payload is too large to be used in a query"),
+            "{err}"
+        );
+    }
 }
 
 #[test]
@@ -445,7 +535,7 @@ fn emulator_update_field_paths_match_in_memory_validation() {
         format!(r#"set("users/{run}/docs/d1", {{"a..b": array_union([1])}}, merge: true)"#),
     ] {
         let Some(fs) = emulator() else {
-            eprintln!("skip: no emulator");
+            eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
             return;
         };
         let err = run_script_with_firestore(&script, fs).unwrap_err();
@@ -461,7 +551,7 @@ fn emulator_delete_field_and_increment_match_in_memory() {
     // Same cases as in-memory `delete_field_removes_fields_via_update_and_merge_set`
     // and `increment_adds_to_numeric_fields`.
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let run = unique("sent");
@@ -469,7 +559,17 @@ fn emulator_delete_field_and_increment_match_in_memory() {
         "set(\"users/{run}\", {{name: \"a\", age: 1, visits: 10}})\nupdate(\"users/{run}\", {{age: delete_field(), visits: increment(5)}})\nget(\"users/{run}\")"
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    assert_eq!(out, map! {"visits" => Value::Int(15)});
+    // The expected value omitted `name`, which the script sets, so this could
+    // never pass wherever the emulator actually ran - it only looked green
+    // because the suite skips without FIRESTORE_EMULATOR_HOST. Both backends
+    // remove `age` and keep `name`; this now matches the sibling in-memory test.
+    assert_eq!(
+        out,
+        map! {
+            "name" => Value::Str("a".to_string()),
+            "visits" => Value::Int(15)
+        }
+    );
 }
 
 #[test]
@@ -478,7 +578,7 @@ fn emulator_extended_query_matches_in_memory() {
     // Fixtures live in a per-run subcollection so the collection-scoped
     // queries stay repeatable against a long-lived local emulator.
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let run = unique("xq");
@@ -523,22 +623,35 @@ fn run_on_shared_runtime(
 
 #[test]
 fn emulator_failed_transaction_aborts_and_restarts() {
-    // 失敗した transaction は rollback RPC で中断され、同じ接続で
-    // 新しい transaction を開始できる("already in transaction" にならない)。
+    // 失敗した transaction は rollback RPC で中断され、子スコープの local も
+    // 残らない。同じ接続で新しい transaction を開始できる
+    // ("already in transaction" にならない)。
     let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let mut rt = firelang::runtime::Runtime::new(fs);
     let run = unique("txab");
     let failing = run_on_shared_runtime(
         &mut rt,
-        &format!("transaction {{ set(\"users/{run}\", {{x: 1}})\nundefined_var }}"),
+        &format!(
+            "transaction {{ tx_local = 1\nset(\"users/{run}\", {{x: tx_local}})\nundefined_var }}"
+        ),
     );
     assert!(failing.is_err());
+    // The comment above claims the failed transaction's local does not
+    // survive: verify it directly. A scope-cleanup regression would leave
+    // `tx_local` defined here instead of erroring.
+    let leaked = run_on_shared_runtime(&mut rt, "tx_local").unwrap_err();
+    assert!(
+        format!("{leaked}").contains("undefined variable: tx_local"),
+        "{leaked}"
+    );
     let out = run_on_shared_runtime(
         &mut rt,
-        &format!("transaction {{ set(\"users/{run}\", {{x: 2}}) }}\nget(\"users/{run}\")"),
+        &format!(
+            "transaction {{ tx_local = 2\nset(\"users/{run}\", {{x: tx_local}}) }}\nget(\"users/{run}\")"
+        ),
     )
     .unwrap();
     assert_eq!(out, map! {"x" => Value::Int(2)});
