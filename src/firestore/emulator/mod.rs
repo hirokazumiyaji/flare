@@ -5,6 +5,7 @@ mod codec;
 mod path;
 mod writes;
 
+use std::env::{self, VarError};
 use std::error::Error;
 
 use gcloud_sdk::google::firestore::v1::{
@@ -19,24 +20,125 @@ use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Value};
 
 pub struct FirestoreEmulator {
     client: client::EmulatorClient,
+    // `Some` means the server-side transaction is still eligible for
+    // rollback. It is cleared only after commit or rollback succeeds.
+    //
+    // State transitions:
+    //   None --begin--> Some --commit/abort success--> None
+    //   Some --preparation/commit/abort failure--> Some
+    //   None --abort--> None
     transaction_id: Option<Vec<u8>>,
 }
 
+/// A validated emulator configuration. Holding this costs nothing and opens no
+/// socket, so it can be obtained before the CLI blocks on script input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmulatorConfig {
+    pub host: String,
+    pub project_id: String,
+}
+
+/// Public so a library consumer can `downcast_ref` a connection failure out of
+/// the `Box<dyn Error>` returned by [`FirestoreEmulator::new`] instead of
+/// string-matching the message.
+#[derive(Debug)]
+pub struct EmulatorConnectionError {
+    pub host: String,
+    source: Box<dyn Error>,
+}
+
+impl std::fmt::Display for EmulatorConnectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to connect to Firestore emulator at {}: {}",
+            self.host, self.source
+        )
+    }
+}
+
+impl Error for EmulatorConnectionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 impl FirestoreEmulator {
+    /// Reads the emulator configuration from the environment.
+    ///
+    /// This compatibility constructor preserves the historical `Option` API.
+    /// Call [`Self::try_from_env`] when configuration and connection errors
+    /// must be surfaced to the caller.
     pub fn from_env() -> Option<Self> {
-        let host = std::env::var("FIRESTORE_EMULATOR_HOST").ok()?;
-        let project_id =
-            std::env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".to_string());
-        Self::new(host, project_id).ok()
+        Self::try_from_env().ok().flatten()
+    }
+
+    /// Fallible environment constructor. `Ok(None)` means that
+    /// `FIRESTORE_EMULATOR_HOST` is not set; a configured but invalid or
+    /// unreachable emulator is returned as an error.
+    pub fn try_from_env() -> Result<Option<Self>, Box<dyn Error>> {
+        match Self::config_from_env()? {
+            None => Ok(None),
+            Some(config) => Ok(Some(Self::new(config.host, config.project_id)?)),
+        }
+    }
+
+    /// Parse and validate the emulator configuration from the environment
+    /// without opening a connection.
+    ///
+    /// This is deliberately separate from [`FirestoreEmulator::try_from_env`]:
+    /// validation is pure and instant, so a CLI can reject a misconfiguration
+    /// before it blocks on reading a script from stdin, while the actual
+    /// network connect is deferred until the client is first needed.
+    pub fn config_from_env() -> Result<Option<EmulatorConfig>, Box<dyn Error>> {
+        let host = match env::var("FIRESTORE_EMULATOR_HOST") {
+            Ok(host) => host,
+            Err(VarError::NotPresent) => return Ok(None),
+            Err(VarError::NotUnicode(_)) => {
+                return Err("FIRESTORE_EMULATOR_HOST must be valid UTF-8".into());
+            }
+        };
+        // Validate both variables here, not in `new`: this is the pure,
+        // instant half of the setup, and the CLI relies on it to reject every
+        // misconfiguration before it blocks on script input. `new` re-validates
+        // so it stays safe for direct callers.
+        validate_config("FIRESTORE_EMULATOR_HOST", &host)?;
+
+        let project_id = match env::var("FIRESTORE_PROJECT_ID") {
+            Ok(project_id) => project_id,
+            Err(VarError::NotPresent) => "firelang-test".to_string(),
+            Err(VarError::NotUnicode(_)) => {
+                return Err("FIRESTORE_PROJECT_ID must be valid UTF-8".into());
+            }
+        };
+        validate_config("FIRESTORE_PROJECT_ID", &project_id)?;
+
+        Ok(Some(EmulatorConfig { host, project_id }))
     }
 
     /// 接続を確立して作る。emulator に届かない場合はエラーを返す。
     pub fn new(host: String, project_id: String) -> Result<Self, Box<dyn Error>> {
+        validate_config("FIRESTORE_EMULATOR_HOST", &host)?;
+        validate_config("FIRESTORE_PROJECT_ID", &project_id)?;
+
+        let client = match client::connect(&host, &project_id) {
+            Ok(client) => client,
+            Err(source) => {
+                return Err(Box::new(EmulatorConnectionError { host, source }));
+            }
+        };
         Ok(Self {
-            client: client::connect(&host, &project_id)?,
+            client,
             transaction_id: None,
         })
     }
+}
+
+fn validate_config(name: &str, value: &str) -> Result<(), Box<dyn Error>> {
+    if value.trim().is_empty() {
+        return Err(format!("{name} must not be empty").into());
+    }
+    Ok(())
 }
 
 impl Firestore for FirestoreEmulator {
@@ -54,7 +156,10 @@ impl Firestore for FirestoreEmulator {
                 .await
         });
         match result {
-            Ok(resp) => codec::decode_document(&resp.into_inner()).map(Some),
+            Ok(resp) => {
+                codec::decode_document(&resp.into_inner(), self.client.db.get_documents_path())
+                    .map(Some)
+            }
             Err(status) if status.code() == Code::NotFound => Ok(None),
             Err(status) => Err(status.into()),
         }
@@ -131,22 +236,37 @@ impl Firestore for FirestoreEmulator {
             }
             Ok::<_, gcloud_sdk::tonic::Status>(None)
         })?;
-        result.as_ref().map(codec::decode_document).transpose()
+        result
+            .as_ref()
+            .map(|doc| codec::decode_document(doc, self.client.db.get_documents_path()))
+            .transpose()
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
-        let tid = self.transaction_id.take().ok_or("not in transaction")?;
+        // Keep the transaction id until the whole commit succeeds.  In
+        // particular, write preparation can fail before the Commit RPC is
+        // sent, and the runtime will call abort_transaction for that error.
+        // Taking the id here would make that rollback a no-op and leave the
+        // server-side transaction open.
+        let tid = self.transaction_id.clone().ok_or("not in transaction")?;
         let sdk_writes = writes::write_ops_to_sdk_writes(&self.client.project_id, &writes)?;
-        writes::commit_writes(&self.client.db, &self.client.runtime, sdk_writes, tid)
+        let result = writes::commit_writes(&self.client.db, &self.client.runtime, sdk_writes, tid);
+        if result.is_ok() {
+            self.transaction_id = None;
+        }
+        result
     }
 
     fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
-        let Some(tid) = self.transaction_id.take() else {
+        // Do not discard the id before Rollback returns.  A transient rollback
+        // failure must leave enough state for a later retry; a successful
+        // rollback (or an already-idle backend) clears the local state.
+        let Some(tid) = self.transaction_id.clone() else {
             return Ok(());
         };
         let db = &self.client.db;
         let database = db.get_database_path().clone();
-        self.client.runtime.block_on(async move {
+        let result = self.client.runtime.block_on(async move {
             db.client()
                 .get()
                 .rollback(Request::new(RollbackRequest {
@@ -155,7 +275,20 @@ impl Firestore for FirestoreEmulator {
                 }))
                 .await?;
             Ok::<_, gcloud_sdk::tonic::Status>(())
-        })?;
+        });
+        match result {
+            Ok(()) => {}
+            // NOT_FOUND means the server no longer holds this transaction:
+            // it was already committed (a commit whose response was lost), or
+            // already rolled back, or never existed.  That is terminal, not
+            // retryable, so the local state must be dropped.  Propagating it
+            // would wedge `Runtime::pending_rollback` and make every later
+            // `transaction` block fail with "already in transaction" forever.
+            // This mirrors how `get` above normalises the same status.
+            Err(status) if status.code() == Code::NotFound => {}
+            Err(status) => return Err(status.into()),
+        }
+        self.transaction_id = None;
         Ok(())
     }
 }
@@ -189,9 +322,10 @@ fn run_query_candidates(
     })?;
 
     let mut out = vec![];
+    let resource_root = fs.client.db.get_documents_path();
     for doc in docs {
         let rel = path::relative_document_name(&doc.name)?;
-        let Value::Map(fields) = codec::decode_document(&doc)? else {
+        let Value::Map(fields) = codec::decode_document(&doc, resource_root)? else {
             return Err("query result must be a map".into());
         };
         out.push((rel, fields));

@@ -31,7 +31,7 @@ puts "found #{rows}"
 ## 2. スクリプトの構造
 
 - ソースは UTF-8 テキスト。文(statement)の区切りは改行または `;`。
-- マップリテラル `{ ... }`、配列リテラル `[ ... ]`、引数リスト `( ... )`、関数・ブロックの仮引数リスト、グループ化 `( expr )`、添字 `[ ... ]` の**内側では改行を無視する**(Ruby と同じ)。要素・値・引数となる**式の途中**の改行も無視される。したがってリテラル・引数リストは複数行に書ける。**末尾カンマ**(`{a: 1,}` / `[1, 2,]` / `f(a, b,)`)も許容する:
+- マップリテラル `{ ... }`、配列リテラル `[ ... ]`、引数リスト `( ... )`、関数・ブロックの仮引数リスト、グループ化 `( expr )`、添字 `[ ... ]` の**内側では改行を無視する**(Ruby と同じ)。要素・値・引数となる**式の途中**の改行も無視される。したがってリテラル・引数リストは複数行に書ける。**二項演算子や postfix の `.` / `[]` の前後**に改行を置いても同じ式として読む。**末尾カンマ**(`{a: 1,}` / `[1, 2,]` / `f(a, b,)`)も許容する:
   ```ruby
   set("users/1", {
     name: "a",
@@ -40,12 +40,17 @@ puts "found #{rows}"
       "y",
     ],
   })
-  [1 +
-    2]   # 式の途中の改行も可
+  [1
+    + 2]
+  m = {value: 1}
+  [
+    m
+      .value
+  ]
   ```
-  ただし `fn` / `if` / `while` / ブロック付きメソッドの `{ ... }`(文の並び)では改行は文の区切りのまま。delimiter の内側では `;` は改行と同じにはならない(要素の区切りは `,` のみ。`[;1]` 等はエラー)。
+  ただし `fn` / `if` / `while` / ブロック付きメソッドの `{ ... }`(文の並び)では改行は文の区切りのまま。delimiter の外側の改行も文の区切りであり、delimiter の内側では `;` は改行と同じにはならない(要素の区切りは `,` のみ。`[;1]` 等はエラー)。
 - `#` から行末まではコメント(文字列リテラル内を除く)。
-- プログラムの評価結果は、最後に評価された文の値。`return` がトップレベルで実行された場合はその値。
+- プログラムの評価結果は、最後に評価された文の値。`return` がトップレベルで実行された場合はその値。ブロック内から持ち上がった `return` も同じで、残りのトップレベル文を中断し、その値がプログラムの結果になる。
 - `fl` CLI は評価結果を `=> <inspect表現>` 形式で標準出力に印字する。
 
 ## 3. 値と型
@@ -165,6 +170,7 @@ a = 2   # エラー: reassignment is not allowed: a
 - 変数は再代入不可。関数定義名も同じ名前空間を使い、再定義不可。
 - ビルトイン関数(`puts` `get` `set` `update` `delete` `batch` `transaction` `doc` `col` `col_group` `array` `len` `now` `timestamp` `server_timestamp` `array_union` `array_remove` `delete_field` `increment`)と同名の関数定義はエラー(`cannot redefine builtin: <name>`)。ビルトイン呼び出しが常に優先されるため。
 - 関数本体内でも外側スコープに見える名前への代入はエラー(シャドーイング不可)。ただし**関数の仮引数**は外側の名前と重なってもよい。
+- 関数とブロックの仮引数名は、それぞれ同じ定義内で重複できない。重複した仮引数は parse / definition エラーになる。
 
 ### スコープ規則(静的スコープ)
 
@@ -215,6 +221,7 @@ total = len(rows)                                            # 要素数
 
 - ブロックは必須(`each()` 等はエラー)。ブロック引数の個数は呼び出し側が渡す個数と一致しなければならない(`[1].each { \|a, b\| ... }` はエラー。**空配列でも検証される**)。`each` / `map` / `len` は引数を取らない(`[1].len(99)` 等はエラー)。
 - ブロック内で外側に見える名前への代入はエラー(変数の不変性ポリシーはブロックでも同様)。
+- ブロック内の `return` はブロックを中断し、**それを囲む関数**の戻り値になる。`each` / `map` の反復もそこで止まる(次の要素を処理しない)。ブロック内から和外側の関数へ `return` が伝播するのは到此までで、関数の内部(関数本体、または本体内のブロック)で起きた `Return` はその関数の戻り値として消費される。ネストしたブロックの `return` は最も内側の**関数**へ属する。
 - `for` 文はない。反復は `each` / `map` を使う。`while` は残すが、変数が再代入不可のため反復には使えない(副作用頼みの待ち合わせ等の特殊用途向け)。
 
 ### メソッドと不変性
@@ -279,7 +286,7 @@ update("users/1", {tags: array_union(["a"])})
 update("users/1", {"profile.name": "b"})              # ドット区切りのフィールドパスでネスト更新
 ```
 
-update と merge `set` のキーはフィールドパスとして解釈されるため、`{"profile.name": "b"}` は `profile` マップ内の `name` を更新する(in-memory / emulator で同じ挙動)。キーの各セグメントは単純フィールドパス([A-Za-z_][A-Za-z0-9_]*)のみで、それ以外(`` `a.b` `` のようなバッククォート、空セグメント、記号)はエラー。この検証は**センチネル値(`array_union` 等)を置いたキーにも適用される**。置換の `set` では `{"a.b": 1}` のようなキーはそのままリテラルのフィールド名として保存され、センチネル(`array_union` 等)をドット付きキーに置いた場合もリテラルキーに対して解決される(両バックエンドで同じ)。
+update と merge `set` のキーはフィールドパスとして解釈されるため、`{"profile.name": "b"}` は `profile` マップ内の `name` を更新する(in-memory / emulator で同じ挙動)。キーの各セグメントは単純フィールドパス([A-Za-z_][A-Za-z0-9_]*)のみで、それ以外(`` `a.b` `` のようなバッククォート、空セグメント、記号)はエラー。この検証は**センチネル値(`array_union` 等)を置いたキーにも適用される**。また、削除・通常値の mask 内だけで同じパスまたは祖先/子孫パスを重ねる場合は、backend へ送信する前に同じ overlap エラーにする(transform との重なりと祖先/子孫の演算順序は spec のとおり許可する)。置換の `set` では `{"a.b": 1}` のようなキーはそのままリテラルのフィールド名として保存され、単純名ではないキーにセンチネル(`array_union` 等)を置いた場合もリテラルキーに対して解決される(両バックエンドで同じ)。emulator は Firestore の quoted field path 表現に送信し、フィールド名内のバックスラッシュとバッククォートも同規約でエスケープする。
 
 ## 7. クエリ
 
@@ -298,7 +305,7 @@ col("users").doc("1")       # doc("users/1") と同等
   - `!=` はフィールドが存在し、値が構造比較で異なる場合にマッチ(存在しないフィールドはマッチしない。型が異なる値は不一致とみなす。emulator バックエンドでは Double と Int の数値比較や Opaque 値の扱いとの整合のため、`!=` はサーバ RPC では絞り込まずクライアント側で評価される)。
   - `in` / `not-in` — `value` は Array(要素は最大 10 個)。`in` はフィールド値がいずれかの要素と等しい場合、`not-in` はフィールドが存在し、どの要素とも等しくない場合にマッチ(ただし Firestore 仕様に準拠し、比較配列に `nil` が含まれる `not-in` は何もマッチしない)。空配列の `in` は何もマッチせず、空配列の `not-in` はフィールドを持つ全ドキュメントにマッチする。Array でない値を渡すとクエリ実行時にエラー。
   - `array_contains` — フィールドが Array で `value` を要素に含む場合にマッチ。`array_contains_any` — `value` は Array(要素は最大 10 個)で、フィールドの Array と 1 つ以上共通の要素を持つ場合にマッチ(空配列は何もマッチしない)。Array でない値を渡すとクエリ実行時にエラー。
-  - **文字列フィルタ値のサイズ制限**: Firestore と同様に、`where` の文字列フィルタ値は **1,500 UTF-8 バイト未満**であること(`in` 等の配列要素・`array_contains` の要素を含む。1,500 バイト以上のフィルタ値はクエリ実行時にエラー:`value for {field} is too large to be used in a query`)。**保存値には長さ制限がない**。有効なフィルタ(< 1,500 バイト)に対しては、保存値との最初の差異位置が常にフィルタ自身の長さ以内に収まるため、全文比較で Firestore と同じ結果になる。in-memory / emulator は同じ検証をクエリ実行時に行う。
+  - **文字列フィルタ値のサイズ制限**: Firestore と同様に、`where` の文字列フィルタ値は **1,500 UTF-8 バイト未満**であること(`in` 等の配列要素・`array_contains` の要素・Map / Array のネストを含む。1,500 バイト以上のフィルタ値はクエリ実行時にエラー:`value for {field} is too large to be used in a query`)。**保存値には長さ制限がない**。有効なフィルタ(< 1,500 バイト)に対しては、保存値との最初の差異位置が常にフィルタ自身の長さ以内に収まるため、全文比較で Firestore と同じ結果になる。in-memory / emulator は同じ検証をクエリ実行時に行う。
   - `where` の値には `doc("users/1")` などの `DocRef` も指定可能(同一データベース内の参照型フィールドに対する `==` や `in`、`array_contains` 等のクエリ。emulator バックエンドでは同一プロジェクト・同一データベースの完全リソース名へエンコードされて実行される)。
   - 異なる型同士の比較は未規定(§13)。in-memory ではマッチしない。
   - フィールドが存在しないドキュメントはマッチしない(`!=` / `not-in` を含む)。
@@ -314,7 +321,7 @@ col("users").doc("1")       # doc("users/1") と同等
 
 ## 8. batch / transaction
 
-どちらも `{ ... }` ブロックが必須で、ブロックの最後の値を返す。ネスト(batch/transaction 内での batch/transaction)は不可(エラーメッセージ: `batch cannot be nested inside batch/transaction` / `transaction cannot be nested inside batch/transaction`)。
+どちらも `{ ... }` ブロックが必須で、ブロックの最後の値を返す。ブロックは**字句的な子スコープ**で評価され、呼び出し元(外側のスコープ)の変数は読める。ただし、見える外側の名前への代入は変数の不変性規則によりエラーになる。ブロック内で定義した変数・関数はブロック外へ公開されず、成功時だけでなくランタイムエラーやバックエンドエラー時も子スコープが破棄される。したがって、失敗後に同じ Runtime で再度 `batch` / `transaction` を実行できる。ブロック内の `return` は書き込みの commit / rollback を済ませてから外の関数へ伝播するので、`x = batch { ...; return }` のように値を束縛する形では値は得られない(囲む関数がその場で抜ける)。ネスト(batch/transaction 内での batch/transaction)は不可(エラーメッセージ: `batch cannot be nested inside batch/transaction` / `transaction cannot be nested inside batch/transaction`)。
 
 ### batch
 
@@ -347,7 +354,7 @@ transaction {
 | `timestamp("2026-02-01T00:00:00+09:00")` | RFC3339 文字列から生成。オフセットは `Z` または `±HH:MM`。小数秒は非対応 |
 | `ts.to_unix()` | Int(Unix 秒)を返す |
 | `ts.to_rfc3339()` | RFC3339 文字列(UTC、`+00:00`)を返す |
-| `ts.add_seconds(n)` | n 秒後の**新しい** Timestamp を返す |
+| `ts.add_seconds(n)` | n 秒後の**新しい** Timestamp を返す。範囲外は `integer overflow` エラー |
 | `t1 > t2` / `<` / `>=` / `<=` / `==` / `!=` | Timestamp 同士の比較(秒で比較) |
 | `t2 - t1` | 秒差を Int で返す。範囲外は `integer overflow` エラー |
 
@@ -360,10 +367,15 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 - スクリプトの指定はちょうど 1 つ:ファイルパス / `-`(stdin) / `-e <script>`(ワンライナー。複数回指定時は改行で連結)。引数なしで stdin がパイプ接続されている場合も stdin から読む(端末直結の引数なしは usage 表示で終了)。`-e` とファイル/`-` の併用はエラー。`--help` / `-h` で usage 表示。未知のオプション・未知のバックエンドはエラー終了。
   ```sh
   fl script.fl
-  echo 'get("users/1")' | fl --backend emulator -
+  cargo run --features emulator --bin fl -- --backend emulator script.fl
+  echo 'get("users/1")' | cargo run --features emulator --bin fl -- --backend emulator -
   fl -e 'col("users").get().len()'
   ```
-- `--backend emulator` のとき:
+- `--backend emulator` を使うバイナリは `emulator` feature を有効にして
+  ビルドする必要がある。feature なしで指定した場合は
+  `emulator backend requires the \`emulator\` Cargo feature; rebuild with --features emulator`
+  を表示して終了する。
+- `--backend emulator` のとき(`emulator` feature 有効時):
   - `FIRESTORE_EMULATOR_HOST` — **必須**。未設定なら即エラー。
   - `FIRESTORE_PROJECT_ID` — 省略時 `firelang-test`。
 - 実行結果は `=> <inspect表現>` で印字。
@@ -371,11 +383,30 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 
 ## 11. バックエンド
 
-| エントリポイント | `in-memory` | `emulator` |
-|------------------|-------------|------------|
+| エントリポイント | `in-memory` | `emulator` feature |
+|------------------|-------------|--------------------|
 | `run_script` | ○(固定) | × |
 | `run_script_with_firestore` | ○ | ○(`FirestoreEmulator` を渡す) |
 | `fl` CLI | ○(デフォルト) | ○(`--backend emulator`) |
+
+### build feature と公開 API
+
+- 既定の feature は空です。`cargo build` / `cargo test` は in-memory
+  backend とライブラリ API だけをビルドし、Firestore SDK・gRPC・TLS の
+  依存層をリンクしません。
+- `emulator` feature を有効にすると、Firestore emulator client と
+  `FirestoreEmulator` が有効になります:
+  `cargo build --features emulator`。
+- `Firestore`、`InMemoryFirestore`、`run_script`、
+  `run_script_with_firestore` は feature なしで利用できるため、in-memory
+  の custom backend を埋め込む consumer は SDK を引き込まない。
+- `FirestoreEmulator` は feature なしの build では公開されない。CLI は
+  feature なしでも `--backend emulator` を指定できるが、環境変数の検証後に
+  feature を有効にする方法を案内する明確なエラーになる。既存コードで
+  emulator を利用する場合は CLI では `--features emulator`、Rust の依存宣言では
+  `features = ["emulator"]` を指定する。
+- 将来的な Auth / Storage client も、emulator と同様のサービス別 feature
+  group に分離する前提とする。
 
 - 認証付きの**本番 Firestore は非対応**(スコープ外)。
 - ランタイムは `Firestore` トレイトでバックエンドを抽象化する。デフォルトは `InMemoryFirestore`。
