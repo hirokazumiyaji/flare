@@ -243,6 +243,151 @@ fn batch_rolls_back_on_runtime_error() {
 }
 
 #[test]
+fn staged_blocks_read_outer_scope_and_keep_locals_private() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let out = run_in(
+        &mut runtime,
+        r#"outer = 7
+batch {
+  local = outer + 1
+  set("users/scope_batch", {n: local})
+}
+transaction {
+  read = get("users/scope_batch")
+  set("users/scope_tx", {n: read["n"] + outer})
+}
+[get("users/scope_batch")["n"], get("users/scope_tx")["n"]]"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(8), Value::Int(15)]));
+
+    let err = run_in(&mut runtime, "local").unwrap_err();
+    assert!(
+        format!("{err}").contains("undefined variable: local"),
+        "{err}"
+    );
+    let err = run_in(&mut runtime, "read").unwrap_err();
+    assert!(
+        format!("{err}").contains("undefined variable: read"),
+        "{err}"
+    );
+
+    // spec §8 says a staged block's variables *and functions* do not escape.
+    // `fn` declarations live in the same scope frames as variables, so a
+    // regression that leaked the body into the caller scope would leak both.
+    for source in [
+        "batch { fn leaked() { 1 } }\nleaked()",
+        "transaction { fn leaked() { 1 } }\nleaked()",
+    ] {
+        let err = run_in(&mut runtime, source).unwrap_err();
+        assert!(
+            format!("{err}").contains("undefined function: leaked"),
+            "{source}: {err}"
+        );
+    }
+}
+
+#[test]
+fn staged_blocks_restore_scopes_after_nested_binding_error() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    // Duplicate params are now rejected at definition time with the precise
+    // diagnostic, so the call inside `batch` is never reached. The runtime
+    // must still be reusable afterwards and must not have leaked `x`.
+    let err = run_in(&mut runtime, "fn f(x, x) { x }\nbatch { f(1, 2) }").unwrap_err();
+    assert!(
+        format!("{err}").contains("duplicate function parameter: x"),
+        "{err}"
+    );
+    let err = run_in(&mut runtime, "x").unwrap_err();
+    assert!(format!("{err}").contains("undefined variable: x"), "{err}");
+    // A well-formed definition still calls cleanly inside a staged block.
+    assert_eq!(
+        run_in(&mut runtime, "fn f(x) { x }\nbatch { f(1) }").unwrap(),
+        Value::Int(1)
+    );
+}
+
+#[test]
+fn staged_blocks_cannot_assign_outer_names() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(&mut runtime, "outer = 1\nbatch { outer = 2 }").unwrap_err();
+    assert!(
+        format!("{err}").contains("reassignment is not allowed: outer"),
+        "{err}"
+    );
+    assert_eq!(run_in(&mut runtime, "outer").unwrap(), Value::Int(1));
+
+    let err = run_in(&mut runtime, "transaction { outer = 2 }").unwrap_err();
+    assert!(
+        format!("{err}").contains("reassignment is not allowed: outer"),
+        "{err}"
+    );
+    assert_eq!(run_in(&mut runtime, "outer").unwrap(), Value::Int(1));
+}
+
+#[test]
+fn batch_can_be_reused_after_runtime_error() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let failing = run_in(&mut runtime, "batch { batch_local = 1\nundefined_var }");
+    assert!(failing.is_err());
+
+    let out = run_in(&mut runtime, "batch { batch_local = 2\nbatch_local }").unwrap();
+    assert_eq!(out, Value::Int(2));
+}
+
+#[test]
+fn transaction_can_be_reused_after_runtime_error() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let failing = run_in(&mut runtime, "transaction { tx_local = 1\nundefined_var }");
+    assert!(failing.is_err());
+
+    let out = run_in(&mut runtime, "transaction { tx_local = 2\ntx_local }").unwrap();
+    assert_eq!(out, Value::Int(2));
+}
+
+#[test]
+fn batch_can_be_reused_after_backend_error_without_partial_writes() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let failing = run_in(
+        &mut runtime,
+        "batch { batch_backend_local = 1\nset(\"users/batch_backend\", {x: 1})\nupdate(\"users/missing\", {y: 2}) }",
+    );
+    assert!(failing.is_err());
+    assert_eq!(
+        run_in(&mut runtime, "get(\"users/batch_backend\")").unwrap(),
+        Value::Nil
+    );
+
+    let out = run_in(
+        &mut runtime,
+        "batch { batch_backend_local = 2\nset(\"users/batch_backend\", {x: batch_backend_local}) }\nget(\"users/batch_backend\")[\"x\"]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(2));
+}
+
+#[test]
+fn transaction_can_be_reused_after_backend_error_without_partial_writes() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let failing = run_in(
+        &mut runtime,
+        "transaction { tx_backend_local = 1\nupdate(\"users/missing\", {x: tx_backend_local}) }",
+    );
+    assert!(failing.is_err());
+    assert_eq!(
+        run_in(&mut runtime, "get(\"users/missing\")").unwrap(),
+        Value::Nil
+    );
+
+    let out = run_in(
+        &mut runtime,
+        "transaction { tx_backend_local = 2\nset(\"users/tx_backend\", {x: tx_backend_local}) }\nget(\"users/tx_backend\")[\"x\"]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(2));
+}
+
+#[test]
 fn transaction_rejects_get_after_write() {
     let err = run_script("transaction { set(\"users/txa\", {n: 1})\nget(\"users/txa\") }");
     assert!(err.is_err());
@@ -365,7 +510,8 @@ fn transaction_can_restart_after_commit_failure_clears_state() {
         "transaction { set(\"users/tx_commit_err\", {x: 2}) }\nget(\"users/tx_commit_err\")",
     )
     .unwrap();
-    assert!(format!("{out:?}").contains("Int(2)"), "{out:?}");
+    // 再開後の transaction が失敗をまたいで値を保持することを、型とフィールドまで検証する。
+    assert_eq!(out, map! {"x" => Value::Int(2)});
 }
 
 #[test]
@@ -462,6 +608,27 @@ fn missing_keys_and_out_of_range_indices_return_nil() {
 }
 
 #[test]
+fn array_index_conversion_is_checked_at_integer_boundaries() {
+    let max_i64 = i64::MAX;
+    let out = run_script(&format!(
+        "a = [\"zero\", \"one\"]\n[a[{max_i64}], a[4294967297]]"
+    ))
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Nil, Value::Nil]));
+
+    // `usize::MAX + 1` only fits in an i64 on targets narrower than 64 bits,
+    // so this case is compiled out on the 64-bit CI runner rather than
+    // silently skipped by a runtime branch.
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        let first_unrepresentable = (usize::MAX as u128) + 1;
+        let index = i64::try_from(first_unrepresentable).expect("fits in i64 below 64 bits");
+        let out = run_script(&format!("[\"zero\", \"one\"][{index}]")).unwrap();
+        assert_eq!(out, Value::Nil);
+    }
+}
+
+#[test]
 fn index_type_mismatch_is_an_error() {
     let err = run_script("[1, 2][\"a\"]").unwrap_err();
     assert!(
@@ -489,6 +656,24 @@ fn query_rows_support_index_access_including_dunder_name() {
     assert_eq!(
         out,
         Value::Array(vec![Value::Str("users/ix1".to_string()), Value::Int(2),])
+    );
+}
+
+#[test]
+fn document_name_filters_match_relative_paths() {
+    let out = run_script(
+        r#"set("users/name1", {n: 1})
+set("users/name2", {n: 2})
+[
+  col("users").where("__name__", "==", "users/name1").get().len(),
+  col("users").where("__name__", "!=", "users/name1").get().len(),
+  col("users").where("__name__", "in", ["users/name1", "users/name2"]).get().len()
+]"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(1), Value::Int(1), Value::Int(2)])
     );
 }
 
@@ -546,6 +731,78 @@ fn each_returns_nil_and_map_returns_transformed_array() {
 }
 
 #[test]
+fn return_inside_a_block_returns_from_the_enclosing_function() {
+    // Iteration stops and the value becomes the function's result, rather than
+    // the block's last value.
+    let out = run_script("fn f() { [1, 2].map { |x| return x } }\nf()").unwrap();
+    assert_eq!(out, Value::Int(1));
+
+    // A return raised in a nested block belongs to the enclosing function.
+    let out =
+        run_script("fn f() { [1, 2].map { |x| [3, 4].each { |y| return y } } }\nf()").unwrap();
+    assert_eq!(out, Value::Int(3));
+}
+
+#[test]
+fn return_inside_a_block_stops_later_statements() {
+    // Statements after the block in the same function must not run.
+    let out = run_script(
+        "fn f() {
+           [1, 2].each { |x| set(\"users/stop_seen\", {n: x})\nreturn }
+           set(\"users/stop_after\", {n: 9})
+         }
+         f()
+         [get(\"users/stop_seen\"), get(\"users/stop_after\")]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![map! {"n" => Value::Int(1)}, Value::Nil])
+    );
+}
+
+#[test]
+fn staged_blocks_commit_writes_and_then_propagate_return() {
+    // A return inside a batch/transaction block still commits: it exits the
+    // enclosing function *after* the staged writes are applied, and the call
+    // itself never yields a value.
+    let out = run_script(
+        "fn f() { batch { set(\"users/b\", {n: 1})\nreturn 5 } }
+         [f(), get(\"users/b\")]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(5), map! {"n" => Value::Int(1)}])
+    );
+
+    let out = run_script(
+        "fn f() { transaction { set(\"users/t\", {n: 1})\nreturn 5 } }
+         [f(), get(\"users/t\")]",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(5), map! {"n" => Value::Int(1)}])
+    );
+}
+
+#[test]
+fn return_inside_a_block_at_top_level_stops_the_program() {
+    // Outside any fn, a return raised from inside a block terminates the
+    // remaining top-level statements and the program yields its value.
+    let out = run_script(
+        "set(\"users/tl_before\", {n: 1})
+         [1].each { |x| return 7 }
+         set(\"users/tl_after\", {n: 2})",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(7));
+    let out = run_script("get(\"users/tl_after\")").unwrap();
+    assert_eq!(out, Value::Nil, "statements after the return must not run");
+}
+
+#[test]
 fn map_extracts_fields_from_query_rows() {
     let out = run_script(
         "set(\"users/mp1\", {n: 1})\nset(\"users/mp2\", {n: 2})\ncol(\"users\").get().map { |row| row[\"n\"] }",
@@ -573,6 +830,23 @@ fn block_param_must_match_yielded_argument_count() {
     let err = run_script("[1].each { |a, b| a }").unwrap_err();
     assert!(
         format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+}
+
+#[test]
+fn duplicate_block_params_are_rejected_at_parse() {
+    use firelang::{ErrorKind, FirelangError};
+
+    let err = run_script("[1].map { |item, item| item }").unwrap_err();
+    // Pin the phase, not just the wording: validate_unique_params produces the
+    // same text, so a runtime check added later would otherwise pass this.
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("duplicate block parameter should be a FirelangError");
+    assert_eq!(ferr.kind, ErrorKind::Parse, "{ferr}");
+    assert!(
+        format!("{err}").contains("duplicate block parameter: item"),
         "{err}"
     );
 }
@@ -648,6 +922,185 @@ fn array_methods_reject_positional_arguments() {
     assert!(
         format!("{err}").contains("does not take arguments"),
         "{err}"
+    );
+}
+
+#[test]
+fn builtin_call_contracts_reject_excess_arguments_and_keywords() {
+    for (source, expected) in [
+        ("get()", "missing positional arguments"),
+        (
+            "col(\"users\").where(\"x\", \"==\")",
+            "missing positional arguments",
+        ),
+        ("timestamp(1).add_seconds()", "missing positional arguments"),
+        (
+            "set(\"users/1\")",
+            "expects at least 2 positional arguments",
+        ),
+        ("get(\"users/1\", 99)", "too many positional arguments"),
+        ("now(1)", "too many positional arguments"),
+        ("batch(1) {}", "too many positional arguments"),
+        ("col(\"users\").get(99)", "too many positional arguments"),
+        (
+            "col(\"users\").where(\"x\", \"==\", 1, 2)",
+            "too many positional arguments",
+        ),
+        ("timestamp(1).to_unix(2)", "too many positional arguments"),
+        (
+            "timestamp(1).add_seconds(1, 2)",
+            "too many positional arguments",
+        ),
+        ("[1].len(2)", "too many positional arguments"),
+        ("{a: 1}.a(2)", "too many positional arguments"),
+        (
+            "set(\"users/1\", {}, mearge: true)",
+            "unknown keyword arguments: mearge",
+        ),
+        (
+            "get(\"users/1\", nope: true)",
+            "unknown keyword arguments: nope",
+        ),
+        (
+            "col(\"users\").get(nope: true)",
+            "unknown keyword arguments: nope",
+        ),
+        (
+            "[1].map(nope: true) { |x| x }",
+            "unknown keyword arguments: nope",
+        ),
+        (
+            "timestamp(1).to_unix(nope: true)",
+            "unknown keyword arguments: nope",
+        ),
+        ("{a: 1}.a(nope: true)", "unknown keyword arguments: nope"),
+    ] {
+        let err = run_script(source).unwrap_err();
+        assert!(format!("{err}").contains(expected), "{source}: {err}");
+    }
+
+    let out = run_script("set(\"users/1\", {ok: true}, true)").unwrap();
+    assert_eq!(out, Value::Nil);
+}
+
+#[test]
+fn builtin_call_contracts_reject_duplicate_keywords() {
+    for (source, expected) in [
+        (
+            "set(\"users/1\", {}, merge: true, merge: false)",
+            "duplicate keyword argument: merge",
+        ),
+        (
+            "fn f(a) { a }\nf(1, a: 2)",
+            "duplicate argument a: specified both positionally and as a keyword",
+        ),
+        (
+            "col(\"users\").get(nope: true, nope: false)",
+            "duplicate keyword argument: nope",
+        ),
+    ] {
+        let err = run_script(source).unwrap_err();
+        assert!(format!("{err}").contains(expected), "{source}: {err}");
+    }
+
+    let err = run_script("set(\"users/1\", {}, false, merge: true)").unwrap_err();
+    assert!(
+        format!("{err}").contains("duplicate argument merge"),
+        "{err}"
+    );
+}
+
+#[test]
+fn rejected_call_contracts_do_not_evaluate_arguments_or_blocks() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(
+        &mut runtime,
+        "fn replacement() { set(\"users/side-effect\", {written: true})\n{old: 1} }\nset(\"users/contract\", replacement(), mearge: true)",
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("unknown keyword arguments: mearge"));
+    assert_eq!(
+        run_in(&mut runtime, "get(\"users/side-effect\")").unwrap(),
+        Value::Nil
+    );
+
+    let err = run_in(
+        &mut runtime,
+        "get(\"users/1\") { set(\"users/block-side-effect\", {written: true}) }",
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("block"));
+    assert_eq!(
+        run_in(&mut runtime, "get(\"users/block-side-effect\")").unwrap(),
+        Value::Nil
+    );
+}
+
+#[test]
+fn user_and_unknown_call_contracts_validate_before_evaluation() {
+    let prefix =
+        "fn replacement() { set(\"users/user-side-effect\", {written: true})\n{old: 1} }\n";
+    for (source, expected) in [
+        (
+            "fn f(x) { x }\nf(replacement(), 2)",
+            "too many positional args",
+        ),
+        ("missing(replacement())", "undefined function: missing"),
+        (
+            "fn f(x) { x }\nf(1) { set(\"users/user-block-effect\", {written: true}) }",
+            "does not take a block",
+        ),
+        (
+            "[1].unknown(replacement())",
+            "unknown array method: unknown",
+        ),
+    ] {
+        let mut runtime = Runtime::new(InMemoryFirestore::default());
+        let err = run_in(&mut runtime, &format!("{prefix}{source}")).unwrap_err();
+        assert!(err.to_string().contains(expected), "{source}: {err}");
+        assert_eq!(
+            run_in(&mut runtime, "get(\"users/user-side-effect\")").unwrap(),
+            Value::Nil
+        );
+        assert_eq!(
+            run_in(&mut runtime, "get(\"users/user-block-effect\")").unwrap(),
+            Value::Nil
+        );
+    }
+}
+
+#[test]
+fn builtin_and_method_call_contracts_validate_block_policies() {
+    for (source, expected) in [
+        ("batch()", "requires { ... } block"),
+        ("transaction()", "requires { ... } block"),
+        ("array(1) {}", "does not take a block"),
+        (
+            "col(\"users\").where(\"x\", \"==\", 1) {}",
+            "does not take a block",
+        ),
+        ("timestamp(1).add_seconds(1) {}", "does not take a block"),
+        ("now() {}", "does not take a block"),
+        ("get(\"users/1\") {}", "does not take a block"),
+        ("set(\"users/1\", {}) {}", "does not take a block"),
+        ("[1].len() {}", "does not take a block"),
+        ("{a: 1}.a {}", "does not take a block"),
+    ] {
+        let err = run_script(source).unwrap_err();
+        assert!(format!("{err}").contains(expected), "{source}: {err}");
+    }
+}
+
+#[test]
+fn array_builtin_keeps_variable_arity() {
+    let out = run_script("[array(), array(1, 2, 3), array(4)]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Array(vec![]),
+            Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            Value::Array(vec![Value::Int(4)]),
+        ])
     );
 }
 
@@ -753,9 +1206,148 @@ fn function_params_may_shadow_globals() {
 }
 
 #[test]
+fn newlines_before_operators_and_postfix_inside_delimiters_parse() {
+    // 演算子・`.`・`[]` の前後にある改行は delimiter 内では無視される。
+    let out = run_script("[1\n+ 2, 1\n< 2, true\n&& false]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(3), Value::Bool(true), Value::Bool(false)])
+    );
+
+    let out = run_script("fn add(a, b) { a + b }\nadd(1\n+ 2, 4)").unwrap();
+    assert_eq!(out, Value::Int(7));
+
+    let out = run_script("m = {value: {items: [10, 20]}}\n[m\n.value\n.items\n[1]]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(20)]));
+
+    let out = run_script("m = {value: 1}\n[m.\nvalue]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1)]));
+
+    // ネストしたメソッドチェーンも同じ式として読む。
+    let out = run_script("[\n  timestamp(100)\n  .add_seconds(1)\n  .to_unix()\n]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(101)]));
+
+    // An outer delimiter must not change the statement semantics inside a
+    // brace block: the newline before `[` starts a new statement instead of
+    // indexing `x`, so every element maps to `[0]`. Asserting the value keeps
+    // the case honest — a newline-transparent parse would yield `[10, 10]`.
+    let out = run_script("[[10, 20].map { |x| x\n[0] }]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Array(vec![
+            Value::Array(vec![Value::Int(0)]),
+            Value::Array(vec![Value::Int(0)]),
+        ])])
+    );
+
+    // ...while delimiters nested inside such a block stay newline-transparent.
+    let out = run_script("[[1].map { |x| [\n  x,\n  x + 1\n] }]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Array(vec![Value::Array(vec![
+            Value::Int(1),
+            Value::Int(2)
+        ])])])
+    );
+}
+
+#[test]
+fn duplicate_function_params_are_rejected_at_definition() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(&mut runtime, "fn f(a, a) { a }\nf(1, 2)").unwrap_err();
+    assert!(
+        format!("{err}").contains("duplicate function parameter: a"),
+        "{err}"
+    );
+    // `a` was never bound: the definition failed before any argument binding.
+    assert!(run_in(&mut runtime, "a").is_err());
+    // The rejected definition must not have installed a callable `f`, otherwise
+    // the redefinition below would fail for the wrong reason.
+    let leftover = run_in(&mut runtime, "f").unwrap_err();
+    assert!(
+        format!("{leftover}").contains("undefined variable: f"),
+        "{leftover}"
+    );
+    assert_eq!(
+        run_in(&mut runtime, "fn f(a) { a }\nf(2)").unwrap(),
+        Value::Int(2)
+    );
+}
+
+#[test]
+fn newlines_before_postfix_outside_delimiters_keep_statement_boundaries() {
+    // `a` と配列リテラルは別の文。delimiter 外では `a[1]` に連結しない。
+    let out = run_script("a = [10, 20]\na\n[1]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1)]));
+
+    let out = run_script("a = [10, 20]\na[1]\n[0]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(0)]));
+}
+
+#[test]
+fn newlines_before_operators_outside_delimiters_keep_statement_boundaries() {
+    // 演算子の前にある改行も delimiter 外では文の区切りのまま。postfix 側と
+    // 並べて固定し、depth ゲートが無条件にならないようにする。
+    for (source, token) in [
+        ("a = 1\n+ 2", "Plus"),
+        ("a = 1\n* 2", "Star"),
+        ("a = true\n&& false", "AndAnd"),
+    ] {
+        let err = run_script(source).unwrap_err();
+        assert!(
+            format!("{err}").contains(&format!("unexpected token: {token}")),
+            "{source}: {err}"
+        );
+    }
+
+    // `-` は二項演算子として続行せず、单項の新しい文になる。
+    let out = run_script("a = 1\n- 2").unwrap();
+    assert_eq!(out, Value::Int(-2));
+}
+
+#[test]
+fn failed_function_call_restores_scope_for_runtime_reuse() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(
+        &mut runtime,
+        "outer = 10\nfn f(param) { undefined_inside }\nf(1)",
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("undefined variable"), "{err}");
+    assert_eq!(run_in(&mut runtime, "outer").unwrap(), Value::Int(10));
+    // Assert the diagnostic, not just any failure: a bare is_err() would
+    // also pass if the scope cleanup regressed into a different error.
+    let leaked = run_in(&mut runtime, "param").unwrap_err();
+    assert!(
+        format!("{leaked}").contains("undefined variable: param"),
+        "{leaked}"
+    );
+}
+
+#[test]
+fn failed_block_call_restores_scope_for_runtime_reuse() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(
+        &mut runtime,
+        "outer = 10\n[1].map { |item| undefined_inside }",
+    )
+    .unwrap_err();
+    assert!(format!("{err}").contains("undefined variable"), "{err}");
+    assert_eq!(run_in(&mut runtime, "outer").unwrap(), Value::Int(10));
+    // Assert the diagnostic, not just any failure: a bare is_err() would
+    // also pass if the scope cleanup regressed into a different error.
+    let leaked = run_in(&mut runtime, "item").unwrap_err();
+    assert!(
+        format!("{leaked}").contains("undefined variable: item"),
+        "{leaked}"
+    );
+}
+
+#[test]
 fn semicolons_are_not_treated_as_newlines_inside_delimiters() {
     // `;` は文の区切りのまま。delimiter の内側ではエラーになる。
     assert!(run_script("[;1]").is_err());
+    assert!(run_script("[1; 2]").is_err());
     assert!(run_script("{;}").is_err());
     assert!(run_script("fn f(a) { a }\nf(;)").is_err());
     assert!(run_script("m = [1]\nm[;0]").is_err());
@@ -878,6 +1470,78 @@ fn where_comparison_supports_str_timestamp_and_bool() {
 }
 
 #[test]
+fn where_cross_type_comparison_contract_is_shared() {
+    // emulator テスト(emulator_where_cross_type_comparison_contract_is_shared)と
+    // 同じ fixture / 期待値。7 種類の値を一つの collection に置き、各
+    // フィルタ型がその型の値だけを見ることを確認する。
+    let setup = r#"set("users/where_int", {v: 1})
+set("users/where_str", {v: "b"})
+set("users/where_bool", {v: true})
+set("users/where_timestamp", {v: timestamp(200)})
+set("users/where_nil", {v: nil})
+set("users/where_array", {v: [1]})
+set("users/where_map", {v: {a: 1}})
+set("users/where_missing", {other: 1})"#;
+    let cases: &[(&str, &str, &[&str])] = &[
+        (">", "0", &["users/where_int"]),
+        (">=", "0", &["users/where_int"]),
+        ("<", "2", &["users/where_int"]),
+        ("<=", "2", &["users/where_int"]),
+        (">", "\"a\"", &["users/where_str"]),
+        (">=", "\"a\"", &["users/where_str"]),
+        ("<", "\"c\"", &["users/where_str"]),
+        ("<=", "\"c\"", &["users/where_str"]),
+        (">", "false", &["users/where_bool"]),
+        (">=", "false", &["users/where_bool"]),
+        ("<", "true", &[]),
+        ("<=", "true", &["users/where_bool"]),
+        (">", "timestamp(100)", &["users/where_timestamp"]),
+        (">=", "timestamp(100)", &["users/where_timestamp"]),
+        ("<", "timestamp(300)", &["users/where_timestamp"]),
+        ("<=", "timestamp(300)", &["users/where_timestamp"]),
+        (">", "nil", &[]),
+        (">=", "nil", &[]),
+        ("<", "nil", &[]),
+        ("<=", "nil", &[]),
+        (">", "[0]", &[]),
+        (">=", "[0]", &[]),
+        ("<", "[2]", &[]),
+        ("<=", "[2]", &[]),
+        (">", "{a: 0}", &[]),
+        (">=", "{a: 0}", &[]),
+        ("<", "{a: 2}", &[]),
+        ("<=", "{a: 2}", &[]),
+    ];
+    for &(op, filter, expected_names) in cases {
+        let source = format!(
+            "{setup}\ncol(\"users\").where(\"v\", \"{op}\", {filter}).get().map {{ |r| r[\"__name__\"] }}"
+        );
+        let out = run_script(&source).unwrap();
+        let expected = Value::Array(
+            expected_names
+                .iter()
+                .map(|name| Value::Str((*name).to_string()))
+                .collect(),
+        );
+        assert_eq!(out, expected, "op={op}, filter={filter}");
+    }
+
+    // nil は equality では存在する値として扱われるが、欠損 field は
+    // `!=` の対象にもならない。
+    let out = run_script(&format!(
+        "{setup}\n[col(\"users\").where(\"v\", \"==\", nil).get().len(), col(\"users\").where(\"v\", \"!=\", nil).get().len()]"
+    ))
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1), Value::Int(6)]));
+
+    let out = run_script(&format!(
+        "{setup}\ncol(\"users\").where(\"v\", \">\", \"a\").count()"
+    ))
+    .unwrap();
+    assert_eq!(out, Value::Int(1));
+}
+
+#[test]
 fn update_supports_dotted_field_paths_like_firestore() {
     // emulator テスト(emulator_dotted_field_path_update_matches_in_memory)と
     // 同じケース。{"profile.name": ...} はネストしたフィールドを更新する。
@@ -966,7 +1630,7 @@ fn update_field_paths_require_simple_field_grammar() {
 
 #[test]
 fn replacement_set_resolves_sentinels_against_literal_dotted_keys() {
-    // emulator テスト(emulator_replacement_set_sentinel_with_dotted_key)と
+    // emulator テスト(emulator_replacement_set_non_simple_transform_keys_matches_in_memory)と
     // 同じケース。置換 set ではドット付きキーはリテラルのフィールド名。
     let out =
         run_script("set(\"users/gv2\", {\"a.b\": array_union([1])})\nget(\"users/gv2\")[\"a.b\"]")
@@ -1003,6 +1667,40 @@ fn where_rejects_large_string_filter_values() {
     ))
     .unwrap();
     assert_eq!(out, Value::Int(0));
+}
+
+#[test]
+fn where_validates_nested_filter_string_sizes() {
+    // 1,499 bytes are valid; 1,500 bytes are rejected for equality,
+    // membership, and array_contains filters, including nested Map / Array
+    // combinations.
+    let valid = "x".repeat(1499);
+    let invalid = "x".repeat(1500);
+    let make_script =
+        |op: &str, value: &str| format!(r#"col("users").where("payload", "{op}", {value}).get()"#);
+
+    let valid_cases = [
+        make_script("==", &format!(r#"["{valid}"]"#)),
+        make_script("in", &format!(r#"[["{valid}"]]"#)),
+        make_script("array_contains", &format!(r#"["{valid}"]"#)),
+    ];
+    for script in valid_cases {
+        assert_eq!(run_script(&script).unwrap(), Value::Array(vec![]));
+    }
+
+    let invalid_cases = [
+        make_script("==", &format!(r#"{{s: "{invalid}"}}"#)),
+        make_script("in", &format!(r#"[{{s: "{invalid}"}}]"#)),
+        make_script("array_contains", &format!(r#"{{s: "{invalid}"}}"#)),
+        make_script("==", &format!(r#"{{s: ["{invalid}"]}}"#)),
+    ];
+    for script in invalid_cases {
+        let err = run_script(&script).unwrap_err();
+        assert!(
+            format!("{err}").contains("value for payload is too large to be used in a query"),
+            "{err}"
+        );
+    }
 }
 
 #[test]
@@ -1352,11 +2050,27 @@ fn update_deletes_ancestor_before_descendant_increment() {
 }
 
 #[test]
-fn replacement_set_resolves_increment_under_literal_hyphen_key() {
-    let out =
-        run_script("set(\"users/lit_hyphen\", {\"a-b\": increment(1)})\nget(\"users/lit_hyphen\")")
-            .unwrap();
-    assert_eq!(out.inspect(), "{\"a-b\" => 1}");
+fn replacement_set_resolves_increment_under_literal_field_names() {
+    let out = run_script(
+        r#"set("users/lit_names", {"a-b": 1, "1start_digit": 2, "a`b": 3, "a\\b": 4})
+set("users/lit_names", {"a-b": increment(1), "1start_digit": increment(2), "a`b": increment(3), "a\\b": increment(4)})
+[
+  get("users/lit_names")["a-b"],
+  get("users/lit_names")["1start_digit"],
+  get("users/lit_names")["a`b"],
+  get("users/lit_names")["a\\b"],
+]"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4),
+        ])
+    );
 }
 
 #[test]
@@ -1406,6 +2120,18 @@ fn timestamp_comparison_diff_and_rfc3339() {
     // if 条件にも使える。
     let out = run_script("if timestamp(200) > timestamp(100) { 1 } else { 2 }").unwrap();
     assert_eq!(out, Value::Int(1));
+}
+
+#[test]
+fn timestamp_add_seconds_overflow_is_an_error_not_a_panic() {
+    // add_seconds の加算は i64 の境界で panic / wraparound しない。
+    let err = run_script("timestamp(9223372036854775807).add_seconds(1)").unwrap_err();
+    assert!(format!("{err}").contains("integer overflow"), "{err}");
+    let err = run_script("timestamp(-9223372036854775807 - 1).add_seconds(-1)").unwrap_err();
+    assert!(format!("{err}").contains("integer overflow"), "{err}");
+    // 境界の反対側は wraparound せずそのまま計算できる。
+    let out = run_script("timestamp(-9223372036854775807 - 1).add_seconds(1).to_unix()").unwrap();
+    assert_eq!(out, Value::Int(-9223372036854775807));
 }
 
 #[test]

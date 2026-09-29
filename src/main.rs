@@ -1,9 +1,17 @@
 use std::env;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{IsTerminal, Read};
+use std::path::PathBuf;
 
-use firelang::{run_script, run_script_with_firestore, FirestoreEmulator};
+use firelang::run_script;
+#[cfg(feature = "emulator")]
+use firelang::{run_script_with_firestore, EmulatorConfig, FirestoreEmulator};
+
+#[cfg(not(feature = "emulator"))]
+const EMULATOR_FEATURE_ERROR: &str =
+    "emulator backend requires the `emulator` Cargo feature; rebuild with --features emulator";
 
 fn main() {
     if let Err(e) = run() {
@@ -13,57 +21,78 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
 
     let mut backend = "in-memory";
-    let mut paths: Vec<String> = vec![];
+    let mut paths: Vec<PathBuf> = vec![];
     let mut inline: Vec<String> = vec![];
     let mut use_stdin = false;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--help" | "-h" => {
+        match args[i].to_str() {
+            Some("--help" | "-h") => {
                 print_usage();
                 return Ok(());
             }
-            "--backend" => {
+            Some("--backend") => {
                 let b = args
                     .get(i + 1)
                     .ok_or("--backend requires in-memory or emulator")?;
-                backend = b.as_str();
+                backend = b.to_str().ok_or("--backend value must be valid UTF-8")?;
                 i += 2;
             }
-            "-e" => {
+            Some("-e") => {
                 let script = args.get(i + 1).ok_or("-e requires a script argument")?;
-                inline.push(script.clone());
+                inline.push(
+                    script
+                        .to_str()
+                        .ok_or("-e value must be valid UTF-8")?
+                        .to_string(),
+                );
                 i += 2;
             }
-            "-" => {
+            Some("-") => {
                 if use_stdin {
                     return Err("stdin script given more than once".into());
                 }
                 use_stdin = true;
                 i += 1;
             }
-            s if s.starts_with('-') => {
+            Some(s) if s.starts_with('-') => {
                 return Err(format!("unknown option: {s}").into());
             }
-            _ => {
-                paths.push(args[i].clone());
+            // Anything that is not a recognised option is a script path. This
+            // deliberately includes a non-UTF-8 argument (`to_str()` is
+            // `None`), because such an argument is exactly the path this CLI
+            // must accept rather than reject.
+            Some(_) | None => {
+                paths.push(PathBuf::from(&args[i]));
                 i += 1;
             }
         }
     }
 
-    let backend_config = match backend {
+    // Validate the backend configuration before reading the script, so a
+    // misconfiguration fails immediately. Only parsing and validation happen
+    // here: connecting opens a socket and can block on the OS connect timeout,
+    // which would stall stdin, so it is deferred until after the script is
+    // read. Without the `emulator` feature there is nothing to configure, so
+    // that arm reports how to enable it instead.
+    #[cfg(feature = "emulator")]
+    let backend_config: Option<EmulatorConfig> = match backend {
         "in-memory" => None,
-        "emulator" => {
-            let host = env::var("FIRESTORE_EMULATOR_HOST")
-                .map_err(|_| "FIRESTORE_EMULATOR_HOST must be set when using --backend emulator")?;
-            let project_id =
-                env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".to_string());
-            Some((host, project_id))
+        "emulator" => Some(
+            FirestoreEmulator::config_from_env()?
+                .ok_or("FIRESTORE_EMULATOR_HOST must be set when using --backend emulator")?,
+        ),
+        other => {
+            return Err(format!("unknown backend: {other} (use in-memory or emulator)").into());
         }
+    };
+    #[cfg(not(feature = "emulator"))]
+    let _backend_config: Option<()> = match backend {
+        "in-memory" => None,
+        "emulator" => return Err(EMULATOR_FEATURE_ERROR.into()),
         other => {
             return Err(format!("unknown backend: {other} (use in-memory or emulator)").into());
         }
@@ -99,12 +128,16 @@ fn run() -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     };
 
+    #[cfg(feature = "emulator")]
     let out = match backend_config {
         None => run_script(&src)?,
-        Some((host, project_id)) => {
-            run_script_with_firestore(&src, FirestoreEmulator::new(host, project_id)?)?
+        Some(config) => {
+            let firestore = FirestoreEmulator::new(config.host, config.project_id)?;
+            run_script_with_firestore(&src, firestore)?
         }
     };
+    #[cfg(not(feature = "emulator"))]
+    let out = run_script(&src)?;
 
     println!("=> {}", out.inspect());
     Ok(())
@@ -121,7 +154,15 @@ fn print_usage() {
     eprintln!();
     eprintln!("  Backends:");
     eprintln!("    in-memory   (default) use the in-memory Firestore stub");
+    // Keep the help honest about this build's own capabilities: a binary
+    // compiled with the feature enabled does accept --backend emulator, and
+    // telling its users otherwise makes --help contradict the artifact.
+    #[cfg(feature = "emulator")]
     eprintln!("    emulator    use FIRESTORE_EMULATOR_HOST and optional FIRESTORE_PROJECT_ID");
+    #[cfg(not(feature = "emulator"))]
+    eprintln!(
+        "    emulator    ({EMULATOR_FEATURE_ERROR}) use FIRESTORE_EMULATOR_HOST and optional FIRESTORE_PROJECT_ID"
+    );
 }
 
 fn read_stdin() -> Result<String, Box<dyn Error>> {
