@@ -270,27 +270,65 @@ get("{path}")"#
 }
 
 #[test]
-fn emulator_replacement_set_sentinel_with_dotted_key_matches_in_memory() {
-    // Same case as in-memory
-    // `replacement_set_resolves_sentinels_against_literal_dotted_keys`:
-    // a replacement `set` treats dotted keys as literal field names, so the
-    // transform must be sent with a backtick-escaped path.
+fn emulator_overlapping_update_and_merge_set_paths_match_in_memory() {
+    let run = unique("ov");
+    for script in [
+        format!(
+            r#"set("users/{run}/docs/update", {{}})
+update("users/{run}/docs/update", {{a: delete_field(), "a.b": 1}})"#
+        ),
+        format!(
+            r#"set("users/{run}/docs/merge", {{}})
+set("users/{run}/docs/merge", {{a: 1, "a.b": 2}}, merge: true)"#
+        ),
+    ] {
+        let Some(fs) = emulator() else {
+            eprintln!("skip: no emulator");
+            return;
+        };
+        let err = run_script_with_firestore(&script, fs).unwrap_err();
+        assert!(
+            format!("{err}").contains("overlapping field paths: a and a.b"),
+            "{script}: {err}"
+        );
+    }
+}
+
+#[test]
+fn emulator_replacement_set_non_simple_transform_keys_match_in_memory() {
+    // A replacement `set` treats every map key as one literal field name.
+    // Every non-simple transform target therefore needs a quoted API path,
+    // including dotted, hyphenated, digit-leading, and backtick-containing keys.
     let Some(fs) = emulator() else {
         eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
     let run = unique("gv");
     let script = format!(
-        r#"set("users/{run}/docs/d1", {{"a.b": array_union([1])}})
-set("users/{run}/docs/d2", {{"x.y": ["a"]}})
-set("users/{run}/docs/d2", {{"x.y": array_remove(["a"])}})
-[get("users/{run}/docs/d1")["a.b"], get("users/{run}/docs/d2")["x.y"]]"#
+        r#"set("users/{run}/docs/names", {{"a-b": 1, "1start_digit": 2, "a`b": 3, "a\\b": 4}})
+set("users/{run}/docs/names", {{"a-b": increment(1), "1start_digit": increment(2), "a`b": increment(3), "a\\b": increment(4)}})
+set("users/{run}/docs/dotted", {{"a.b": [1]}})
+set("users/{run}/docs/dotted", {{"a.b": array_union([2])}})
+set("users/{run}/docs/remove", {{"x.y": ["a"]}})
+set("users/{run}/docs/remove", {{"x.y": array_remove(["a"])}})
+[
+  get("users/{run}/docs/names")["a-b"],
+  get("users/{run}/docs/names")["1start_digit"],
+  get("users/{run}/docs/names")["a`b"],
+  get("users/{run}/docs/names")["a\\b"],
+  get("users/{run}/docs/dotted")["a.b"],
+  get("users/{run}/docs/remove")["x.y"],
+]"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
     assert_eq!(
         out,
         Value::Array(vec![
-            Value::Array(vec![Value::Int(1)]),
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4),
+            Value::Array(vec![Value::Int(2)]),
             Value::Array(vec![]),
         ])
     );

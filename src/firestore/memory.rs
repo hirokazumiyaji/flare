@@ -120,18 +120,18 @@ fn apply_write_to_docs(
         } => {
             if merge {
                 let current = docs.entry(path).or_default();
-                apply_update_map(current, &mut data)?;
+                apply_update_map(current, &data)?;
             } else {
                 resolve_sentinel_map(&mut data, None)?;
                 docs.insert(path, data);
             }
             Ok(())
         }
-        WriteOp::Update { path, mut data } => {
+        WriteOp::Update { path, data } => {
             let current = docs
                 .get_mut(&path)
                 .ok_or_else(|| format!("document not found: {path}"))?;
-            apply_update_map(current, &mut data)?;
+            apply_update_map(current, &data)?;
             Ok(())
         }
         WriteOp::Delete { path } => {
@@ -200,33 +200,16 @@ fn compare_values(a: Option<&Value>, b: &Value, pred: impl Fn(std::cmp::Ordering
 
 fn apply_update_map(
     current: &mut BTreeMap<String, Value>,
-    updates: &mut BTreeMap<String, Value>,
+    updates: &BTreeMap<String, Value>,
 ) -> Result<(), Box<dyn Error>> {
-    for (k, v) in updates.iter() {
-        super::validate_field_path(k)?;
-        reject_nested_sentinels(v, false)?;
-    }
+    let super::WriteValues {
+        plain,
+        transforms,
+        deletes,
+    } = super::plan_update_writes(updates)?;
+
     // Firestore の挙動に合わせ、1) 削除 2) 通常フィールド更新 3) フィールド変換(increment等)
     // の順序で適用する。
-    let mut deletes = vec![];
-    let mut plain = vec![];
-    let mut transforms = vec![];
-    for (k, v) in updates.iter() {
-        match v {
-            Value::DeleteField => deletes.push(k.clone()),
-            Value::ArrayUnion(_)
-            | Value::ArrayRemove(_)
-            | Value::ServerTimestamp
-            | Value::Increment(_) => transforms.push((k.clone(), v.clone())),
-            _ => plain.push((k.clone(), v.clone())),
-        }
-    }
-    super::validate_no_overlapping_paths(
-        deletes
-            .iter()
-            .map(String::as_str)
-            .chain(plain.iter().map(|(k, _)| k.as_str())),
-    )?;
     for k in &deletes {
         let segments: Vec<&str> = k.split('.').collect();
         remove_at_field_path(current, &segments)?;
@@ -282,7 +265,7 @@ fn resolve_sentinel_map(
     current: Option<&BTreeMap<String, Value>>,
 ) -> Result<(), Box<dyn Error>> {
     for (k, v) in map.clone() {
-        reject_nested_sentinels(&v, false)?;
+        super::reject_nested_sentinels(&v, false)?;
         let segments: Vec<&str> = k.split('.').collect();
         let base = || lookup_field_path(current, &segments);
         let resolved = match v {
@@ -324,35 +307,6 @@ fn resolve_sentinel_map(
             other => other,
         };
         map.insert(k, resolved);
-    }
-    Ok(())
-}
-
-fn reject_nested_sentinels(value: &Value, nested: bool) -> Result<(), Box<dyn Error>> {
-    if nested
-        && matches!(
-            value,
-            Value::ArrayUnion(_)
-                | Value::ArrayRemove(_)
-                | Value::ServerTimestamp
-                | Value::Increment(_)
-                | Value::DeleteField
-        )
-    {
-        return Err("field transforms cannot be nested".into());
-    }
-    match value {
-        Value::Array(items) | Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
-            for item in items {
-                reject_nested_sentinels(item, true)?;
-            }
-        }
-        Value::Map(map) => {
-            for item in map.values() {
-                reject_nested_sentinels(item, true)?;
-            }
-        }
-        _ => {}
     }
     Ok(())
 }

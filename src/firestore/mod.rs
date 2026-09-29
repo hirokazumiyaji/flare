@@ -60,59 +60,6 @@ fn check_query_value_size(field: &str, value: &Value) -> Result<(), Box<dyn Erro
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn map_array(value: &str) -> Value {
-        Value::Map(BTreeMap::from([(
-            "outer".to_string(),
-            Value::Array(vec![Value::Map(BTreeMap::from([(
-                "inner".to_string(),
-                Value::Str(value.to_string()),
-            )]))]),
-        )]))
-    }
-
-    fn array_map(value: &str) -> Value {
-        Value::Array(vec![Value::Map(BTreeMap::from([(
-            "outer".to_string(),
-            Value::Map(BTreeMap::from([(
-                "inner".to_string(),
-                Value::Str(value.to_string()),
-            )])),
-        )]))])
-    }
-
-    #[test]
-    fn query_filter_string_limit_is_recursive_and_byte_based() {
-        let valid = "界".repeat(499) + "ab";
-        let invalid = "界".repeat(500);
-        assert_eq!(valid.len(), 1499);
-        assert_eq!(invalid.len(), 1500);
-
-        for make_value in [map_array as fn(&str) -> Value, array_map] {
-            assert!(validate_query_filters(&[QueryFilter {
-                field: "payload".to_string(),
-                op: QueryOp::Eq,
-                value: make_value(&valid),
-            }])
-            .is_ok());
-
-            let err = validate_query_filters(&[QueryFilter {
-                field: "payload".to_string(),
-                op: QueryOp::Eq,
-                value: make_value(&invalid),
-            }])
-            .unwrap_err();
-            assert_eq!(
-                err.to_string(),
-                "value for payload is too large to be used in a query"
-            );
-        }
-    }
-}
-
 pub(crate) fn paths_overlap(a: &str, b: &str) -> bool {
     if a == b {
         return true;
@@ -145,20 +92,136 @@ pub(crate) fn validate_no_overlapping_paths<'a>(
     Ok(())
 }
 
+/// Firestore の 1 セグメントの単純フィールド名
+/// (`[A-Za-z_][A-Za-z0-9_]*`)かどうかを返す。
+fn is_simple_field_name(field: &str) -> bool {
+    let mut chars = field.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// フィールド名を Firestore API の field path 表現へ変換する。単純名だけを
+/// quote せず、それ以外はバッククォートで囲み、内部のバッククォートと
+/// バックスラッシュをエスケープする。
+/// emulator でのみ使うため、通常ビルドの dead_code 警告を避ける。
+/// 単体テストでも検証できるよう test でも有効化する。
+#[cfg(any(test, feature = "emulator"))]
+pub(crate) fn quote_field_name(field: &str) -> String {
+    if is_simple_field_name(field) {
+        return field.to_string();
+    }
+
+    let mut quoted = String::with_capacity(field.len() + 2);
+    quoted.push('`');
+    for ch in field.chars() {
+        if matches!(ch, '`' | '\\') {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('`');
+    quoted
+}
+
+/// write data を通常の値・transform・削除に分ける。update / merge では
+/// Firestore と同じく「削除 → 通常値 → transform」の順に適用する。
+#[derive(Debug)]
+pub(crate) struct WriteValues {
+    pub(crate) plain: BTreeMap<String, Value>,
+    pub(crate) transforms: Vec<(String, Value)>,
+    pub(crate) deletes: Vec<String>,
+}
+
+pub(crate) fn split_write_values(data: &BTreeMap<String, Value>) -> WriteValues {
+    let mut plain = BTreeMap::new();
+    let mut transforms = vec![];
+    let mut deletes = vec![];
+    for (key, value) in data {
+        match value {
+            Value::ArrayUnion(_)
+            | Value::ArrayRemove(_)
+            | Value::ServerTimestamp
+            | Value::Increment(_) => transforms.push((key.clone(), value.clone())),
+            Value::DeleteField => deletes.push(key.clone()),
+            _ => {
+                plain.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    WriteValues {
+        plain,
+        transforms,
+        deletes,
+    }
+}
+
+/// センチネルは data_map の直下にだけ置ける。値の中の Map / Array を
+/// 再帰的にたどり、ネストされた transform を両バックエンドで拒否する。
+pub(crate) fn reject_nested_sentinels(value: &Value, nested: bool) -> Result<(), Box<dyn Error>> {
+    if nested
+        && matches!(
+            value,
+            Value::ArrayUnion(_)
+                | Value::ArrayRemove(_)
+                | Value::ServerTimestamp
+                | Value::Increment(_)
+                | Value::DeleteField
+        )
+    {
+        return Err("field transforms cannot be nested".into());
+    }
+    match value {
+        Value::Array(items) | Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
+            for item in items {
+                reject_nested_sentinels(item, true)?;
+            }
+        }
+        Value::Map(map) => {
+            for item in map.values() {
+                reject_nested_sentinels(item, true)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// update / merge set 共通の plan。plain と delete は mask に入るため互いに
+/// overlap してはいけない。transform 同士も targets が曖昧になるため
+/// overlap を拒否する。transform と mask の重なりは仕様 §6 の順序
+/// (delete → plain → transform)を両 backend で適用するため許可し、
+/// emulator 互換の parity テストで結果を確認する。
+pub(crate) fn plan_update_writes(
+    data: &BTreeMap<String, Value>,
+) -> Result<WriteValues, Box<dyn Error>> {
+    for key in data.keys() {
+        validate_field_path(key)?;
+    }
+
+    let values = split_write_values(data);
+    validate_no_overlapping_paths(
+        values
+            .deletes
+            .iter()
+            .map(String::as_str)
+            .chain(values.plain.keys().map(String::as_str)),
+    )?;
+    validate_no_overlapping_paths(values.transforms.iter().map(|(path, _)| path.as_str()))?;
+    // Keep the nested-sentinel rule in the shared plan so the emulator and
+    // in-memory backend reject the same payload with the same message.
+    for value in data.values() {
+        reject_nested_sentinels(value, false)?;
+    }
+    Ok(values)
+}
+
 /// update / merge set のキーは `.` 区切りのフィールドパス(Firestore 準拠)。
 /// 各セグメントは Firestore の単純フィールドパス文法
 /// (`[A-Za-z_][A-Za-z0-9_]*`)に従うこと。バッククォートによるエスケープは
 /// 非対応なので、バッククォートや空セグメントを含むキーはエラーにする。
 pub(crate) fn validate_field_path(key: &str) -> Result<(), Box<dyn Error>> {
     for segment in key.split('.') {
-        let valid = match segment.chars().next() {
-            Some(c) => c.is_ascii_alphabetic() || c == '_',
-            None => false,
-        } && segment
-            .chars()
-            .skip(1)
-            .all(|c| c.is_ascii_alphanumeric() || c == '_');
-        if !valid {
+        if !is_simple_field_name(segment) {
             return Err(format!(
                 "invalid field path: {key} (segment {segment:?} must match [A-Za-z_][A-Za-z0-9_]*)"
             )
@@ -232,4 +295,102 @@ pub trait Firestore {
     /// returned so callers can decide; `Runtime` ignores them to preserve
     /// the original block or commit error.
     fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map_array(value: &str) -> Value {
+        Value::Map(BTreeMap::from([(
+            "outer".to_string(),
+            Value::Array(vec![Value::Map(BTreeMap::from([(
+                "inner".to_string(),
+                Value::Str(value.to_string()),
+            )]))]),
+        )]))
+    }
+
+    fn array_map(value: &str) -> Value {
+        Value::Array(vec![Value::Map(BTreeMap::from([(
+            "outer".to_string(),
+            Value::Map(BTreeMap::from([(
+                "inner".to_string(),
+                Value::Str(value.to_string()),
+            )])),
+        )]))])
+    }
+
+    #[test]
+    fn query_filter_string_limit_is_recursive_and_byte_based() {
+        let valid = "界".repeat(499) + "ab";
+        let invalid = "界".repeat(500);
+        assert_eq!(valid.len(), 1499);
+        assert_eq!(invalid.len(), 1500);
+
+        for make_value in [map_array as fn(&str) -> Value, array_map] {
+            assert!(validate_query_filters(&[QueryFilter {
+                field: "payload".to_string(),
+                op: QueryOp::Eq,
+                value: make_value(&valid),
+            }])
+            .is_ok());
+
+            let err = validate_query_filters(&[QueryFilter {
+                field: "payload".to_string(),
+                op: QueryOp::Eq,
+                value: make_value(&invalid),
+            }])
+            .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "value for payload is too large to be used in a query"
+            );
+        }
+    }
+
+    #[test]
+    fn quote_field_name_quotes_every_non_simple_name() {
+        assert_eq!(quote_field_name("simple_2"), "simple_2");
+        assert_eq!(quote_field_name("a.b"), r#"`a.b`"#);
+        assert_eq!(quote_field_name("a-b"), r#"`a-b`"#);
+        assert_eq!(quote_field_name("1start_digit"), r#"`1start_digit`"#);
+        assert_eq!(quote_field_name("a`b"), r#"`a\`b`"#);
+        assert_eq!(quote_field_name(r"a\b"), r#"`a\\b`"#);
+    }
+
+    #[test]
+    fn update_plan_rejects_mask_path_overlap() {
+        let err = plan_update_writes(&BTreeMap::from([
+            ("a".to_string(), Value::DeleteField),
+            ("a.b".to_string(), Value::Int(1)),
+        ]))
+        .unwrap_err();
+        assert_eq!(err.to_string(), "overlapping field paths: a and a.b");
+    }
+
+    #[test]
+    fn update_plan_rejects_overlapping_transform_targets() {
+        let err = plan_update_writes(&BTreeMap::from([
+            ("a".to_string(), Value::Increment(1)),
+            ("a.b".to_string(), Value::Increment(1)),
+        ]))
+        .unwrap_err();
+        assert_eq!(err.to_string(), "overlapping field paths: a and a.b");
+    }
+
+    #[test]
+    fn update_plan_allows_transform_path_overlap_for_ordered_application() {
+        let plan = plan_update_writes(&BTreeMap::from([
+            ("a".to_string(), Value::Int(100)),
+            ("a.b".to_string(), Value::Increment(1)),
+        ]))
+        .unwrap();
+        assert_eq!(plan.plain.get("a"), Some(&Value::Int(100)));
+        assert_eq!(
+            plan.transforms,
+            vec![("a.b".to_string(), Value::Increment(1))]
+        );
+        assert!(plan.deletes.is_empty());
+    }
 }
