@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 use std::error::Error;
 
-use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
+use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
 use crate::error::{FirelangError, Span};
 use crate::lexer::{SpannedToken, StrPart, Token};
 
-type ParsedArgs = (Vec<Expr>, Vec<(String, Expr)>);
+type ParsedArgs = Vec<CallArg>;
 
 /// 二項演算子の優先順位表(弱い順)。`parse_or` / `parse_and` より強く、
 /// 単項より弱い 3 段。和・積の各段は左結合。
@@ -250,12 +250,11 @@ impl Parser {
                 self.bump();
                 self.skip_newlines_inside_delimiter();
                 let name = self.expect_ident()?;
-                let (args, kwargs) = self.parse_args()?;
+                let args = self.parse_args()?;
                 expr = Expr::Call {
                     receiver: Some(Box::new(expr)),
                     name,
                     args,
-                    kwargs,
                     block: self.parse_optional_brace_block()?,
                 };
             } else if self.at(&Token::LBracket) {
@@ -308,12 +307,11 @@ impl Parser {
                     || (self.is_arg_start() && self.suppress_block_calls == 0)
                     || (self.at(&Token::LBrace) && self.suppress_block_calls == 0)
                 {
-                    let (args, kwargs) = self.parse_args()?;
+                    let args = self.parse_args()?;
                     Ok(Expr::Call {
                         receiver: None,
                         name,
                         args,
-                        kwargs,
                         block: self.parse_optional_brace_block()?,
                     })
                 } else {
@@ -420,58 +418,40 @@ impl Parser {
     fn parse_array_items(&mut self) -> Result<Vec<Expr>, Box<dyn Error>> {
         self.parse_comma_separated(Token::RBracket, |p| p.parse_expr())
     }
-    fn parse_arg_into(
-        &mut self,
-        args: &mut Vec<Expr>,
-        kwargs: &mut Vec<(String, Expr)>,
-    ) -> Result<(), Box<dyn Error>> {
-        if let Some(kw) = self.parse_kwarg()? {
-            kwargs.push(kw);
+    fn parse_arg(&mut self) -> Result<CallArg, Box<dyn Error>> {
+        if let Some((name, value)) = self.parse_kwarg()? {
+            Ok(CallArg::Keyword { name, value })
         } else {
-            args.push(self.parse_expr()?);
+            Ok(CallArg::Positional(self.parse_expr()?))
         }
-        Ok(())
     }
 
+    // Keep positional and keyword arguments in one sequence.  The runtime
+    // later separates them for parameter binding, but evaluation must retain
+    // this source order.
     fn parse_args(&mut self) -> Result<ParsedArgs, Box<dyn Error>> {
-        let mut args = vec![];
-        let mut kwargs = vec![];
         if self.at(&Token::LParen) {
             self.bump();
             self.depth += 1;
-            let parsed = self.parse_paren_args(&mut args, &mut kwargs);
+            let parsed = self.parse_comma_separated(Token::RParen, |p| p.parse_arg());
             self.depth -= 1;
-            parsed?;
+            let args = parsed?;
             self.expect(Token::RParen)?;
-            return Ok((args, kwargs));
+            return Ok(args);
         }
         if self.is_arg_start() {
+            let mut args = vec![];
             loop {
-                self.parse_arg_into(&mut args, &mut kwargs)?;
+                args.push(self.parse_arg()?);
                 if self.at(&Token::Comma) {
                     self.bump();
                 } else {
                     break;
                 }
             }
+            return Ok(args);
         }
-        Ok((args, kwargs))
-    }
-
-    fn parse_paren_args(
-        &mut self,
-        args: &mut Vec<Expr>,
-        kwargs: &mut Vec<(String, Expr)>,
-    ) -> Result<(), Box<dyn Error>> {
-        self.parse_comma_separated(Token::RParen, |p| {
-            if let Some(kw) = p.parse_kwarg()? {
-                kwargs.push(kw);
-            } else {
-                args.push(p.parse_expr()?);
-            }
-            Ok(())
-        })?;
-        Ok(())
+        Ok(vec![])
     }
     fn expr_from_string_parts(parts: Vec<StrPart>) -> Result<Expr, Box<dyn Error>> {
         if let [StrPart::Lit(s)] = parts.as_slice() {

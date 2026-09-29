@@ -159,6 +159,13 @@ rows[0]["__name__"]  # => "users/1"(クエリ結果 Map の要素アクセス。
 
 Int 同士の算術演算(`+` `-` `*` `/`)の結果が i64 の範囲を超えると `integer overflow` エラー(debug ビルドでも panic しない)。`/ 0` は "division by zero" エラー。
 
+### 呼び出しの式評価順
+
+- receiver を持つメソッド呼び出しでは、**receiver の式を先に評価する**。receiver を持たない関数呼び出しでは arguments の評価から始める。
+- arguments は positional / keyword を区別せず、**ソース上に現れた順に左から右へ**評価する。parser は両者を一つの順序付き列として保持し、混在した順序も許す。各引数の式は一度だけ評価する。
+- 評価順とパラメータへの束縛順は別である。関数呼び出しでは positional の値を仮引数の左から右へ優先して割り当て、keyword は名前で対応する仮引数を埋める。したがって `fn f(b, a) { ... }` に `f(a: first(), second())` と書けば、`first()` → `second()` の順で評価するが、positional 値が `b`、keyword 値が `a` に対応する。
+- 評価中に receiver または argument の式がエラーになったら、残りの式を評価せずそのエラーを返す。receiver の式評価、または receiver の型検証でエラーになった場合、後続 argument の副作用は起こらない。逆に receiver の評価が成功した後に argument がエラーになった場合は、receiver の評価ですでに起きた副作用は残る。
+
 ## 5. 変数・関数・制御構文
 
 ### 変数(immutable)

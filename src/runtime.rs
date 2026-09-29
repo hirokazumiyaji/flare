@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 
-use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
+use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
 use crate::error::{FirelangError, Span};
 use crate::firestore::{Firestore, WriteOp};
 use crate::value::{
@@ -13,6 +13,15 @@ enum ExecCtx {
     Normal,
     Batch { writes: Vec<WriteOp> },
     Transaction { writes: Vec<WriteOp> },
+}
+
+enum MethodReceiver {
+    Collection(CollectionRef),
+    CollectionGroup(CollectionGroupRef),
+    Query(QueryRef),
+    Array(Vec<Value>),
+    Timestamp(Timestamp),
+    Map(BTreeMap<String, Value>),
 }
 
 pub struct Runtime<F: Firestore> {
@@ -312,7 +321,6 @@ impl<F: Firestore> Runtime<F> {
                 receiver,
                 name,
                 args,
-                kwargs,
                 block,
             } => {
                 // Validate the call shape before evaluating argument
@@ -320,13 +328,13 @@ impl<F: Firestore> Runtime<F> {
                 // writes (or other side effects) before their contract error
                 // is reported.  Keyword values are irrelevant for this
                 // pre-check; only their names and arity are needed.
-                validate_unique_keywords(kwargs)?;
-                if let Some(receiver_expr) = receiver {
+                validate_unique_keywords(args)?;
+                if receiver.is_some() {
                     // Keyword arguments are not part of any method contract.
                     // Reject them before evaluating the receiver, which may
                     // itself contain a staged or immediate write.
-                    if !kwargs.is_empty() {
-                        return Err(unknown_keyword_names(kwargs));
+                    if has_keyword_args(args) {
+                        return Err(unknown_keyword_names(args));
                     }
                     if let Some(block) = block.as_ref() {
                         if name == "each" || name == "map" {
@@ -335,48 +343,37 @@ impl<F: Firestore> Runtime<F> {
                             return Err(format!("method {name} does not take a block").into());
                         }
                     }
-                    let receiver_value = match self.eval_expr(receiver_expr)? {
+                }
+                // A receiver is the first expression in a method call.  Keep
+                // this evaluation here (rather than in `eval_call`) so a
+                // receiver failure is returned before any argument expression
+                // can run.
+                let receiver_value = match receiver.as_deref() {
+                    Some(expr) => Some(into_method_receiver(match self.eval_expr(expr)? {
                         ExecFlow::Value(v) => v,
                         flow @ ExecFlow::Return(_) => return Ok(flow),
-                    };
-                    let keyword_names = keyword_names(kwargs);
+                    })?),
+                    None => None,
+                };
+
+                // The method contract needs the receiver value; plain-call
+                // contracts were already checked above without evaluation.
+                // Either way this runs before any argument expression, so a
+                // contract error preempts argument side effects.
+                if let Some(rec) = receiver_value.as_ref() {
+                    let keyword_names = keyword_names(args);
                     validate_method_call(
-                        &receiver_value,
+                        rec,
                         name,
-                        args.len(),
+                        positional_arg_count(args),
                         &keyword_names,
                         block.as_ref(),
                     )?;
-                    let mut argv = vec![];
-                    for arg in args {
-                        match self.eval_expr(arg)? {
-                            ExecFlow::Value(v) => argv.push(v),
-                            flow @ ExecFlow::Return(_) => return Ok(flow),
-                        }
-                    }
-                    let mut kw = BTreeMap::new();
-                    for (k, vexpr) in kwargs {
-                        match self.eval_expr(vexpr)? {
-                            ExecFlow::Value(v) => {
-                                kw.insert(k.clone(), v);
-                            }
-                            flow @ ExecFlow::Return(_) => return Ok(flow),
-                        }
-                    }
-                    return self.eval_method_call_unchecked(
-                        receiver_value,
-                        name,
-                        argv,
-                        kw,
-                        block.as_ref(),
-                    );
-                }
-
-                if lookup_builtin::<F>(name).is_some() {
-                    let keyword_names = keyword_names(kwargs);
+                } else if lookup_builtin::<F>(name).is_some() {
+                    let keyword_names = keyword_names(args);
                     validate_call_contract(
                         name,
-                        args.len(),
+                        positional_arg_count(args),
                         &keyword_names,
                         block.as_ref(),
                         builtin_contract(name),
@@ -388,29 +385,32 @@ impl<F: Firestore> Runtime<F> {
                     validate_user_call_contract(
                         name,
                         &func.params,
-                        args.len(),
-                        kwargs,
+                        args,
                         block.as_ref(),
                     )?;
                 }
 
+                // `args` is one ordered sequence; splitting it into
+                // positional/keyword collections for binding must not change
+                // the order in which the expressions above are evaluated.
                 let mut argv = vec![];
-                for arg in args {
-                    match self.eval_expr(arg)? {
-                        ExecFlow::Value(v) => argv.push(v),
-                        flow @ ExecFlow::Return(_) => return Ok(flow),
-                    }
-                }
                 let mut kw = BTreeMap::new();
-                for (k, vexpr) in kwargs {
-                    match self.eval_expr(vexpr)? {
-                        ExecFlow::Value(v) => {
-                            kw.insert(k.clone(), v);
-                        }
-                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                for arg in args {
+                    match arg {
+                        CallArg::Positional(expr) => match self.eval_expr(expr)? {
+                            ExecFlow::Value(v) => argv.push(v),
+                            flow @ ExecFlow::Return(_) => return Ok(flow),
+                        },
+                        CallArg::Keyword { name, value } => match self.eval_expr(value)? {
+                            ExecFlow::Value(v) => {
+                                kw.insert(name.clone(), v);
+                            }
+                            flow @ ExecFlow::Return(_) => return Ok(flow),
+                        },
                     }
                 }
-                self.eval_call(None, name, argv, kw, block.as_ref())
+                self.eval_call(receiver_value, name, argv, kw, block.as_ref())
+
             }
             Expr::Map(entries) => {
                 let mut out = BTreeMap::new();
@@ -450,18 +450,18 @@ impl<F: Firestore> Runtime<F> {
 
     fn eval_call(
         &mut self,
-        receiver: Option<&Expr>,
+        receiver: Option<MethodReceiver>,
         name: &str,
         args: Vec<Value>,
         kwargs: BTreeMap<String, Value>,
         block: Option<&Block>,
     ) -> Result<ExecFlow, Box<dyn Error>> {
-        if let Some(r) = receiver {
-            let rec = match self.eval_expr(r)? {
-                ExecFlow::Value(v) => v,
-                flow @ ExecFlow::Return(_) => return Ok(flow),
-            };
+        if let Some(rec) = receiver {
+            if !kwargs.is_empty() {
+                return Err("keyword args are not supported for method calls yet".into());
+            }
             return self.eval_method_call(rec, name, args, kwargs, block);
+
         }
 
         // ビルトインはテーブル駆動で引く。ユーザー定義より優先されるため、
@@ -493,7 +493,7 @@ impl<F: Firestore> Runtime<F> {
 
     fn eval_method_call(
         &mut self,
-        receiver: Value,
+        receiver: MethodReceiver,
         name: &str,
         args: Vec<Value>,
         kwargs: BTreeMap<String, Value>,
@@ -505,14 +505,14 @@ impl<F: Firestore> Runtime<F> {
 
     fn eval_method_call_unchecked(
         &mut self,
-        receiver: Value,
+        receiver: MethodReceiver,
         name: &str,
         args: Vec<Value>,
         _kwargs: BTreeMap<String, Value>,
         block: Option<&Block>,
     ) -> Result<ExecFlow, Box<dyn Error>> {
         match receiver {
-            Value::CollectionRef(collection) if name == "doc" => {
+            MethodReceiver::Collection(collection) if name == "doc" => {
                 let id = expect_string(args.first())?;
                 if id.is_empty() || id.contains('/') {
                     return Err(format!("invalid document id: {id}").into());
@@ -521,17 +521,17 @@ impl<F: Firestore> Runtime<F> {
                     path: format!("{}/{}", collection.path, id),
                 })))
             }
-            Value::CollectionRef(collection) => self
+            MethodReceiver::Collection(collection) => self
                 .eval_query_method(collection.to_query(), name, args)
                 .map(ExecFlow::Value),
-            Value::CollectionGroupRef(group) => self
+            MethodReceiver::CollectionGroup(group) => self
                 .eval_query_method(group.to_query(), name, args)
                 .map(ExecFlow::Value),
-            Value::QueryRef(query) => self
+            MethodReceiver::Query(query) => self
                 .eval_query_method(query, name, args)
                 .map(ExecFlow::Value),
-            Value::Array(items) => self.eval_array_method(items, name, args, block),
-            Value::Timestamp(ts) => match name {
+            MethodReceiver::Array(items) => self.eval_array_method(items, name, args, block),
+            MethodReceiver::Timestamp(ts) => match name {
                 "to_unix" => Ok(ExecFlow::Value(Value::Int(ts.seconds))),
                 "to_rfc3339" => Ok(ExecFlow::Value(Value::Str(ts.to_rfc3339()?))),
                 "add_seconds" => Ok(ExecFlow::Value(Value::Timestamp(Timestamp {
@@ -540,9 +540,10 @@ impl<F: Firestore> Runtime<F> {
                         .checked_add(expect_int(args.first())?)
                         .ok_or("integer overflow")?,
                 }))),
+
                 _ => Err(format!("unknown timestamp method: {name}").into()),
             },
-            Value::Map(map) => {
+            MethodReceiver::Map(map) => {
                 // Map レシーバは `m.key` 形式のキーアクセス(Ruby の OpenStruct 風)のみ。
                 // 引数を取るメソッドは持たないので、Args がある場合はエラーにする。
                 if !args.is_empty() {
@@ -552,7 +553,6 @@ impl<F: Firestore> Runtime<F> {
                     map.get(name).cloned().unwrap_or(Value::Nil),
                 ))
             }
-            _ => Err("unsupported method receiver".into()),
         }
     }
 
@@ -697,14 +697,42 @@ impl<F: Firestore> Runtime<F> {
     }
 }
 
-fn validate_unique_keywords(kwargs: &[(String, Expr)]) -> Result<(), Box<dyn Error>> {
+/// Convert an evaluated receiver into the exhaustive set accepted by method
+/// dispatch.  Keeping this conversion next to the dispatch match prevents a
+/// new receiver from being accepted by one path but rejected by the other.
+fn into_method_receiver(value: Value) -> Result<MethodReceiver, Box<dyn Error>> {
+    match value {
+        Value::CollectionRef(value) => Ok(MethodReceiver::Collection(value)),
+        Value::CollectionGroupRef(value) => Ok(MethodReceiver::CollectionGroup(value)),
+        Value::QueryRef(value) => Ok(MethodReceiver::Query(value)),
+        Value::Array(value) => Ok(MethodReceiver::Array(value)),
+        Value::Timestamp(value) => Ok(MethodReceiver::Timestamp(value)),
+        Value::Map(value) => Ok(MethodReceiver::Map(value)),
+        _ => Err("unsupported method receiver".into()),
+    }
+}
+
+fn validate_unique_keywords(args: &[CallArg]) -> Result<(), Box<dyn Error>> {
     let mut seen = BTreeSet::<&str>::new();
-    for (key, _) in kwargs {
-        if !seen.insert(key.as_str()) {
-            return Err(format!("duplicate keyword argument: {key}").into());
+    for arg in args {
+        if let CallArg::Keyword { name, .. } = arg {
+            if !seen.insert(name.as_str()) {
+                return Err(format!("duplicate keyword argument: {name}").into());
+            }
         }
     }
     Ok(())
+}
+
+fn has_keyword_args(args: &[CallArg]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg, CallArg::Keyword { .. }))
+}
+
+fn positional_arg_count(args: &[CallArg]) -> usize {
+    args.iter()
+        .filter(|arg| matches!(arg, CallArg::Positional(_)))
+        .count()
 }
 
 /// Scope cleanup guard for function and block calls.
@@ -762,23 +790,30 @@ fn validate_unique_params(params: &[String], kind: &str) -> Result<(), Box<dyn E
     Ok(())
 }
 
-fn keyword_names(kwargs: &[(String, Expr)]) -> BTreeMap<String, Value> {
-    kwargs
-        .iter()
-        .map(|(key, _)| (key.clone(), Value::Nil))
+fn keyword_names(args: &[CallArg]) -> BTreeMap<String, Value> {
+    args.iter()
+        .filter_map(|arg| match arg {
+            CallArg::Keyword { name, .. } => Some((name.clone(), Value::Nil)),
+            _ => None,
+        })
         .collect()
 }
 
-fn unknown_keyword_names(kwargs: &[(String, Expr)]) -> Box<dyn Error> {
-    let keys: Vec<&str> = kwargs.iter().map(|(key, _)| key.as_str()).collect();
+fn unknown_keyword_names(args: &[CallArg]) -> Box<dyn Error> {
+    let keys: Vec<&str> = args
+        .iter()
+        .filter_map(|arg| match arg {
+            CallArg::Keyword { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
     format!("unknown keyword arguments: {}", keys.join(", ")).into()
 }
 
 fn validate_user_call_contract(
     name: &str,
     params: &[String],
-    positional_len: usize,
-    kwargs: &[(String, Expr)],
+    args: &[CallArg],
     block: Option<&Block>,
 ) -> Result<(), Box<dyn Error>> {
     if block.is_some() {
@@ -786,8 +821,8 @@ fn validate_user_call_contract(
     }
     bind_function_args(
         params,
-        vec![Value::Nil; positional_len],
-        keyword_names(kwargs),
+        vec![Value::Nil; positional_arg_count(args)],
+        keyword_names(args),
     )
     .map(|_| ())
 }
@@ -1063,36 +1098,34 @@ fn timestamp_method_contract(name: &str) -> Option<CallContract> {
     }
 }
 
-fn method_contract(receiver: &Value, name: &str) -> Option<CallContract> {
+fn method_contract(receiver: &MethodReceiver, name: &str) -> Option<CallContract> {
     match receiver {
-        Value::CollectionRef(_) if name == "doc" => Some(CallContract::exact(1)),
-        Value::CollectionRef(_) | Value::CollectionGroupRef(_) | Value::QueryRef(_) => {
-            query_method_contract(name)
-        }
-        Value::Array(_) => array_method_contract(name),
-        Value::Timestamp(_) => timestamp_method_contract(name),
+        MethodReceiver::Collection(_) if name == "doc" => Some(CallContract::exact(1)),
+        MethodReceiver::Collection(_)
+        | MethodReceiver::CollectionGroup(_)
+        | MethodReceiver::Query(_) => query_method_contract(name),
+        MethodReceiver::Array(_) => array_method_contract(name),
+        MethodReceiver::Timestamp(_) => timestamp_method_contract(name),
         // `m.key` is map key access rather than a fixed set of methods.  It
         // still has a strict zero-argument/no-block contract.
-        Value::Map(_) => Some(CallContract::exact(0)),
-        _ => None,
+        MethodReceiver::Map(_) => Some(CallContract::exact(0)),
     }
 }
 
-fn method_call_label(receiver: &Value, name: &str) -> String {
+fn method_call_label(receiver: &MethodReceiver, name: &str) -> String {
     match receiver {
-        Value::CollectionRef(_) if name == "doc" => format!("collection method {name}"),
-        Value::CollectionRef(_) | Value::CollectionGroupRef(_) | Value::QueryRef(_) => {
-            format!("query method {name}")
-        }
-        Value::Array(_) => format!("array method {name}"),
-        Value::Timestamp(_) => format!("timestamp method {name}"),
-        Value::Map(_) => format!("map key access {name}"),
-        _ => format!("method {name}"),
+        MethodReceiver::Collection(_) if name == "doc" => format!("collection method {name}"),
+        MethodReceiver::Collection(_)
+        | MethodReceiver::CollectionGroup(_)
+        | MethodReceiver::Query(_) => format!("query method {name}"),
+        MethodReceiver::Array(_) => format!("array method {name}"),
+        MethodReceiver::Timestamp(_) => format!("timestamp method {name}"),
+        MethodReceiver::Map(_) => format!("map key access {name}"),
     }
 }
 
 fn validate_method_call(
-    receiver: &Value,
+    receiver: &MethodReceiver,
     name: &str,
     positional_len: usize,
     kwargs: &BTreeMap<String, Value>,
@@ -1122,12 +1155,14 @@ fn validate_method_call(
         .into());
     }
     Err(match receiver {
-        Value::CollectionRef(_) | Value::CollectionGroupRef(_) | Value::QueryRef(_) => {
+        MethodReceiver::Collection(_)
+        | MethodReceiver::CollectionGroup(_)
+        | MethodReceiver::Query(_) => {
             format!("unknown query method: {name}").into()
         }
-        Value::Array(_) => format!("unknown array method: {name}").into(),
-        Value::Timestamp(_) => format!("unknown timestamp method: {name}").into(),
-        _ => "unsupported method receiver".into(),
+        MethodReceiver::Array(_) => format!("unknown array method: {name}").into(),
+        MethodReceiver::Timestamp(_) => format!("unknown timestamp method: {name}").into(),
+        MethodReceiver::Map(_) => format!("unknown map method: {name}").into(),
     })
 }
 
@@ -1937,7 +1972,6 @@ mod tests {
             receiver: None,
             name: "transaction".into(),
             args: vec![],
-            kwargs: vec![],
             block: Some(Block {
                 params: vec![],
                 body: vec![],
