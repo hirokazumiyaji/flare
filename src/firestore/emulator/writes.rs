@@ -13,7 +13,9 @@ use tokio::runtime::Runtime;
 
 use super::codec::encode_fields;
 use super::path::document_name;
-use crate::firestore::{insert_at_field_path, validate_field_path, WriteOp};
+use crate::firestore::{
+    insert_at_field_path, plan_update_writes, quote_field_name, split_write_values, WriteOp,
+};
 use crate::value::Value;
 
 pub(super) fn commit_writes(
@@ -102,14 +104,18 @@ fn build_write(project_id: &str, op: &WriteOp) -> Result<Write, Box<dyn Error>> 
             if *merge {
                 build_masked_write(project_id, path, data, false)
             } else {
-                let split = split_fields_and_transforms(data);
+                let split = split_write_values(data);
                 if !split.deletes.is_empty() {
                     return Err("delete_field() cannot be used with set() without merge".into());
                 }
                 // 置換 set: キーはリテラルのフィールド名として保存する。
-                // センチネル変換のパスは Firestore にネストパスと解釈されない
-                // ようバッククォートでエスケープして送る。
-                let transforms = escape_literal_transform_keys(split.transforms)?;
+                // センチネル変換は、非単純名でも Firestore がリテラル名と
+                // 解釈できる quoted field path にして送る。
+                let transforms: Vec<_> = split
+                    .transforms
+                    .into_iter()
+                    .map(|(key, value)| (quote_field_name(&key), value))
+                    .collect();
                 let fields = encode_fields(&split.plain)?;
                 Ok(Write {
                     update_mask: None,
@@ -136,17 +142,15 @@ fn build_write(project_id: &str, op: &WriteOp) -> Result<Write, Box<dyn Error>> 
 
 /// merge `set` と `update` の共通組み立て。違いは存在事前条件の有無だけ。
 /// マスクには plain と delete のキーが入り、payload は plain をネスト化した
-/// ものになる。transform / delete のキーも検証する(Firestore の
-/// field_transforms は quoted パスを受け付けるため、検証しないと
-/// in-memory と emulator で挙動が分かれる)。
+/// ものになる。フィールド path と mask 内の overlap は in-memory と同じ共通
+/// helper で、RPC を送る前に検証する。
 fn build_masked_write(
     project_id: &str,
     path: &str,
     data: &BTreeMap<String, Value>,
     require_existing: bool,
 ) -> Result<Write, Box<dyn Error>> {
-    validated_field_paths(data)?;
-    let split = split_fields_and_transforms(data);
+    let split = plan_update_writes(data)?;
     // DeleteField は update_mask に含めつつ fields から除外する。
     let mut field_paths: Vec<String> = split.plain.keys().cloned().collect();
     field_paths.extend(split.deletes);
@@ -166,18 +170,6 @@ fn build_masked_write(
     })
 }
 
-/// update / merge set のキー(ドット区切りフィールドパス)を検証する。
-/// plain(transform でない)キーと transform のキーの**両方**を検証する。
-/// Firestore の field_transforms は quoted パスを受け付けるため、transform
-/// キーを検証しないと in-memory(全キーを検証)と emulator で挙動が分かれる。
-/// in-memory と同じエラーを、RPC を送る前に出す。
-fn validated_field_paths(all: &BTreeMap<String, Value>) -> Result<(), Box<dyn Error>> {
-    for k in all.keys() {
-        validate_field_path(k)?;
-    }
-    Ok(())
-}
-
 /// フラットなフィールドパスマップをネストしたマップに組み替える。
 /// update_mask のパス("profile.name" など)が payload から解決されるように
 /// するための変換。
@@ -190,60 +182,6 @@ fn nest_field_paths(
         insert_at_field_path(&mut out, &segments, value)?;
     }
     Ok(out)
-}
-
-/// 置換の `set` ではキーはリテラルのフィールド名として扱う(spec §6)。
-/// ドットを含むキーのセンチネル変換は、Firestore にネストパスと解釈されない
-/// ようバッククォートでエスケープして送る(in-memory のリテラルキーと一致)。
-fn escape_literal_transform_keys(
-    transforms: Vec<(String, Value)>,
-) -> Result<Vec<(String, Value)>, Box<dyn Error>> {
-    transforms
-        .into_iter()
-        .map(|(key, value)| {
-            if key.contains('`') {
-                return Err(
-                    format!("unsupported field name: {key} (backtick is not supported)").into(),
-                );
-            }
-            if key.contains('.') {
-                Ok((format!("`{key}`"), value))
-            } else {
-                Ok((key, value))
-            }
-        })
-        .collect()
-}
-
-fn split_fields_and_transforms(data: &BTreeMap<String, Value>) -> SplitFields {
-    let mut plain = BTreeMap::new();
-    let mut transforms = vec![];
-    let mut deletes = vec![];
-    for (k, v) in data {
-        match v {
-            Value::ArrayUnion(_)
-            | Value::ArrayRemove(_)
-            | Value::ServerTimestamp
-            | Value::Increment(_) => {
-                transforms.push((k.clone(), v.clone()));
-            }
-            Value::DeleteField => deletes.push(k.clone()),
-            _ => {
-                plain.insert(k.clone(), v.clone());
-            }
-        }
-    }
-    SplitFields {
-        plain,
-        transforms,
-        deletes,
-    }
-}
-
-struct SplitFields {
-    plain: BTreeMap<String, Value>,
-    transforms: Vec<(String, Value)>,
-    deletes: Vec<String>,
 }
 
 fn encode_field_transforms(
@@ -342,6 +280,30 @@ mod tests {
     }
 
     #[test]
+    fn masked_writes_reject_overlapping_paths_before_rpc() {
+        for op in [
+            WriteOp::Update {
+                path: "users/overlap".to_string(),
+                data: BTreeMap::from([
+                    ("a".to_string(), Value::DeleteField),
+                    ("a.b".to_string(), Value::Int(1)),
+                ]),
+            },
+            WriteOp::Set {
+                path: "users/overlap".to_string(),
+                merge: true,
+                data: BTreeMap::from([
+                    ("a".to_string(), Value::Int(1)),
+                    ("a.b".to_string(), Value::Int(2)),
+                ]),
+            },
+        ] {
+            let err = write_ops_to_sdk_writes("p", &[op]).unwrap_err();
+            assert_eq!(err.to_string(), "overlapping field paths: a and a.b");
+        }
+    }
+
+    #[test]
     fn build_write_replacement_set_rejects_delete_field() {
         let err = write_ops_to_sdk_writes(
             "p",
@@ -355,6 +317,42 @@ mod tests {
         assert!(
             format!("{err}").contains("delete_field() cannot be used with set() without merge"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn replacement_set_quotes_non_simple_transform_field_names() {
+        let writes = write_ops_to_sdk_writes(
+            "p",
+            &[WriteOp::Set {
+                path: "users/quoted".to_string(),
+                merge: false,
+                data: BTreeMap::from([
+                    ("1start_digit".to_string(), Value::Increment(1)),
+                    ("a-b".to_string(), Value::Increment(1)),
+                    ("a.b".to_string(), Value::Increment(1)),
+                    ("a`b".to_string(), Value::Increment(1)),
+                    (r"a\b".to_string(), Value::Increment(1)),
+                    ("simple_2".to_string(), Value::Increment(1)),
+                ]),
+            }],
+        )
+        .unwrap();
+        let paths: Vec<&str> = writes[0]
+            .update_transforms
+            .iter()
+            .map(|transform| transform.field_path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                r#"`1start_digit`"#,
+                r#"`a-b`"#,
+                r#"`a.b`"#,
+                r#"`a\\b`"#,
+                r#"`a\`b`"#,
+                "simple_2",
+            ]
         );
     }
 
