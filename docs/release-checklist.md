@@ -5,8 +5,11 @@ Use before tagging a release or publishing binaries.
 1. **Local quality gates**
    - `cargo fmt --check`
    - `cargo clippy --all-targets -- -D warnings`
+   - `cargo clippy --features emulator --all-targets -- -D warnings`
+   - `cargo check --no-default-features --all-targets`
+   - `cargo check --features emulator --all-targets`
    - `cargo test --all-targets`
-   - `cargo build --release --bin fl`
+   - `cargo build --release --features emulator --bin fl`
 
    These are the same required checks run by the reusable CI workflow. A
    successful build by itself is not a release gate.
@@ -14,14 +17,14 @@ Use before tagging a release or publishing binaries.
 2. **Firestore emulator (required release gate)**
    - Install [Firebase CLI](https://firebase.google.com/docs/cli) and Java 11+.
    - From the repo root:  
-     `firebase emulators:exec --only firestore --project demo-firelang 'FIRESTORE_PROJECT_ID=demo-firelang cargo test --test firestore_emulator -- --nocapture'`
+     `firebase emulators:exec --only firestore --project demo-firelang 'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --locked -- --nocapture'`
    - The `integration-emulator` job runs this suite for branch/PR CI and is
      also run by CD. The release therefore does not omit emulator coverage.
 
 3. **Smoke**
    - `./target/release/fl --help`
    - `./target/release/fl examples/scripts/01_basic.fl`
-   - With emulator: set `FIRESTORE_EMULATOR_HOST` and `FIRESTORE_PROJECT_ID`, then `./target/release/fl --backend emulator examples/scripts/01_basic.fl`
+   - With emulator: set `FIRESTORE_EMULATOR_HOST` and `FIRESTORE_PROJECT_ID`, then run the feature-enabled binary with `./target/release/fl --backend emulator examples/scripts/01_basic.fl` (the release workflow builds with `--features emulator`).
 
 4. **Tag and package**
    - Confirm the tag is `v<Cargo package version>` and not merely any `v*` tag. The validator compares it with `cargo metadata --no-deps --format-version 1`:
