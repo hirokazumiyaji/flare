@@ -1,6 +1,10 @@
 name: CI
 
 on:
+  # CD calls this workflow for release tags.  Keeping the same job graph for
+  # branch/PR runs and workflow_call runs prevents the release path from
+  # drifting from the normal quality gate.
+  workflow_call:
   push:
     branches:
       - "**"
@@ -31,10 +35,10 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --all-targets --locked
 
       - name: Verify default feature set is in-memory-only
         run: |
@@ -52,7 +56,7 @@ jobs:
           fi
 
       - name: Build release binary
-        run: cargo build --release --bin fl
+        run: cargo build --release --bin fl --locked
 
   # Keep the optional dependency boundary covered in CI.  The default build
   # is in-memory-only; `emulator` is the explicit opt-in build.
@@ -94,10 +98,11 @@ jobs:
         if: matrix.name == 'emulator'
         run: cargo build --release --features emulator --bin fl
 
-  # Firestore emulator integration tests (Task 06). Uses firebase-tools + Java.
+  # Firestore emulator integration tests (Task 06).  This job is also run when
+  # the workflow is called by CD, so a release cannot skip the emulator suite.
   integration-emulator:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -117,7 +122,7 @@ jobs:
           node-version: "20"
 
       - name: Install firebase-tools
-        run: npm install -g firebase-tools
+        run: npm install -g firebase-tools@15.31.0
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -125,4 +130,4 @@ jobs:
       - name: Run integration tests with Firestore emulator
         run: |
           firebase emulators:exec --only firestore --project demo-firelang \
-            'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator -- --nocapture'
+            'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --locked -- --nocapture'

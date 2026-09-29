@@ -48,8 +48,12 @@ firebase emulators:exec --only firestore --project demo-firelang \
 ## テスト
 
 ```bash
+cargo test --all-targets            # ユニット + 統合テスト
+cargo test --test example_scripts   # サンプルスクリプト一括実行
+cargo test --test cli               # CLI スモークテスト
+cargo test --test release           # release tag/package の検証
+
 # 既定 feature なし: in-memory のみ
-cargo test --all-targets
 cargo check --no-default-features --all-targets
 cargo test --no-default-features --all-targets
 
@@ -71,10 +75,20 @@ cargo test --features emulator --test firestore_emulator -- --nocapture
 
 ## CI / CD (GitHub Actions)
 
-- **`test` ジョブ**: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`
-- **`feature-builds` ジョブ**: default / `--no-default-features` / `--features emulator` のビルド境界を `cargo check --all-targets` で検証
+- **`test` ジョブ**: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`, `cargo build --release --bin fl` を実行
+- **`feature-builds` ジョブ**: default / `--no-default-features` / `--features emulator` のビルド境界を検証
 - **`integration-emulator` ジョブ**: Firestore エミュレータを起動して `cargo test --features emulator --test firestore_emulator` を実行
-- **`CD`**: `v*` タグ push で `fl` の Linux バイナリを `--features emulator` でビルドして GitHub Release に添付
+- CI は reusable workflow になっており、`v*` タグを押した CD も同じジョブ群（integration test を含む）を必ず実行します。CD の release ジョブはこの gate と tag version check に依存するため、branch CI を飛ばした tag でも公開できません。
+- **CD**: tag の `v` を除いた部分（例: `v0.1.0` → `0.1.0`）が `cargo metadata --no-deps` の `firelang` package version と一致する場合だけ、`fl` の Linux バイナリを `--features emulator` でビルドして release します。
+- release asset は raw binary ではなく `firelang-<version>-linux-x86_64.tar.gz` と SHA-256 `.sha256` sidecar です。tarball には実行権限付きの `fl`、`README.md`、`LICENSE`、`docs/spec.md`、ファイル単位の `SHA256SUMS` が含まれます。
+
+ダウンロード後は、archive とその sidecar を同じディレクトリに置いて次のように検証できます。
+
+```bash
+sha256sum -c firelang-0.1.0-linux-x86_64.tar.gz.sha256
+tar -xzf firelang-0.1.0-linux-x86_64.tar.gz
+(cd firelang-0.1.0-linux-x86_64 && sha256sum -c SHA256SUMS)
+```
 
 ## ライセンス
 
