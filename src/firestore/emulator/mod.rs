@@ -179,11 +179,21 @@ impl Firestore for FirestoreEmulator {
         match &query.source {
             QuerySource::Collection(path) => {
                 let (parent, collection_id) = path::split_collection_path(path)?;
-                let sq = structured_query(collection_id, false, &server_filters)?;
+                let sq = structured_query(
+                    &self.client.project_id,
+                    collection_id,
+                    false,
+                    &server_filters,
+                )?;
                 run_query_candidates(self, parent.as_deref(), sq, &query.filters)
             }
             QuerySource::CollectionGroup(id) => {
-                let sq = structured_query(id, true, &server_filters)?;
+                let sq = structured_query(
+                    &self.client.project_id,
+                    id,
+                    true,
+                    &server_filters,
+                )?;
                 run_query_candidates(self, None, sq, &query.filters)
             }
         }
@@ -330,7 +340,11 @@ fn run_query_candidates(
     let mut out = vec![];
     let resource_root = fs.client.db.get_documents_path();
     for doc in docs {
-        let rel = path::relative_document_name(&doc.name)?;
+        let rel = path::relative_document_name_for(
+            &doc.name,
+            &fs.client.project_id,
+            path::DEFAULT_DATABASE_ID,
+        )?;
         let Value::Map(fields) = codec::decode_document(&doc, resource_root)? else {
             return Err("query result must be a map".into());
         };
@@ -386,6 +400,7 @@ fn is_server_prefilter_safe(filter: &QueryFilter) -> bool {
 
 
 fn structured_query(
+    project_id: &str,
     collection_id: &str,
     all_descendants: bool,
     filters: &[QueryFilter],
@@ -396,7 +411,7 @@ fn structured_query(
             collection_id: collection_id.to_string(),
             all_descendants,
         }],
-        r#where: build_where(filters)?,
+        r#where: build_where(project_id, filters)?,
         order_by: vec![],
         start_at: None,
         end_at: None,
@@ -409,6 +424,7 @@ fn structured_query(
 // `filters` is the deliberately small, server-safe subset selected by
 // `server_prefilters`; all original filters are checked again locally.
 fn build_where(
+    project_id: &str,
     filters: &[QueryFilter],
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
     let mut parts = vec![];
@@ -432,7 +448,7 @@ fn build_where(
                         field_path: f.field.clone(),
                     }),
                     op: op.into(),
-                    value: Some(codec::encode_field_value(&f.value)?),
+                    value: Some(codec::encode_query_value(project_id, &f.value)?),
                 },
             )),
         });
@@ -463,6 +479,68 @@ mod tests {
         match res {
             Ok(_) => panic!("expected connection failure"),
             Err(e) => assert!(!format!("{e}").is_empty()),
+        }
+    }
+
+    #[test]
+    fn build_where_encodes_doc_refs_for_reference_operators() {
+        let ref_value = || {
+            Value::DocRef(crate::value::DocRef {
+                path: "users/owner".to_string(),
+            })
+        };
+        let cases = [
+            (QueryOp::Eq, ref_value()),
+            (QueryOp::In, Value::Array(vec![ref_value()])),
+            (QueryOp::ArrayContains, ref_value()),
+        ];
+        for (op, value) in cases {
+            let filter = build_where(
+                "query-project",
+                &[QueryFilter {
+                    field: "owner".to_string(),
+                    op,
+                    value,
+                }],
+            )
+            .unwrap()
+            .unwrap();
+            let Some(structured_query::filter::FilterType::FieldFilter(field_filter)) =
+                filter.filter_type
+            else {
+                panic!("expected field filter for {op:?}");
+            };
+            let encoded = field_filter.value.expect("filter value");
+            match op {
+                QueryOp::In => {
+                    let Some(gcloud_sdk::google::firestore::v1::value::ValueType::ArrayValue(
+                        values,
+                    )) = encoded.value_type
+                    else {
+                        panic!("expected array filter value");
+                    };
+                    assert_eq!(values.values.len(), 1);
+                    assert_eq!(
+                        values.values[0].value_type,
+                        Some(
+                            gcloud_sdk::google::firestore::v1::value::ValueType::ReferenceValue(
+                                "projects/query-project/databases/(default)/documents/users/owner"
+                                    .to_string()
+                            )
+                        )
+                    );
+                }
+                QueryOp::Eq | QueryOp::ArrayContains => assert_eq!(
+                    encoded.value_type,
+                    Some(
+                        gcloud_sdk::google::firestore::v1::value::ValueType::ReferenceValue(
+                            "projects/query-project/databases/(default)/documents/users/owner"
+                                .to_string()
+                        )
+                    )
+                ),
+                other => panic!("unexpected test case: {other:?}"),
+            }
         }
     }
 }

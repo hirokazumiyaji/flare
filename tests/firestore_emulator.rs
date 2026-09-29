@@ -7,8 +7,12 @@
 #[macro_use]
 mod common;
 
+use std::collections::HashMap;
+
 use firelang::run_script_with_firestore;
 use firelang::{FirestoreEmulator, Value};
+use firestore::{FirestoreCreateSupport, FirestoreDb, FirestoreDbOptions};
+use gcloud_sdk::google::firestore::v1::{value, ArrayValue, Document, MapValue, Value as SdkValue};
 
 fn emulator() -> Option<FirestoreEmulator> {
     match FirestoreEmulator::try_from_env() {
@@ -25,6 +29,82 @@ fn unique(prefix: &str) -> String {
         .unwrap()
         .as_nanos();
     format!("{prefix}_{n}")
+}
+
+fn reference_value(project: &str, database: &str, path: &str) -> SdkValue {
+    SdkValue {
+        value_type: Some(value::ValueType::ReferenceValue(format!(
+            "projects/{project}/databases/{database}/documents/{path}"
+        ))),
+    }
+}
+
+fn map_value(fields: impl IntoIterator<Item = (&'static str, SdkValue)>) -> SdkValue {
+    SdkValue {
+        value_type: Some(value::ValueType::MapValue(MapValue {
+            fields: fields
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value))
+                .collect::<HashMap<_, _>>(),
+        })),
+    }
+}
+
+fn array_value(values: impl IntoIterator<Item = SdkValue>) -> SdkValue {
+    SdkValue {
+        value_type: Some(value::ValueType::ArrayValue(ArrayValue {
+            values: values.into_iter().collect(),
+        })),
+    }
+}
+
+fn seed_reference_documents(
+    project_id: &str,
+    collection_id: &str,
+    documents: impl IntoIterator<Item = (&'static str, HashMap<String, SdkValue>)>,
+) {
+    let host = std::env::var("FIRESTORE_EMULATOR_HOST").expect("emulator host");
+    let url = if host.contains("://") {
+        host
+    } else {
+        format!("http://{host}")
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create test runtime");
+    let options = FirestoreDbOptions::new(project_id.to_string()).with_firebase_api_url(url);
+    let db = runtime
+        .block_on(FirestoreDb::with_options_token_source(
+            options,
+            gcloud_sdk::GCP_DEFAULT_SCOPES.clone(),
+            gcloud_sdk::TokenSourceType::ExternalSource(Box::new(
+                gcloud_sdk::ExternalJwtFunctionSource::new(|| {
+                    std::future::ready(Ok(gcloud_sdk::Token::new(
+                        "Bearer".to_string(),
+                        "owner".into(),
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(4_102_444_800, 0)
+                            .expect("valid token expiry"),
+                    )))
+                }),
+            )),
+        ))
+        .expect("connect test Firestore client");
+    for (id, fields) in documents {
+        runtime
+            .block_on(db.create_doc(
+                collection_id,
+                Some(id.to_string()),
+                Document {
+                    name: String::new(),
+                    fields,
+                    create_time: None,
+                    update_time: None,
+                },
+                None,
+            ))
+            .expect("seed reference document");
+    }
 }
 
 #[test]
@@ -605,6 +685,7 @@ fn emulator_delete_field_and_increment_match_in_memory() {
     // never pass wherever the emulator actually ran - it only looked green
     // because the suite skips without FIRESTORE_EMULATOR_HOST. Both backends
     // remove `age` and keep `name`; this now matches the sibling in-memory test.
+
     assert_eq!(
         out,
         map! {
@@ -652,6 +733,63 @@ set("users/{run}/rows/r6", {{other: 1}})
             Value::Int(3),
             Value::Int(2),
             Value::Int(5),
+        ])
+    );
+}
+
+#[test]
+fn emulator_query_encodes_doc_refs_and_ignores_external_references() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let project = std::env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".into());
+    let collection = format!("ref_queries_{}", unique("run"));
+    let local = reference_value(&project, "(default)", "users/owner");
+    let other_project = reference_value("other-project", "(default)", "users/owner");
+    let other_database = reference_value(&project, "other", "users/owner");
+    let matching_fields = HashMap::from([
+        ("owner".to_string(), local.clone()),
+        ("members".to_string(), array_value([local.clone()])),
+        ("meta".to_string(), map_value([("owner", local.clone())])),
+    ]);
+    let external_fields = HashMap::from([
+        ("owner".to_string(), other_project.clone()),
+        ("members".to_string(), array_value([other_database.clone()])),
+        (
+            "meta".to_string(),
+            map_value([("owner", other_database.clone())]),
+        ),
+        ("other_project".to_string(), other_project),
+        ("other_database".to_string(), other_database),
+    ]);
+    seed_reference_documents(
+        &project,
+        &collection,
+        [("matching", matching_fields), ("external", external_fields)],
+    );
+
+    let script = format!(
+        r#"owner = doc("users/owner")
+[
+  col("{collection}").where("owner", "==", owner).get().len(),
+  col("{collection}").where("owner", "in", [owner]).get().len(),
+  col("{collection}").where("members", "array_contains", owner).get().len(),
+  col("{collection}").where("meta", "==", {{owner: owner}}).get().len(),
+  col("{collection}").where("other_project", "==", owner).get().len(),
+  col("{collection}").where("other_database", "==", owner).get().len(),
+]"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Int(1),
+            Value::Int(1),
+            Value::Int(1),
+            Value::Int(0),
+            Value::Int(0),
         ])
     );
 }
