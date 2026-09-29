@@ -49,11 +49,27 @@ impl Firestore for InMemoryFirestore {
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
-        let mut next = self.tx_snapshot.take().ok_or("not in transaction")?;
+        // Build the committed state from a copy.  A failed write (for
+        // example, an update of a missing document) must not consume the
+        // transaction state: the runtime needs to be able to abort it and a
+        // direct caller may retry after correcting the writes.
+        if writes.is_empty() {
+            // Nothing can fail, so the snapshot can be moved instead of
+            // cloned; this keeps `transaction { ... }` with no staged write
+            // from copying the whole store.
+            self.docs = self.tx_snapshot.take().ok_or("not in transaction")?;
+            return Ok(());
+        }
+        let mut next = self
+            .tx_snapshot
+            .as_ref()
+            .ok_or("not in transaction")?
+            .clone();
         for op in writes {
             apply_write_to_docs(&mut next, op)?;
         }
         self.docs = next;
+        self.tx_snapshot = None;
         Ok(())
     }
 
@@ -332,4 +348,36 @@ fn lookup_field_path<'a>(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_commit_keeps_transaction_until_abort() {
+        let mut fs = InMemoryFirestore::default();
+        fs.apply(vec![WriteOp::Set {
+            path: "users/existing".into(),
+            data: BTreeMap::from([("n".into(), Value::Int(1))]),
+            merge: false,
+        }])
+        .unwrap();
+        fs.begin_transaction().unwrap();
+
+        let err = fs
+            .commit_transaction(vec![WriteOp::Update {
+                path: "users/missing".into(),
+                data: BTreeMap::from([("n".into(), Value::Int(2))]),
+            }])
+            .unwrap_err();
+        assert!(err.to_string().contains("document not found"));
+        // The failed commit did not consume the snapshot, so cleanup can
+        // still be performed and a new transaction can be started afterward.
+        assert!(fs.transaction_get("users/existing").unwrap().is_some());
+
+        fs.abort_transaction().unwrap();
+        fs.begin_transaction().unwrap();
+        fs.abort_transaction().unwrap();
+    }
 }
