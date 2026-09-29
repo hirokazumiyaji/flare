@@ -1582,6 +1582,144 @@ fn invalid_collection_paths_are_rejected() {
 }
 
 #[test]
+fn firestore_path_segment_ids_follow_firestore_constraints() {
+    let long_id = "x".repeat(1501);
+    let cases = vec![
+        (
+            r#"set("users/.", {a: 1})"#.to_string(),
+            "invalid document path",
+        ),
+        (
+            r#"set("users/..", {a: 1})"#.to_string(),
+            "invalid document path",
+        ),
+        (
+            r#"set("users/__reserved__", {a: 1})"#.to_string(),
+            "invalid document path",
+        ),
+        (
+            format!(r#"set("users/{long_id}", {{a: 1}})"#),
+            "1,500 UTF-8 bytes",
+        ),
+        (
+            format!(r#"set("users/{long_id}/posts/p1", {{a: 1}})"#),
+            "1,500 UTF-8 bytes",
+        ),
+        (r#"col(".")"#.to_string(), "invalid collection path"),
+        (
+            r#"col("teams/../members")"#.to_string(),
+            "invalid collection path",
+        ),
+        (
+            r#"col_group(".")"#.to_string(),
+            "invalid collection group id",
+        ),
+        (format!(r#"col_group("{long_id}")"#), "1,500 UTF-8 bytes"),
+        (
+            r#"col("users").doc(".")"#.to_string(),
+            "invalid document id",
+        ),
+        (
+            r#"col("users").doc("__reserved__")"#.to_string(),
+            "invalid document id",
+        ),
+        (
+            format!(r#"col("users").doc("{long_id}")"#),
+            "1,500 UTF-8 bytes",
+        ),
+    ];
+
+    for (source, expected) in cases {
+        let err = run_script(&source).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains(expected), "{source}: {message}");
+    }
+}
+
+#[test]
+fn reserved_ids_are_rejected_in_collection_segments_too() {
+    // spec §6: ID 制約(予約パターン `__.*__` を含む)は document / collection
+    // で同一。collection ID だけ通すと `col("__x__")` と `doc("users/__x__")`
+    // で挙動が割れる。
+    for source in [
+        r#"col("__reserved__").get()"#,
+        r#"col_group("__reserved__").get()"#,
+        r#"set("__reserved__/m1", {ok: true})"#,
+        r#"get("__reserved__/m1")"#,
+        r#"col("users").doc("__reserved__")"#,
+    ] {
+        let err = run_script(source).unwrap_err();
+        let message = format!("{err}");
+        assert!(
+            message.contains("__.*__"),
+            "expected the reserved-pattern error for {source}, got: {message}"
+        );
+    }
+}
+
+#[test]
+fn ordinary_collection_ids_still_work() {
+    // 予約パターンに当たらない collection ID は従来どおり使える。
+    let out = run_script(
+        r#"set("_meta/m1", {ok: true})
+[col("_meta").get().len(), col_group("_meta").get().len()]"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1), Value::Int(1)]));
+}
+
+#[test]
+fn legacy_datastore_numeric_ids_are_accepted() {
+    // Datastore 由来の数値 ID(`__id123__` 形式)は既存参照として許可する。
+    // 一般の予約パターン(`__reserved__` 等)は引き続き拒否される。
+    let out = run_script(
+        r#"set("users/__id123__", {n: 1})
+[get("users/__id123__")["n"], col("users").doc("__id123__")]"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(1),
+            Value::DocRef(firelang::value::DocRef {
+                path: "users/__id123__".to_string()
+            }),
+        ])
+    );
+    for source in [
+        r#"col("users").doc("__id__")"#,
+        r#"col("users").doc("__id12a__")"#,
+        r#"col("users").doc("__ID123__")"#,
+    ] {
+        let err = run_script(source).unwrap_err();
+        assert!(
+            format!("{err}").contains("__.*__"),
+            "expected the reserved-pattern error for {source}, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn firestore_path_segment_limit_counts_utf8_bytes() {
+    // ASCII 1,500 bytes と 750 個の 2-byte 文字はどちらも許可される。
+    for id in ["x".repeat(1500), "é".repeat(750)] {
+        let source = format!(
+            r#"set("users/{id}", {{ok: true}})
+get("users/{id}")"#
+        );
+        let out = run_script(&source).unwrap();
+        assert_eq!(out, map! {"ok" => Value::Bool(true)});
+    }
+
+    // 1,501 ASCII bytes と 751 個の 2-byte 文字はどちらも拒否される。
+    for id in ["x".repeat(1501), "é".repeat(751)] {
+        let source = format!(r#"set("users/{id}", {{ok: true}})"#);
+        let err = run_script(&source).unwrap_err();
+        assert!(err.to_string().contains("1,500 UTF-8 bytes"), "{err}");
+    }
+}
+
+#[test]
 fn valid_subcollection_paths_still_work() {
     let out = run_script(
         "set(\"teams/t1/members/m1\", {n: 1})\ncol(\"teams/t1/members\").get()[0][\"__name__\"]",

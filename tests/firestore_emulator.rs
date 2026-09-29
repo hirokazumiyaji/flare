@@ -9,7 +9,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use firelang::run_script_with_firestore;
+use firelang::{run_script, run_script_with_firestore};
 use firelang::{FirestoreEmulator, Value};
 use firestore::{FirestoreCreateSupport, FirestoreDb, FirestoreDbOptions};
 use gcloud_sdk::google::firestore::v1::{value, ArrayValue, Document, MapValue, Value as SdkValue};
@@ -117,6 +117,54 @@ fn firestore_global_functions_with_emulator() {
     let script = format!("set(doc(\"{doc_path}\"), {{value: \"ok\"}})\nget(\"{doc_path}\")");
     let out = run_script_with_firestore(&script, fs).unwrap();
     assert_eq!(out, map! {"value" => Value::Str("ok".to_string())});
+}
+
+#[test]
+fn emulator_path_segment_id_errors_match_in_memory() {
+    if emulator().is_none() {
+        eprintln!("skip: no emulator");
+        return;
+    }
+
+    let long_id = "x".repeat(1501);
+    let sources = [
+        r#"set("users/.", {a: 1})"#.to_string(),
+        r#"set("users/..", {a: 1})"#.to_string(),
+        r#"set("users/__reserved__", {a: 1})"#.to_string(),
+        format!(r#"set("users/{long_id}", {{a: 1}})"#),
+        r#"col("teams/../members")"#.to_string(),
+        r#"col_group("__reserved__")"#.to_string(),
+        r#"col("users").doc(".")"#.to_string(),
+    ];
+
+    for source in sources {
+        let in_memory = run_script(&source).unwrap_err().to_string();
+        let Some(fs) = emulator() else {
+            eprintln!("skip: emulator disconnected");
+            return;
+        };
+        let emulator_error = run_script_with_firestore(&source, fs)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(emulator_error, in_memory, "{source}");
+    }
+}
+
+#[test]
+fn emulator_accepts_1500_byte_path_segment() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let id = "x".repeat(1500);
+    let collection = format!("users/{}/docs", unique("id_limit"));
+    let path = format!("{collection}/{id}");
+    let source = format!(
+        r#"set("{path}", {{ok: true}})
+get("{path}")"#
+    );
+    let out = run_script_with_firestore(&source, fs).unwrap();
+    assert_eq!(out, map! {"ok" => Value::Bool(true)});
 }
 
 #[test]

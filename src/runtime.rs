@@ -514,9 +514,7 @@ impl<F: Firestore> Runtime<F> {
         match receiver {
             MethodReceiver::Collection(collection) if name == "doc" => {
                 let id = expect_string(args.first())?;
-                if id.is_empty() || id.contains('/') {
-                    return Err(format!("invalid document id: {id}").into());
-                }
+                validate_document_id(id)?;
                 Ok(ExecFlow::Value(Value::DocRef(DocRef {
                     path: format!("{}/{}", collection.path, id),
                 })))
@@ -1281,9 +1279,7 @@ fn builtin_col_group<F: Firestore>(
     _block: Option<&Block>,
 ) -> Result<ExecFlow, Box<dyn Error>> {
     let id = expect_string(args.first())?;
-    if id.is_empty() || id.contains('/') {
-        return Err(format!("invalid collection group id: {id}").into());
-    }
+    validate_collection_group_id(id)?;
     Ok(ExecFlow::Value(Value::CollectionGroupRef(
         CollectionGroupRef { id: id.to_string() },
     )))
@@ -1589,13 +1585,90 @@ fn expect_doc_path(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
             validate_doc_path(s)?;
             Ok(s)
         }
-        Some(Value::DocRef(d)) => Ok(&d.path),
+        Some(Value::DocRef(d)) => {
+            // DocRef は通常 doc() / col().doc() で作られ、その時点で検証済み。
+            // 外部から渡された値でも同じ runtime 制約を適用する。
+            validate_doc_path(&d.path)?;
+            Ok(&d.path)
+        }
         _ => Err("expected document path string or doc object".into()),
     }
 }
 
+/// Firestore の document / collection ID は UTF-8 バイト数で 1,500 以下。
+/// Rust の `str::len()` は文字数ではなく UTF-8 のバイト数を返すため、
+/// 日本語などの ID でも Firestore と同じ単位で判定できる。
+const MAX_FIRESTORE_ID_BYTES: usize = 1_500;
+
+/// 単一 ID 引数(`col().doc()` / `col_group()`)を検証する。
+fn validate_document_id(id: &str) -> Result<(), Box<dyn Error>> {
+    validate_standalone_id(id, "document id")
+}
+
+fn validate_collection_group_id(id: &str) -> Result<(), Box<dyn Error>> {
+    validate_standalone_id(id, "collection group id")
+}
+
+fn validate_standalone_id(id: &str, kind: &str) -> Result<(), Box<dyn Error>> {
+    // 空文字と `/` は既存の error format を保ちつつ、他の ID 制約も同じ
+    // runtime エラーにする。
+    if id.is_empty() || id.contains('/') {
+        return Err(format!("invalid {kind}: {id}").into());
+    }
+    if let Err(reason) = validate_firestore_id(id) {
+        return Err(format!("invalid {kind}: {id} ({reason})").into());
+    }
+    Ok(())
+}
+
+/// Firestore の ID 固有の制約。パス上のセグメントと単一 ID 引数で共有する。
+///
+/// spec §6 の通り、document ID と collection ID で制約は同一。予約パターン
+/// `__.*__` の検査も document だけを対象にせず両方に適用する(片方だけだと
+/// `col("__meta__")` が通るが `doc("users/__x__")` は弾くというズレが
+/// in-memory / emulator の食い違いの原因になる)。
+fn validate_firestore_id(id: &str) -> Result<(), &'static str> {
+    if id.is_empty() {
+        return Err("must not be empty");
+    }
+    if id.contains('/') {
+        return Err("must not contain '/'");
+    }
+    if id.len() > MAX_FIRESTORE_ID_BYTES {
+        return Err("must be at most 1,500 UTF-8 bytes");
+    }
+    if id == "." || id == ".." {
+        return Err("must not be \".\" or \"..\"");
+    }
+    if is_reserved_firestore_id(id) {
+        return Err("must not match the reserved pattern __.*__");
+    }
+    Ok(())
+}
+
+/// Firestore の予約 ID 正規表現 `^__.*__$` 相当。
+///
+/// Datastore 由来の数値 ID(`__id123__` 形式)は既存ドキュメントの参照として
+/// 扱うため例外とする。クエリや参照フィールドで返されたドキュメントを
+/// `get` / `update` / `delete` に渡せなくなるのを避ける。
+fn is_reserved_firestore_id(id: &str) -> bool {
+    if id.len() >= 4 && id.starts_with("__") && id.ends_with("__") {
+        return !is_legacy_datastore_numeric_id(id);
+    }
+    false
+}
+
+/// Datastore 由来の数値エンティティ ID(`__id` + 10進数字 + `__`)かどうか。
+fn is_legacy_datastore_numeric_id(id: &str) -> bool {
+    let Some(inner) = id.strip_prefix("__id").and_then(|s| s.strip_suffix("__")) else {
+        return false;
+    };
+    !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// ドキュメントパスは偶数個・コレクションパスは奇数個の非空セグメントで
 /// 構成されていなければならない(`users/1`、`teams/t1/members`)。
+/// 各セグメントは Firestore の document / collection ID 制約も満たす。
 /// runtime 層で検証するため、in-memory / emulator のどちらのバックエンド
 /// でも同じエラーになる。
 fn validate_doc_path(path: &str) -> Result<(), Box<dyn Error>> {
@@ -1619,6 +1692,24 @@ fn validate_path(path: &str, collection: bool) -> Result<(), Box<dyn Error>> {
             "invalid {kind} path: {path} (expected an {expected} number of segments)"
         )
         .into());
+    }
+
+    let path_kind = if collection { "collection" } else { "document" };
+    for (index, segment) in segments.iter().enumerate() {
+        // 偶数番目は collection ID、奇数番目は document ID。ID 制約自体は
+        // 両者で同一(spec §6)だが、エラー文でどのセグメントが不正かを
+        // 区別するため id_kind は残す。
+        let id_kind = if index % 2 == 0 {
+            "collection"
+        } else {
+            "document"
+        };
+        if let Err(reason) = validate_firestore_id(segment) {
+            return Err(format!(
+                "invalid {path_kind} path: {path} (segment {segment:?} is an invalid {id_kind} id: {reason})"
+            )
+            .into());
+        }
     }
     Ok(())
 }
