@@ -14,13 +14,14 @@ pub enum Value {
     Array(Vec<Value>),
     Map(BTreeMap<String, Value>),
     Timestamp(Timestamp),
+    Bytes(Vec<u8>),
     ServerTimestamp,
     ArrayUnion(Vec<Value>),
     ArrayRemove(Vec<Value>),
     DeleteField,
     Increment(i64),
-    /// emulator が読んだ firelang 外の型(double / geo_point / bytes)の
-    /// 表示専用値。スクリプトからは生成できず、書き戻しもできない。
+    /// emulator が読んだ firelang 外の型(double / geo_point)の表示専用値。
+    /// スクリプトからは生成できず、書き戻しもできない。
     Opaque(String),
     DocRef(DocRef),
     CollectionRef(CollectionRef),
@@ -153,16 +154,34 @@ impl Value {
     }
 
     /// クエリ `order_by` 用の全順序。同型は自然順(Int 数値順 / Str 辞書順 /
-    /// Bool `false < true` / Timestamp 秒)、異型は Nil < Bool < Int <
-    /// Timestamp < Str < Array < Map < その他 の型ランクで比べる。
-    /// 両バックエンドの決定性を同じコードで保証するために使う(spec §7)。
+    /// Bool `false < true` / Timestamp 秒 / Bytes の辞書順)、異型は Nil <
+    /// Bool < Int < Timestamp < Str < Bytes < Array < Map < その他の
+    /// 型ランクで比べる。両バックエンドの決定性を同じコードで保証するために
+    /// 使う(spec §7)。
     pub fn cmp_for_order(&self, other: &Self) -> std::cmp::Ordering {
         match (self, other) {
             (Value::Int(x), Value::Int(y)) => x.cmp(y),
             (Value::Str(x), Value::Str(y)) => x.cmp(y),
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
             (Value::Timestamp(x), Value::Timestamp(y)) => x.seconds.cmp(&y.seconds),
+            (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
             _ => type_rank(self).cmp(&type_rank(other)),
+        }
+    }
+
+    /// クエリ `where` の大小比較。同じ順序関係を持つ型だけが比較可能。
+    ///
+    /// `order_by` の全順序とは別の契約である。Nil / Array / Map は
+    /// `where` の大小比較では順序付けられず、異型も比較結果にならない。
+    /// emulator の Firestore 型順序に依存しないための共通実装。
+    pub fn cmp_for_where(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
+            (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
+            (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+            (Value::Timestamp(x), Value::Timestamp(y)) => Some(x.seconds.cmp(&y.seconds)),
+            (Value::Bytes(x), Value::Bytes(y)) => Some(x.cmp(y)),
+            _ => None,
         }
     }
 }
@@ -174,9 +193,10 @@ fn type_rank(v: &Value) -> u8 {
         Value::Int(_) => 2,
         Value::Timestamp(_) => 3,
         Value::Str(_) => 4,
-        Value::Array(_) => 5,
-        Value::Map(_) => 6,
-        _ => 7,
+        Value::Bytes(_) => 5,
+        Value::Array(_) => 6,
+        Value::Map(_) => 7,
+        _ => 8,
     }
 }
 
@@ -225,6 +245,7 @@ impl Value {
                 format!("{{{}}}", inner.join(", "))
             }
             Value::Timestamp(ts) => format!("Timestamp({})", ts.seconds),
+            Value::Bytes(bytes) => inspect_bytes(bytes),
             Value::ServerTimestamp => "ServerTimestamp".to_string(),
             Value::ArrayUnion(v) => {
                 let inner: Vec<String> = v.iter().map(|x| x.inspect()).collect();
@@ -246,6 +267,29 @@ impl Value {
             Value::Func(_) => "<func>".to_string(),
         }
     }
+}
+
+const BYTES_INSPECT_LIMIT: usize = 32;
+
+fn inspect_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let shown = bytes.len().min(BYTES_INSPECT_LIMIT);
+    let mut out = String::with_capacity(7 + shown.saturating_mul(2));
+    out.push_str("Bytes(");
+    // `format!` で 1 バイトごとに使い捨ての String を確保するのを避けて、
+    // 既存のバッファへ直接書き込む(`inspect()` は毎回の文字列表示で動く)。
+    for byte in &bytes[..shown] {
+        // String への書き込みは失敗しない。
+        let _ = write!(out, "{byte:02x}");
+    }
+    // `shown = min(len, LIMIT)` なので常に `len >= shown` であり、
+    // `checked_sub` の None 分支には到達しない。
+    let omitted = bytes.len() - shown;
+    if omitted > 0 {
+        let _ = write!(out, ", {omitted} more bytes");
+    }
+    out.push(')');
+    out
 }
 
 fn inspect_str(s: &str) -> String {
