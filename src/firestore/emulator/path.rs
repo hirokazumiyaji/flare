@@ -4,23 +4,31 @@ use std::error::Error;
 
 /// この adapter が接続する database id。
 ///
-/// resource name を組み立てる `document_name` / `parent_path` と、
-/// デコード時に resource name を解釈する `relative_document_name_for` が
-/// 同じ値を共有해야する。ずれると参照が `Opaque` に化ける、
-/// あるいは正当な document を拒否する。
+/// resource name を組み立てる `document_root` / `document_name` /
+/// `parent_path` と、デコード時に resource name を解釈する
+/// `relative_document_name_for` が同じ値を共有する必要がある。ずれると
+/// 参照が `Opaque` に化ける、あるいは正当な document を拒否する。
 pub(super) const DEFAULT_DATABASE_ID: &str = "(default)";
+
+/// `projects/{project_id}/databases/(default)/documents` を返す。
+///
+/// Firestore の reference をローカルの相対パスへ変換するときは、decode 側が
+/// 渡す `resource_root` がこの形と一致している必要がある。decode の呼び出し側は
+/// SDK の `db.get_documents_path()` をそのまま渡すので、この関数が唯一の定義先で
+/// あるこの文字列を `document_name` / `parent_path` にも共有させている。
+pub(super) fn document_root(project_id: &str) -> String {
+    format!("projects/{project_id}/databases/{DEFAULT_DATABASE_ID}/documents")
+}
 
 /// `projects/{project_id}/databases/(default)/documents/{path}` を組み立てる。
 pub(super) fn document_name(project_id: &str, path: &str) -> String {
-    format!("projects/{project_id}/databases/{DEFAULT_DATABASE_ID}/documents/{path}")
+    format!("{}/{path}", document_root(project_id))
 }
 
 pub(super) fn parent_path(project_id: &str, relative_parent: Option<&str>) -> String {
     match relative_parent {
-        Some(parent) if !parent.is_empty() => {
-            format!("projects/{project_id}/databases/{DEFAULT_DATABASE_ID}/documents/{parent}")
-        }
-        _ => format!("projects/{project_id}/databases/{DEFAULT_DATABASE_ID}/documents"),
+        Some(parent) if !parent.is_empty() => document_name(project_id, parent),
+        _ => document_root(project_id),
     }
 }
 
@@ -43,7 +51,7 @@ pub(super) fn relative_document_name_for(
 
 /// `projects/{p}/databases/{db}/documents/{relative}` を 1 回だけ走査して分解する。
 ///
-/// 返り値はすべて `name` からの借用で、追加の確保核心竞争力がない。
+/// 返り値はすべて `name` からの借用で、追加の確保がない。
 /// 相対パスは `documents/` 以降の連続した部分文字列なので、
 /// `splitn(6, '/')` の 6 番目がそのまま相対パスになる(`Vec` への収集と
 /// `join("/")` による再構築が不要になる)。この関数は decode / query の
@@ -96,6 +104,18 @@ pub(super) fn split_collection_path(path: &str) -> Result<(Option<String>, &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn document_root_is_the_single_source_for_every_assembled_path() {
+        // document_name and parent_path must delegate, so a future database-id
+        // change cannot update the query parent but not the read/write target.
+        let root = document_root("p");
+        assert_eq!(root, "projects/p/databases/(default)/documents");
+        assert_eq!(document_name("p", "users/a"), format!("{root}/users/a"));
+        assert_eq!(parent_path("p", None), root);
+        assert_eq!(parent_path("p", Some("")), root);
+        assert_eq!(parent_path("p", Some("users")), format!("{root}/users"));
+    }
 
     #[test]
     fn split_collection_path_supports_subcollections() {
