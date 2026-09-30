@@ -174,18 +174,71 @@ fn print_usage() {
 /// Reading both names lets one Firebase CLI project (`--project X`) drive the
 /// Firestore and Auth emulators together without exporting a second variable.
 fn project_id_from_env(prefer_firebase: bool) -> String {
+    resolve_project_id(prefer_firebase, |key| env::var(key).ok())
+}
+
+/// Pure precedence rule behind [`project_id_from_env`], split out so it can be
+/// tested without mutating process-wide environment state.
+fn resolve_project_id(prefer_firebase: bool, lookup: impl Fn(&str) -> Option<String>) -> String {
     let (first, second) = if prefer_firebase {
         ("FIREBASE_PROJECT_ID", "FIRESTORE_PROJECT_ID")
     } else {
         ("FIRESTORE_PROJECT_ID", "FIREBASE_PROJECT_ID")
     };
-    env::var(first)
-        .or_else(|_| env::var(second))
-        .unwrap_or_else(|_| "firelang-test".to_string())
+    lookup(first)
+        .or_else(|| lookup(second))
+        .unwrap_or_else(|| "firelang-test".to_string())
 }
 
 fn read_stdin() -> Result<String, Box<dyn Error>> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_project_id;
+
+    fn lookup<'a>(values: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            values
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
+    #[test]
+    fn firestore_backend_keeps_firestore_project_id_precedence() {
+        let both = lookup(&[
+            ("FIRESTORE_PROJECT_ID", "from-firestore"),
+            ("FIREBASE_PROJECT_ID", "from-firebase"),
+        ]);
+        assert_eq!(resolve_project_id(false, both), "from-firestore");
+    }
+
+    #[test]
+    fn auth_backend_prefers_firebase_project_id() {
+        let both = lookup(&[
+            ("FIRESTORE_PROJECT_ID", "from-firestore"),
+            ("FIREBASE_PROJECT_ID", "from-firebase"),
+        ]);
+        assert_eq!(resolve_project_id(true, both), "from-firebase");
+    }
+
+    #[test]
+    fn each_backend_falls_back_to_the_other_name() {
+        let only_firebase = lookup(&[("FIREBASE_PROJECT_ID", "shared")]);
+        assert_eq!(resolve_project_id(false, only_firebase), "shared");
+        let only_firestore = lookup(&[("FIRESTORE_PROJECT_ID", "shared")]);
+        assert_eq!(resolve_project_id(true, only_firestore), "shared");
+    }
+
+    #[test]
+    fn default_project_id_is_used_when_unset() {
+        let empty = lookup(&[]);
+        assert_eq!(resolve_project_id(false, &empty), "firelang-test");
+        assert_eq!(resolve_project_id(true, &empty), "firelang-test");
+    }
 }
