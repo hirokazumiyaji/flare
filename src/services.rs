@@ -9,10 +9,11 @@
 use std::error::Error;
 use std::time::Duration;
 
-use crate::auth::Auth;
+pub use crate::auth::Auth;
+pub use crate::storage::Storage;
+
 use crate::error::{CapabilityError, FirelangError};
 use crate::firestore::{Firestore, InMemoryFirestore};
-use crate::storage::Storage;
 
 /// Default project used by local in-memory execution.
 pub const DEFAULT_PROJECT_ID: &str = "firelang-test";
@@ -61,9 +62,7 @@ impl ProjectConfig {
 
     pub fn try_new(project_id: impl Into<String>) -> Result<Self, Box<dyn Error>> {
         let config = Self::new(project_id);
-        if config.project_id.trim().is_empty() {
-            return Err("project id must not be empty".into());
-        }
+        config.validate()?;
         Ok(config)
     }
 
@@ -112,6 +111,16 @@ impl ProjectConfig {
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }
+
+    pub fn validate(&self) -> Result<(), Box<dyn Error>> {
+        if self.project_id.trim().is_empty() {
+            return Err("project id must not be empty".into());
+        }
+        if self.request_timeout.is_zero() {
+            return Err("request timeout must be greater than zero".into());
+        }
+        Ok(())
+    }
 }
 
 /// The set of optional capabilities available to one script context.
@@ -133,6 +142,11 @@ impl Default for Services {
 }
 
 impl Services {
+    /// Construct an empty service set explicitly.
+    pub fn new() -> Self {
+        Self::empty()
+    }
+
     /// No capabilities are configured.  This is the strict configuration for
     /// capability-error tests and for a host that only evaluates pure scripts.
     pub fn empty() -> Self {
@@ -216,6 +230,10 @@ impl Services {
         self
     }
 
+    pub fn is_empty(&self) -> bool {
+        !self.has_firestore() && !self.has_auth() && !self.has_storage()
+    }
+
     pub fn has_firestore(&self) -> bool {
         self.firestore.is_some()
     }
@@ -252,6 +270,45 @@ impl Services {
         self.storage.as_deref_mut()
     }
 
+    pub fn require_firestore(&self, operation: &str) -> Result<&dyn Firestore, Box<dyn Error>> {
+        self.firestore_ref()
+            .ok_or_else(|| capability_error("firestore", operation))
+    }
+
+    pub fn require_auth(&self, operation: &str) -> Result<&dyn Auth, Box<dyn Error>> {
+        self.auth_ref()
+            .ok_or_else(|| capability_error("auth", operation))
+    }
+
+    pub fn require_storage(&self, operation: &str) -> Result<&dyn Storage, Box<dyn Error>> {
+        self.storage_ref()
+            .ok_or_else(|| capability_error("storage", operation))
+    }
+
+    pub fn require_firestore_mut(
+        &mut self,
+        operation: &str,
+    ) -> Result<&mut (dyn Firestore + 'static), Box<dyn Error>> {
+        self.firestore_mut()
+            .ok_or_else(|| capability_error("firestore", operation))
+    }
+
+    pub fn require_auth_mut(
+        &mut self,
+        operation: &str,
+    ) -> Result<&mut (dyn Auth + 'static), Box<dyn Error>> {
+        self.auth_mut()
+            .ok_or_else(|| capability_error("auth", operation))
+    }
+
+    pub fn require_storage_mut(
+        &mut self,
+        operation: &str,
+    ) -> Result<&mut (dyn Storage + 'static), Box<dyn Error>> {
+        self.storage_mut()
+            .ok_or_else(|| capability_error("storage", operation))
+    }
+
     pub fn into_runtime_context(self) -> RuntimeContext {
         RuntimeContext::new(self)
     }
@@ -278,6 +335,13 @@ impl ServicesBuilder {
         self
     }
 
+    pub fn with_firestore<F>(self, firestore: F) -> Self
+    where
+        F: Firestore + 'static,
+    {
+        self.firestore(firestore)
+    }
+
     pub fn auth<A>(mut self, auth: A) -> Self
     where
         A: Auth + 'static,
@@ -286,12 +350,26 @@ impl ServicesBuilder {
         self
     }
 
+    pub fn with_auth<A>(self, auth: A) -> Self
+    where
+        A: Auth + 'static,
+    {
+        self.auth(auth)
+    }
+
     pub fn storage<S>(mut self, storage: S) -> Self
     where
         S: Storage + 'static,
     {
         self.storage = Some(Box::new(storage));
         self
+    }
+
+    pub fn with_storage<S>(self, storage: S) -> Self
+    where
+        S: Storage + 'static,
+    {
+        self.storage(storage)
     }
 
     pub fn build(self) -> Services {
@@ -326,6 +404,12 @@ impl Default for RuntimeContext {
 }
 
 impl RuntimeContext {
+    /// Start a builder that composes project configuration and capabilities in
+    /// one expression.
+    pub fn builder() -> RuntimeContextBuilder {
+        RuntimeContextBuilder::new()
+    }
+
     pub fn new(services: impl Into<Services>) -> Self {
         Self {
             config: ProjectConfig::default(),
@@ -348,6 +432,23 @@ impl RuntimeContext {
         Self::new(services)
     }
 
+    pub fn with_project_config(mut self, config: ProjectConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn from_parts(config: ProjectConfig, services: impl Into<Services>) -> Self {
+        Self::with_config(config, services)
+    }
+
+    pub fn try_with_config(
+        config: ProjectConfig,
+        services: impl Into<Services>,
+    ) -> Result<Self, Box<dyn Error>> {
+        config.validate()?;
+        Ok(Self::with_config(config, services))
+    }
+
     /// Construct the strict Firestore-only adapter context.
     pub fn firestore_only<F>(firestore: F) -> Self
     where
@@ -368,6 +469,10 @@ impl RuntimeContext {
         &self.config
     }
 
+    pub fn project(&self) -> &ProjectConfig {
+        self.project_config()
+    }
+
     pub fn project_id(&self) -> &str {
         self.config.project_id()
     }
@@ -379,17 +484,90 @@ impl RuntimeContext {
     pub fn services_mut(&mut self) -> &mut Services {
         &mut self.services
     }
+
+    pub fn into_services(self) -> Services {
+        self.services
+    }
+
+    pub fn has_firestore(&self) -> bool {
+        self.services.has_firestore()
+    }
+
+    pub fn has_auth(&self) -> bool {
+        self.services.has_auth()
+    }
+
+    pub fn has_storage(&self) -> bool {
+        self.services.has_storage()
+    }
+}
+
+/// Builder for [`RuntimeContext`].
+#[derive(Default)]
+pub struct RuntimeContextBuilder {
+    config: ProjectConfig,
+    services: ServicesBuilder,
+}
+
+impl RuntimeContextBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn config(mut self, config: ProjectConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn project_config(self, config: ProjectConfig) -> Self {
+        self.config(config)
+    }
+
+    pub fn services(mut self, services: impl Into<Services>) -> Self {
+        let services = services.into();
+        self.services = ServicesBuilder {
+            firestore: services.firestore,
+            auth: services.auth,
+            storage: services.storage,
+        };
+        self
+    }
+
+    pub fn firestore<F: Firestore + 'static>(mut self, firestore: F) -> Self {
+        self.services = self.services.firestore(firestore);
+        self
+    }
+
+    pub fn with_firestore<F: Firestore + 'static>(self, firestore: F) -> Self {
+        self.firestore(firestore)
+    }
+
+    pub fn auth<A: Auth + 'static>(mut self, auth: A) -> Self {
+        self.services = self.services.auth(auth);
+        self
+    }
+
+    pub fn with_auth<A: Auth + 'static>(self, auth: A) -> Self {
+        self.auth(auth)
+    }
+
+    pub fn storage<S: Storage + 'static>(mut self, storage: S) -> Self {
+        self.services = self.services.storage(storage);
+        self
+    }
+
+    pub fn with_storage<S: Storage + 'static>(self, storage: S) -> Self {
+        self.storage(storage)
+    }
+
+    pub fn build(self) -> RuntimeContext {
+        RuntimeContext::with_config(self.config, self.services.build())
+    }
 }
 
 impl From<Services> for RuntimeContext {
     fn from(services: Services) -> Self {
         Self::new(services)
-    }
-}
-
-impl From<RuntimeContext> for Services {
-    fn from(context: RuntimeContext) -> Self {
-        context.services
     }
 }
 
@@ -437,6 +615,11 @@ mod tests {
             .with_request_timeout(Duration::from_millis(250));
         assert_eq!(config.project_id(), "demo");
         assert_eq!(config.request_timeout(), Duration::from_millis(250));
+        assert!(config.validate().is_ok());
+        assert!(ProjectConfig::new("demo")
+            .with_request_timeout(Duration::ZERO)
+            .validate()
+            .is_err());
         // Compile-time guard: adding a credential field would make this literal
         // require another field and fail the test.
         let _ = ProjectConfig {
@@ -449,11 +632,25 @@ mod tests {
     }
 
     #[test]
+    fn context_builder_composes_all_capabilities() {
+        let context = RuntimeContext::builder()
+            .config(ProjectConfig::new("builder-project"))
+            .firestore(InMemoryFirestore::default())
+            .auth(InMemoryAuth::new())
+            .storage(InMemoryStorage::new())
+            .build();
+        assert_eq!(context.project_id(), "builder-project");
+        assert!(context.services().has_firestore());
+        assert!(context.services().has_auth());
+        assert!(context.services().has_storage());
+    }
+
+    #[test]
     fn context_conversions_preserve_services_and_config() {
         let config = ProjectConfig::new("demo");
         let context = RuntimeContext::with_config(config.clone(), Services::in_memory());
         assert_eq!(context.project_config(), &config);
-        let services: Services = context.into();
+        let services = context.into_services();
         assert!(services.has_firestore());
     }
 }

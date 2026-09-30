@@ -397,6 +397,8 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 
 - Float(数値は Int のみ)
 - 本番 Firestore への認証付きアクセス
+- 本番 Firebase Authentication / Cloud Storage への認証付きアクセス
+- Auth / Storage の token を script の値として直接 read する API
 - transaction の自動リトライ
 - カーソルによるページネーション(`start_after` 等。`order_by` + `offset` + `limit` で代替)
 - リスナー(リアルタイム購読)・インデックス依存機能
@@ -454,15 +456,18 @@ Auth の戻り値は次の Map とする。未設定の optional field は `nil`
 
 | 関数 | 戻り値 | 説明 |
 |------|--------|------|
-| `auth_sign_in(email, password)` | Map | email / password で sign-in して user を返す |
+| `auth_sign_up(email, password)` | Map | email / password の local user を作って sign-in する |
+| `auth_sign_in(email, password)` / `auth_login(email, password)` | Map | email / password で sign-in して user を返す |
 | `auth_sign_in_anonymously()` | Map | anonymous user を作って sign-in する |
 | `auth_current_user()` | Map / Nil | 現在の user。未 sign-in なら nil |
 | `auth_user()` | Map / Nil | `auth_current_user()` の alias |
-| `auth_sign_out()` | Nil | local session を破棄する |
+| `auth_sign_out()` / `auth_logout()` | Nil | local session を破棄する |
 
 - `run_script` の既定 Auth は `InMemoryAuth` で、既定の user は 0 件である。
+  `auth_sign_up` を使う script はその場で local user を作れる。
   `auth_sign_in` を使う host は `InMemoryAuth::with_user` などで user を登録してから context を作る。
 - `auth_sign_in_anonymously()` は user を 1 件作る。
+- `AuthEmulator` は in-process の emulator-mode adapter であり、Auth emulator への HTTP 接続は行わない。
 - password は call の引数として provider へ渡すが、戻り値や `ProjectConfig` には含めない。
 - ID token、refresh token、credential を script の `Value` として公開しない。
   token を使う operation を追加する場合も、表示と `inspect` では redact する。
@@ -475,11 +480,12 @@ Firestore の document path のような segment 数の偶奇規則は適用し�
 
 | 関数 | 戻り値 | 説明 |
 |------|--------|------|
-| `storage_put(path, data)` | Map | object を保存して object Map を返す |
+| `storage_put(path, data)` / `storage_upload(path, data)` | Map | object を保存して object Map を返す |
 | `storage_put(path, data, content_type: "...")` | Map | content type を付けて保存する |
 | `storage_write(...)` | Map | `storage_put` の alias |
-| `storage_get(path)` | 値 / Nil | data を返す。object が無ければ nil |
+| `storage_get(path)` / `storage_download(path)` | 値 / Nil | data を返す。object が無ければ nil |
 | `storage_read(path)` | 値 / Nil | `storage_get` の alias |
+| `storage_metadata(path)` | Map / Nil | object の path、data、metadata を返す |
 | `storage_list()` / `storage_list(prefix)` | Array\<Map> | directory 境界で list する。path 昇順 |
 | `storage_delete(path)` | Bool | object を削除する。元から無ければ false |
 | `storage_remove(path)` | Bool | `storage_delete` の alias |
@@ -496,6 +502,7 @@ Firestore の document path のような segment 数の偶奇規則は適用し�
 - `storage_get` は data だけを返す。
 - `storage_list("images")` は `images` 自身と `images/...` だけを返す。
   `images-old/...` は含まない。
+- `StorageEmulator` は in-process の emulator-mode adapter であり、Storage emulator への HTTP 接続は行わない。
 - `data` には Int / Str / Bool / Nil / Array / Map / Timestamp を渡せる。
   Firestore の field transform sentinel、reference、query、function は保存しない。
 

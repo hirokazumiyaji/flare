@@ -6,8 +6,8 @@ use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
 use crate::auth::Auth;
 use crate::error::{FirelangError, Span};
 use crate::firestore::{Firestore, InMemoryFirestore, WriteOp};
-use crate::services::{capability_error, RuntimeContext, Services};
-use crate::storage::{Storage, StorageObject};
+use crate::services::{RuntimeContext, Services};
+use crate::storage::{validate_content_type, validate_storage_path, Storage, StorageObject};
 use crate::value::{
     CollectionGroupRef, CollectionRef, Direction, DocRef, QueryFilter, QueryOp, QueryRef,
     Timestamp, UserFunc, Value,
@@ -57,6 +57,14 @@ impl<F> Runtime<F> {
         Self::from_context(context)
     }
 
+    /// Construct from a context using its existing project configuration.
+    pub fn new_with_config(
+        config: crate::services::ProjectConfig,
+        services: impl Into<Services>,
+    ) -> Self {
+        Self::with_services_and_config(config, services)
+    }
+
     /// Construct with an explicitly selected service set and the default
     /// project configuration.
     pub fn with_services(services: impl Into<Services>) -> Self {
@@ -93,6 +101,10 @@ impl<F> Runtime<F> {
         &mut self.context
     }
 
+    pub fn into_context(self) -> RuntimeContext {
+        self.context
+    }
+
     pub fn services(&self) -> &Services {
         self.context.services()
     }
@@ -105,52 +117,54 @@ impl<F> Runtime<F> {
         self.context.project_config()
     }
 
+    pub fn project_id(&self) -> &str {
+        self.context.project_id()
+    }
+
+    pub fn config(&self) -> &crate::services::ProjectConfig {
+        self.project_config()
+    }
+
+    pub fn has_firestore(&self) -> bool {
+        self.context.services().has_firestore()
+    }
+
+    pub fn has_auth(&self) -> bool {
+        self.context.services().has_auth()
+    }
+
+    pub fn has_storage(&self) -> bool {
+        self.context.services().has_storage()
+    }
+
     fn firestore(&self, operation: &str) -> Result<&dyn Firestore, Box<dyn Error>> {
-        self.context
-            .services
-            .firestore_ref()
-            .ok_or_else(|| capability_error("firestore", operation))
+        self.context.services.require_firestore(operation)
     }
 
     fn firestore_mut(
         &mut self,
         operation: &str,
     ) -> Result<&mut (dyn Firestore + 'static), Box<dyn Error>> {
-        self.context
-            .services
-            .firestore_mut()
-            .ok_or_else(|| capability_error("firestore", operation))
+        self.context.services.require_firestore_mut(operation)
     }
 
     fn auth(&self, operation: &str) -> Result<&dyn Auth, Box<dyn Error>> {
-        self.context
-            .services
-            .auth_ref()
-            .ok_or_else(|| capability_error("auth", operation))
+        self.context.services.require_auth(operation)
     }
 
     fn auth_mut(&mut self, operation: &str) -> Result<&mut (dyn Auth + 'static), Box<dyn Error>> {
-        self.context
-            .services
-            .auth_mut()
-            .ok_or_else(|| capability_error("auth", operation))
+        self.context.services.require_auth_mut(operation)
     }
 
     fn storage(&self, operation: &str) -> Result<&dyn Storage, Box<dyn Error>> {
-        self.context
-            .services
-            .storage_ref()
-            .ok_or_else(|| capability_error("storage", operation))
+        self.context.services.require_storage(operation)
     }
 
     fn storage_mut(
         &mut self,
         operation: &str,
     ) -> Result<&mut (dyn Storage + 'static), Box<dyn Error>> {
-        self.context
-            .services
-            .storage_mut()
-            .ok_or_else(|| capability_error("storage", operation))
+        self.context.services.require_storage_mut(operation)
     }
 }
 
@@ -169,6 +183,41 @@ impl<F: Firestore + 'static> Runtime<F> {
     /// Explicit spelling of the legacy adapter.
     pub fn with_firestore(fs: F) -> Self {
         Self::new(fs)
+    }
+
+    /// Compose a Firestore backend with an Auth provider without introducing
+    /// another evaluator type parameter.
+    pub fn with_auth<A: Auth + 'static>(fs: F, auth: A) -> Self {
+        Self::from_context(RuntimeContext::new(
+            Services::from_firestore(fs).with_auth(auth),
+        ))
+    }
+
+    pub fn new_with_auth<A: Auth + 'static>(fs: F, auth: A) -> Self {
+        Self::with_auth(fs, auth)
+    }
+
+    /// Compose a Firestore backend with a Storage provider.
+    pub fn with_storage<S: Storage + 'static>(fs: F, storage: S) -> Self {
+        Self::from_context(RuntimeContext::new(
+            Services::from_firestore(fs).with_storage(storage),
+        ))
+    }
+
+    pub fn new_with_storage<S: Storage + 'static>(fs: F, storage: S) -> Self {
+        Self::with_storage(fs, storage)
+    }
+
+    pub fn with_auth_and_storage<A: Auth + 'static, S: Storage + 'static>(
+        fs: F,
+        auth: A,
+        storage: S,
+    ) -> Self {
+        Self::from_context(RuntimeContext::new(
+            Services::from_firestore(fs)
+                .with_auth(auth)
+                .with_storage(storage),
+        ))
     }
 }
 
@@ -681,12 +730,18 @@ const BUILTIN_NAMES: &[&str] = &[
     "batch",
     "transaction",
     "auth_sign_in",
+    "auth_login",
+    "auth_sign_up",
     "auth_sign_out",
+    "auth_logout",
     "auth_current_user",
     "auth_sign_in_anonymously",
     "auth_user",
     "storage_put",
+    "storage_upload",
     "storage_get",
+    "storage_download",
+    "storage_metadata",
     "storage_delete",
     "storage_list",
     "storage_read",
@@ -702,7 +757,7 @@ type Builtin<F> = fn(
 ) -> Result<Value, Box<dyn Error>>;
 
 /// ビルトインの対応テーブル。
-fn builtin_entries<F: Firestore + 'static>() -> [(&'static str, Builtin<F>); 31] {
+fn builtin_entries<F: Firestore + 'static>() -> [(&'static str, Builtin<F>); 37] {
     [
         ("puts", builtin_puts),
         ("doc", builtin_doc),
@@ -724,12 +779,18 @@ fn builtin_entries<F: Firestore + 'static>() -> [(&'static str, Builtin<F>); 31]
         ("batch", builtin_batch),
         ("transaction", builtin_transaction),
         ("auth_sign_in", builtin_auth_sign_in),
+        ("auth_login", builtin_auth_login),
+        ("auth_sign_up", builtin_auth_sign_up),
         ("auth_sign_out", builtin_auth_sign_out),
+        ("auth_logout", builtin_auth_logout),
         ("auth_current_user", builtin_auth_current_user),
         ("auth_sign_in_anonymously", builtin_auth_sign_in_anonymously),
         ("auth_user", builtin_auth_user),
         ("storage_put", builtin_storage_put),
+        ("storage_upload", builtin_storage_upload),
         ("storage_get", builtin_storage_get),
+        ("storage_download", builtin_storage_download),
+        ("storage_metadata", builtin_storage_metadata),
         ("storage_delete", builtin_storage_delete),
         ("storage_list", builtin_storage_list),
         ("storage_read", builtin_storage_read),
@@ -1023,6 +1084,25 @@ fn builtin_transaction<F: Firestore + 'static>(
     }
 }
 
+fn builtin_auth_sign_up<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    reject_service_kwargs(&kwargs)?;
+    if args.len() != 2 {
+        return Err("auth_sign_up expects email and password".into());
+    }
+    let email = expect_string(args.first())?;
+    let password = expect_string(args.get(1))?;
+    let user = rt
+        .auth_mut("sign_up")?
+        .sign_up(email, password)
+        .map_err(service_err)?;
+    Ok(auth_user_value(user))
+}
+
 fn builtin_auth_sign_in<F: Firestore + 'static>(
     rt: &mut Runtime<F>,
     args: Vec<Value>,
@@ -1042,6 +1122,15 @@ fn builtin_auth_sign_in<F: Firestore + 'static>(
     Ok(auth_user_value(user))
 }
 
+fn builtin_auth_login<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    builtin_auth_sign_in(rt, args, kwargs, block)
+}
+
 fn builtin_auth_sign_out<F: Firestore + 'static>(
     rt: &mut Runtime<F>,
     args: Vec<Value>,
@@ -1052,6 +1141,15 @@ fn builtin_auth_sign_out<F: Firestore + 'static>(
     expect_no_service_args("auth_sign_out", &args)?;
     rt.auth_mut("sign_out")?.sign_out().map_err(service_err)?;
     Ok(Value::Nil)
+}
+
+fn builtin_auth_logout<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    builtin_auth_sign_out(rt, args, kwargs, block)
 }
 
 fn builtin_auth_current_user<F: Firestore + 'static>(
@@ -1106,6 +1204,7 @@ fn builtin_storage_put<F: Firestore + 'static>(
     }
     validate_storage_value(&args[1])?;
     let path = expect_string(args.first())?.to_string();
+    validate_storage_path(&path)?;
     let mut object = StorageObject::new(path, args[1].clone());
     for key in kwargs.keys() {
         if key != "content_type" {
@@ -1116,6 +1215,7 @@ fn builtin_storage_put<F: Firestore + 'static>(
         let Value::Str(content_type) = content_type else {
             return Err("storage_put content_type must be string".into());
         };
+        validate_content_type(content_type)?;
         object.content_type = Some(content_type.clone());
     }
     Ok(rt
@@ -1123,6 +1223,15 @@ fn builtin_storage_put<F: Firestore + 'static>(
         .put_object(object)
         .map_err(service_err)?
         .to_value())
+}
+
+fn builtin_storage_upload<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    builtin_storage_put(rt, args, kwargs, block)
 }
 
 fn builtin_storage_get<F: Firestore + 'static>(
@@ -1136,11 +1245,41 @@ fn builtin_storage_get<F: Firestore + 'static>(
         return Err("storage_get expects path".into());
     }
     let path = expect_string(args.first())?;
+    validate_storage_path(path)?;
     Ok(rt
         .storage("get")?
         .get(path)
         .map_err(service_err)?
         .map(|object| object.data)
+        .unwrap_or(Value::Nil))
+}
+
+fn builtin_storage_download<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    builtin_storage_get(rt, args, kwargs, block)
+}
+
+fn builtin_storage_metadata<F: Firestore + 'static>(
+    rt: &mut Runtime<F>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<Value, Box<dyn Error>> {
+    reject_service_kwargs(&kwargs)?;
+    if args.len() != 1 {
+        return Err("storage_metadata expects path".into());
+    }
+    let path = expect_string(args.first())?;
+    validate_storage_path(path)?;
+    Ok(rt
+        .storage("metadata")?
+        .get(path)
+        .map_err(service_err)?
+        .map(|object| object.to_value())
         .unwrap_or(Value::Nil))
 }
 
@@ -1155,6 +1294,7 @@ fn builtin_storage_delete<F: Firestore + 'static>(
         return Err("storage_delete expects path".into());
     }
     let path = expect_string(args.first())?;
+    validate_storage_path(path)?;
     Ok(Value::Bool(
         rt.storage_mut("delete")?
             .delete(path)

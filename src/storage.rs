@@ -107,6 +107,18 @@ pub trait Storage {
         self.get(path)
     }
 
+    fn download(&self, path: &str) -> Result<Option<StorageObject>, Box<dyn Error>> {
+        self.get(path)
+    }
+
+    fn metadata(&self, path: &str) -> Result<Option<StorageObject>, Box<dyn Error>> {
+        self.get(path)
+    }
+
+    fn upload(&mut self, path: &str, data: Value) -> Result<StorageObject, Box<dyn Error>> {
+        self.put(path, data)
+    }
+
     fn remove(&mut self, path: &str) -> Result<bool, Box<dyn Error>> {
         self.delete(path)
     }
@@ -121,6 +133,10 @@ pub struct InMemoryStorage {
 impl InMemoryStorage {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn insert(&mut self, object: StorageObject) -> Result<StorageObject, Box<dyn Error>> {
+        self.put_object(object)
     }
 
     pub fn len(&self) -> usize {
@@ -201,6 +217,7 @@ impl StorageEmulator {
     /// Detect non-secret emulator configuration without opening a connection.
     pub fn from_env() -> Option<Self> {
         let project_id = std::env::var("FIREBASE_PROJECT_ID")
+            .or_else(|_| std::env::var("GCLOUD_PROJECT"))
             .or_else(|_| std::env::var("FIRESTORE_PROJECT_ID"))
             .unwrap_or_else(|_| "firelang-test".to_string());
         std::env::var("FIREBASE_STORAGE_EMULATOR_HOST")
@@ -246,6 +263,30 @@ impl Storage for StorageEmulator {
 /// Alias for hosts that name their in-process emulator-mode adapter with the
 /// Firebase provider.
 pub type FirebaseStorageEmulator = StorageEmulator;
+
+/// Validate a Storage object path without performing I/O.
+///
+/// Storage paths are directory-style names, not Firestore document paths, so
+/// they have no even/odd segment rule.
+pub fn validate_storage_path(path: &str) -> Result<(), Box<dyn Error>> {
+    normalize_path(path).map(|_| ())
+}
+
+/// Validate a media type string used by a provider adapter.
+pub fn validate_content_type(content_type: &str) -> Result<(), Box<dyn Error>> {
+    let invalid = content_type.trim().is_empty()
+        || content_type.trim() != content_type
+        || content_type.chars().any(char::is_control);
+    let essence = content_type.split(';').next().unwrap_or_default().trim();
+    let valid_essence = essence.split('/').count() == 2
+        && !essence.starts_with('/')
+        && !essence.ends_with('/')
+        && !essence.chars().any(char::is_whitespace);
+    if invalid || !valid_essence {
+        return Err(format!("invalid storage content type: {content_type}").into());
+    }
+    Ok(())
+}
 
 fn normalize_path(path: &str) -> Result<String, Box<dyn Error>> {
     if path.is_empty()
@@ -296,6 +337,16 @@ mod tests {
         assert!(storage.delete("images/a.png").unwrap());
         assert!(!storage.delete("images/a.png").unwrap());
         assert!(storage.get("images/a.png").unwrap().is_none());
+    }
+
+    #[test]
+    fn public_path_and_content_type_validators_are_provider_neutral() {
+        validate_storage_path("avatars/alice.png").unwrap();
+        assert!(validate_storage_path("/avatars").is_err());
+        validate_content_type("image/png").unwrap();
+        assert!(validate_content_type("").is_err());
+        assert!(validate_content_type("image").is_err());
+        assert!(validate_content_type("image/png\n").is_err());
     }
 
     #[test]

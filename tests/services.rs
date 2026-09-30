@@ -2,17 +2,16 @@
 
 use std::error::Error;
 
-use firelang::runtime::Runtime;
 use firelang::{
     run_script, run_script_with_firestore, run_script_with_services, Auth, AuthUser, ErrorKind,
-    FirelangError, InMemoryAuth, InMemoryFirestore, InMemoryStorage, ProjectConfig, RuntimeContext,
-    Services, Storage, StorageObject, Value,
+    FirelangError, InMemoryAuth, InMemoryFirestore, InMemoryStorage, ProjectConfig, Runtime,
+    RuntimeContext, Services, Storage, StorageObject, Value,
 };
 
 #[test]
 fn default_runtime_uses_all_in_memory_services_without_an_emulator() {
     let out = run_script(
-        r#"user = auth_sign_in_anonymously()
+        r#"user = auth_sign_up("local@example.com", "secret")
 storage_put("notes/a.txt", "hello", content_type: "text/plain")
 [
   auth_current_user()["uid"] == user["uid"],
@@ -215,6 +214,21 @@ fn explicit_runtime_type_and_constructor_remain_source_compatible() {
         .run("set(\"users/1\", {n: 7})\nget(\"users/1\")[\"n\"]")
         .unwrap();
     assert_eq!(out, Value::Int(7));
+}
+
+#[test]
+fn emulator_mode_adapters_are_drop_in_capability_implementations() {
+    let auth = firelang::AuthEmulator::new("demo").with_user(
+        AuthUser::new("emu-user").with_email("emu@example.com"),
+        "secret",
+    );
+    let storage = firelang::StorageEmulator::new("demo");
+    let out = run_script_with_services(
+        r#"auth_sign_in("emu@example.com", "secret")["uid"]
+storage_put("emu/a", "ok")"#,
+        Services::builder().auth(auth).storage(storage).build(),
+    );
+    assert!(out.is_ok(), "{out:?}");
 }
 
 #[test]

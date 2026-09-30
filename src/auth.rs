@@ -61,6 +61,13 @@ impl AuthUser {
 /// selected providers without adding a type parameter to `Runtime`.
 pub trait Auth {
     fn sign_in(&mut self, email: &str, password: &str) -> Result<AuthUser, Box<dyn Error>>;
+
+    /// Create a local account and make it the current session when the
+    /// provider supports email/password sign-up.
+    fn sign_up(&mut self, _email: &str, _password: &str) -> Result<AuthUser, Box<dyn Error>> {
+        Err("authentication provider does not support sign-up".into())
+    }
+
     fn sign_out(&mut self) -> Result<(), Box<dyn Error>>;
     fn current_user(&self) -> Result<Option<AuthUser>, Box<dyn Error>>;
 
@@ -75,6 +82,18 @@ pub trait Auth {
     /// implement.
     fn verify_token(&self, _token: &str) -> Result<Option<AuthUser>, Box<dyn Error>> {
         Err("authentication provider does not support token verification".into())
+    }
+
+    fn login(&mut self, email: &str, password: &str) -> Result<AuthUser, Box<dyn Error>> {
+        self.sign_in(email, password)
+    }
+
+    fn logout(&mut self) -> Result<(), Box<dyn Error>> {
+        self.sign_out()
+    }
+
+    fn user(&self) -> Result<Option<AuthUser>, Box<dyn Error>> {
+        self.current_user()
     }
 }
 
@@ -129,6 +148,14 @@ impl InMemoryAuth {
         Ok(())
     }
 
+    pub fn insert_user(
+        &mut self,
+        user: AuthUser,
+        password: impl Into<String>,
+    ) -> Result<(), Box<dyn Error>> {
+        self.add_user(user, password)
+    }
+
     pub fn user_count(&self) -> usize {
         self.users.len()
     }
@@ -144,6 +171,23 @@ impl InMemoryAuth {
 }
 
 impl Auth for InMemoryAuth {
+    fn sign_up(&mut self, email: &str, password: &str) -> Result<AuthUser, Box<dyn Error>> {
+        if email.trim().is_empty() || password.is_empty() {
+            return Err("auth email and password must not be empty".into());
+        }
+        if self
+            .users
+            .values()
+            .any(|stored| stored.user.email.as_deref() == Some(email))
+        {
+            return Err(format!("auth user already exists: {email}").into());
+        }
+        let user = AuthUser::new(self.create_uid()).with_email(email);
+        self.add_user(user.clone(), password)?;
+        self.current_uid = Some(user.uid.clone());
+        Ok(user)
+    }
+
     fn sign_in(&mut self, email: &str, password: &str) -> Result<AuthUser, Box<dyn Error>> {
         let user = self
             .users
@@ -207,6 +251,7 @@ impl AuthEmulator {
     /// detected host.
     pub fn from_env() -> Option<Self> {
         let project_id = std::env::var("FIREBASE_PROJECT_ID")
+            .or_else(|_| std::env::var("GCLOUD_PROJECT"))
             .or_else(|_| std::env::var("FIRESTORE_PROJECT_ID"))
             .unwrap_or_else(|_| "firelang-test".to_string());
         std::env::var("FIREBASE_AUTH_EMULATOR_HOST")
@@ -231,6 +276,10 @@ impl AuthEmulator {
 }
 
 impl Auth for AuthEmulator {
+    fn sign_up(&mut self, email: &str, password: &str) -> Result<AuthUser, Box<dyn Error>> {
+        self.inner.sign_up(email, password)
+    }
+
     fn sign_in(&mut self, email: &str, password: &str) -> Result<AuthUser, Box<dyn Error>> {
         self.inner.sign_in(email, password)
     }
@@ -282,6 +331,15 @@ mod tests {
         auth.sign_out().unwrap();
         assert!(!auth.is_signed_in());
         assert_eq!(auth.current_user().unwrap(), None);
+    }
+
+    #[test]
+    fn sign_up_creates_a_session_and_rejects_duplicate_email() {
+        let mut auth = InMemoryAuth::new();
+        let user = auth.sign_up("new@example.com", "secret").unwrap();
+        assert_eq!(auth.current_user().unwrap(), Some(user.clone()));
+        let err = auth.sign_up("new@example.com", "other").unwrap_err();
+        assert!(format!("{err}").contains("already exists"));
     }
 
     #[test]

@@ -49,7 +49,7 @@ let services = Services::builder()
     .firestore(InMemoryFirestore::default())
     .auth(InMemoryAuth::with_user(
         firelang::AuthUser::new("u1").with_email("alice@example.com"),
-        "secret",
+        "example-password",
     ))
     .storage(InMemoryStorage::default())
     .build();

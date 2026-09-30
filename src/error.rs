@@ -100,6 +100,14 @@ impl FirelangError {
             CapabilityError::new(service, operation).to_string(),
         )
     }
+
+    pub fn missing_capability(service: impl Into<String>) -> Self {
+        Self::from(CapabilityError::for_service(service))
+    }
+
+    pub fn is_capability(&self) -> bool {
+        self.kind == ErrorKind::Capability
+    }
 }
 
 impl fmt::Display for FirelangError {
@@ -137,6 +145,10 @@ impl CapabilityError {
             service: service.into(),
             operation: operation.into(),
         }
+    }
+
+    pub fn for_service(service: impl Into<String>) -> Self {
+        Self::new(service, "not configured")
     }
 }
 

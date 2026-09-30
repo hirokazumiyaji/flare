@@ -94,6 +94,23 @@ fn run_fl_with_piped_stdin(args: &[&str], stdin_text: &str) -> std::process::Out
 }
 
 #[test]
+fn fl_in_memory_backend_exposes_auth_and_storage() {
+    let out = Command::new(FL_EXE)
+        .args([
+            "-e",
+            "user = auth_sign_up(\"cli@example.com\", \"secret\")\nstorage_put(\"cli/a.txt\", \"ok\")\nuser[\"uid\"]",
+        ])
+        .output()
+        .expect("spawn fl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("in-memory-user-"));
+}
+
+#[test]
 fn fl_inline_script_with_dash_e() {
     let out = Command::new(FL_EXE)
         .args(["-e", "1 + 2"])

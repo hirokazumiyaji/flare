@@ -68,6 +68,7 @@ let mut runtime: Runtime = Runtime::from_context(RuntimeContext::new(services));
 ```bash
 cargo test                          # ユニット + in-memory テスト
 cargo test --test example_scripts   # サンプルスクリプト一括実行
+cargo test --test services           # Services / Auth / Storage の契約テスト
 cargo test --test cli               # CLI スモークテスト
 ```
 
