@@ -96,11 +96,14 @@ impl AuthEmulator {
     }
 
     fn post(&self, operation: &str, body: JsonValue) -> Result<JsonValue, AuthError> {
-        // The public Identity Toolkit endpoints are project-scoped by the
-        // API key.  The emulator accepts the conventional fake key; the
-        // project header is still sent so custom/mock transports can observe
-        // the configured project and so multi-project setups have a useful
-        // diagnostic hook.
+        // The public Identity Toolkit endpoints authenticate with the API key
+        // query parameter.  No OAuth2 `Authorization` header is sent on purpose:
+        // the emulator treats such a request as an Admin SDK call, and the
+        // sign-up operation then returns a user record *without* issuing ID or
+        // refresh tokens.
+        //
+        // The project header is still sent so multi-project setups have a
+        // useful diagnostic hook for which project this client was built for.
         let url = format!(
             "{}/identitytoolkit.googleapis.com/v1/{operation}?key={}",
             self.base_url, self.api_key
@@ -109,7 +112,6 @@ impl AuthEmulator {
             let response = self
                 .client
                 .post(url)
-                .header("Authorization", "Bearer owner")
                 .header("X-Firebase-Project-ID", &self.project_id)
                 .header("X-Goog-Api-Key", &self.api_key)
                 .json(&body)
@@ -254,13 +256,6 @@ fn network_error(error: reqwest::Error) -> AuthError {
 
 fn map_http_error(status: u16, body: &str) -> AuthError {
     let parsed = serde_json::from_str::<JsonValue>(body).ok();
-    let code = parsed
-        .as_ref()
-        .and_then(|value| value.get("error"))
-        .and_then(|error| error.get("message"))
-        .and_then(JsonValue::as_str)
-        .unwrap_or_default()
-        .to_ascii_uppercase();
     let message = parsed
         .as_ref()
         .and_then(|value| value.get("error"))
@@ -268,16 +263,24 @@ fn map_http_error(status: u16, body: &str) -> AuthError {
         .and_then(JsonValue::as_str)
         .unwrap_or("the Auth emulator returned an error");
 
+    // Identity Toolkit codes may carry a human-readable suffix, for example
+    // `WEAK_PASSWORD : Password should be at least 6 characters`.  Match on the
+    // leading code token so those details do not push a known code into the
+    // untyped fallback.
+    let code = message
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_uppercase();
+
     match code.as_str() {
         "EMAIL_NOT_FOUND" | "USER_NOT_FOUND" => AuthError::UserNotFound,
         "INVALID_PASSWORD" | "INVALID_LOGIN_CREDENTIALS" => AuthError::InvalidCredentials,
         "EMAIL_EXISTS" | "DUPLICATE_EMAIL" => AuthError::UserAlreadyExists,
         "USER_DISABLED" => AuthError::InvalidCredentials,
-        "INVALID_EMAIL" => AuthError::InvalidEmail,
-        "WEAK_PASSWORD" | "PASSWORD_LOGIN_DISABLED" => AuthError::WeakPassword,
-        _ if (500..=599).contains(&status) => {
-            AuthError::InvalidResponse(format!("Auth emulator HTTP {status}: {message}"))
-        }
+        "INVALID_EMAIL" | "MISSING_EMAIL" => AuthError::InvalidEmail,
+        "WEAK_PASSWORD" | "MISSING_PASSWORD" | "PASSWORD_LOGIN_DISABLED" => AuthError::WeakPassword,
         _ => AuthError::InvalidResponse(format!("Auth emulator HTTP {status}: {message}")),
     }
 }
@@ -406,8 +409,40 @@ mod tests {
             AuthError::InvalidCredentials
         ));
         assert!(matches!(
+            map_http_error(400, r#"{"error":{"message":"EMAIL_EXISTS"}}"#),
+            AuthError::UserAlreadyExists
+        ));
+        assert!(matches!(
+            map_http_error(400, r#"{"error":{"message":"INVALID_EMAIL"}}"#),
+            AuthError::InvalidEmail
+        ));
+        assert!(matches!(
             map_http_error(503, r#"{"error":{"message":"unavailable"}}"#),
             AuthError::InvalidResponse(_)
         ));
+    }
+
+    #[test]
+    fn maps_codes_that_carry_a_detail_suffix() {
+        // The live emulator formats this as
+        // `WEAK_PASSWORD : Password should be at least 6 characters`.
+        assert!(matches!(
+            map_http_error(
+                400,
+                r#"{"error":{"message":"WEAK_PASSWORD : Password should be at least 6 characters"}}"#
+            ),
+            AuthError::WeakPassword
+        ));
+    }
+
+    #[test]
+    fn error_details_never_echo_a_secret_or_a_url() {
+        // `map_http_error` is the only place that forwards a server message
+        // into an AuthError; it must stay free of request URLs (which can
+        // carry the API key).
+        let err = map_http_error(400, r#"{"error":{"message":"SOMETHING_UNEXPECTED"}}"#);
+        let text = err.to_string();
+        assert!(!text.contains("://"), "{text}");
+        assert!(!text.contains("key="), "{text}");
     }
 }

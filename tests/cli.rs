@@ -206,3 +206,92 @@ fn fl_validates_backend_before_reading_stdin() {
         "{stderr:?}"
     );
 }
+
+#[test]
+fn fl_validates_auth_backend_before_reading_stdin() {
+    // Unknown auth backend must fail fast, before stdin is drained.
+    let out = Command::new(FL_EXE)
+        .args(["--auth-backend", "not-a-backend", "-"])
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown auth backend: not-a-backend"),
+        "{stderr:?}"
+    );
+
+    // `--auth-backend emulator` without FIREBASE_AUTH_EMULATOR_HOST must also
+    // fail immediately rather than hanging on stdin.
+    let out = Command::new(FL_EXE)
+        .args(["--auth-backend", "emulator", "-"])
+        .env_remove("FIREBASE_AUTH_EMULATOR_HOST")
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("FIREBASE_AUTH_EMULATOR_HOST must be set"),
+        "{stderr:?}"
+    );
+}
+
+#[test]
+fn fl_auth_in_memory_smoke_keeps_tokens_out_of_output() {
+    // Default backend is the in-memory Auth stub, so the whole vertical slice
+    // is reachable without any emulator running.
+    let out = run_fl_script(
+        "auth-vertical",
+        "session = auth_sign_up(\"cli@example.com\", \"password\")\n\
+         puts(session)\n\
+         puts(auth_current_user()[\"email\"])\n\
+         auth_sign_out()\n\
+         auth_current_user()",
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("AuthSession"), "{stdout}");
+    assert!(stdout.contains("id_token=<redacted>"), "{stdout}");
+    assert!(stdout.contains("refresh_token=<redacted>"), "{stdout}");
+    assert!(stdout.contains("cli@example.com"), "{stdout}");
+    // After sign-out there is no current user, so the final result is nil.
+    assert!(stdout.trim_end().ends_with("=> nil"), "{stdout}");
+
+    // The fake token must never appear in stdout.
+    assert!(!stdout.contains("fake-id-token"), "{stdout}");
+    assert!(!stdout.contains("fake-refresh-token"), "{stdout}");
+}
+
+#[test]
+fn fl_auth_error_is_reported_with_position() {
+    let out = run_fl_script(
+        "auth-error",
+        "x = 1\nauth_sign_in(\"nobody@example.com\", \"password\")",
+    );
+    assert!(
+        !out.status.success(),
+        "failing auth script should exit nonzero"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with("error: 2:1: "),
+        "stderr should start with 'error: 2:1: ', got {stderr:?}"
+    );
+    assert!(stderr.contains("auth user not found"), "{stderr:?}");
+}
+
+#[test]
+fn fl_auth_help_mentions_auth_backend() {
+    let out = Command::new(FL_EXE)
+        .arg("--help")
+        .output()
+        .expect("spawn fl");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--auth-backend"), "{stderr:?}");
+    assert!(stderr.contains("FIREBASE_AUTH_EMULATOR_HOST"), "{stderr:?}");
+}

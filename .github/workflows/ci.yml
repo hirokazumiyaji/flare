@@ -62,3 +62,8 @@ jobs:
         run: |
           firebase emulators:exec --only firestore --project demo-firelang \
             'FIRESTORE_PROJECT_ID=demo-firelang cargo test --test firestore_emulator -- --nocapture'
+
+      - name: Run integration tests with Auth emulator
+        run: |
+          firebase emulators:exec --only auth --project demo-firelang \
+            'FIREBASE_PROJECT_ID=demo-firelang cargo test --test auth_emulator -- --nocapture'

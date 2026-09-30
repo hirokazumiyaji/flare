@@ -14,9 +14,10 @@
 - [8. batch / transaction](#8-batch--transaction)
 - [9. Timestamp API](#9-timestamp-api)
 - [10. CLI (`fl`)](#10-cli-fl)
-- [11. バックエンド](#11-バックエンド)
-- [12. スコープ外(MVP)](#12-スコープ外mvp)
-- [13. 既知の制限・実装メモ](#13-既知の制限実装メモ)
+- [11. Auth API](#11-auth-api)
+- [12. バックエンド](#12-バックエンド)
+- [13. スコープ外(MVP)](#13-スコープ外mvp)
+- [14. 既知の制限・実装メモ](#14-既知の制限実装メモ)
 
 ## 1. 概要
 
@@ -74,6 +75,8 @@ Firestore 操作のための特殊な値:
 | DeleteField | `delete_field()` | フィールド削除センチネル(`update` / merge `set` のみ) |
 | Increment | `increment(n)` | 数値加算センチネル |
 | Opaque | (生成不可。emulator 読み取りのみ) | `double` / `geo_point` / `bytes` フィールドの表示専用値(`Double(1.5)` 等)。書き込みには使えない |
+| AuthSession | `auth_sign_up(...)` / `auth_sign_in(...)` | Auth のセッション。user record と ID / refresh token の所有者を保持する。`inspect` ではトークンが redact される(§11) |
+| RedactedToken | (生成不可。`session.id_token` アクセス) | トークンの redacted 投影値(`<redacted:id_token>`)。生のトークンは決してスクリプトに現れない(§11) |
 
 センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(emulator バックエンドではエラー)。
 
@@ -163,7 +166,7 @@ a = 2   # エラー: reassignment is not allowed: a
 ```
 
 - 変数は再代入不可。関数定義名も同じ名前空間を使い、再定義不可。
-- ビルトイン関数(`puts` `get` `set` `update` `delete` `batch` `transaction` `doc` `col` `col_group` `array` `len` `now` `timestamp` `server_timestamp` `array_union` `array_remove` `delete_field` `increment`)と同名の関数定義はエラー(`cannot redefine builtin: <name>`)。ビルトイン呼び出しが常に優先されるため。
+- ビルトイン関数(`puts` `get` `set` `update` `delete` `batch` `transaction` `doc` `col` `col_group` `array` `len` `now` `timestamp` `server_timestamp` `array_union` `array_remove` `delete_field` `increment` `auth_sign_up` `auth_sign_in` `auth_current_user` `auth_sign_out`)と同名の関数定義はエラー(`cannot redefine builtin: <name>`)。ビルトイン呼び出しが常に優先されるため。
 - 関数本体内でも外側スコープに見える名前への代入はエラー(シャドーイング不可)。ただし**関数の仮引数**は外側の名前と重なってもよい。
 
 ### スコープ規則(静的スコープ)
@@ -354,10 +357,10 @@ transaction {
 ## 10. CLI (`fl`)
 
 ```
-usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
+usage: fl [--backend in-memory|emulator] [--auth-backend in-memory|emulator] (<script-file> | - | -e <script>)
 ```
 
-- スクリプトの指定はちょうど 1 つ:ファイルパス / `-`(stdin) / `-e <script>`(ワンライナー。複数回指定時は改行で連結)。引数なしで stdin がパイプ接続されている場合も stdin から読む(端末直結の引数なしは usage 表示で終了)。`-e` とファイル/`-` の併用はエラー。`--help` / `-h` で usage 表示。未知のオプション・未知のバックエンドはエラー終了。
+- スクリプトの指定はちょうど 1 つ:ファイルパス / `-`(stdin) / `-e <script>`(ワンライナー。複数回指定時は改行で連結)。引数なしで stdin がパイプ接続されている場合も stdin から読む(端末直結の引数なしは usage 表示で終了)。`-e` とファイル/`-` の併用はエラー。`--help` / `-h` で usage 表示。未知のオプション・未知のバックエンド(`--backend` / `--auth-backend` 両方)はエラー終了。
   ```sh
   fl script.fl
   echo 'get("users/1")' | fl --backend emulator -
@@ -365,39 +368,134 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
   ```
 - `--backend emulator` のとき:
   - `FIRESTORE_EMULATOR_HOST` — **必須**。未設定なら即エラー。
-  - `FIRESTORE_PROJECT_ID` — 省略時 `firelang-test`。
+  - `FIRESTORE_PROJECT_ID` — 省略時 `firelang-test`(`FIREBASE_PROJECT_ID` が設定されていればそちらを使う)。
+- `--auth-backend emulator` のとき:
+  - `FIREBASE_AUTH_EMULATOR_HOST` — **必須**。未設定なら即エラー。
+  - `FIREBASE_PROJECT_ID` — 省略時 `firelang-test`(`FIRESTORE_PROJECT_ID` が設定されていればそちらを使う)。
+- どちらの backend も同じ 2 つの変数名を受け取るが、それぞれの backend が優先する名前が異なる(Firestore は `FIRESTORE_PROJECT_ID`、Auth は `FIREBASE_PROJECT_ID`)。そのため既存の Firestore 環境の優先順位は変わらない。
+- Firestore backend と Auth backend は独立に選べる。両方を `emulator` にすると両方のエミュレータへ同時に接続する。
+- バックエンドの検証は stdin / ファイルを読む前に行われる(不正な指定で stdin を待たされない)。
 - 実行結果は `=> <inspect表現>` で印字。
 - エラーは `error: <line>:<col>: <message>` を stderr に印字して exit 1。lex / parse エラーは該当トークンの位置、runtime / backend エラーは失敗したトップレベル文の開始位置。位置が付かない場合(補間内の単一式制約違反など)は `error: <message>`。
 
-## 11. バックエンド
+## 11. Auth API
+
+認証は Firestore と同じ global 関数として提供する。Auth backend は Firestore backend とは独立で、デフォルトは in-memory(`--auth-backend emulator` / `AuthEmulator` で emulator に切り替え)。
+
+| 関数 | 戻り値 | 説明 |
+|------|--------|------|
+| `auth_sign_up(email, password)` | AuthSession | email/password ユーザーを新規作成してサインインする。既に存在する場合はエラー |
+| `auth_sign_in(email, password)` | AuthSession | 既存ユーザーでサインインする |
+| `auth_current_user()` | Map / Nil | 現在のセッションの user record。未サインインなら `nil` |
+| `auth_sign_out()` | Nil | ローカルセッションを破棄する。冪等(未サインインでもエラーにならない) |
+
+```ruby
+session = auth_sign_up("mail@example.com", "password")
+session.user["email"]   # => "mail@example.com"
+auth_current_user()["uid"]
+auth_sign_out()
+auth_current_user()      # => nil
+```
+
+### AuthSession とトークンの redaction
+
+`auth_sign_up` / `auth_sign_in` は AuthSession を返す。AuthSession は user record と **ID token / refresh token の所有者**を明示的に保持する専用の値であり、Map ではない。
+
+- トークンは **スクリプトへ生文字列として公開しない**。`inspect` / `puts` / `fl` の最終結果、`Debug` 出力のいずれにも現れない。表示は必ず次の形になる:
+  ```
+  AuthSession(user={"email" => "mail@example.com", "uid" => "...", ...}, id_token=<redacted>, refresh_token=<redacted>, expires_at=1769907600)
+  ```
+- トークンへフィールドアクセスした場合も redacted な投影値(`<redacted:id_token>` / `<redacted:refresh_token>`)が返る。生のトークン文字列を取り出す API はスクリプトに存在しない。
+- AuthSession は **ドキュメントへ書き込めない**。`set` / `update` の data_map に AuthSession やトークン投影値が含まれる場合は、バックエンドへ送る前にエラーになる(in-memory が token を保存してしまうのを防ぐ)。
+- トークンの実値は Rust 側の `AuthSession.id_token` / `refresh_token`(`AuthToken`)だけが保持し、`AuthToken::expose()` で明示的に取得できる。`Debug` / `Display` は redact される。
+
+### セッションの寿命と sign-out
+
+- セッションは ID token の有効期限(`expires_at`、Unix 秒)を持つ。emulator から返された `expiresIn` から算出し(emulator 応答の `expiresIn` は文字列でも数値でも受理する)、期限切れのセッションは `auth_current_user()` で `nil` になる。
+- `auth_sign_out()` はローカルで保持しているセッションとトークンを破棄する。**サーバ側のトークン revoke は行わない**(MVP スコープ外)。idempotent なので、未サインイン状態で呼んでもエラーにならない。
+- 新しい `auth_sign_up` / `auth_sign_in` は既存のセッションを差し替える。
+
+### Auth user record の Map/Value 表現
+
+`auth_current_user()` と `session.user` は同じ user record を返す。Map であり、次のキーを持ちうる(Auth emulator のフィールド名を正規化したもの):
+
+| キー | 型 | 説明 |
+|------|----|------|
+| `uid` | Str | Firebase user ID |
+| `email` | Str | canonical 化(小文字)済みの email |
+| `emailVerified` | Bool | 常に含まれる(未検証なら `false`) |
+| `disabled` | Bool | 常に含まれる(有効なら `false`) |
+| `displayName` | Str | 存在するときのみ |
+| `photoUrl` | Str | 存在するときのみ |
+| `createdAt` / `lastLoginAt` | Str | 存在するときのみ |
+| `providerId` | Str | 存在するときのみ(`"password"` など) |
+
+password hash や provider secret は **含まれない**。
+
+### typed error
+
+Auth backend の失敗は型付きのカテゴリを持ち、in-memory / emulator で同じカテゴリを返す。スクリプトからは通常の backend エラーとして `error: <line>:<col>: <message>` で報告される。
+
+| カテゴリ | トリガー例 |
+|----------|-----------|
+| `UserNotFound` | 存在しない email で `auth_sign_in`(emulator の `EMAIL_NOT_FOUND`) |
+| `InvalidCredentials` | password 不一致(`INVALID_PASSWORD` / `INVALID_LOGIN_CREDENTIALS`) |
+| `UserAlreadyExists` | 既存 email で `auth_sign_up`(`EMAIL_EXISTS`) |
+| `InvalidEmail` | email 形式不正(`INVALID_EMAIL`) |
+| `WeakPassword` | 6 文字未満の password(`WEAK_PASSWORD`) |
+| `Network` | Auth emulator へ接続できない・タイムアウト |
+| `InvalidResponse` | emulator 応答が壊れている・未知のエラーコード |
+| `Configuration` | ホスト / project ID が不正、または host が未設定 |
+
+Identity Toolkit のエラーコードは `:` 区切りの詳細が付くことがある(`WEAK_PASSWORD : Password should be at least 6 characters`)ため、先頭のコード部分で一致させる。
+
+### 検証
+
+- `auth_sign_up` / `auth_sign_in` は email / password が **文字列**であること(email は `@` と `.` を含む形式、password は 6 文字以上)を検証し、backend へ到達する前に型エラーや validation エラーを返す。
+- email は canonical 化(前後空白の除去 + 小文字化)してから照合する。
+- `auth_current_user` / `auth_sign_out` は引数・キーワード引数・ブロックを受け取らない。
+- 未知のキーワード引数・余分な位置引数・ブロック指定はエラー。
+
+## 12. バックエンド
 
 | エントリポイント | `in-memory` | `emulator` |
 |------------------|-------------|------------|
 | `run_script` | ○(固定) | × |
 | `run_script_with_firestore` | ○ | ○(`FirestoreEmulator` を渡す) |
-| `fl` CLI | ○(デフォルト) | ○(`--backend emulator`) |
+| `run_script_with_auth` | ○ | ○(`AuthEmulator` を渡す) |
+| `run_script_with_backends` | ○ | ○(両方を渡す) |
+| `fl` CLI | ○(デフォルト) | ○(`--backend emulator` / `--auth-backend emulator`) |
 
 - 認証付きの**本番 Firestore は非対応**(スコープ外)。
-- ランタイムは `Firestore` トレイトでバックエンドを抽象化する。デフォルトは `InMemoryFirestore`。
-- emulator バックエンドは Firestore Rust SDK(`firestore` crate)の gRPC クライアントで Firestore API を呼ぶ。database は `(default)` 固定。
-- 両バックエンドは同じ可視挙動(値の往復・クエリ順序・batch/transaction の原子性)を持たなければならない。
+- ランタイムは `Firestore` トレイトと `Auth` トレイトでバックエンドを抽象化する。デフォルトは `InMemoryFirestore` と `InMemoryAuth`。
+- Firestore emulator バックエンドは Firestore Rust SDK(`firestore` crate)の gRPC クライアントで Firestore API を呼ぶ。database は `(default)` 固定。
+- Auth emulator バックエンドは Identity Toolkit のローカル REST API(`accounts:signUp` / `accounts:signInWithPassword`)を HTTP で呼ぶ。本番 Firebase SDK は使わないので、本番資格情報へ暗黙に到達することはない。
+  - public エンドポイントは API key query(`?key=...`)で認証する。**OAuth2 `Authorization` ヘッダは送らない** — emulator はそのヘッダを Admin SDK 呼び出しと解釈し、sign-up 応答からトークンを発行しない。
+  - `FIREBASE_API_KEY` を指定すれば API key を上書きできる(既定は emulator 慣例の `fake-api-key`)。
+- 両バックエンドは同じ可視挙動(値の往復・クエリ順序・batch/transaction の原子性・Auth の戻り値と typed error)を持たなければならない。
 - ただし emulator 側に firelang 外の型(`double` / `reference` / `geo_point` / `bytes`)で書かれたフィールドがある場合、emulator バックエンドは `Opaque` / `DocRef` に読み替えて返す(§3)。in-memory にはそのような値は存在しない。
 
-## 12. スコープ外(MVP)
+## 13. スコープ外(MVP)
 
 以下は明示的に**非対応**。実装しない・README で匂わせない。
 
 - Float(数値は Int のみ)
 - 本番 Firestore への認証付きアクセス
+- **本番 Firebase Authentication への接続**(`AuthEmulator` は local emulator のみ)
+- Auth の sign-out 時のサーバ側トークン revoke
+- ID token の refresh(`auth_refresh` 等は無い。期限切れ後は `auth_sign_in` する)
+- Auth provider 以外の sign-in 方式(OAuth / anonymous / MFA)
+- Auth による Firestore ルール評価(token を Firestore request に付与する機能)
 - transaction の自動リトライ
 - カーソルによるページネーション(`start_after` 等。`order_by` + `offset` + `limit` で代替)
 - リスナー(リアルタイム購読)・インデックス依存機能
 - ドキュメントに書かれたサブセットを超える mruby 互換
 
-## 13. 既知の制限・実装メモ
+## 14. 既知の制限・実装メモ
 
 実装済みコードから確認された、仕様としては保証しない・将来直す予定の挙動。
 
 | 項目 | 現状の挙動 | 予定 |
 |------|-----------|------|
 | `where` の異なる型同士の大小比較 | in-memory ではマッチしない。emulator では Firestore の型順序で比較される(§7 は同型のみを規定) | backlog |
+| Auth セッションの永続化 | セッションはプロセス内のメモリにのみ保持される。スクリプト実行をまたぐ永続化は行わない | backlog |
