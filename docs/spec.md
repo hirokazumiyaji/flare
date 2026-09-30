@@ -380,6 +380,7 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 - 認証付きの**本番 Firestore は非対応**(スコープ外)。
 - ランタイムは `Firestore` トレイトでバックエンドを抽象化する。デフォルトは `InMemoryFirestore`。
 - emulator バックエンドは Firestore Rust SDK(`firestore` crate)の gRPC クライアントで Firestore API を呼ぶ。database は `(default)` 固定。
+- ローカル実行の security rules は `firebase.emulators.json` が参照する `firestore.emulator.rules`(read/write 許可)を使う。`firebase.json` が参照する `firestore.rules` は read/write 拒否で、リモート project への誤デプロイに備えてある([Firebase rules の分離とデプロイ防止策](firebase-security.md))。
 - 両バックエンドは同じ可視挙動(値の往復・クエリ順序・batch/transaction の原子性)を持たなければならない。
 - ただし emulator 側に firelang 外の型(`double` / `reference` / `geo_point` / `bytes`)で書かれたフィールドがある場合、emulator バックエンドは `Opaque` / `DocRef` に読み替えて返す(§3)。in-memory にはそのような値は存在しない。
 
