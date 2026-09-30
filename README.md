@@ -1,18 +1,22 @@
 # firelang
 
-Firestore を操作するための **mruby 風スクリプト言語ランタイム**(Rust 実装)です。
+Firestore と Cloud Storage を操作するための **mruby 風スクリプト言語ランタイム**(Rust 実装)です。
 
 ```ruby
 set("users/1", {name: "alice", age: 20})
 rows = col("users").where("age", ">=", 20).limit(10).get()
 puts "found #{rows}"
+
+payload = bytes([0, 255, 128])
+storage_upload("avatars/alice.bin", payload, content_type: "application/octet-stream")
+content = storage_download("avatars/alice.bin")
 ```
 
 数値は整数のみ、変数は再代入不可、`batch` / `transaction` は原子的に適用 — といった言語・API の正式な契約はすべて **[言語仕様 / API リファレンス](docs/spec.md)** にまとまっています(このリポジトリの唯一の正式仕様です)。
 
 ## ドキュメント
 
-- [言語仕様 / API リファレンス](docs/spec.md) — 言語・Firestore API・batch/transaction セマンティクスの正式仕様
+- [言語仕様 / API リファレンス](docs/spec.md) — 言語・Firestore / Storage API・batch/transaction セマンティクスの正式仕様
 - [examples/scripts/](examples/scripts/) — 動くサンプルスクリプト集
 - [リリースチェックリスト](docs/release-checklist.md)
 - [過去の MVP 計画資料(アーカイブ)](docs/archive/mvp/)
@@ -43,7 +47,21 @@ firebase emulators:exec --only firestore --project demo-firelang \
   'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator -- --nocapture'
 ```
 
-本番 Firestore(認証付き)は非対応です。詳細は [仕様の 11-12 章](docs/spec.md#11-バックエンド) を参照してください。
+本番 Firestore および本番 Cloud Storage(認証付き)は非対応です。詳細は [仕様のバックエンド](docs/spec.md#11-バックエンド) と [Cloud Storage API](docs/spec.md#14-cloud-storage-api) を参照してください。
+
+## Cloud Storage
+
+Storage の MVP CRUD は `storage_upload` / `storage_download` / `storage_metadata` / `storage_delete` のグローバル関数です。`bytes([0, 255])` は UTF-8 文字列ではなくバイト列で、ダウンロード時も text 化されません。Storage object path は Firestore の document path と異なり、セグメント数の偶奇を要求しません。
+
+`firebase.json` にはローカル用の `storage.rules` と port 9199 の emulator を設定しています。Storage だけを検証する quickstart:
+
+```bash
+export FIREBASE_PROJECT_ID=demo-firelang
+firebase emulators:exec --only storage --project demo-firelang \
+  'cargo test --test storage_emulator -- --nocapture'
+```
+
+Firestore と Storage を同時に使う場合は `--only firestore,storage` を指定します。`fl` は `--storage-backend emulator` で `FIREBASE_STORAGE_EMULATOR_HOST` を明示的に要求でき、未指定の `auto` では host があれば Storage emulator、なければ in-memory を使います。`FIREBASE_PROJECT_ID`（未設定時は `GCLOUD_PROJECT` / `FIRESTORE_PROJECT_ID` / `firelang-test`）からバケットを導出します。必要なら `FIREBASE_STORAGE_BUCKET` と、local rules テスト用の明示的な `FIREBASE_STORAGE_AUTH_TOKEN` も設定できます。本番 token の自動取得は MVP の対象外です。
 
 ## テスト
 
@@ -66,6 +84,7 @@ cargo test --features emulator --all-targets
 
 ```bash
 cargo test --features emulator --test firestore_emulator -- --nocapture
+cargo test --features emulator --test storage_emulator -- --nocapture   # FIREBASE_STORAGE_EMULATOR_HOST 未設定なら skip
 ```
 
 `Firestore` / `InMemoryFirestore` / `run_script` は feature に依存せず利用できます。

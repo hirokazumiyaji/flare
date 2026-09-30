@@ -98,8 +98,9 @@ jobs:
         if: matrix.name == 'emulator'
         run: cargo build --release --features emulator --bin fl
 
-  # Firestore emulator integration tests (Task 06).  This job is also run when
-  # the workflow is called by CD, so a release cannot skip the emulator suite.
+  # Firestore and Storage emulator integration tests.  This job is also run
+  # when the workflow is called by CD, so a release cannot skip the emulator
+  # suite.
   integration-emulator:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -127,7 +128,7 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: Run integration tests with Firestore emulator
+      - name: Run integration tests with Firestore and Storage emulators
         run: |
-          firebase emulators:exec --only firestore --project demo-firelang \
-            'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --locked -- --nocapture'
+          firebase emulators:exec --only firestore,storage --project demo-firelang \
+            'FIRESTORE_PROJECT_ID=demo-firelang FIREBASE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --test storage_emulator --locked -- --nocapture'

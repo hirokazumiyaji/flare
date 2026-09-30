@@ -141,6 +141,8 @@ fn apply_write_to_docs(
     }
 }
 
+
+
 fn apply_update_map(
     current: &mut BTreeMap<String, Value>,
     updates: &BTreeMap<String, Value>,

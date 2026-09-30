@@ -4,6 +4,7 @@ use std::error::Error;
 use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
 use crate::error::{FirelangError, Span};
 use crate::firestore::{Firestore, WriteOp};
+use crate::storage::{validate_content_type, validate_storage_path, InMemoryStorage, Storage};
 use crate::value::{
     CollectionGroupRef, CollectionRef, Direction, DocRef, QueryFilter, QueryOp, QueryRef,
     Timestamp, UserFunc, Value,
@@ -21,12 +22,14 @@ enum MethodReceiver {
     Query(QueryRef),
     Array(Vec<Value>),
     Timestamp(Timestamp),
+    Bytes(Vec<u8>),
     Map(BTreeMap<String, Value>),
 }
 
-pub struct Runtime<F: Firestore> {
+pub struct Runtime<F: Firestore, S: Storage = InMemoryStorage> {
     scopes: Vec<HashMap<String, Value>>,
     fs: F,
+    storage: S,
     exec: ExecCtx,
     /// Set when a best-effort rollback failed, so the backend still holds the
     /// transaction open. The next `transaction` block retries the rollback
@@ -36,11 +39,21 @@ pub struct Runtime<F: Firestore> {
     pending_rollback: bool,
 }
 
-impl<F: Firestore> Runtime<F> {
+impl<F: Firestore> Runtime<F, InMemoryStorage> {
     pub fn new(fs: F) -> Self {
+        Self::with_storage(fs, InMemoryStorage::default())
+    }
+}
+
+impl<F: Firestore, S: Storage> Runtime<F, S> {
+    /// Construct a runtime with an independent Storage backend. Firestore and
+    /// Storage deliberately remain separate services; the default runtime
+    /// uses [`InMemoryStorage`].
+    pub fn with_storage(fs: F, storage: S) -> Self {
         Self {
             scopes: vec![HashMap::new()],
             fs,
+            storage,
             exec: ExecCtx::Normal,
             pending_rollback: false,
         }
@@ -369,7 +382,7 @@ impl<F: Firestore> Runtime<F> {
                         &keyword_names,
                         block.as_ref(),
                     )?;
-                } else if lookup_builtin::<F>(name).is_some() {
+                } else if lookup_builtin::<F, S>(name).is_some() {
                     let keyword_names = keyword_names(args);
                     validate_call_contract(
                         name,
@@ -541,6 +554,10 @@ impl<F: Firestore> Runtime<F> {
 
                 _ => Err(format!("unknown timestamp method: {name}").into()),
             },
+            MethodReceiver::Bytes(bytes) if name == "len" && args.is_empty() => {
+                Ok(ExecFlow::Value(Value::Int(bytes.len() as i64)))
+            }
+            MethodReceiver::Bytes(_) => Err(format!("unknown bytes method: {name}").into()),
             MethodReceiver::Map(map) => {
                 // Map レシーバは `m.key` 形式のキーアクセス(Ruby の OpenStruct 風)のみ。
                 // 引数を取るメソッドは持たないので、Args がある場合はエラーにする。
@@ -705,6 +722,7 @@ fn into_method_receiver(value: Value) -> Result<MethodReceiver, Box<dyn Error>> 
         Value::QueryRef(value) => Ok(MethodReceiver::Query(value)),
         Value::Array(value) => Ok(MethodReceiver::Array(value)),
         Value::Timestamp(value) => Ok(MethodReceiver::Timestamp(value)),
+        Value::Bytes(value) => Ok(MethodReceiver::Bytes(value)),
         Value::Map(value) => Ok(MethodReceiver::Map(value)),
         _ => Err("unsupported method receiver".into()),
     }
@@ -739,15 +757,15 @@ fn positional_arg_count(args: &[CallArg]) -> usize {
 /// global scope visible. A block only adds one frame. In both cases the
 /// original scope stack is restored on every exit path, including `?` returns
 /// and panic unwinding.
-struct ScopeGuard<'a, F: Firestore> {
-    runtime: &'a mut Runtime<F>,
+struct ScopeGuard<'a, F: Firestore, S: Storage> {
+    runtime: &'a mut Runtime<F, S>,
     // `Some` is a function frame and contains the caller-local suffix. `None`
     // is a block frame, which is removed from the end on drop.
     saved: Option<Vec<HashMap<String, Value>>>,
 }
 
-impl<'a, F: Firestore> ScopeGuard<'a, F> {
-    fn function(runtime: &'a mut Runtime<F>) -> Self {
+impl<'a, F: Firestore, S: Storage> ScopeGuard<'a, F, S> {
+    fn function(runtime: &'a mut Runtime<F, S>) -> Self {
         let saved = runtime.scopes.split_off(1);
         runtime.scopes.push(HashMap::new());
         Self {
@@ -756,7 +774,7 @@ impl<'a, F: Firestore> ScopeGuard<'a, F> {
         }
     }
 
-    fn block(runtime: &'a mut Runtime<F>) -> Self {
+    fn block(runtime: &'a mut Runtime<F, S>) -> Self {
         runtime.scopes.push(HashMap::new());
         Self {
             runtime,
@@ -765,7 +783,7 @@ impl<'a, F: Firestore> ScopeGuard<'a, F> {
     }
 }
 
-impl<F: Firestore> Drop for ScopeGuard<'_, F> {
+impl<F: Firestore, S: Storage> Drop for ScopeGuard<'_, F, S> {
     fn drop(&mut self) {
         if let Some(mut saved) = self.saved.take() {
             // Keep the global frame and discard every frame created while the
@@ -1065,6 +1083,12 @@ fn builtin_contract(name: &str) -> CallContract {
             .with_keywords(&["merge"])
             .with_positional_keyword_conflicts(&[("merge", 2)]),
         "batch" | "transaction" => CallContract::exact(0).requiring_block(),
+        "storage_upload" => CallContract::range(2, 3)
+            .with_keywords(&["content_type"])
+            .with_positional_keyword_conflicts(&[("content_type", 2)]),
+        "storage_download" | "storage_metadata" | "storage_delete" => {
+            CallContract::exact(1)
+        }
         _ => unreachable!("unknown builtin contract: {name}"),
     }
 }
@@ -1075,6 +1099,13 @@ fn query_method_contract(name: &str) -> Option<CallContract> {
         "order_by" => Some(CallContract::exact(2)),
         "limit" | "offset" => Some(CallContract::exact(1)),
         "count" | "get" => Some(CallContract::exact(0)),
+        _ => None,
+    }
+}
+
+fn bytes_method_contract(name: &str) -> Option<CallContract> {
+    match name {
+        "len" => Some(CallContract::exact(0)),
         _ => None,
     }
 }
@@ -1104,6 +1135,7 @@ fn method_contract(receiver: &MethodReceiver, name: &str) -> Option<CallContract
         | MethodReceiver::Query(_) => query_method_contract(name),
         MethodReceiver::Array(_) => array_method_contract(name),
         MethodReceiver::Timestamp(_) => timestamp_method_contract(name),
+        MethodReceiver::Bytes(_) => bytes_method_contract(name),
         // `m.key` is map key access rather than a fixed set of methods.  It
         // still has a strict zero-argument/no-block contract.
         MethodReceiver::Map(_) => Some(CallContract::exact(0)),
@@ -1118,6 +1150,7 @@ fn method_call_label(receiver: &MethodReceiver, name: &str) -> String {
         | MethodReceiver::Query(_) => format!("query method {name}"),
         MethodReceiver::Array(_) => format!("array method {name}"),
         MethodReceiver::Timestamp(_) => format!("timestamp method {name}"),
+        MethodReceiver::Bytes(_) => format!("bytes method {name}"),
         MethodReceiver::Map(_) => format!("map key access {name}"),
     }
 }
@@ -1160,6 +1193,7 @@ fn validate_method_call(
         }
         MethodReceiver::Array(_) => format!("unknown array method: {name}").into(),
         MethodReceiver::Timestamp(_) => format!("unknown timestamp method: {name}").into(),
+        MethodReceiver::Bytes(_) => format!("unknown bytes method: {name}").into(),
         MethodReceiver::Map(_) => format!("unknown map method: {name}").into(),
     })
 }
@@ -1187,17 +1221,21 @@ const BUILTIN_NAMES: &[&str] = &[
     "delete",
     "batch",
     "transaction",
+    "storage_upload",
+    "storage_download",
+    "storage_metadata",
+    "storage_delete",
 ];
 
-type Builtin<F> = fn(
-    &mut Runtime<F>,
+type Builtin<F, S> = fn(
+    &mut Runtime<F, S>,
     Vec<Value>,
     BTreeMap<String, Value>,
     Option<&Block>,
 ) -> Result<ExecFlow, Box<dyn Error>>;
 
 /// ビルトインの対応テーブル。
-fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 20] {
+fn builtin_entries<F: Firestore, S: Storage>() -> [(&'static str, Builtin<F, S>); 24] {
     [
         ("puts", builtin_puts),
         ("doc", builtin_doc),
@@ -1219,12 +1257,16 @@ fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 20] {
         ("delete", builtin_delete),
         ("batch", builtin_batch),
         ("transaction", builtin_transaction),
+        ("storage_upload", builtin_storage_upload),
+        ("storage_download", builtin_storage_download),
+        ("storage_metadata", builtin_storage_metadata),
+        ("storage_delete", builtin_storage_delete),
     ]
 }
 
 /// ビルトインのテーブル引き。
-fn lookup_builtin<F: Firestore>(name: &str) -> Option<Builtin<F>> {
-    builtin_entries::<F>()
+fn lookup_builtin<F: Firestore, S: Storage>(name: &str) -> Option<Builtin<F, S>> {
+    builtin_entries::<F, S>()
         .into_iter()
         .find(|(n, _)| *n == name)
         .map(|(_, f)| f)
@@ -1234,8 +1276,8 @@ fn is_builtin_name(name: &str) -> bool {
     BUILTIN_NAMES.contains(&name)
 }
 
-fn builtin_puts<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_puts<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1246,8 +1288,8 @@ fn builtin_puts<F: Firestore>(
     Ok(ExecFlow::Value(Value::Nil))
 }
 
-fn builtin_doc<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_doc<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1259,8 +1301,8 @@ fn builtin_doc<F: Firestore>(
     })))
 }
 
-fn builtin_col<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_col<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1272,8 +1314,8 @@ fn builtin_col<F: Firestore>(
     })))
 }
 
-fn builtin_col_group<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_col_group<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1285,8 +1327,8 @@ fn builtin_col_group<F: Firestore>(
     )))
 }
 
-fn builtin_array<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_array<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1294,8 +1336,8 @@ fn builtin_array<F: Firestore>(
     Ok(ExecFlow::Value(Value::Array(args)))
 }
 
-fn builtin_len<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_len<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1304,12 +1346,13 @@ fn builtin_len<F: Firestore>(
         Some(Value::Array(a)) => Ok(ExecFlow::Value(Value::Int(a.len() as i64))),
         Some(Value::Map(m)) => Ok(ExecFlow::Value(Value::Int(m.len() as i64))),
         Some(Value::Str(s)) => Ok(ExecFlow::Value(Value::Int(s.chars().count() as i64))),
-        _ => Err("len expects array, map, or string".into()),
+        Some(Value::Bytes(bytes)) => Ok(ExecFlow::Value(Value::Int(bytes.len() as i64))),
+        _ => Err("len expects array, map, string, or bytes".into()),
     }
 }
 
-fn builtin_now<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_now<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1317,8 +1360,8 @@ fn builtin_now<F: Firestore>(
     Ok(ExecFlow::Value(Value::Timestamp(Timestamp::now()?)))
 }
 
-fn builtin_timestamp<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_timestamp<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1328,8 +1371,8 @@ fn builtin_timestamp<F: Firestore>(
     })))
 }
 
-fn builtin_bytes<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_bytes<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     kwargs: BTreeMap<String, Value>,
     block: Option<&Block>,
@@ -1353,8 +1396,8 @@ fn builtin_bytes<F: Firestore>(
     Ok(ExecFlow::Value(Value::Bytes(bytes)))
 }
 
-fn builtin_server_timestamp<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_server_timestamp<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1362,8 +1405,8 @@ fn builtin_server_timestamp<F: Firestore>(
     Ok(ExecFlow::Value(Value::ServerTimestamp))
 }
 
-fn builtin_array_union<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_array_union<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1373,8 +1416,8 @@ fn builtin_array_union<F: Firestore>(
     )))
 }
 
-fn builtin_array_remove<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_array_remove<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1384,8 +1427,8 @@ fn builtin_array_remove<F: Firestore>(
     )))
 }
 
-fn builtin_delete_field<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_delete_field<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1393,8 +1436,8 @@ fn builtin_delete_field<F: Firestore>(
     Ok(ExecFlow::Value(Value::DeleteField))
 }
 
-fn builtin_increment<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_increment<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1402,8 +1445,157 @@ fn builtin_increment<F: Firestore>(
     Ok(ExecFlow::Value(Value::Increment(expect_int(args.first())?)))
 }
 
-fn builtin_get<F: Firestore>(
-    rt: &mut Runtime<F>,
+fn builtin_storage_upload<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    forbid_storage_in_batch_or_transaction(rt)?;
+    reject_unknown_kwargs("storage_upload", &kwargs, &["content_type"])?;
+    if args.len() > 3 {
+        return Err("storage_upload expects path, bytes, and optional content_type".into());
+    }
+    let path = expect_storage_path(args.first())?;
+    let content = expect_storage_bytes(args.get(1))?;
+    let content_type = match (args.get(2), kwargs.get("content_type")) {
+        (Some(Value::Str(value)), None) => value.as_str(),
+        (None, Some(Value::Str(value))) => value.as_str(),
+        (None, None) => "application/octet-stream",
+        (Some(_), Some(_)) => {
+            return Err(
+                "storage_upload received content_type twice (positional and keyword)".into(),
+            )
+        }
+        (Some(_), None) => return Err("storage_upload content_type must be a string".into()),
+        (None, Some(_)) => return Err("storage_upload content_type must be a string".into()),
+    };
+    validate_storage_path(path)?;
+    validate_content_type(content_type)?;
+    rt.storage
+        .upload(path, content, content_type)
+        .map(|metadata| ExecFlow::Value(metadata.to_value()))
+        .map_err(backend_err)
+}
+
+fn builtin_storage_download<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    forbid_storage_in_batch_or_transaction(rt)?;
+    reject_storage_kwargs("storage_download", &kwargs)?;
+    expect_storage_arity("storage_download", &args, 1)?;
+    let path = expect_storage_path(args.first())?;
+    validate_storage_path(path)?;
+    rt.storage
+        .download(path)
+        .map(|bytes| ExecFlow::Value(Value::Bytes(bytes)))
+        .map_err(backend_err)
+}
+
+fn builtin_storage_metadata<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    forbid_storage_in_batch_or_transaction(rt)?;
+    reject_storage_kwargs("storage_metadata", &kwargs)?;
+    expect_storage_arity("storage_metadata", &args, 1)?;
+    let path = expect_storage_path(args.first())?;
+    validate_storage_path(path)?;
+    rt.storage
+        .metadata(path)
+        .map(|metadata| ExecFlow::Value(metadata.to_value()))
+        .map_err(backend_err)
+}
+
+fn builtin_storage_delete<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    forbid_storage_in_batch_or_transaction(rt)?;
+    reject_storage_kwargs("storage_delete", &kwargs)?;
+    expect_storage_arity("storage_delete", &args, 1)?;
+    let path = expect_storage_path(args.first())?;
+    validate_storage_path(path)?;
+    rt.storage.delete(path).map_err(backend_err)?;
+    Ok(ExecFlow::Value(Value::Nil))
+}
+
+fn forbid_storage_in_batch_or_transaction<F: Firestore, S: Storage>(
+    rt: &Runtime<F, S>,
+) -> Result<(), Box<dyn Error>> {
+    match rt.exec {
+        ExecCtx::Batch { .. } => Err("storage APIs are not allowed inside batch".into()),
+        ExecCtx::Transaction { .. } => {
+            Err("storage APIs are not allowed inside transaction".into())
+        }
+        ExecCtx::Normal => Ok(()),
+    }
+}
+
+fn reject_storage_kwargs(
+    name: &str,
+    kwargs: &BTreeMap<String, Value>,
+) -> Result<(), Box<dyn Error>> {
+    if kwargs.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{name} does not take keyword arguments").into())
+    }
+}
+
+fn reject_unknown_kwargs(
+    name: &str,
+    kwargs: &BTreeMap<String, Value>,
+    allowed: &[&str],
+) -> Result<(), Box<dyn Error>> {
+    let unknown: Vec<&str> = kwargs
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .map(String::as_str)
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name} received unknown keyword arguments: {}",
+            unknown.join(", ")
+        )
+        .into())
+    }
+}
+
+fn expect_storage_arity(name: &str, args: &[Value], expected: usize) -> Result<(), Box<dyn Error>> {
+    if args.len() == expected {
+        Ok(())
+    } else {
+        Err(format!("{name} expects {expected} argument(s), got {}", args.len()).into())
+    }
+}
+
+fn expect_storage_path(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
+    match v {
+        Some(Value::Str(path)) => Ok(path),
+        _ => Err("storage API expects an object path string".into()),
+    }
+}
+
+fn expect_storage_bytes(v: Option<&Value>) -> Result<&[u8], Box<dyn Error>> {
+    match v {
+        Some(Value::Bytes(bytes)) => Ok(bytes),
+        Some(_) => Err("storage_upload expects bytes(...) content".into()),
+        None => Err("storage_upload requires bytes(...) content".into()),
+    }
+}
+
+fn builtin_get<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1426,8 +1618,8 @@ fn builtin_get<F: Firestore>(
     Ok(ExecFlow::Value(v))
 }
 
-fn builtin_set<F: Firestore>(
-    rt: &mut Runtime<F>,
+fn builtin_set<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1444,8 +1636,8 @@ fn builtin_set<F: Firestore>(
     Ok(ExecFlow::Value(Value::Nil))
 }
 
-fn builtin_update<F: Firestore>(
-    rt: &mut Runtime<F>,
+fn builtin_update<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1456,8 +1648,8 @@ fn builtin_update<F: Firestore>(
     Ok(ExecFlow::Value(Value::Nil))
 }
 
-fn builtin_delete<F: Firestore>(
-    rt: &mut Runtime<F>,
+fn builtin_delete<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
@@ -1467,8 +1659,8 @@ fn builtin_delete<F: Firestore>(
     Ok(ExecFlow::Value(Value::Nil))
 }
 
-fn builtin_batch<F: Firestore>(
-    rt: &mut Runtime<F>,
+fn builtin_batch<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     block: Option<&Block>,
@@ -1488,8 +1680,8 @@ fn builtin_batch<F: Firestore>(
     Ok(flow)
 }
 
-fn builtin_transaction<F: Firestore>(
-    rt: &mut Runtime<F>,
+fn builtin_transaction<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     block: Option<&Block>,
@@ -1993,7 +2185,7 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), BUILTIN_NAMES.len(), "duplicate builtin names");
-        for (name, _) in builtin_entries::<InMemoryFirestore>() {
+        for (name, _) in builtin_entries::<InMemoryFirestore, InMemoryStorage>() {
             assert!(
                 is_builtin_name(name),
                 "{name} is implemented but missing from BUILTIN_NAMES"
@@ -2001,13 +2193,13 @@ mod tests {
         }
         for name in BUILTIN_NAMES {
             assert!(
-                lookup_builtin::<InMemoryFirestore>(name).is_some(),
+                lookup_builtin::<InMemoryFirestore, InMemoryStorage>(name).is_some(),
                 "{name} is listed but has no implementation"
             );
             assert!(is_builtin_name(name));
         }
         assert!(!is_builtin_name("undefined_fn"));
-        assert!(lookup_builtin::<InMemoryFirestore>("undefined_fn").is_none());
+        assert!(lookup_builtin::<InMemoryFirestore, InMemoryStorage>("undefined_fn").is_none());
     }
 
     struct FailingCommitFirestore {

@@ -17,6 +17,7 @@
 - [11. バックエンド](#11-バックエンド)
 - [12. スコープ外(MVP)](#12-スコープ外mvp)
 - [13. 既知の制限・実装メモ](#13-既知の制限実装メモ)
+- [14. Cloud Storage API](#14-cloud-storage-api)
 
 ## 1. 概要
 
@@ -59,6 +60,7 @@ puts "found #{rows}"
 |----|----|------|
 | Int | `42` | 64bit 符号付き整数。**数値は整数のみ**(Float は非対応) |
 | Str | `"hello"` | UTF-8 文字列 |
+| Bytes | `bytes([0, 255])` | UTF-8 文字列とは独立した任意のバイト列。Storage の内容として無損失で往復する |
 | Bool | `true` / `false` | 真偽値 |
 | Nil | `nil` | 値なし。存在しないドキュメントの `get` も nil |
 | Array | `[1, 2, "a"]` | 任意の値の列 |
@@ -83,7 +85,7 @@ Firestore 操作のための特殊な値:
 
 センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(emulator バックエンドではエラー)。
 
-emulator バックエンドで firelang が持たない型のフィールドを含むドキュメントを読んだ場合、ドキュメント全体はエラーにせず次のように読み替える:`bytes` は lossless な第一級の `Bytes` 値、`double` / `geo_point` は `Opaque` の表示専用値(例 `Double(1.5)`、`GeoPoint(35.7, 139.7)`)、`reference` は同一データベース内であれば相対パスの `DocRef`(別プロジェクトや別データベースの参照は `Reference(...)` の `Opaque` 値)。`Opaque` 値はクエリの `==` 等でマッチさせることはできず(スクリプトからは生成できない)、書き戻しはエラー(`unsupported value in emulator write`)。
+emulator バックエンドで firelang が持たない型のフィールドを含むドキュメントを読んだ場合、ドキュメント全体はエラーにせず次のように読み替える:`bytes` は lossless な第一級の `Bytes` 値、`double` / `geo_point` は `Opaque` の表示専用値(例 `Double(1.5)`、`GeoPoint(35.7, 139.7)`)、`reference` は同一データベース内であれば相対パスの `DocRef`(別プロジェクトや別データベースの参照は `Reference(...)` の `Opaque` 値)。`Opaque` 値はクエリの `==` 等でマッチさせることはできず(スクリプトからは生成できない)、書き戻しはエラー(`unsupported value in emulator write`)。Storage の `bytes([...])` は `Value::Bytes` であり、ダウンロード時も要素ごとのバイト列を保持する。
 
 ### 真偽値判定(truthiness)
 
@@ -118,6 +120,10 @@ name = "fire"
 ```
 
 マップのキーは識別子または文字列リテラル。値は任意の式。
+
+### バイト列
+
+`bytes([0, 255, 128])` は `0..=255` の Int 配列から `Bytes` を作る。文字列リテラルを UTF-8 バイト列へ暗黙に変換する変換子は用意しない。
 
 ### 要素アクセス(`expr[expr]` と `m.key`)
 
@@ -176,7 +182,7 @@ a = 2   # エラー: reassignment is not allowed: a
 ```
 
 - 変数は再代入不可。関数定義名も同じ名前空間を使い、再定義不可。
-- ビルトイン関数(`puts` `get` `set` `update` `delete` `batch` `transaction` `doc` `col` `col_group` `array` `len` `now` `timestamp` `bytes` `server_timestamp` `array_union` `array_remove` `delete_field` `increment`)と同名の関数定義はエラー(`cannot redefine builtin: <name>`)。ビルトイン呼び出しが常に優先されるため。
+- ビルトイン関数(`puts` `get` `set` `update` `delete` `batch` `transaction` `doc` `col` `col_group` `array` `len` `now` `timestamp` `bytes` `server_timestamp` `array_union` `array_remove` `delete_field` `increment` `storage_upload` `storage_download` `storage_metadata` `storage_delete`)と同名の関数定義はエラー(`cannot redefine builtin: <name>`)。ビルトイン呼び出しが常に優先されるため。
 - 関数本体内でも外側スコープに見える名前への代入はエラー(シャドーイング不可)。ただし**関数の仮引数**は外側の名前と重なってもよい。
 - 関数とブロックの仮引数名は、それぞれ同じ定義内で重複できない。重複した仮引数は parse / definition エラーになる。
 
@@ -225,7 +231,7 @@ total = len(rows)                                            # 要素数
 | `array.each { \|item\| ... }` | 各要素をブロック引数に束縛して評価。戻り値は nil。**クエリ結果(`.get()` の戻り値)にもそのまま使える** |
 | `array.map { \|item\| expr }` | 各要素のブロック評価結果からなる新しい Array |
 | `array.len()` / `len(array)` | 要素数(Int) |
-| `len(map)` / `len(str)` | Map のキー数 / Str の文字数 |
+| `len(map)` / `len(str)` / `len(bytes)` | Map のキー数 / Str の文字数 / Bytes のバイト数 |
 
 - ブロックは必須(`each()` 等はエラー)。ブロック引数の個数は呼び出し側が渡す個数と一致しなければならない(`[1].each { \|a, b\| ... }` はエラー。**空配列でも検証される**)。`each` / `map` / `len` は引数を取らない(`[1].len(99)` 等はエラー)。
 - ブロック内で外側に見える名前への代入はエラー(変数の不変性ポリシーはブロックでも同様)。
@@ -370,7 +376,7 @@ transaction {
 ## 10. CLI (`fl`)
 
 ```
-usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
+usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] (<script-file> | - | -e <script>)
 ```
 
 - スクリプトの指定はちょうど 1 つ:ファイルパス / `-`(stdin) / `-e <script>`(ワンライナー。複数回指定時は改行で連結)。引数なしで stdin がパイプ接続されている場合も stdin から読む(端末直結の引数なしは usage 表示で終了)。`-e` とファイル/`-` の併用はエラー。`--help` / `-h` で usage 表示。未知のオプション・未知のバックエンドはエラー終了。
@@ -387,6 +393,7 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 - `--backend emulator` のとき(`emulator` feature 有効時):
   - `FIRESTORE_EMULATOR_HOST` — **必須**。未設定なら即エラー。
   - `FIRESTORE_PROJECT_ID` — 省略時 `firelang-test`。
+- `--storage-backend` は Storage の選択で、`auto`(既定)、`in-memory`、`emulator` を取る。`auto` は `FIREBASE_STORAGE_EMULATOR_HOST` があれば Storage emulator、なければ in-memory を使う。`emulator` を明示した場合は `FIREBASE_STORAGE_EMULATOR_HOST` が必須で、project ID は `FIREBASE_PROJECT_ID` → `GCLOUD_PROJECT` → `FIRESTORE_PROJECT_ID` → `firelang-test` の順で読む。
 - 実行結果は `=> <inspect表現>` で印字。
 - エラーは `error: <line>:<col>: <message>` を stderr に印字して exit 1。lex / parse エラーは該当トークンの位置、runtime / backend エラーは失敗したトップレベル文の開始位置。位置が付かない場合(補間内の単一式制約違反など)は `error: <message>`。
 
@@ -394,9 +401,11 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 
 | エントリポイント | `in-memory` | `emulator` feature |
 |------------------|-------------|--------------------|
-| `run_script` | ○(固定) | × |
-| `run_script_with_firestore` | ○ | ○(`FirestoreEmulator` を渡す) |
-| `fl` CLI | ○(デフォルト) | ○(`--backend emulator`) |
+| `run_script` | Firestore / Storage とも in-memory(固定) | × |
+| `run_script_with_firestore` | Firestore を指定、Storage は in-memory | ○(`FirestoreEmulator` を渡す。Storage は in-memory) |
+| `run_script_with_storage` | Firestore は in-memory、Storage を指定 | Storage を指定可能(Firestore は in-memory) |
+| `run_script_with_backends` | Firestore と Storage を別々に指定 | 同左 |
+| `fl` CLI | ○(デフォルト) | Firestore は `--backend emulator`、Storage は `--storage-backend` |
 
 ### build feature と公開 API
 
@@ -420,7 +429,8 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 - 認証付きの**本番 Firestore は非対応**(スコープ外)。
 - ランタイムは `Firestore` トレイトでバックエンドを抽象化する。デフォルトは `InMemoryFirestore`。
 - emulator バックエンドは Firestore Rust SDK(`firestore` crate)の gRPC クライアントで Firestore API を呼ぶ。database は `(default)` 固定。
-- 両バックエンドは同じ可視挙動(値の往復・クエリ順序・batch/transaction の原子性)を持たなければならない。
+- Firestore の両バックエンドは同じ可視挙動(値の往復・クエリ順序・batch/transaction の原子性)を持たなければならない。Storage の両バックエンドも path / metadata / content type / size / not-found の契約を共有する。
+- Storage バックエンドは `Storage` トレイトを実装する。in-memory は `Vec<u8>` を保存し、emulator は Firebase Storage REST API (`/v0/b/{bucket}/o`) を同期 HTTP で呼ぶ。バケットは既定で `{project_id}.appspot.com`、`FIREBASE_STORAGE_BUCKET` で上書きできる。HTTP I/O は `StorageTransport` に分離(fake transport でネットワークなしに契約テストできる)。
 - ただし emulator 側に firelang 外の型(`double` / `reference` / `geo_point`)で書かれたフィールドがある場合、emulator バックエンドは `Opaque` / `DocRef` に読み替えて返す(§3)。`bytes` は `Bytes` として lossless に往復する。in-memory には firelang 外の型の値は存在しない。
 
 ## 12. スコープ外(MVP)
@@ -429,12 +439,50 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 
 - Float(数値は Int のみ)
 - 本番 Firestore への認証付きアクセス
+- 本番 Cloud Storage への認証付きアクセス(ID token の自動取得・OAuth など)。emulator client は明示的な bearer token をテスト用の Option として渡せるだけで、未設定なら未認証リクエストとして local rules に委ねる。
 - transaction の自動リトライ
 - カーソルによるページネーション(`start_after` 等。`order_by` + `offset` + `limit` で代替)
 - リスナー(リアルタイム購読)・インデックス依存機能
 - ドキュメントに書かれたサブセットを超える mruby 互換
 
 ## 13. 既知の制限・実装メモ
+
+## 14. Cloud Storage API
+
+Cloud Storage の MVP CRUD はグローバル関数として提供する。Firestore の `doc()` / `col()` とは別の object path を使う。
+
+### 14.1 値・パス
+
+- `bytes([0, 255, 128])` は `Value::Bytes` を作る。配列の要素は `0..=255` の Int だけ。文字列を暗黙に UTF-8 に変換しないため、ダウンロードした任意バイト列を `storage_download()` から比較できる。
+- Storage object path は 1 個以上の非空セグメントを `/` で連結したものなので、`"avatars/alice.png"`、`"a/b/c"` は有効。Firestore のドキュメントのような偶数/奇数セグメント規則は適用しない。先頭・末尾の `/`、`//`、空 path、NUL/制御文字は `invalid storage object path` になる。
+- path と content type は in-memory / emulator で同じ検証を行う。content type を省略した場合は `application/octet-stream` とする。
+
+### 14.2 CRUD
+
+| 関数 | 戻り値 | 説明 |
+|------|--------|------|
+| `storage_upload(path, bytes_value, content_type: "image/png")` | Metadata Map | object を作成または置換する。content type は位置引数にも渡せるが、位置引数と keyword の同時指定は不可。戻り値の `name` / `bucket` / `content_type` / `size`  等を検査できる |
+| `storage_download(path)` | Bytes | object の内容をそのまま返す。HTTP の body を UTF-8 化しない |
+| `storage_metadata(path)` | Metadata Map | object の metadata を返す。`generation` / `metageneration` / `size` / `content_type` を含む |
+| `storage_delete(path)` | Nil | object を削除する。存在しない object は `storage object not found` |
+
+Metadata Map のキーは snake_case (`name`, `bucket`, `content_type`, `size`, `generation`, `metageneration`, `time_created`, `updated`, `md5_hash`, `crc32c`, `etag`, `cache_control`, `content_disposition`, `metadata`) で、サーバが返さない optional 値は `nil` になる。`size` はアップロードしたバイト数と一致することを emulator adapter でも検証する。Storage API は Firestore の `batch` / `transaction` の staging 対象ではなく、それらの中では `storage APIs are not allowed inside ...` エラーになる。
+
+### 14.3 エラー・認証
+
+- path は `invalid storage object path: ...`、不正な MIME type は `invalid storage content type: ...`、malformed JSON は `invalid storage metadata ...`、size 不一致は `storage metadata size mismatch ...` になる。
+- download / metadata / delete の 404 は backend にかかわらず `storage object not found: <path>` に正規化する。
+- `StorageEmulator` は `FIREBASE_STORAGE_EMULATOR_HOST` と project ID から作る。認証 header を明示しない場合は未認証で、Storage emulator の rules に委ねる。Rust client の `with_auth_token()`、または CLI の `FIREBASE_STORAGE_AUTH_TOKEN` は rules テスト用の bearer header を追加するが、本番認証や token の自動取得は MVP のスコープ外。
+
+### 14.4 ローカル quickstart
+
+```bash
+export FIREBASE_PROJECT_ID=demo-firelang
+firebase emulators:exec --only storage --project demo-firelang \
+  'cargo test --test storage_emulator -- --nocapture'
+```
+
+`firebase.json` の `storage.rules` はローカルの CRUD fixture として全 object を許可する。実際の production rules、list、resumable upload、public URL、object generation 操作、認証付き本番接続は別途扱う。
 
 現在、§7 の `where` 異型比較（含める Nil / Array / Map / 欠損フィールドの扱い）
 について未解決の制限はない。emulator では Firestore の server filter を候補絞りに

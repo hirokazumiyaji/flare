@@ -14,17 +14,18 @@ Use before tagging a release or publishing binaries.
    These are the same required checks run by the reusable CI workflow. A
    successful build by itself is not a release gate.
 
-2. **Firestore emulator (required release gate)**
+2. **Firestore / Storage emulators (required release gate)**
    - Install [Firebase CLI](https://firebase.google.com/docs/cli) and Java 11+.
    - From the repo root:  
-     `firebase emulators:exec --only firestore --project demo-firelang 'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --locked -- --nocapture'`
+     `firebase emulators:exec --only firestore,storage --project demo-firelang 'FIRESTORE_PROJECT_ID=demo-firelang FIREBASE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --test storage_emulator --locked -- --nocapture'`
+   - Storage-only quickstart: `firebase emulators:exec --only storage --project demo-firelang 'FIREBASE_STORAGE_EMULATOR_HOST=localhost:9199 cargo test --features emulator --test storage_emulator --locked -- --nocapture'`
    - The `integration-emulator` job runs this suite for branch/PR CI and is
      also run by CD. The release therefore does not omit emulator coverage.
 
 3. **Smoke**
    - `./target/release/fl --help`
    - `./target/release/fl examples/scripts/01_basic.fl`
-   - With emulator: set `FIRESTORE_EMULATOR_HOST` and `FIRESTORE_PROJECT_ID`, then run the feature-enabled binary with `./target/release/fl --backend emulator examples/scripts/01_basic.fl` (the release workflow builds with `--features emulator`).
+   - With emulator: set `FIRESTORE_EMULATOR_HOST` and `FIRESTORE_PROJECT_ID` (plus `FIREBASE_STORAGE_EMULATOR_HOST` for storage), then run the feature-enabled binary with `./target/release/fl --backend emulator examples/scripts/01_basic.fl` (the release workflow builds with `--features emulator`).
 
 4. **Tag and package**
    - Confirm the tag is `v<Cargo package version>` and not merely any `v*` tag. The validator compares it with `cargo metadata --no-deps --format-version 1`:

@@ -425,6 +425,21 @@ fn fl_validates_emulator_backend_before_reading_stdin() {
     );
 }
 
+#[test]
+fn fl_storage_backend_requires_storage_emulator_host() {
+    let out = Command::new(FL_EXE)
+        .args(["--storage-backend", "emulator", "-e", "1"])
+        .env_remove("FIREBASE_STORAGE_EMULATOR_HOST")
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("FIREBASE_STORAGE_EMULATOR_HOST must be set"),
+        "{stderr:?}"
+    );
+}
+
 // The emulator validation messages only exist in the `emulator` build: without
 // the feature every `--backend emulator` invocation fails first with the
 // feature error, so these assertions can only run there.
@@ -440,6 +455,45 @@ fn fl_rejects_empty_emulator_host_before_reading_stdin() {
     assert!(
         stderr.contains("FIRESTORE_EMULATOR_HOST must not be empty"),
         "{stderr:?}"
+    );
+}
+
+#[test]
+fn fl_auto_storage_falls_back_when_emulator_is_unavailable() {
+    let out = Command::new(FL_EXE)
+        .args(["-e", "1"])
+        .env("FIREBASE_STORAGE_EMULATOR_HOST", "127.0.0.1:1")
+        .output()
+        .expect("spawn fl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "=> 1\n");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("using in-memory"));
+}
+
+#[test]
+fn fl_in_memory_storage_crud_is_available_by_default() {
+    let out = Command::new(FL_EXE)
+        .args([
+            "-e",
+            "storage_upload(\"cli/a\", bytes([0, 255]))\nstorage_download(\"cli/a\")",
+        ])
+        .env_remove("FIREBASE_STORAGE_EMULATOR_HOST")
+        .output()
+        .expect("spawn fl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "=> Bytes(00ff)\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

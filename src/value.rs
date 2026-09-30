@@ -9,12 +9,14 @@ use crate::ast::Stmt;
 pub enum Value {
     Int(i64),
     Str(String),
+    /// UTF-8 ではないデータも失わず保持するバイナリ値。
+    /// `bytes([0, 255])` で生成し、Storage の内容として往返する。
+    Bytes(Vec<u8>),
     Bool(bool),
     Nil,
     Array(Vec<Value>),
     Map(BTreeMap<String, Value>),
     Timestamp(Timestamp),
-    Bytes(Vec<u8>),
     ServerTimestamp,
     ArrayUnion(Vec<Value>),
     ArrayRemove(Vec<Value>),
