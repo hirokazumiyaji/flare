@@ -376,7 +376,14 @@ fn emulator_delete_field_and_increment_match_in_memory() {
         "set(\"users/{run}\", {{name: \"a\", age: 1, visits: 10}})\nupdate(\"users/{run}\", {{age: delete_field(), visits: increment(5)}})\nget(\"users/{run}\")"
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    assert_eq!(out, map! {"visits" => Value::Int(15)});
+    // `age` だけが削除されるため `name` は残る(in-memory と同じ結果)。
+    assert_eq!(
+        out,
+        map! {
+            "name" => Value::Str("a".to_string()),
+            "visits" => Value::Int(15)
+        }
+    );
 }
 
 #[test]
@@ -460,12 +467,14 @@ fn emulator_set_rejects_unsupported_values_recursively() {
     let mut rt = Runtime::new(fs);
     let run = unique("write_set");
     let cases = [
-        format!("fn f() {{ 1 }}\nset(\"users/{run}/func\", {{value: f}})"),
-        format!("set(\"users/{run}/doc\", {{value: doc(\"users/ref\")}})"),
-        format!("set(\"users/{run}/collection\", {{value: col(\"users\")}})"),
-        format!("set(\"users/{run}/group\", {{value: col_group(\"members\")}})"),
-        format!("set(\"users/{run}/query\", {{value: col(\"users\").where(\"x\", \"==\", 1)}})"),
-        format!("set(\"users/{run}/nested\", {{value: {{nested: [col(\"users\")]}}}})"),
+        format!("fn f() {{ 1 }}\nset(\"users/{run}/docs/func\", {{value: f}})"),
+        format!("set(\"users/{run}/docs/doc\", {{value: doc(\"users/ref\")}})"),
+        format!("set(\"users/{run}/docs/collection\", {{value: col(\"users\")}})"),
+        format!("set(\"users/{run}/docs/group\", {{value: col_group(\"members\")}})"),
+        format!(
+            "set(\"users/{run}/docs/query\", {{value: col(\"users\").where(\"x\", \"==\", 1)}})"
+        ),
+        format!("set(\"users/{run}/docs/nested\", {{value: {{nested: [col(\"users\")]}}}})"),
     ];
     for source in cases {
         let err = rt.run(&source).unwrap_err();
@@ -501,8 +510,8 @@ fn emulator_batch_with_unsupported_value_persists_nothing() {
     };
     let mut rt = Runtime::new(fs);
     let run = unique("write_batch");
-    let good = format!("users/{run}/good");
-    let bad = format!("users/{run}/bad");
+    let good = format!("users/{run}/docs/good");
+    let bad = format!("users/{run}/docs/bad");
     let err = rt
         .run(&format!(
             "batch {{ set(\"{good}\", {{ok: true}})\nset(\"{bad}\", {{value: col(\"users\")}}) }}"
@@ -520,9 +529,9 @@ fn emulator_documented_values_and_direct_transforms_remain_writable() {
         return;
     };
     let mut rt = Runtime::new(fs);
-    let path = format!("users/{}/allowed", unique("write_allowed"));
+    let path = format!("users/{}/docs/allowed", unique("write_allowed"));
     let source = format!(
-        "set(\"{path}\", {{int: 1, str: \"s\", bool: true, nil: nil, array: [1, {{nested: timestamp(2)}}], map: {{ok: false}}, ts: timestamp(3), tags: array_union([\"a\"]), items: [\"x\"], remove_me: true, count: 10}})\nupdate(\"{path}\", {{tags: array_union([\"b\"]), items: array_remove([\"x\"]), remove_me: delete_field(), count: increment(2), updated_at: server_timestamp()}})\nget(\"{path}\")"
+        "set(\"{path}\", {{int: 1, str: \"s\", bool: true, \"nil\": nil, array: [1, {{nested: timestamp(2)}}], map: {{ok: false}}, ts: timestamp(3), tags: array_union([\"a\"]), items: [\"x\"], remove_me: true, count: 10}})\nupdate(\"{path}\", {{tags: array_union([\"b\"]), items: array_remove([\"x\"]), remove_me: delete_field(), count: increment(2), updated_at: server_timestamp()}})\nget(\"{path}\")"
     );
     let out = rt.run(&source).unwrap();
     let Value::Map(fields) = out else {
