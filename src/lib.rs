@@ -13,7 +13,10 @@ use runtime::Runtime;
 
 pub use error::{ErrorKind, FirelangError, Span};
 #[cfg(feature = "emulator")]
-pub use firestore::{EmulatorConfig, EmulatorConnectionError, FirestoreEmulator};
+pub use firestore::{
+    parse_timeout_ms, EmulatorConfig, EmulatorConnectionError, FirestoreEmulator,
+    FirestoreEmulatorOptions, DEFAULT_OPERATION_TIMEOUT, OPERATION_TIMEOUT_ENV,
+};
 pub use firestore::{Firestore, InMemoryFirestore};
 pub use storage::{
     HttpStorageTransport, HttpTransport, InMemoryStorage, Storage, StorageEmulator, StorageError,

@@ -4,10 +4,14 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
+#[cfg(feature = "emulator")]
+use std::time::Duration;
 
 use firelang::{run_script_with_backends, InMemoryFirestore, InMemoryStorage, StorageEmulator};
 #[cfg(feature = "emulator")]
-use firelang::{EmulatorConfig, FirestoreEmulator};
+use firelang::{
+    parse_timeout_ms as parse_library_timeout_ms, EmulatorConfig, FirestoreEmulator,
+};
 
 #[cfg(not(feature = "emulator"))]
 const EMULATOR_FEATURE_ERROR: &str =
@@ -25,6 +29,10 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut backend = "in-memory";
     let mut storage_backend = "auto";
+    #[cfg(feature = "emulator")]
+    let mut emulator_timeout: Option<Duration> = None;
+    #[cfg(feature = "emulator")]
+    let mut emulator_timeout_flag: Option<String> = None;
     let mut paths: Vec<PathBuf> = vec![];
     let mut inline: Vec<String> = vec![];
     let mut use_stdin = false;
@@ -49,6 +57,19 @@ fn run() -> Result<(), Box<dyn Error>> {
                 storage_backend = b
                     .to_str()
                     .ok_or("--storage-backend value must be valid UTF-8")?;
+                i += 2;
+            }
+            #[cfg(feature = "emulator")]
+            Some("--emulator-timeout-ms") | Some("--timeout-ms") => {
+                let flag = args[i].to_str().unwrap_or("--emulator-timeout-ms").to_string();
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| format!("{flag} requires a value in milliseconds"))?;
+                let value = value
+                    .to_str()
+                    .ok_or_else(|| format!("{flag} value must be valid UTF-8"))?;
+                emulator_timeout = Some(parse_timeout_ms(value)?);
+                emulator_timeout_flag = Some(flag);
                 i += 2;
             }
             Some("-e") => {
@@ -80,6 +101,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                 i += 1;
             }
         }
+    }
+
+    #[cfg(feature = "emulator")]
+    if emulator_timeout.is_some() && backend != "emulator" {
+        let flag = emulator_timeout_flag
+            .as_deref()
+            .unwrap_or("--emulator-timeout-ms");
+        return Err(format!("{flag} requires --backend emulator").into());
     }
 
     // Validate the backend configuration before reading the script, so a
@@ -184,7 +213,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         )?,
         (Some(config), SelectedStorage::Memory) => run_script_with_backends(
             &src,
-            FirestoreEmulator::new(config.host, config.project_id)?,
+            FirestoreEmulator::new_with_timeout(
+                config.host,
+                config.project_id,
+                emulator_timeout.unwrap_or(config.operation_timeout),
+            )?,
             InMemoryStorage::default(),
         )?,
         (None, SelectedStorage::Emulator(storage)) => {
@@ -192,7 +225,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
         (Some(config), SelectedStorage::Emulator(storage)) => run_script_with_backends(
             &src,
-            FirestoreEmulator::new(config.host, config.project_id)?,
+            FirestoreEmulator::new_with_timeout(
+                config.host,
+                config.project_id,
+                emulator_timeout.unwrap_or(config.operation_timeout),
+            )?,
             storage,
         )?,
     };
@@ -208,6 +245,27 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     println!("=> {}", out.inspect());
     Ok(())
+}
+
+#[cfg(feature = "emulator")]
+fn parse_timeout_ms(value: &str) -> Result<Duration, Box<dyn Error>> {
+    // Reuse the library parser so the CLI and FirestoreEmulator::from_env
+    // cannot disagree about what a valid timeout is.
+    parse_library_timeout_ms(value)
+}
+
+#[cfg(all(test, feature = "emulator"))]
+mod timeout_helper_tests {
+    use super::*;
+
+    #[test]
+    fn timeout_parser_rejects_zero_and_accepts_positive_values() {
+        assert_eq!(parse_timeout_ms("25").unwrap(), Duration::from_millis(25));
+        assert!(parse_timeout_ms("0").is_err());
+        assert!(parse_timeout_ms("-1").is_err());
+        assert!(parse_timeout_ms("nope").is_err());
+    }
+
 }
 
 enum SelectedStorage {
@@ -252,7 +310,7 @@ fn make_storage(host: String, project_id: String) -> Result<StorageEmulator, Box
 
 fn print_usage() {
     eprintln!(
-        "usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] (<script-file> | - | -e <script>)"
+        "usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--emulator-timeout-ms <ms>] (<script-file> | - | -e <script>)"
     );
     eprintln!();
     eprintln!("  Script source (exactly one):");
@@ -272,6 +330,19 @@ fn print_usage() {
     eprintln!(
         "    emulator    ({EMULATOR_FEATURE_ERROR}) use FIRESTORE_EMULATOR_HOST and optional FIRESTORE_PROJECT_ID"
     );
+    #[cfg(feature = "emulator")]
+    eprintln!();
+    #[cfg(feature = "emulator")]
+    eprintln!("  Emulator timeout:");
+    #[cfg(feature = "emulator")]
+    eprintln!(
+        "    --emulator-timeout-ms <ms>  per-RPC timeout (default: {}ms)",
+        firelang::DEFAULT_OPERATION_TIMEOUT.as_millis()
+    );
+    #[cfg(feature = "emulator")]
+    eprintln!("    --timeout-ms <ms>          alias for --emulator-timeout-ms");
+    #[cfg(feature = "emulator")]
+    eprintln!("    FIRESTORE_EMULATOR_TIMEOUT_MS  environment override for the default");
     eprintln!();
     eprintln!("  Storage backends:");
     eprintln!("    auto       use the Storage emulator when FIREBASE_STORAGE_EMULATOR_HOST is set");

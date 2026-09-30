@@ -5,7 +5,10 @@ mod emulator;
 mod memory;
 
 #[cfg(feature = "emulator")]
-pub use emulator::{EmulatorConfig, EmulatorConnectionError, FirestoreEmulator};
+pub use emulator::{
+    parse_timeout_ms, EmulatorConfig, EmulatorConnectionError, FirestoreEmulator,
+    FirestoreEmulatorOptions, DEFAULT_OPERATION_TIMEOUT, OPERATION_TIMEOUT_ENV,
+};
 pub use memory::InMemoryFirestore;
 
 use std::cmp::Ordering;
