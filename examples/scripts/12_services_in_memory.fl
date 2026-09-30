@@ -1,0 +1,8 @@
+user = auth_sign_in_anonymously()
+object = storage_put("reports/today.txt", "done", content_type: "text/plain")
+set("users/#{user["uid"]}", {report: object["path"]})
+[
+  get("users/#{user["uid"]}")["report"],
+  storage_get("reports/today.txt"),
+  storage_list("reports").len(),
+]

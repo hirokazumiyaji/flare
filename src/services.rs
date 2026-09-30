@@ -31,6 +31,7 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectConfig {
     pub project_id: String,
+    pub firestore_emulator_host: Option<String>,
     pub auth_emulator_host: Option<String>,
     pub storage_emulator_host: Option<String>,
     pub request_timeout: Duration,
@@ -40,6 +41,7 @@ impl Default for ProjectConfig {
     fn default() -> Self {
         Self {
             project_id: DEFAULT_PROJECT_ID.to_string(),
+            firestore_emulator_host: None,
             auth_emulator_host: None,
             storage_emulator_host: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
@@ -76,6 +78,7 @@ impl ProjectConfig {
             .unwrap_or_else(|_| DEFAULT_PROJECT_ID.to_string());
         Self {
             project_id,
+            firestore_emulator_host: std::env::var("FIRESTORE_EMULATOR_HOST").ok(),
             auth_emulator_host: std::env::var("FIREBASE_AUTH_EMULATOR_HOST").ok(),
             storage_emulator_host: std::env::var("FIREBASE_STORAGE_EMULATOR_HOST").ok(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
@@ -84,6 +87,11 @@ impl ProjectConfig {
 
     pub fn project_id(&self) -> &str {
         &self.project_id
+    }
+
+    pub fn with_firestore_emulator_host(mut self, host: impl Into<String>) -> Self {
+        self.firestore_emulator_host = Some(host.into());
+        self
     }
 
     pub fn with_auth_emulator_host(mut self, host: impl Into<String>) -> Self {
@@ -159,6 +167,28 @@ impl Services {
             firestore: Some(Box::new(firestore)),
             auth: None,
             storage: None,
+        }
+    }
+
+    pub fn from_auth<A>(auth: A) -> Self
+    where
+        A: Auth + 'static,
+    {
+        Self {
+            firestore: None,
+            auth: Some(Box::new(auth)),
+            storage: None,
+        }
+    }
+
+    pub fn from_storage<S>(storage: S) -> Self
+    where
+        S: Storage + 'static,
+    {
+        Self {
+            firestore: None,
+            auth: None,
+            storage: Some(Box::new(storage)),
         }
     }
 
@@ -314,6 +344,18 @@ impl RuntimeContext {
         }
     }
 
+    pub fn with_services(services: impl Into<Services>) -> Self {
+        Self::new(services)
+    }
+
+    /// Construct the strict Firestore-only adapter context.
+    pub fn firestore_only<F>(firestore: F) -> Self
+    where
+        F: Firestore + 'static,
+    {
+        Self::new(Services::from_firestore(firestore))
+    }
+
     pub fn from_config(config: ProjectConfig) -> Self {
         Self::with_config(config, Services::default())
     }
@@ -399,6 +441,7 @@ mod tests {
         // require another field and fail the test.
         let _ = ProjectConfig {
             project_id: "demo".to_string(),
+            firestore_emulator_host: None,
             auth_emulator_host: None,
             storage_emulator_host: None,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,

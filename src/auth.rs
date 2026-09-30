@@ -179,12 +179,12 @@ impl Auth for InMemoryAuth {
     }
 }
 
-/// Local Firebase Auth emulator adapter.
+/// In-process Auth emulator-mode adapter.
 ///
-/// The adapter keeps state in memory and therefore never needs credentials or
-/// a global token source.  It is deliberately usable without an emulator for
-/// tests and local scripts; a future HTTP adapter can implement the same
-/// [`Auth`] trait without changing `Runtime` or the language API.
+/// This adapter keeps state in memory and performs **no** HTTP request to a
+/// Firebase Auth emulator.  It exists to give hosts an emulator-named local
+/// implementation of the same [`Auth`] contract; a remote adapter can replace
+/// it without changing `Runtime` or the language API.
 pub struct AuthEmulator {
     project_id: String,
     inner: InMemoryAuth,
@@ -203,7 +203,8 @@ impl AuthEmulator {
     }
 
     /// Read only non-secret emulator configuration.  No credential is read or
-    /// retained by this constructor.
+    /// retained by this constructor, and no connection is opened to the
+    /// detected host.
     pub fn from_env() -> Option<Self> {
         let project_id = std::env::var("FIREBASE_PROJECT_ID")
             .or_else(|_| std::env::var("FIRESTORE_PROJECT_ID"))
@@ -245,10 +246,14 @@ impl Auth for AuthEmulator {
     fn sign_in_anonymously(&mut self) -> Result<AuthUser, Box<dyn Error>> {
         self.inner.sign_in_anonymously()
     }
+
+    fn verify_token(&self, token: &str) -> Result<Option<AuthUser>, Box<dyn Error>> {
+        self.inner.verify_token(token)
+    }
 }
 
-/// Explicit name for code that wants to document that it is using the local
-/// Firebase emulator adapter rather than the generic fake.
+/// Alias for hosts that name their in-process emulator-mode adapter with the
+/// Firebase provider.
 pub type FirebaseAuthEmulator = AuthEmulator;
 
 #[cfg(test)]

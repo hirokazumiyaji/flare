@@ -15,7 +15,10 @@ pub use auth::{Auth, AuthEmulator, AuthUser, FirebaseAuthEmulator, InMemoryAuth}
 pub use error::{CapabilityError, ErrorKind, FirelangError, Span};
 pub use firestore::{Firestore, FirestoreEmulator, InMemoryFirestore};
 use runtime::Runtime;
-pub use services::{ProjectConfig, RuntimeContext, Services, ServicesBuilder};
+pub use services::{
+    capability_error, ProjectConfig, RuntimeContext, Services, ServicesBuilder, DEFAULT_PROJECT_ID,
+    DEFAULT_REQUEST_TIMEOUT,
+};
 pub use storage::{
     FirebaseStorageEmulator, InMemoryStorage, Storage, StorageEmulator, StorageObject,
 };

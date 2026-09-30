@@ -2,8 +2,8 @@
 
 ## 対象
 
-Firestore  除了.Firestore に加えて Auth と Cloud Storage を同じスクリプトから扱うため、ランタイムがサービスオブジェクトを 1 つの実行コンテキストにまとめる。
-この文書は型之间的关系、互換性の保ち方、認証情報の扱い、同期 client の deadline について決める。
+Firestore に加えて Auth と Cloud Storage を同じスクリプトから扱うため、ランタイムがサービスオブジェクトを 1 つの実行コンテキストにまとめる。
+この文書は型の関係、互換性の保ち方、認証情報の扱い、同期 client の deadline について決める。
 文書の記載と実装が食い違う場合は、`docs/spec.md` とテストを正とする。
 
 ## 決定
@@ -25,8 +25,8 @@ Auth の session や Storage の object などの mutable な状態はすべて 
 ### `Runtime` の generic は互換性マーカーに残す
 
 Firestore 導入時は `Runtime<F: Firestore>` を使い、`F` にバックエンドの型を埋め込んでいた。
-Auth と Storage を追加したnym、`Runtime<F, A, S>` へ広げると `Runtime` 型を書くすべての呼び出し側と組み込み関数の定義が変わる。
-そこで、 evaluator が保持する `F` の実体を捨て、既定値を持つ互換性マーカーへ残した。
+Auth と Storage を追加するたびに `Runtime<F, A, S>` へ広げると、`Runtime` 型を書く呼び出し側と組み込み関数の定義をすべて変えることになる。
+そこで evaluator が保持する `F` の実体を捨て、既定値を持つ互換性マーカーへ残した。
 
 ```rust
 pub struct Runtime<F = InMemoryFirestore> {
@@ -41,7 +41,7 @@ pub struct Runtime<F = InMemoryFirestore> {
 
 ```rust
 use firelang::{
-    InMemoryAuth, InMemoryFirestore, InMemoryStorage, ProjectConfig, RuntimeContext, Runtime,
+    InMemoryAuth, InMemoryFirestore, InMemoryStorage, ProjectConfig, Runtime, RuntimeContext,
     Services,
 };
 
@@ -57,11 +57,11 @@ let config = ProjectConfig::new("demo");
 let mut runtime: Runtime = Runtime::from_context(RuntimeContext::with_config(config, services));
 ```
 
-Auth と Storage を別々に差し替える場合も、`Services::builder()` へ必要��� capability だけを渡す。
+Auth と Storage を別々に差し替える場合も、`Services::builder()` に必要な capability だけを渡す。
 
 ## 既存 API の adapter
 
-Firestore だけを渡す API はiba、技术的には `Services` へ Firestore だけが入った context である。
+Firestore だけを渡す API は、技術的には `Services` へ Firestore だけが入った context である。
 `Runtime::new` と `run_script_with_firestore` はその adapter として残す。
 この経路では Auth と Storage を暗黙に補わない。
 Auth を必要とする script が `run_script_with_firestore` を使うと、未設定 capability の error になる。
@@ -73,13 +73,13 @@ legacy.run("get(\"users/1\")");
 
 `run_script` は `Services::in_memory()` を使い、3 つの in-memory service をすべて設定する。
 そのため emulator が無くても Auth と Storage の contract を実行できる。
- Conversely、`run_script_with_services` と `run_script_with_context` は、呼び出し側が選んだ service と project 設定をそのまま使う。
+逆に、`run_script_with_services` と `run_script_with_context` は、呼び出し側が選んだ service と project 設定をそのまま使う。
 
 ## Capability error
 
 未設定の service を呼び出した場合、runtime は `ErrorKind::Capability` の `FirelangError` を返す。
 message は `capability unavailable: <service> (<operation>)` で、operation には `current_user`、`get`、`put` のような呼び出し名が入る。
-source position は通常の runtime/backend error と同じく、失敗したトップレベル文の開始位置になる。
+source position は通常の runtime error や backend error と同じく、失敗したトップレベル文の開始位置になる。
 
 ```ruby
 auth_current_user()
@@ -96,7 +96,7 @@ provider が optional operation を実装しない場合も、capability error �
 credential、private key、ID token、refresh token を `ProjectConfig` には持たせない。
 token を必要とする provider は adapter 自身の client state として保持し、script の `Value` へ変換しない。
 
-`ProjectConfig::from_env` が読むのは `FIREBASE_PROJECT_ID`、`GCLOUD_PROJECT`、`FIRESTORE_PROJECT_ID` と emulator host だけで、credential source の解決を行わない。
+`ProjectConfig::from_env` が読むのは `FIREBASE_PROJECT_ID`、`GCLOUD_PROJECT`、`FIRESTORE_PROJECT_ID` と 3 つの emulator host だけで、credential source の解決を行わない。
 既定の request timeout は 30 秒である。
 
 ## 同期 runtime と network client
@@ -106,7 +106,7 @@ script は provider の future を await できず、background task を開始�
 async SDK を使う adapter は、method から戻る前までに future を完了させ、timeout、retry、token refresh を adapter 内で処理する。
 
 network adapter は `ProjectConfig::request_timeout` を 1 回の remote operation の deadline として適用する。
-timeout は script の実行時間全体ではなく、adapter がophile network call ごとに適用する。
+timeout は script の実行時間全体ではなく、adapter が送る network call ごとに適用する。
 in-memory service は network call を行わないため deadline の対象にならない。
 
 Auth と Storage の token は `Auth::verify_token` のような Rust API からは provider へ渡せるが、language builtin には公開しない。
@@ -115,7 +115,7 @@ Auth と Storage の token は `Auth::verify_token` のような Rust API から
 ## Auth identity と security rules
 
 Auth identity と Firestore request は同じ `RuntimeContext` に置ける。
-これにより、embedding host は「-signed-in user と project's Firestore adapter」を 1 つの値として組み立てられる。
+これにより、embedding host は signed-in user と project の Firestore adapter を 1 つの値として組み立てられる。
 ただし runtime が Auth の uid を Firestore request の identity として自動付与する処理は含めない。
 
 Firestore security rules と Storage rules の評価は、それぞれの adapter と emulator が担う。
@@ -129,13 +129,13 @@ in-memory implementation は network を使わず、同じ script contract を C
 `AuthEmulator` と `StorageEmulator` はこの issue で追加した emulator-mode の local adapter であり、状態も in-process に保持する。
 これらは `FIREBASE_AUTH_EMULATOR_HOST` や `FIREBASE_STORAGE_EMULATOR_HOST` への HTTP/gRPC 接続を行わない。
 remote emulator との通信は、同じ trait を実装する別の adapter として追加する。
-名前だけを見て remote emulator と解釈しないよう、remote 接続を実装した時点で host を必須の constructor 引数にする。
+remote 接続を実装した adapter では、host を必須の constructor 引数にして、local adapter と名前で区別できるようにする。
 
 ## Contract test の分け方
 
 in-memory と remote adapter は同じ trait contract を実装しているため、同じ script 群を使える。
 ただし network failure の分類や emulator 固有の response は adapter の test に置く。
-建议する test matrix を次のように分ける。
+test matrix は次のように分ける。
 
 - **in-memory**：全 operation、validation、状態継続、capability error を固定した script で検証する。
 - **runtime**：Rust の custom provider を差し替え、`Runtime` の generic が増えないことを確認する。
@@ -153,4 +153,4 @@ Auth、Storage、Firestore を別々の fake に差し替えられること、co
 3. 未設定時の `ErrorKind::Capability` を作る。
 4. 必要な script builtin を追加する。
 5. in-memory implementation と contract test を追加する。
-6. remote adapter を必要になった時点で個別に追加する。
+6. remote adapter が必要になった時点で個別に追加する。

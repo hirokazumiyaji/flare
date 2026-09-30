@@ -167,19 +167,20 @@ impl Storage for InMemoryStorage {
             .objects
             .values()
             .filter(|object| {
-                object.path == prefix || object.path.starts_with(&format!("{prefix}/"))
+                prefix.is_empty()
+                    || object.path == prefix
+                    || object.path.starts_with(&format!("{prefix}/"))
             })
             .cloned()
             .collect())
     }
 }
 
-/// Local Firebase Storage emulator adapter.
+/// In-process Storage emulator-mode adapter.
 ///
-/// Like the Auth emulator adapter, this implementation is a local, in-memory
-/// adapter with the same public contract as a network adapter.  It is useful
-/// in emulator-free tests and can be replaced by an HTTP implementation
-/// without changing scripts or `Runtime`.
+/// Like the Auth emulator adapter, this implementation keeps state in memory
+/// and performs **no** HTTP request to a Firebase Storage emulator.  A remote
+/// adapter can implement the same trait without changing scripts or `Runtime`.
 pub struct StorageEmulator {
     project_id: String,
     inner: InMemoryStorage,
@@ -197,6 +198,7 @@ impl StorageEmulator {
         Self::new(config.project_id.clone())
     }
 
+    /// Detect non-secret emulator configuration without opening a connection.
     pub fn from_env() -> Option<Self> {
         let project_id = std::env::var("FIREBASE_PROJECT_ID")
             .or_else(|_| std::env::var("FIRESTORE_PROJECT_ID"))
@@ -241,8 +243,8 @@ impl Storage for StorageEmulator {
     }
 }
 
-/// Explicit name for code that wants to document that it is using the local
-/// Firebase emulator adapter rather than the generic fake.
+/// Alias for hosts that name their in-process emulator-mode adapter with the
+/// Firebase provider.
 pub type FirebaseStorageEmulator = StorageEmulator;
 
 fn normalize_path(path: &str) -> Result<String, Box<dyn Error>> {
@@ -286,6 +288,7 @@ mod tests {
 
         assert_eq!(storage.list("images").unwrap().len(), 2);
         assert_eq!(storage.list("images/").unwrap().len(), 2);
+        assert_eq!(storage.list("").unwrap().len(), 3);
         assert_eq!(
             storage.get("images/a.png").unwrap().unwrap().metadata["owner"],
             "alice"

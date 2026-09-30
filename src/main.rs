@@ -120,8 +120,9 @@ fn print_usage() {
     eprintln!("    (no args)     read from stdin when piped, otherwise show this usage");
     eprintln!();
     eprintln!("  Backends:");
-    eprintln!("    in-memory   (default) use the in-memory Firestore stub");
+    eprintln!("    in-memory   (default) use local in-memory Firestore, Auth, and Storage");
     eprintln!("    emulator    use FIRESTORE_EMULATOR_HOST and optional FIRESTORE_PROJECT_ID");
+    eprintln!("                (Auth and Storage are not configured on this CLI path)");
 }
 
 fn read_stdin() -> Result<String, Box<dyn Error>> {

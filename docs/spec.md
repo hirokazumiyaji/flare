@@ -17,6 +17,7 @@
 - [11. バックエンド](#11-バックエンド)
 - [12. スコープ外(MVP)](#12-スコープ外mvp)
 - [13. 既知の制限・実装メモ](#13-既知の制限実装メモ)
+- [14. Services と Auth / Storage API](#14-services-と-auth--storage-api)
 
 ## 1. 概要
 
@@ -163,7 +164,7 @@ a = 2   # エラー: reassignment is not allowed: a
 ```
 
 - 変数は再代入不可。関数定義名も同じ名前空間を使い、再定義不可。
-- ビルトイン関数(`puts` `get` `set` `update` `delete` `batch` `transaction` `doc` `col` `col_group` `array` `len` `now` `timestamp` `server_timestamp` `array_union` `array_remove` `delete_field` `increment`)と同名の関数定義はエラー(`cannot redefine builtin: <name>`)。ビルトイン呼び出しが常に優先されるため。
+- ビルトイン関数(`puts` `get` `set` `update` `delete` `batch` `transaction` `doc` `col` `col_group` `array` `len` `now` `timestamp` `server_timestamp` `array_union` `array_remove` `delete_field` `increment`、および 14 章の Auth / Storage 関数)と同名の関数定義はエラー(`cannot redefine builtin: <name>`)。ビルトイン呼び出しが常に優先されるため。
 - 関数本体内でも外側スコープに見える名前への代入はエラー(シャドーイング不可)。ただし**関数の仮引数**は外側の名前と重なってもよい。
 
 ### スコープ規則(静的スコープ)
@@ -366,21 +367,28 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 - `--backend emulator` のとき:
   - `FIRESTORE_EMULATOR_HOST` — **必須**。未設定なら即エラー。
   - `FIRESTORE_PROJECT_ID` — 省略時 `firelang-test`。
+  - Auth と Storage は未設定のままなので、それぞれの builtin を呼ぶと `capability unavailable` エラーになる。
 - 実行結果は `=> <inspect表現>` で印字。
 - エラーは `error: <line>:<col>: <message>` を stderr に印字して exit 1。lex / parse エラーは該当トークンの位置、runtime / backend エラーは失敗したトップレベル文の開始位置。位置が付かない場合(補間内の単一式制約違反など)は `error: <message>`。
 
 ## 11. バックエンド
 
-| エントリポイント | `in-memory` | `emulator` |
-|------------------|-------------|------------|
-| `run_script` | ○(固定) | × |
-| `run_script_with_firestore` | ○ | ○(`FirestoreEmulator` を渡す) |
-| `fl` CLI | ○(デフォルト) | ○(`--backend emulator`) |
+| エントリポイント | Firestore | Auth | Storage | project 設定 |
+|------------------|-----------|------|---------|--------------|
+| `run_script` | in-memory | in-memory | in-memory | 既定値 |
+| `run_script_with_firestore` | 呼び出し側が渡す | 未設定 | 未設定 | 既定値 |
+| `run_script_with_services` | `Services` で選択 | `Services` で選択 | `Services` で選択 | 既定値 |
+| `run_script_with_services_and_config` | `Services` で選択 | `Services` で選択 | `Services` で選択 | 呼び出し側が渡す |
+| `run_script_with_context` | `RuntimeContext` で選択 | `RuntimeContext` で選択 | `RuntimeContext` で選択 | `RuntimeContext` で選択 |
+| `fl` CLI(既定) | in-memory | in-memory | in-memory | `firelang-test` |
+| `fl --backend emulator` | Firestore emulator | 未設定 | 未設定 | `FIRESTORE_PROJECT_ID`(既定 `firelang-test`) |
 
 - 認証付きの**本番 Firestore は非対応**(スコープ外)。
-- ランタイムは `Firestore` トレイトでバックエンドを抽象化する。デフォルトは `InMemoryFirestore`。
+- ランタイムは `Firestore`、`Auth`、`Storage` の各トレイトでバックエンドを抽象化する。
+- `Runtime` は `RuntimeContext` を 1 つ持ち、service ごとに generic parameter を増やさない(§14)。
 - emulator バックエンドは Firestore Rust SDK(`firestore` crate)の gRPC クライアントで Firestore API を呼ぶ。database は `(default)` 固定。
-- 両バックエンドは同じ可視挙動(値の往復・クエリ順序・batch/transaction の原子性)を持たなければならない。
+- Firestore emulator と組み合わせる場合、`FirestoreEmulator` を `Services::builder().firestore(...)` へ渡す。Auth と Storage は個別に選択でき、未設定のままでも Firestore だけの script は従来どおり動く。
+- 両 Firestore バックエンドは同じ可視挙動(値の往復・クエリ順序・batch/transaction の原子性)を持たなければならない。
 - ただし emulator 側に firelang 外の型(`double` / `reference` / `geo_point` / `bytes`)で書かれたフィールドがある場合、emulator バックエンドは `Opaque` / `DocRef` に読み替えて返す(§3)。in-memory にはそのような値は存在しない。
 
 ## 12. スコープ外(MVP)
@@ -401,3 +409,123 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 | 項目 | 現状の挙動 | 予定 |
 |------|-----------|------|
 | `where` の異なる型同士の大小比較 | in-memory ではマッチしない。emulator では Firestore の型順序で比較される(§7 は同型のみを規定) | backlog |
+
+## 14. Services と Auth / Storage API
+
+### RuntimeContext と Services
+
+**`Services`** は Firestore、Auth、Storage の実装をそれぞれ `Option` で保持する。
+**`RuntimeContext`** は `Services` と project 設定の組で、mutable なサービス状態を所有する。
+global state はなく、同じ `Runtime` で複数の script を順に評価すると、同じ context の Auth session と Storage object が続く。
+別の `RuntimeContext` へ移ると状態は見えない。
+
+```rust
+use firelang::{
+    InMemoryFirestore, InMemoryStorage, ProjectConfig, Runtime, RuntimeContext, Services,
+};
+
+let services = Services::builder()
+    .firestore(InMemoryFirestore::default())
+    .storage(InMemoryStorage::default())
+    .build();
+let context = RuntimeContext::with_config(ProjectConfig::new("demo"), services);
+let mut runtime: Runtime = Runtime::from_context(context);
+```
+
+`Runtime<F>` の `F` は `Runtime<InMemoryFirestore>` のような記法を引き継ぐ互換性マーカーである。
+`Runtime` が保持する実際の evaluator state に `F` の値は含まれない。
+Auth / Storage / 将来の capability を追加しても、`Runtime` と既存ビルトイン関数に generic parameter は増えない。
+
+`ProjectConfig` は project ID、Firestore / Auth / Storage の emulator host、network call の request timeout を保持する。
+credential、private key、access token、refresh token は持たない。
+既定の request timeout は 30 秒である。
+
+### Auth API
+
+Auth の戻り値は次の Map とする。未設定の optional field は `nil` になる。
+
+| キー | 型 | 説明 |
+|------|----|------|
+| `uid` | Str | provider が付ける不変の user ID |
+| `email` | Str / Nil | email |
+| `display_name` | Str / Nil | 表示名 |
+| `email_verified` | Bool | email の確認済みかどうか |
+| `custom_claims` | Map | provider が正規化した String 値の claim |
+
+| 関数 | 戻り値 | 説明 |
+|------|--------|------|
+| `auth_sign_in(email, password)` | Map | email / password で sign-in して user を返す |
+| `auth_sign_in_anonymously()` | Map | anonymous user を作って sign-in する |
+| `auth_current_user()` | Map / Nil | 現在の user。未 sign-in なら nil |
+| `auth_user()` | Map / Nil | `auth_current_user()` の alias |
+| `auth_sign_out()` | Nil | local session を破棄する |
+
+- `run_script` の既定 Auth は `InMemoryAuth` で、既定の user は 0 件である。
+  `auth_sign_in` を使う host は `InMemoryAuth::with_user` などで user を登録してから context を作る。
+- `auth_sign_in_anonymously()` は user を 1 件作る。
+- password は call の引数として provider へ渡すが、戻り値や `ProjectConfig` には含めない。
+- ID token、refresh token、credential を script の `Value` として公開しない。
+  token を使う operation を追加する場合も、表示と `inspect` では redact する。
+
+### Storage API
+
+Storage object の path は 1 個以上の空でない `/` 区切り segment からなる。
+Firestore の document path のような segment 数の偶奇規則は適用しない。
+先頭・末尾の `/`、空 segment を含む path は `storage_put` / `storage_get` / `storage_delete` の呼び出し時にエラーになる。
+
+| 関数 | 戻り値 | 説明 |
+|------|--------|------|
+| `storage_put(path, data)` | Map | object を保存して object Map を返す |
+| `storage_put(path, data, content_type: "...")` | Map | content type を付けて保存する |
+| `storage_write(...)` | Map | `storage_put` の alias |
+| `storage_get(path)` | 値 / Nil | data を返す。object が無ければ nil |
+| `storage_read(path)` | 値 / Nil | `storage_get` の alias |
+| `storage_list()` / `storage_list(prefix)` | Array\<Map> | directory 境界で list する。path 昇順 |
+| `storage_delete(path)` | Bool | object を削除する。元から無ければ false |
+| `storage_remove(path)` | Bool | `storage_delete` の alias |
+
+`storage_put` が返す object Map と `storage_list` の要素は次の形を持つ。
+
+| キー | 型 | 説明 |
+|------|----|------|
+| `path` | Str | object path |
+| `data` | 値 | 保存した data |
+| `content_type` | Str | content type を指定した場合だけ存在 |
+| `metadata` | Map\<Str, Str> | user metadataがある場合だけ存在 |
+
+- `storage_get` は data だけを返す。
+- `storage_list("images")` は `images` 自身と `images/...` だけを返す。
+  `images-old/...` は含まない。
+- `data` には Int / Str / Bool / Nil / Array / Map / Timestamp を渡せる。
+  Firestore の field transform sentinel、reference、query、function は保存しない。
+
+### Capability error
+
+context に設定されていない service を呼び出した場合、runtime は `ErrorKind::Capability` の error を返す。
+
+```ruby
+auth_current_user()
+# 1:1: capability unavailable: auth (current_user)
+```
+
+message は `capability unavailable: <service> (<operation>)` となり、`<service>` は `firestore`、`auth`、`storage` のいずれかである。
+error は失敗したトップレベル文の開始位置を持つ。
+service が存在するが remote call が失敗した場合は capability error ではなく backend error になる。
+
+### 同期実行と network deadline
+
+`Runtime`、`Auth`、`Storage` の trait は同期 API である。
+script には await、background task、callback の登録がない。
+async SDK を使う provider adapter は、method が戻るまでに future を完了させ、timeout と retry を adapter 内で処理する。
+
+network adapter は `ProjectConfig::request_timeout` を 1 回の remote call の deadline として使う。
+script 全体の実行時間制限ではない。
+in-memory service は network call を行わない。
+
+### 設計の決定
+
+- **provider-neutral**：Auth と Storage の trait は Firebase の API 固有の型に依存しない。Firebase は adapter の一実装として扱う。
+- **in-memory contract test**：in-memory implementation で operation、validation、状態継続、capability error を検証する。
+  remote emulator adapter は同じ script contract を使い、provider 固有の token や error 変換を追加検証する。
+- **Auth identity と security rules**：Auth identity と Firestore / Storage request は同じ `RuntimeContext` に置ける。
+  runtime は user identity を request へ自動付与せず、rule の評価と credential の付与は provider adapter の責務とする。

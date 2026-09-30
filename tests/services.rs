@@ -178,6 +178,7 @@ fn legacy_firestore_only_entry_point_still_works_and_has_no_implicit_auth() {
 #[test]
 fn runtime_context_keeps_config_and_service_state_without_globals() {
     let config = ProjectConfig::new("demo-services")
+        .with_firestore_emulator_host("127.0.0.1:8080")
         .with_auth_emulator_host("127.0.0.1:9099")
         .with_storage_emulator_host("127.0.0.1:9199")
         .with_request_timeout(std::time::Duration::from_secs(3));
@@ -214,6 +215,29 @@ fn explicit_runtime_type_and_constructor_remain_source_compatible() {
         .run("set(\"users/1\", {n: 7})\nget(\"users/1\")[\"n\"]")
         .unwrap();
     assert_eq!(out, Value::Int(7));
+}
+
+#[test]
+fn storage_rejects_firestore_only_values() {
+    for (source, expected) in [
+        (
+            "storage_put(\"a\", server_timestamp())",
+            "storage_put cannot store Firestore field transforms",
+        ),
+        (
+            "storage_put(\"a\", doc(\"users/1\"))",
+            "storage_put cannot store a reference or function value",
+        ),
+    ] {
+        let err = run_script_with_services(
+            source,
+            Services::builder()
+                .storage(InMemoryStorage::default())
+                .build(),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains(expected), "{source}: {err}");
+    }
 }
 
 #[test]

@@ -13,6 +13,7 @@ puts "found #{rows}"
 ## ドキュメント
 
 - [言語仕様 / API リファレンス](docs/spec.md) — 言語・Firestore API・batch/transaction セマンティクスの正式仕様
+- [Services 構成の設計](docs/services.md) — Firestore / Auth / Storage の合成、互換性 adapter、capability error、同期 client の制約
 - [examples/scripts/](examples/scripts/) — 動くサンプルスクリプト集
 - [リリースチェックリスト](docs/release-checklist.md)
 - [過去の MVP 計画資料(アーカイブ)](docs/archive/mvp/)
@@ -39,6 +40,28 @@ firebase emulators:exec --only firestore --project demo-firelang \
 ```
 
 本番 Firestore(認証付き)は非対応です。詳細は [仕様の 11-12 章](docs/spec.md#11-バックエンド) を参照してください。
+
+## Services の組み合わせ
+
+`fl` の in-memory backend と `run_script` は、Firestore、Auth、Storage の in-memory 実装をすべて設定します。Rust から Firestore emulator を `Services` へ渡す場合も、Auth と Storage は個別に差し替えられます。
+
+```ruby
+user = auth_sign_in_anonymously()
+storage_put("reports/today.txt", "done", content_type: "text/plain")
+puts "signed in as #{user["uid"]}"
+```
+
+```rust
+use firelang::{InMemoryFirestore, InMemoryStorage, Runtime, RuntimeContext, Services};
+
+let services = Services::builder()
+    .firestore(InMemoryFirestore::default())
+    .storage(InMemoryStorage::default())
+    .build();
+let mut runtime: Runtime = Runtime::from_context(RuntimeContext::new(services));
+```
+
+`run_script_with_firestore` は従来の Firestore だけを受け取る adapter です。Auth や Storage を明示的に設定していないため、それらを呼び出すと `capability unavailable` エラーになります。設計上の判断は [Services 構成の設計](docs/services.md) にまとめています。
 
 ## テスト
 

@@ -52,10 +52,20 @@ impl<F> Runtime<F> {
         Self::from_context(context)
     }
 
+    /// Descriptive alias for [`Self::from_context`].
+    pub fn new_with_context(context: RuntimeContext) -> Self {
+        Self::from_context(context)
+    }
+
     /// Construct with an explicitly selected service set and the default
     /// project configuration.
     pub fn with_services(services: impl Into<Services>) -> Self {
         Self::from_context(RuntimeContext::new(services))
+    }
+
+    /// Descriptive alias for [`Self::with_services`].
+    pub fn new_with_services(services: impl Into<Services>) -> Self {
+        Self::with_services(services)
     }
 
     /// Construct with project configuration and an explicitly selected
@@ -65,6 +75,14 @@ impl<F> Runtime<F> {
         services: impl Into<Services>,
     ) -> Self {
         Self::from_context(RuntimeContext::with_config(config, services))
+    }
+
+    /// Descriptive alias for [`Self::with_services_and_config`].
+    pub fn new_with_services_and_config(
+        config: crate::services::ProjectConfig,
+        services: impl Into<Services>,
+    ) -> Self {
+        Self::with_services_and_config(config, services)
     }
 
     pub fn context(&self) -> &RuntimeContext {
@@ -1086,6 +1104,7 @@ fn builtin_storage_put<F: Firestore + 'static>(
     if args.len() != 2 {
         return Err("storage_put expects path and data".into());
     }
+    validate_storage_value(&args[1])?;
     let path = expect_string(args.first())?.to_string();
     let mut object = StorageObject::new(path, args[1].clone());
     for key in kwargs.keys() {
@@ -1211,6 +1230,25 @@ fn expect_no_service_args(name: &str, args: &[Value]) -> Result<(), Box<dyn Erro
         Ok(())
     } else {
         Err(format!("{name} does not take arguments").into())
+    }
+}
+
+fn validate_storage_value(value: &Value) -> Result<(), Box<dyn Error>> {
+    match value {
+        Value::Int(_) | Value::Str(_) | Value::Bool(_) | Value::Nil | Value::Timestamp(_) => Ok(()),
+        Value::Array(items) => items.iter().try_for_each(validate_storage_value),
+        Value::Map(map) => map.values().try_for_each(validate_storage_value),
+        Value::ServerTimestamp
+        | Value::ArrayUnion(_)
+        | Value::ArrayRemove(_)
+        | Value::DeleteField
+        | Value::Increment(_) => Err("storage_put cannot store Firestore field transforms".into()),
+        Value::Opaque(_) => Err("storage_put cannot store an opaque value".into()),
+        Value::DocRef(_)
+        | Value::CollectionRef(_)
+        | Value::CollectionGroupRef(_)
+        | Value::QueryRef(_)
+        | Value::Func(_) => Err("storage_put cannot store a reference or function value".into()),
     }
 }
 
