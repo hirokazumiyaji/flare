@@ -12,7 +12,9 @@ use std::error::Error;
 use runtime::Runtime;
 
 pub use error::{ErrorKind, FirelangError, Span};
-pub use firestore::{Firestore, FirestoreEmulator, InMemoryFirestore};
+#[cfg(feature = "emulator")]
+pub use firestore::{EmulatorConfig, EmulatorConnectionError, FirestoreEmulator};
+pub use firestore::{Firestore, InMemoryFirestore};
 pub use storage::{
     HttpStorageTransport, HttpTransport, InMemoryStorage, Storage, StorageEmulator, StorageError,
     StorageErrorKind, StorageHttpTransport, StorageMetadata, StorageRequest, StorageResponse,

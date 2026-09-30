@@ -8,8 +8,13 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
+
+/// Upper bound for establishing the emulator TCP connection. An unreachable
+/// or blackholed host must fail fast instead of stalling startup for the
+/// operating system's multi-minute TCP timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 use serde_json::Value as JsonValue;
 
@@ -120,7 +125,7 @@ impl HttpStorageTransport {
     /// Verify that the configured emulator endpoint accepts TCP connections.
     /// The actual HTTP request is still deferred until a CRUD operation.
     pub fn probe(&self) -> Result<(), StorageError> {
-        TcpStream::connect(&self.address).map(|_| ()).map_err(|e| {
+        self.connect().map(|_| ()).map_err(|e| {
             StorageError::backend(format!(
                 "storage emulator connection failed for {}: {e}",
                 self.address
@@ -128,8 +133,22 @@ impl HttpStorageTransport {
         })
     }
 
+    fn connect(&self) -> Result<TcpStream, std::io::Error> {
+        let mut last_err = std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("storage emulator host did not resolve: {}", self.address),
+        );
+        for addr in self.address.to_socket_addrs()? {
+            match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last_err = e,
+            }
+        }
+        Err(last_err)
+    }
+
     fn send_http(&self, request: &StorageRequest) -> Result<StorageResponse, StorageError> {
-        let mut stream = TcpStream::connect(&self.address).map_err(|e| {
+        let mut stream = self.connect().map_err(|e| {
             StorageError::backend(format!(
                 "storage emulator connection failed for {}: {e}",
                 self.address

@@ -317,27 +317,42 @@ pub fn validate_content_type(content_type: &str) -> Result<(), Box<dyn Error>> {
         return Err(StorageError::invalid_content_type(content_type).into());
     }
     let Some((essence, parameters)) = trimmed.split_once(';') else {
-        if !trimmed.chars().any(char::is_whitespace)
-            && trimmed.contains('/')
-            && !trimmed.starts_with('/')
-            && !trimmed.ends_with('/')
-            && !trimmed.split('/').any(str::is_empty)
-        {
+        if !trimmed.chars().any(char::is_whitespace) && is_media_essence(trimmed) {
             return Ok(());
         }
         return Err(StorageError::invalid_content_type(content_type).into());
     };
     if essence.chars().any(char::is_whitespace)
-        || !essence.contains('/')
-        || essence.starts_with('/')
-        || essence.ends_with('/')
-        || essence.split('/').any(str::is_empty)
+        || !is_media_essence(essence)
         || parameters.trim().is_empty()
         || parameters.contains(';')
     {
         return Err(StorageError::invalid_content_type(content_type).into());
     }
     Ok(())
+}
+
+/// A media-type essence is exactly one `type/subtype` pair whose parts are
+/// RFC 9110 tokens. Values such as `image/png/extra` are not media types and
+/// must be rejected so both backends share the same validation contract.
+fn is_media_essence(essence: &str) -> bool {
+    let mut parts = essence.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(main), Some(sub), None) => is_rfc9110_token(main) && is_rfc9110_token(sub),
+        _ => false,
+    }
+}
+
+fn is_rfc9110_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^'
+                        | b'_' | b'`' | b'|' | b'~'
+                )
+        })
 }
 
 #[cfg(test)]
@@ -362,7 +377,16 @@ mod tests {
     fn content_type_validation_is_clear() {
         validate_content_type("image/png").unwrap();
         validate_content_type("text/plain; charset=utf-8").unwrap();
-        for value in ["", "image png", "image/png;", "image/"] {
+        for value in [
+            "",
+            "image png",
+            "image/png;",
+            "image/",
+            "image/png/extra",
+            "image//png",
+            "/png",
+            "ima ge/png",
+        ] {
             let err = validate_content_type(value).unwrap_err();
             assert!(
                 format!("{err}").contains("invalid storage content type"),

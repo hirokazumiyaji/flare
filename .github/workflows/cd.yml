@@ -5,37 +5,111 @@ on:
     tags:
       - 'v*'
 
+# The release job is the only job that needs to write to the repository.  The
+# reusable CI workflow is deliberately called below instead of being copied
+# into a second, potentially divergent list of release checks.
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: false
 
 jobs:
-  release:
+  quality-gate:
+    name: Required CI checks
+    # This reusable workflow runs cargo fmt --check, cargo clippy
+    # --all-targets -- -D warnings, cargo test --all-targets, and the release
+    # build.  Its integration-emulator job is part of the same gate.
+    uses: ./.github/workflows/ci.yml
+
+  validate-version:
+    name: Validate release tag
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+
+      - name: Validate tag against Cargo metadata
+        # validate-release-tag.sh compares the tag with the package version
+        # returned by cargo metadata --no-deps --format-version 1.
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: scripts/validate-release-tag.sh "$RELEASE_TAG"
+
+  release:
+    name: Publish release package
+    needs:
+      - quality-gate
+      - validate-version
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build release binary
-        run: cargo build --release --bin fl
+        run: cargo build --release --features emulator --bin fl --locked
 
-      - name: Package artifact
+      - name: Package executable, documentation, license, and checksums
+        # package-release.sh chmods fl to 0755 and creates SHA256SUMS plus
+        # the archive's .sha256 sidecar.
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: scripts/package-release.sh "$RELEASE_TAG" target/release/fl dist
+
+      - name: Verify release package before upload
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          mkdir -p dist
-          cp target/release/fl dist/fl-linux-x86_64
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          archive="dist/firelang-${version}-linux-x86_64.tar.gz"
+          checksum="${archive}.sha256"
+          test -f "$archive"
+          test -f "$checksum"
+          (cd dist && sha256sum -c "$(basename "$checksum")")
+          verify_dir="$(mktemp -d)"
+          trap 'rm -rf "$verify_dir"' EXIT
+          tar -xzf "$archive" -C "$verify_dir"
+          package_dir="$verify_dir/firelang-${version}-linux-x86_64"
+          test -x "$package_dir/fl"
+          test -f "$package_dir/README.md"
+          test -f "$package_dir/LICENSE"
+          test -f "$package_dir/docs/spec.md"
+          (cd "$package_dir" && sha256sum -c SHA256SUMS)
 
-      - name: Upload artifact to workflow
-        uses: actions/upload-artifact@v4
+      - name: Upload release package to workflow artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: fl-linux-x86_64
-          path: dist/fl-linux-x86_64
+          name: firelang-${{ github.ref_name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
 
-      - name: Publish GitHub Release asset
-        uses: softprops/action-gh-release@v2
+      - name: Publish GitHub Release assets
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: dist/fl-linux-x86_64
+          tag_name: ${{ github.ref_name }}
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true

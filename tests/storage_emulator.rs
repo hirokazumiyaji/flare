@@ -7,6 +7,15 @@
 
 use firelang::{run_script_with_storage, StorageEmulator, Value};
 
+fn emulator() -> Option<StorageEmulator> {
+    match StorageEmulator::try_from_env() {
+        Ok(emulator) => emulator,
+        Err(error) => {
+            panic!("FIREBASE_STORAGE_EMULATOR_HOST is configured, but emulator setup failed: {error}")
+        }
+    }
+}
+
 fn unique(prefix: &str) -> String {
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -17,7 +26,7 @@ fn unique(prefix: &str) -> String {
 
 #[test]
 fn storage_emulator_crud_and_lossless_binary_round_trip() {
-    let Some(storage) = StorageEmulator::from_env() else {
+    let Some(storage) = emulator() else {
         eprintln!("skip: FIREBASE_STORAGE_EMULATOR_HOST is not set");
         return;
     };
@@ -45,7 +54,7 @@ meta = storage_metadata("{path}")
 
 #[test]
 fn storage_emulator_delete_then_not_found() {
-    let Some(storage) = StorageEmulator::from_env() else {
+    let Some(storage) = emulator() else {
         eprintln!("skip: FIREBASE_STORAGE_EMULATOR_HOST is not set");
         return;
     };

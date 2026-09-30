@@ -59,7 +59,7 @@ fn storage_paths_and_content_have_clear_errors() {
         ),
         (
             "storage_upload(\"avatars/a\", bytes([1]), \"text/plain\", content_type: \"image/png\")",
-            "content_type twice",
+            "duplicate argument content_type",
         ),
         ("storage_delete(\"missing\")", "storage object not found"),
     ] {
@@ -69,19 +69,19 @@ fn storage_paths_and_content_have_clear_errors() {
 }
 
 #[test]
-fn firestore_keeps_its_bytes_fields_read_only() {
-    for script in [
-        "set(\"users/a\", {data: bytes([1])})",
-        "set(\"users/a\", {data: array_union([bytes([1])])})",
-        "set(\"users/a\", {data: array_remove([bytes([1])])})",
-        "col(\"users\").where(\"data\", \"==\", bytes([1])).get()",
-    ] {
-        let err = run_script(script).unwrap_err();
-        assert!(
-            format!("{err}").contains("Bytes values are only supported by Storage"),
-            "{script}: {err}"
-        );
-    }
+fn firestore_accepts_bytes_fields() {
+    // `Bytes` is a first-class Firestore value: writes and query filters
+    // accept it on both backends.
+    let out = run_script(
+        "set(\"users/a\", {data: bytes([1])})\nget(\"users/a\")[\"data\"]",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Bytes(vec![1]));
+    let out = run_script(
+        "set(\"users/a\", {data: bytes([1])})\ncol(\"users\").where(\"data\", \"==\", bytes([1])).get().len()",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(1));
 }
 
 #[test]
