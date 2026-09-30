@@ -250,3 +250,45 @@ impl Auth for AuthEmulator {
 /// Explicit name for code that wants to document that it is using the local
 /// Firebase emulator adapter rather than the generic fake.
 pub type FirebaseAuthEmulator = AuthEmulator;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_memory_auth_tracks_the_local_session() {
+        let user = AuthUser::new("u1")
+            .with_email("alice@example.com")
+            .verified(true);
+        let mut auth = InMemoryAuth::with_user(user, "secret");
+
+        assert_eq!(auth.current_user().unwrap(), None);
+        assert!(format!(
+            "{}",
+            auth.sign_in("alice@example.com", "wrong").unwrap_err()
+        )
+        .contains("auth sign-in failed"));
+
+        let signed_in = auth.sign_in("alice@example.com", "secret").unwrap();
+        assert_eq!(signed_in.uid, "u1");
+        assert!(auth.is_signed_in());
+        assert_eq!(auth.current_user().unwrap(), Some(signed_in));
+
+        auth.sign_out().unwrap();
+        assert!(!auth.is_signed_in());
+        assert_eq!(auth.current_user().unwrap(), None);
+    }
+
+    #[test]
+    fn anonymous_sign_in_creates_a_unique_local_identity() {
+        let mut auth = InMemoryAuth::new();
+        let first = auth.sign_in_anonymously().unwrap();
+        let second = auth.sign_in_anonymously().unwrap();
+        assert_ne!(first.uid, second.uid);
+        assert_eq!(auth.user_count(), 2);
+        assert_eq!(
+            auth.current_user().unwrap().map(|user| user.uid),
+            Some(second.uid)
+        );
+    }
+}

@@ -7,7 +7,7 @@ use crate::auth::Auth;
 use crate::error::{FirelangError, Span};
 use crate::firestore::{Firestore, InMemoryFirestore, WriteOp};
 use crate::services::{capability_error, RuntimeContext, Services};
-use crate::storage::Storage;
+use crate::storage::{Storage, StorageObject};
 use crate::value::{
     CollectionGroupRef, CollectionRef, Direction, DocRef, QueryFilter, QueryOp, QueryRef,
     Timestamp, UserFunc, Value,
@@ -31,7 +31,9 @@ pub struct Runtime<F = InMemoryFirestore> {
     scopes: Vec<HashMap<String, Value>>,
     context: RuntimeContext,
     exec: ExecCtx,
-    _legacy_firestore: PhantomData<F>,
+    // `fn() -> F` keeps the compatibility marker covariant and does not make
+    // the runtime require `F: Send`/`Sync` even though no `F` value is kept.
+    _legacy_firestore: PhantomData<fn() -> F>,
 }
 
 impl<F> Runtime<F> {
@@ -85,46 +87,52 @@ impl<F> Runtime<F> {
         self.context.project_config()
     }
 
-    fn firestore(&self) -> Result<&dyn Firestore, Box<dyn Error>> {
+    fn firestore(&self, operation: &str) -> Result<&dyn Firestore, Box<dyn Error>> {
         self.context
             .services
             .firestore_ref()
-            .ok_or_else(|| capability_error("firestore", "service"))
+            .ok_or_else(|| capability_error("firestore", operation))
     }
 
-    fn firestore_mut(&mut self) -> Result<&mut (dyn Firestore + 'static), Box<dyn Error>> {
+    fn firestore_mut(
+        &mut self,
+        operation: &str,
+    ) -> Result<&mut (dyn Firestore + 'static), Box<dyn Error>> {
         self.context
             .services
             .firestore_mut()
-            .ok_or_else(|| capability_error("firestore", "service"))
+            .ok_or_else(|| capability_error("firestore", operation))
     }
 
-    fn auth(&self) -> Result<&dyn Auth, Box<dyn Error>> {
+    fn auth(&self, operation: &str) -> Result<&dyn Auth, Box<dyn Error>> {
         self.context
             .services
             .auth_ref()
-            .ok_or_else(|| capability_error("auth", "service"))
+            .ok_or_else(|| capability_error("auth", operation))
     }
 
-    fn auth_mut(&mut self) -> Result<&mut (dyn Auth + 'static), Box<dyn Error>> {
+    fn auth_mut(&mut self, operation: &str) -> Result<&mut (dyn Auth + 'static), Box<dyn Error>> {
         self.context
             .services
             .auth_mut()
-            .ok_or_else(|| capability_error("auth", "service"))
+            .ok_or_else(|| capability_error("auth", operation))
     }
 
-    fn storage(&self) -> Result<&dyn Storage, Box<dyn Error>> {
+    fn storage(&self, operation: &str) -> Result<&dyn Storage, Box<dyn Error>> {
         self.context
             .services
             .storage_ref()
-            .ok_or_else(|| capability_error("storage", "service"))
+            .ok_or_else(|| capability_error("storage", operation))
     }
 
-    fn storage_mut(&mut self) -> Result<&mut (dyn Storage + 'static), Box<dyn Error>> {
+    fn storage_mut(
+        &mut self,
+        operation: &str,
+    ) -> Result<&mut (dyn Storage + 'static), Box<dyn Error>> {
         self.context
             .services
             .storage_mut()
-            .ok_or_else(|| capability_error("storage", "service"))
+            .ok_or_else(|| capability_error("storage", operation))
     }
 }
 
@@ -278,7 +286,10 @@ impl<F: Firestore + 'static> Runtime<F> {
 
     fn dispatch_write(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
         match &mut self.exec {
-            ExecCtx::Normal => self.firestore_mut()?.apply(vec![op]).map_err(backend_err),
+            ExecCtx::Normal => self
+                .firestore_mut("apply")?
+                .apply(vec![op])
+                .map_err(backend_err),
             ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => {
                 writes.push(op);
                 Ok(())
@@ -557,7 +568,7 @@ impl<F: Firestore + 'static> Runtime<F> {
                 unpaged.offset = None;
                 unpaged.limit = None;
                 Ok(Value::Int(
-                    self.firestore()?
+                    self.firestore("count")?
                         .run_query(&unpaged)
                         .map_err(backend_err)?
                         .len() as i64,
@@ -565,7 +576,10 @@ impl<F: Firestore + 'static> Runtime<F> {
             }
             "get" => {
                 self.forbid_query_in_batch_or_transaction()?;
-                let rows = self.firestore()?.run_query(&query).map_err(backend_err)?;
+                let rows = self
+                    .firestore("get")?
+                    .run_query(&query)
+                    .map_err(backend_err)?;
                 Ok(Value::Array(apply_query_shape(rows, &query)))
             }
             _ => Err(format!("unknown query method: {name}").into()),
@@ -874,12 +888,12 @@ fn builtin_get<F: Firestore + 'static>(
             return Err("get is not allowed after the first write in a transaction".into());
         }
         ExecCtx::Transaction { .. } => rt
-            .firestore()?
+            .firestore("transaction_get")?
             .transaction_get(path)
             .map_err(backend_err)?
             .unwrap_or(Value::Nil),
         ExecCtx::Normal => rt
-            .firestore()?
+            .firestore("get")?
             .get(path)
             .map_err(backend_err)?
             .unwrap_or(Value::Nil),
@@ -945,7 +959,9 @@ fn builtin_batch<F: Firestore + 'static>(
     }
     let (flow, writes) = rt.run_staged_block(ExecCtx::Batch { writes: vec![] }, &stmts.body);
     let flow = flow?;
-    rt.firestore_mut()?.apply(writes).map_err(backend_err)?;
+    rt.firestore_mut("batch_apply")?
+        .apply(writes)
+        .map_err(backend_err)?;
     Ok(flow.into_value())
 }
 
@@ -964,14 +980,17 @@ fn builtin_transaction<F: Firestore + 'static>(
     if !matches!(rt.exec, ExecCtx::Normal) {
         return Err("transaction cannot be nested inside batch/transaction".into());
     }
-    rt.firestore_mut()?
+    rt.firestore_mut("begin_transaction")?
         .begin_transaction()
         .map_err(backend_err)?;
     let (flow, writes) = rt.run_staged_block(ExecCtx::Transaction { writes: vec![] }, &stmts.body);
     match flow {
         Ok(flow) => {
-            if let Err(e) = rt.firestore_mut()?.commit_transaction(writes) {
-                let _ = rt.firestore_mut()?.abort_transaction();
+            if let Err(e) = rt
+                .firestore_mut("commit_transaction")?
+                .commit_transaction(writes)
+            {
+                let _ = rt.firestore_mut("abort_transaction")?.abort_transaction();
                 return Err(backend_err(e));
             }
             Ok(flow.into_value())
@@ -980,7 +999,7 @@ fn builtin_transaction<F: Firestore + 'static>(
             // Rollback は best-effort: 元のブロックエラーを優先し、
             // rollback 自体の失敗は無視する(サーバ側タイムアウトが
             // 最終的な後ろ盾になる)。
-            let _ = rt.firestore_mut()?.abort_transaction();
+            let _ = rt.firestore_mut("abort_transaction")?.abort_transaction();
             Err(e)
         }
     }
@@ -999,7 +1018,7 @@ fn builtin_auth_sign_in<F: Firestore + 'static>(
     let email = expect_string(args.first())?;
     let password = expect_string(args.get(1))?;
     let user = rt
-        .auth_mut()?
+        .auth_mut("sign_in")?
         .sign_in(email, password)
         .map_err(service_err)?;
     Ok(auth_user_value(user))
@@ -1013,7 +1032,7 @@ fn builtin_auth_sign_out<F: Firestore + 'static>(
 ) -> Result<Value, Box<dyn Error>> {
     reject_service_kwargs(&kwargs)?;
     expect_no_service_args("auth_sign_out", &args)?;
-    rt.auth_mut()?.sign_out().map_err(service_err)?;
+    rt.auth_mut("sign_out")?.sign_out().map_err(service_err)?;
     Ok(Value::Nil)
 }
 
@@ -1026,7 +1045,7 @@ fn builtin_auth_current_user<F: Firestore + 'static>(
     reject_service_kwargs(&kwargs)?;
     expect_no_service_args("auth_current_user", &args)?;
     Ok(rt
-        .auth()?
+        .auth("current_user")?
         .current_user()
         .map_err(service_err)?
         .map(auth_user_value)
@@ -1041,7 +1060,10 @@ fn builtin_auth_sign_in_anonymously<F: Firestore + 'static>(
 ) -> Result<Value, Box<dyn Error>> {
     reject_service_kwargs(&kwargs)?;
     expect_no_service_args("auth_sign_in_anonymously", &args)?;
-    let user = rt.auth_mut()?.sign_in_anonymously().map_err(service_err)?;
+    let user = rt
+        .auth_mut("sign_in_anonymously")?
+        .sign_in_anonymously()
+        .map_err(service_err)?;
     Ok(auth_user_value(user))
 }
 
@@ -1065,22 +1087,23 @@ fn builtin_storage_put<F: Firestore + 'static>(
         return Err("storage_put expects path and data".into());
     }
     let path = expect_string(args.first())?.to_string();
-    let mut object = rt
-        .storage_mut()?
-        .put(&path, args[1].clone())
-        .map_err(service_err)?;
+    let mut object = StorageObject::new(path, args[1].clone());
+    for key in kwargs.keys() {
+        if key != "content_type" {
+            return Err(format!("unknown keyword arguments: {key}").into());
+        }
+    }
     if let Some(content_type) = kwargs.get("content_type") {
         let Value::Str(content_type) = content_type else {
             return Err("storage_put content_type must be string".into());
         };
         object.content_type = Some(content_type.clone());
     }
-    for key in kwargs.keys() {
-        if key != "content_type" {
-            return Err(format!("unknown keyword arguments: {key}").into());
-        }
-    }
-    Ok(object.to_value())
+    Ok(rt
+        .storage_mut("put")?
+        .put_object(object)
+        .map_err(service_err)?
+        .to_value())
 }
 
 fn builtin_storage_get<F: Firestore + 'static>(
@@ -1095,7 +1118,7 @@ fn builtin_storage_get<F: Firestore + 'static>(
     }
     let path = expect_string(args.first())?;
     Ok(rt
-        .storage()?
+        .storage("get")?
         .get(path)
         .map_err(service_err)?
         .map(|object| object.data)
@@ -1114,7 +1137,9 @@ fn builtin_storage_delete<F: Firestore + 'static>(
     }
     let path = expect_string(args.first())?;
     Ok(Value::Bool(
-        rt.storage_mut()?.delete(path).map_err(service_err)?,
+        rt.storage_mut("delete")?
+            .delete(path)
+            .map_err(service_err)?,
     ))
 }
 
@@ -1133,7 +1158,7 @@ fn builtin_storage_list<F: Firestore + 'static>(
         None => "",
     };
     Ok(Value::Array(
-        rt.storage()?
+        rt.storage("list")?
             .list(prefix)
             .map_err(service_err)?
             .iter()

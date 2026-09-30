@@ -69,17 +69,17 @@ impl ProjectConfig {
     ///
     /// Missing emulator variables are represented as `None`; this does not
     /// attempt to discover credentials or contact a provider.
-    pub fn from_env() -> Option<Self> {
+    pub fn from_env() -> Self {
         let project_id = std::env::var("FIREBASE_PROJECT_ID")
             .or_else(|_| std::env::var("GCLOUD_PROJECT"))
             .or_else(|_| std::env::var("FIRESTORE_PROJECT_ID"))
             .unwrap_or_else(|_| DEFAULT_PROJECT_ID.to_string());
-        Some(Self {
+        Self {
             project_id,
             auth_emulator_host: std::env::var("FIREBASE_AUTH_EMULATOR_HOST").ok(),
             storage_emulator_host: std::env::var("FIREBASE_STORAGE_EMULATOR_HOST").ok(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
-        })
+        }
     }
 
     pub fn project_id(&self) -> &str {
@@ -354,4 +354,63 @@ impl From<RuntimeContext> for Services {
 /// Create the canonical typed error for an unavailable capability.
 pub fn capability_error(service: &str, operation: &str) -> Box<dyn Error> {
     FirelangError::from(CapabilityError::new(service, operation)).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::{AuthUser, InMemoryAuth};
+    use crate::storage::InMemoryStorage;
+
+    #[test]
+    fn default_services_are_local_but_the_builder_starts_empty() {
+        let defaults = Services::default();
+        assert!(defaults.has_firestore());
+        assert!(defaults.has_auth());
+        assert!(defaults.has_storage());
+
+        let built = Services::builder().build();
+        assert!(!built.has_firestore());
+        assert!(!built.has_auth());
+        assert!(!built.has_storage());
+    }
+
+    #[test]
+    fn each_capability_can_be_installed_without_the_others() {
+        let auth = InMemoryAuth::with_user(AuthUser::new("u1"), "secret");
+        let services = Services::builder()
+            .auth(auth)
+            .storage(InMemoryStorage::new())
+            .build();
+        assert!(!services.has_firestore());
+        assert!(services.has_auth());
+        assert!(services.has_storage());
+    }
+
+    #[test]
+    fn project_config_contains_only_non_secret_connection_settings() {
+        let config = ProjectConfig::new("demo")
+            .with_auth_emulator_host("127.0.0.1:9099")
+            .with_storage_emulator_host("127.0.0.1:9199")
+            .with_request_timeout(Duration::from_millis(250));
+        assert_eq!(config.project_id(), "demo");
+        assert_eq!(config.request_timeout(), Duration::from_millis(250));
+        // Compile-time guard: adding a credential field would make this literal
+        // require another field and fail the test.
+        let _ = ProjectConfig {
+            project_id: "demo".to_string(),
+            auth_emulator_host: None,
+            storage_emulator_host: None,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+        };
+    }
+
+    #[test]
+    fn context_conversions_preserve_services_and_config() {
+        let config = ProjectConfig::new("demo");
+        let context = RuntimeContext::with_config(config.clone(), Services::in_memory());
+        assert_eq!(context.project_config(), &config);
+        let services: Services = context.into();
+        assert!(services.has_firestore());
+    }
 }

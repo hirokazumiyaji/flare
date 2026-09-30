@@ -68,12 +68,21 @@ pub trait Storage {
     fn get(&self, path: &str) -> Result<Option<StorageObject>, Box<dyn Error>>;
     fn delete(&mut self, path: &str) -> Result<bool, Box<dyn Error>>;
 
-    /// List objects below a prefix.  Providers that cannot list may keep the
-    /// default and return an empty list; the in-memory implementation returns
-    /// a deterministic path-sorted list.
-    fn list(&self, prefix: &str) -> Result<Vec<StorageObject>, Box<dyn Error>> {
-        let _ = prefix;
-        Ok(vec![])
+    /// Store a complete object, including optional content type and user
+    /// metadata.  Providers that do not have a metadata concept can keep this
+    /// default; providers that do should override it so metadata round-trips.
+    fn put_object(&mut self, object: StorageObject) -> Result<StorageObject, Box<dyn Error>> {
+        let mut stored = self.put(&object.path, object.data)?;
+        stored.content_type = object.content_type;
+        stored.metadata = object.metadata;
+        Ok(stored)
+    }
+
+    /// List objects below a directory-style prefix.  Listing is optional for a
+    /// provider and unsupported operations fail explicitly instead of looking
+    /// like an empty bucket.
+    fn list(&self, _prefix: &str) -> Result<Vec<StorageObject>, Box<dyn Error>> {
+        Err("storage provider does not support list".into())
     }
 
     /// Text convenience operation for Rust adapters.  The script runtime uses
@@ -140,6 +149,13 @@ impl Storage for InMemoryStorage {
         Ok(self.objects.get(&path).cloned())
     }
 
+    fn put_object(&mut self, object: StorageObject) -> Result<StorageObject, Box<dyn Error>> {
+        let mut object = object;
+        object.path = normalize_path(&object.path)?;
+        self.objects.insert(object.path.clone(), object.clone());
+        Ok(object)
+    }
+
     fn delete(&mut self, path: &str) -> Result<bool, Box<dyn Error>> {
         let path = normalize_path(path)?;
         Ok(self.objects.remove(&path).is_some())
@@ -150,7 +166,9 @@ impl Storage for InMemoryStorage {
         Ok(self
             .objects
             .values()
-            .filter(|object| object.path.starts_with(&prefix))
+            .filter(|object| {
+                object.path == prefix || object.path.starts_with(&format!("{prefix}/"))
+            })
             .cloned()
             .collect())
     }
@@ -206,6 +224,10 @@ impl Storage for StorageEmulator {
         self.inner.put(path, data)
     }
 
+    fn put_object(&mut self, object: StorageObject) -> Result<StorageObject, Box<dyn Error>> {
+        self.inner.put_object(object)
+    }
+
     fn get(&self, path: &str) -> Result<Option<StorageObject>, Box<dyn Error>> {
         self.inner.get(path)
     }
@@ -238,5 +260,69 @@ fn normalize_prefix(prefix: &str) -> Result<String, Box<dyn Error>> {
     if prefix.is_empty() {
         return Ok(String::new());
     }
-    normalize_path(prefix)
+    // Accept a directory form such as `images/` and normalize it to the same
+    // boundary used by `list`.
+    let trimmed = prefix.strip_suffix('/').unwrap_or(prefix);
+    normalize_path(trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_memory_storage_round_trips_and_lists_directory_boundaries() {
+        let mut storage = InMemoryStorage::new();
+        let object = StorageObject::new("images/a.png", Value::Str("a".to_string()))
+            .with_content_type("image/png")
+            .with_metadata("owner", "alice");
+        assert_eq!(
+            storage.put_object(object).unwrap().content_type.as_deref(),
+            Some("image/png")
+        );
+
+        storage.put("images/nested/b.png", Value::Int(2)).unwrap();
+        storage.put("images-old/c.png", Value::Int(3)).unwrap();
+
+        assert_eq!(storage.list("images").unwrap().len(), 2);
+        assert_eq!(storage.list("images/").unwrap().len(), 2);
+        assert_eq!(
+            storage.get("images/a.png").unwrap().unwrap().metadata["owner"],
+            "alice"
+        );
+        assert!(storage.delete("images/a.png").unwrap());
+        assert!(!storage.delete("images/a.png").unwrap());
+        assert!(storage.get("images/a.png").unwrap().is_none());
+    }
+
+    #[test]
+    fn storage_paths_are_validated_before_state_changes() {
+        let mut storage = InMemoryStorage::new();
+        for path in ["", "/a", "a/", "a//b"] {
+            let err = storage.put(path, Value::Nil).unwrap_err();
+            assert!(format!("{err}").contains("invalid storage path"), "{path}");
+        }
+        assert!(storage.is_empty());
+    }
+
+    #[test]
+    fn unsupported_list_is_an_explicit_error() {
+        struct PutGetOnly;
+        impl Storage for PutGetOnly {
+            fn put(&mut self, path: &str, data: Value) -> Result<StorageObject, Box<dyn Error>> {
+                Ok(StorageObject::new(path, data))
+            }
+
+            fn get(&self, _path: &str) -> Result<Option<StorageObject>, Box<dyn Error>> {
+                Ok(None)
+            }
+
+            fn delete(&mut self, _path: &str) -> Result<bool, Box<dyn Error>> {
+                Ok(false)
+            }
+        }
+
+        let err = PutGetOnly.list("").unwrap_err();
+        assert!(format!("{err}").contains("does not support list"));
+    }
 }
