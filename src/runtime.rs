@@ -18,6 +18,22 @@ enum ExecCtx {
     Transaction { writes: Vec<WriteOp> },
 }
 
+/// Propagate the parts of the budget that constrain the *backend*.
+///
+/// A backend that recurses while converting values (the emulator codec) must
+/// know the depth ceiling, otherwise it overflows the native stack before the
+/// runtime can validate the result. A disabled value-depth budget still needs a
+/// finite number for that recursion guard, so the shipped default is used as
+/// the backstop.
+fn apply_backend_limits<F: Firestore>(fs: &mut F, limits: &RuntimeLimits) {
+    fs.set_timeout(limits.backend_timeout);
+    fs.set_max_value_depth(
+        limits
+            .max_value_depth
+            .unwrap_or(crate::limits::DEFAULT_MAX_VALUE_DEPTH),
+    );
+}
+
 pub struct Runtime<F: Firestore> {
     scopes: Vec<HashMap<String, Value>>,
     fs: F,
@@ -41,7 +57,7 @@ impl<F: Firestore> Runtime<F> {
     /// `FirestoreEmulator` that must also apply the same deadline while
     /// connecting should be created with `FirestoreEmulator::new_with_timeout`.
     pub fn with_limits(mut fs: F, limits: RuntimeLimits) -> Self {
-        fs.set_timeout(limits.backend_timeout);
+        apply_backend_limits(&mut fs, &limits);
         Self {
             scopes: vec![HashMap::new()],
             fs,
@@ -72,7 +88,7 @@ impl<F: Firestore> Runtime<F> {
 
     pub fn set_limits(&mut self, limits: RuntimeLimits) {
         self.limits = limits;
-        self.fs.set_timeout(limits.backend_timeout);
+        apply_backend_limits(&mut self.fs, &self.limits);
     }
 
     /// Return a snapshot of the counters consumed by the most recent run.

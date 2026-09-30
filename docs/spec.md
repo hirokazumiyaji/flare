@@ -398,7 +398,7 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 | 壁時計時間 | 5,000 ms | 字句解析・構文解析・評価の経過時間。`wall-clock limit exceeded` |
 | パーサ深度 | 128 | 括弧・マップ/配列リテラル・`else if` チェーン・`!`/`-` のネスト。`parser nesting limit exceeded` |
 | 補間深度 | 32 | ネストした `"#{...}"` |
-| 値ネスト深度 | 64 | 実行時 `Value`(Array / Map)のネスト。ルートは深さ 0。`value nesting limit exceeded` |
+| 値ネスト深度 | 64 | 実行時 `Value`(Array / Map)のネスト。ルートは深さ 0。`value nesting limit exceeded`。emulator の `Value` ⇔ SDK コーデックも同じ上限で再帰を止める(保存されたネストが深い文書でも、runtime が検査する**前**にスタックを枯渇させないため) |
 | 値ノード数 | 100,000 | 実行時 `Value` の総ノード数 |
 | クエリ結果数 | 10,000 | 1 回のクエリで materialize される候補件数。`query result limit exceeded` |
 | ソース長 | 1 MiB | UTF-8 バイト数 |
@@ -427,7 +427,7 @@ let usage = rt.usage();   // steps / loop_iterations / max_call_depth / ...
 
 `Runtime::new_unlimited` / `RuntimeLimits::unlimited()` は予算をすべて無効にする**明示的なオプトイン**である。ユーザー入力・アップロードされたスクリプト・CLI には使わず、信頼済みスクリプトにのみ用いること。`fl --unlimited` は CLI 側の同等手段である。
 
-なお汎用の同期 `Firestore` トレイトは任意の実装を強制中断できないため、`backend_timeout` を強制するのは組み込み `FirestoreEmulator` である。応答しない独自バックエンドは、自身が timeout を実装すること。
+なお汎用の同期 `Firestore` トレイトは任意の実装を強制中断できないため、`backend_timeout` を強制するのは組み込み `FirestoreEmulator` である(`Runtime::backend_timeout_supported()` で確認できる)。応答しない独自バックエンドは、自身が timeout を実装すること。バックエンド呼び出しの timeout は発生原因を保つため `ErrorKind::Backend` で報告し、位置は他と同じく失敗した文の開始位置につく。
 
 ## 13. スコープ外(MVP)
 

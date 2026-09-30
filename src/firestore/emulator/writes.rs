@@ -13,7 +13,7 @@ use gcloud_sdk::tonic::{Code, Request, Status};
 use tokio::runtime::Runtime;
 
 use super::client;
-use super::codec::encode_fields;
+use super::codec::encode_fields_bounded;
 use super::path::document_name;
 use crate::firestore::{insert_at_field_path, validate_field_path, WriteOp};
 use crate::value::Value;
@@ -109,15 +109,22 @@ fn write_target(write: &Write) -> Option<String> {
 pub(super) fn write_ops_to_sdk_writes(
     project_id: &str,
     ops: &[WriteOp],
+    max_value_depth: usize,
 ) -> Result<Vec<Write>, Box<dyn Error>> {
-    ops.iter().map(|op| build_write(project_id, op)).collect()
+    ops.iter()
+        .map(|op| build_write(project_id, op, max_value_depth))
+        .collect()
 }
 
-fn build_write(project_id: &str, op: &WriteOp) -> Result<Write, Box<dyn Error>> {
+fn build_write(
+    project_id: &str,
+    op: &WriteOp,
+    max_value_depth: usize,
+) -> Result<Write, Box<dyn Error>> {
     match op {
         WriteOp::Set { path, data, merge } => {
             if *merge {
-                build_masked_write(project_id, path, data, false)
+                build_masked_write(project_id, path, data, false, max_value_depth)
             } else {
                 let split = split_fields_and_transforms(data);
                 if !split.deletes.is_empty() {
@@ -127,10 +134,10 @@ fn build_write(project_id: &str, op: &WriteOp) -> Result<Write, Box<dyn Error>> 
                 // センチネル変換のパスは Firestore にネストパスと解釈されない
                 // ようバッククォートでエスケープして送る。
                 let transforms = escape_literal_transform_keys(split.transforms)?;
-                let fields = encode_fields(&split.plain)?;
+                let fields = encode_fields_bounded(&split.plain, 0, max_value_depth)?;
                 Ok(Write {
                     update_mask: None,
-                    update_transforms: encode_field_transforms(&transforms)?,
+                    update_transforms: encode_field_transforms(&transforms, max_value_depth)?,
                     current_document: None,
                     operation: Some(write::Operation::Update(Document {
                         name: document_name(project_id, path),
@@ -141,7 +148,9 @@ fn build_write(project_id: &str, op: &WriteOp) -> Result<Write, Box<dyn Error>> 
                 })
             }
         }
-        WriteOp::Update { path, data } => build_masked_write(project_id, path, data, true),
+        WriteOp::Update { path, data } => {
+            build_masked_write(project_id, path, data, true, max_value_depth)
+        }
         WriteOp::Delete { path } => Ok(Write {
             update_mask: None,
             update_transforms: vec![],
@@ -161,16 +170,17 @@ fn build_masked_write(
     path: &str,
     data: &BTreeMap<String, Value>,
     require_existing: bool,
+    max_value_depth: usize,
 ) -> Result<Write, Box<dyn Error>> {
     validated_field_paths(data)?;
     let split = split_fields_and_transforms(data);
     // DeleteField は update_mask に含めつつ fields から除外する。
     let mut field_paths: Vec<String> = split.plain.keys().cloned().collect();
     field_paths.extend(split.deletes);
-    let fields = encode_fields(&nest_field_paths(split.plain)?)?;
+    let fields = encode_fields_bounded(&nest_field_paths(split.plain)?, 0, max_value_depth)?;
     Ok(Write {
         update_mask: Some(DocumentMask { field_paths }),
-        update_transforms: encode_field_transforms(&split.transforms)?,
+        update_transforms: encode_field_transforms(&split.transforms, max_value_depth)?,
         current_document: require_existing.then_some(Precondition {
             condition_type: Some(precondition::ConditionType::Exists(true)),
         }),
@@ -265,10 +275,11 @@ struct SplitFields {
 
 fn encode_field_transforms(
     transforms: &[(String, Value)],
+    max_value_depth: usize,
 ) -> Result<Vec<document_transform::FieldTransform>, Box<dyn Error>> {
     let mut out = vec![];
     for (path, v) in transforms {
-        out.push(encode_field_transform(path, v)?);
+        out.push(encode_field_transform(path, v, max_value_depth)?);
     }
     Ok(out)
 }
@@ -276,6 +287,7 @@ fn encode_field_transforms(
 fn encode_field_transform(
     field_path: &str,
     v: &Value,
+    max_value_depth: usize,
 ) -> Result<document_transform::FieldTransform, Box<dyn Error>> {
     let transform_type = match v {
         Value::ServerTimestamp => {
@@ -285,12 +297,12 @@ fn encode_field_transform(
         }
         Value::ArrayUnion(items) => {
             document_transform::field_transform::TransformType::AppendMissingElements(ArrayValue {
-                values: super::codec::encode_array_items(items)?,
+                values: super::codec::encode_array_items_bounded(items, 1, max_value_depth)?,
             })
         }
         Value::ArrayRemove(items) => {
             document_transform::field_transform::TransformType::RemoveAllFromArray(ArrayValue {
-                values: super::codec::encode_array_items(items)?,
+                values: super::codec::encode_array_items_bounded(items, 1, max_value_depth)?,
             })
         }
         Value::Increment(n) => {
@@ -310,9 +322,35 @@ fn encode_field_transform(
 mod tests {
     use super::*;
 
+    /// The shipped default depth, so the write-shape tests below keep focusing
+    /// on their own behaviour rather than on the budget.
+    fn writes(project_id: &str, ops: &[WriteOp]) -> Result<Vec<Write>, Box<dyn Error>> {
+        write_ops_to_sdk_writes(project_id, ops, crate::limits::DEFAULT_MAX_VALUE_DEPTH)
+    }
+
+    #[test]
+    fn write_encoding_honours_the_configured_depth() {
+        // A deeply nested value must be refused by the encoder rather than
+        // recursing without bound.
+        let mut data = Value::Int(1);
+        for _ in 0..20 {
+            data = Value::Map(BTreeMap::from([("n".to_string(), data)]));
+        }
+        let op = WriteOp::Set {
+            path: "users/deep".to_string(),
+            data: BTreeMap::from([("v".to_string(), data)]),
+            merge: false,
+        };
+        let err = write_ops_to_sdk_writes("p", &[op], 4).unwrap_err();
+        assert!(
+            format!("{err}").contains("value nesting limit exceeded"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn build_write_update_treats_delete_field_as_mask_only() {
-        let writes = write_ops_to_sdk_writes(
+        let writes = writes(
             "p",
             &[WriteOp::Update {
                 path: "users/d1".to_string(),
@@ -339,7 +377,7 @@ mod tests {
 
     #[test]
     fn build_write_merge_set_masks_deleted_fields() {
-        let writes = write_ops_to_sdk_writes(
+        let writes = writes(
             "p",
             &[WriteOp::Set {
                 path: "users/d2".to_string(),
@@ -360,7 +398,7 @@ mod tests {
 
     #[test]
     fn build_write_replacement_set_rejects_delete_field() {
-        let err = write_ops_to_sdk_writes(
+        let err = writes(
             "p",
             &[WriteOp::Set {
                 path: "users/d3".to_string(),
@@ -377,7 +415,7 @@ mod tests {
 
     #[test]
     fn build_write_encodes_increment_as_field_transform() {
-        let writes = write_ops_to_sdk_writes(
+        let writes = writes(
             "p",
             &[WriteOp::Update {
                 path: "users/i1".to_string(),
@@ -401,7 +439,7 @@ mod tests {
 
     #[test]
     fn build_write_update_includes_exists_precondition() {
-        let writes = write_ops_to_sdk_writes(
+        let writes = writes(
             "p",
             &[WriteOp::Update {
                 path: "c/d".to_string(),
@@ -420,7 +458,7 @@ mod tests {
 
     #[test]
     fn not_found_error_includes_write_target_and_status_message() {
-        let writes = write_ops_to_sdk_writes(
+        let writes = writes(
             "p",
             &[WriteOp::Update {
                 path: "users/missing".to_string(),
@@ -438,7 +476,7 @@ mod tests {
 
     #[test]
     fn failed_precondition_is_missing_document_only_for_exists_precondition() {
-        let writes = write_ops_to_sdk_writes(
+        let writes = writes(
             "p",
             &[WriteOp::Update {
                 path: "users/missing".to_string(),
@@ -459,7 +497,7 @@ mod tests {
 
     #[test]
     fn update_mask_excludes_transform_keys() {
-        let writes = write_ops_to_sdk_writes(
+        let writes = writes(
             "p",
             &[WriteOp::Update {
                 path: "c/d".to_string(),
@@ -481,7 +519,7 @@ mod tests {
 
     #[test]
     fn set_merge_mask_excludes_transform_keys() {
-        let writes = write_ops_to_sdk_writes(
+        let writes = writes(
             "p",
             &[WriteOp::Set {
                 path: "c/d".to_string(),
@@ -502,7 +540,7 @@ mod tests {
 
     #[test]
     fn server_timestamp_uses_sdk_transform() {
-        let writes = write_ops_to_sdk_writes(
+        let writes = writes(
             "p",
             &[WriteOp::Set {
                 path: "c/d".to_string(),
@@ -526,6 +564,7 @@ mod tests {
             &WriteOp::Delete {
                 path: "users/a?b".to_string(),
             },
+            crate::limits::DEFAULT_MAX_VALUE_DEPTH,
         )
         .unwrap();
         assert!(matches!(write.operation, Some(write::Operation::Delete(_))));

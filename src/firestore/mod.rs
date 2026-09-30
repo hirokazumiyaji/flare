@@ -225,6 +225,15 @@ pub trait Firestore {
     /// emulator overrides it and applies the deadline to every RPC.
     fn set_timeout(&mut self, _timeout: Option<std::time::Duration>) {}
 
+    /// Configure the maximum `Value` nesting depth this backend may recurse
+    /// through while encoding or decoding.
+    ///
+    /// Backends that convert values recursively (the built-in emulator codec)
+    /// must bound that recursion, otherwise a deeply nested document overflows
+    /// the native stack before the runtime can inspect the result. The default
+    /// is a no-op for source compatibility.
+    fn set_max_value_depth(&mut self, _max_depth: usize) {}
+
     /// Whether this backend actually enforces the configured timeout.
     ///
     /// This is a capability query, not another limit. It lets embedders

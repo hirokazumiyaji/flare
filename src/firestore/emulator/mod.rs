@@ -21,6 +21,10 @@ use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Value};
 pub struct FirestoreEmulator {
     client: client::EmulatorClient,
     transaction_id: Option<Vec<u8>>,
+    /// Maximum `Value` nesting the recursive codec may traverse.  Bounding the
+    /// codec is what actually prevents a deeply nested stored document from
+    /// overflowing the stack; validating after the fact would be too late.
+    max_value_depth: usize,
 }
 
 impl FirestoreEmulator {
@@ -52,7 +56,13 @@ impl FirestoreEmulator {
         Ok(Self {
             client: client::connect(&host, &project_id, operation_timeout)?,
             transaction_id: None,
+            max_value_depth: crate::limits::DEFAULT_MAX_VALUE_DEPTH,
         })
+    }
+
+    /// Return the maximum `Value` nesting depth the codec will traverse.
+    pub fn max_value_depth(&self) -> usize {
+        self.max_value_depth
     }
 
     /// Return the currently configured per-operation deadline.
@@ -91,14 +101,20 @@ impl Firestore for FirestoreEmulator {
             },
         );
         match result {
-            Ok(resp) => codec::decode_document(&resp.into_inner()).map(Some),
+            Ok(resp) => {
+                codec::decode_document_bounded(&resp.into_inner(), self.max_value_depth).map(Some)
+            }
             Err(error) if is_not_found(error.as_ref()) => Ok(None),
             Err(error) => Err(error),
         }
     }
 
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
-        let sdk_writes = writes::write_ops_to_sdk_writes(&self.client.project_id, &writes)?;
+        let sdk_writes = writes::write_ops_to_sdk_writes(
+            &self.client.project_id,
+            &writes,
+            self.max_value_depth,
+        )?;
         writes::commit_writes(
             &self.client.db,
             &self.client.runtime,
@@ -145,6 +161,10 @@ impl Firestore for FirestoreEmulator {
 
     fn set_timeout(&mut self, timeout: Option<Duration>) {
         self.set_operation_timeout(timeout);
+    }
+
+    fn set_max_value_depth(&mut self, max_depth: usize) {
+        self.max_value_depth = max_depth;
     }
 
     fn supports_backend_timeout(&self) -> bool {
@@ -212,7 +232,10 @@ impl Firestore for FirestoreEmulator {
                 Ok::<_, gcloud_sdk::tonic::Status>(None)
             },
         )?;
-        result.as_ref().map(codec::decode_document).transpose()
+        result
+            .as_ref()
+            .map(|doc| codec::decode_document_bounded(doc, self.max_value_depth))
+            .transpose()
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
@@ -220,7 +243,11 @@ impl Firestore for FirestoreEmulator {
             .transaction_id
             .clone()
             .ok_or_else(|| "not in transaction".to_string())?;
-        let sdk_writes = writes::write_ops_to_sdk_writes(&self.client.project_id, &writes)?;
+        let sdk_writes = writes::write_ops_to_sdk_writes(
+            &self.client.project_id,
+            &writes,
+            self.max_value_depth,
+        )?;
         let result = writes::commit_writes(
             &self.client.db,
             &self.client.runtime,
@@ -278,7 +305,7 @@ fn run_query_candidates(
     query: StructuredQuery,
 ) -> Result<QueryCandidates, Box<dyn Error>> {
     let (docs, _) = run_query_candidate_documents(fs, parent, query, None)?;
-    decode_query_documents(docs)
+    decode_query_documents(docs, fs.max_value_depth)
 }
 
 /// Consume a server-streaming query while keeping at most `max_results`
@@ -295,7 +322,7 @@ fn run_query_candidates_bounded(
     if exceeded {
         return Err(super::query_result_limit_error(max_results));
     }
-    decode_query_documents(docs)
+    decode_query_documents(docs, fs.max_value_depth)
 }
 
 /// Return raw documents and whether a document beyond the bounded result set
@@ -374,11 +401,14 @@ fn run_query_candidate_documents(
     })
 }
 
-fn decode_query_documents(docs: Vec<Document>) -> Result<QueryCandidates, Box<dyn Error>> {
+fn decode_query_documents(
+    docs: Vec<Document>,
+    max_value_depth: usize,
+) -> Result<QueryCandidates, Box<dyn Error>> {
     let mut out = Vec::with_capacity(docs.len());
     for doc in docs {
         let rel = path::relative_document_name(&doc.name)?;
-        let Value::Map(fields) = codec::decode_document(&doc)? else {
+        let Value::Map(fields) = codec::decode_document_bounded(&doc, max_value_depth)? else {
             return Err("query result must be a map".into());
         };
         out.push((rel, fields));
@@ -437,7 +467,11 @@ fn build_where(
                         field_path: f.field.clone(),
                     }),
                     op: op.into(),
-                    value: Some(codec::encode_field_value(&f.value)?),
+                    value: Some(codec::encode_field_value_bounded(
+                        &f.value,
+                        0,
+                        crate::limits::DEFAULT_MAX_VALUE_DEPTH,
+                    )?),
                 },
             )),
         });
