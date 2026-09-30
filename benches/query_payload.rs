@@ -5,18 +5,14 @@ use std::time::Instant;
 use firelang::firestore::{Firestore, InMemoryFirestore, WriteOp};
 use firelang::value::{QueryRef, QuerySource, Value};
 
-const DOCUMENT_COUNT: usize = 4_000;
+const DOCUMENT_COUNT: usize = 1_000;
 const PAYLOAD_BYTES: usize = 4 * 1024;
-const ITERATIONS: usize = 5;
+const ITERATIONS: usize = 3;
 
 fn main() {
-    // `cargo test --all-targets` also builds harness-free targets. Keep the
-    // benchmark setup out of that path; `cargo bench --bench query_payload`
-    // runs the measurement below.
-    if cfg!(test) {
-        return;
-    }
-
+    // `cargo test --all-targets` は bench target も test として実行するため、
+    // 絶対時間より「全件を複製する経路」と「page に含まれる行だけ複製する
+    // 経路」の比を見る。dataset は CI でも数 ms で終わる大きさに留める。
     let payload = "x".repeat(PAYLOAD_BYTES);
     let writes = (0..DOCUMENT_COUNT)
         .map(|index| WriteOp::Set {
@@ -64,10 +60,12 @@ fn main() {
     }
     let optimized_page = started.elapsed();
 
+    // 旧経路は全件を複製してから offset/limit を本地で適用していた。複製が
+    // 済んだ時点でコストは確定するので、切り詰めずに全件件数を測る。
     let started = Instant::now();
     for _ in 0..ITERATIONS {
         let rows = black_box(firestore.run_query(&page_query).unwrap());
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), DOCUMENT_COUNT);
     }
     let fallback_page = started.elapsed();
 

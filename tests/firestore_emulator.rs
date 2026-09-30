@@ -362,7 +362,10 @@ fn emulator_delete_field_and_increment_match_in_memory() {
         "set(\"users/{run}\", {{name: \"a\", age: 1, visits: 10}})\nupdate(\"users/{run}\", {{age: delete_field(), visits: increment(5)}})\nget(\"users/{run}\")"
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
-    assert_eq!(out, map! {"visits" => Value::Int(15)});
+    assert_eq!(
+        out,
+        map! {"name" => Value::Str("a".to_string()), "visits" => Value::Int(15)}
+    );
 }
 
 #[test]
@@ -426,14 +429,15 @@ set("users/{run}/rows/other", {{kind: "skip", payload: "{payload}"}})
 ]"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
+    // `map` は行ごとにブロックの値を 1 つ返すため、2 番目の要素は行の配列。
     assert_eq!(
         out,
         Value::Array(vec![
             Value::Int(3),
-            Value::Array(vec![
+            Value::Array(vec![Value::Array(vec![
                 Value::Str(format!("users/{run}/rows/m")),
                 Value::Int((32 * 1024) as i64),
-            ]),
+            ])]),
         ])
     );
 }
