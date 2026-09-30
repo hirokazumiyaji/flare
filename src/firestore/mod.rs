@@ -8,8 +8,8 @@ pub use memory::InMemoryFirestore;
 
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::fmt;
 
-use crate::error::FirelangError;
 use crate::value::{QueryFilter, QueryOp, QueryRef, Value};
 
 /// クエリフィルタ値の共有検証。in-memory / emulator のクエリ実行前に
@@ -160,12 +160,30 @@ pub enum WriteOp {
 /// 順序・offset/limit・`__name__` は未適用(runtime が付ける)。
 pub type QueryCandidates = Vec<(String, BTreeMap<String, Value>)>;
 
+/// Marker error used when a backend would materialize more query candidates
+/// than the runtime's query budget permits.
+///
+/// A distinct type (rather than a formatted `String`) lets the runtime tell a
+/// budget failure apart from a genuine backend failure, so it can record the
+/// budget that was hit and still report the failure as a *runtime* error with a
+/// source position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueryResultLimitExceeded {
+    pub(crate) max_results: usize,
+}
+
+impl fmt::Display for QueryResultLimitExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "query result limit exceeded (max {})", self.max_results)
+    }
+}
+
+impl Error for QueryResultLimitExceeded {}
+
 /// Error used when a backend would materialize more query candidates than
-/// the runtime's query budget permits.  It is a runtime error (rather than a
-/// backend error) so the CLI and embedding callers can treat all budget
-/// failures uniformly and attach the source span.
+/// the runtime's query budget permits.
 pub(crate) fn query_result_limit_error(max_results: usize) -> Box<dyn Error> {
-    FirelangError::runtime(format!("query result limit exceeded (max {max_results})")).into()
+    Box::new(QueryResultLimitExceeded { max_results })
 }
 
 pub trait Firestore {

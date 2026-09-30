@@ -9,12 +9,11 @@ pub mod value;
 
 use std::error::Error;
 
-use runtime::Runtime;
-
 pub use error::{ErrorKind, FirelangError, Span};
 pub use firestore::{Firestore, FirestoreEmulator, InMemoryFirestore};
 pub use limits::{ParserLimits, RuntimeLimits, RuntimeUsage};
-pub use value::Value;
+pub use runtime::Runtime;
+pub use value::{validate_value_depth, validate_value_limits, Value};
 
 pub fn run_script(source: &str) -> Result<Value, Box<dyn Error>> {
     run_script_with_firestore(source, InMemoryFirestore::default())

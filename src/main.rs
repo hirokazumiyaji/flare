@@ -3,7 +3,9 @@ use std::error::Error;
 use std::fs;
 use std::io::{IsTerminal, Read};
 
-use firelang::{run_script, run_script_with_firestore, FirestoreEmulator};
+use std::time::Duration;
+
+use firelang::{FirestoreEmulator, Runtime, RuntimeLimits};
 
 fn main() {
     if let Err(e) = run() {
@@ -19,6 +21,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut paths: Vec<String> = vec![];
     let mut inline: Vec<String> = vec![];
     let mut use_stdin = false;
+    let mut limits = RuntimeLimits::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -32,6 +35,43 @@ fn run() -> Result<(), Box<dyn Error>> {
                     .ok_or("--backend requires in-memory or emulator")?;
                 backend = b.as_str();
                 i += 2;
+            }
+            "--max-call-depth" => {
+                limits.max_call_depth = Some(parse_u64(&args, i, "--max-call-depth")? as usize);
+                i += 2;
+            }
+            "--max-steps" => {
+                limits.max_steps = Some(parse_u64(&args, i, "--max-steps")?);
+                i += 2;
+            }
+            "--max-loop-iterations" => {
+                limits.max_loop_iterations = Some(parse_u64(&args, i, "--max-loop-iterations")?);
+                i += 2;
+            }
+            "--max-wall-clock-ms" => {
+                limits.max_wall_clock = Some(Duration::from_millis(parse_u64(
+                    &args,
+                    i,
+                    "--max-wall-clock-ms",
+                )?));
+                i += 2;
+            }
+            "--max-parser-depth" => {
+                limits.max_parser_depth = Some(parse_u64(&args, i, "--max-parser-depth")? as usize);
+                i += 2;
+            }
+            "--max-value-depth" => {
+                limits.max_value_depth = Some(parse_u64(&args, i, "--max-value-depth")? as usize);
+                i += 2;
+            }
+            "--max-query-results" => {
+                limits.max_query_results =
+                    Some(parse_u64(&args, i, "--max-query-results")? as usize);
+                i += 2;
+            }
+            "--unlimited" => {
+                limits = RuntimeLimits::unlimited();
+                i += 1;
             }
             "-e" => {
                 let script = args.get(i + 1).ok_or("-e requires a script argument")?;
@@ -100,9 +140,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let out = match backend_config {
-        None => run_script(&src)?,
+        None => Runtime::with_limits(firelang::InMemoryFirestore::default(), limits).run(&src)?,
         Some((host, project_id)) => {
-            run_script_with_firestore(&src, FirestoreEmulator::new(host, project_id)?)?
+            let fs = FirestoreEmulator::new(host, project_id)?;
+            Runtime::with_limits(fs, limits).run(&src)?
         }
     };
 
@@ -110,8 +151,19 @@ fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Parse a non-negative budget value for `--<name> <n>`.
+fn parse_u64(args: &[String], i: usize, name: &str) -> Result<u64, Box<dyn Error>> {
+    let raw = args
+        .get(i + 1)
+        .ok_or_else(|| format!("{name} requires a number"))?;
+    raw.parse::<u64>()
+        .map_err(|_| format!("{name} requires a non-negative integer, got {raw:?}").into())
+}
+
 fn print_usage() {
-    eprintln!("usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)");
+    eprintln!(
+        "usage: fl [--backend in-memory|emulator] [budget options] (<script-file> | - | -e <script>)"
+    );
     eprintln!();
     eprintln!("  Script source (exactly one):");
     eprintln!("    <script-file>  run a script file");
@@ -122,6 +174,17 @@ fn print_usage() {
     eprintln!("  Backends:");
     eprintln!("    in-memory   (default) use the in-memory Firestore stub");
     eprintln!("    emulator    use FIRESTORE_EMULATOR_HOST and optional FIRESTORE_PROJECT_ID");
+    eprintln!();
+    eprintln!("  Budgets (all optional; finite defaults protect untrusted input):");
+    eprintln!("    --max-call-depth <n>        nested call depth (default 64)");
+    eprintln!("    --max-steps <n>             evaluated statements (default 1000000)");
+    eprintln!("    --max-loop-iterations <n>   while/each/map iterations (default 100000)");
+    eprintln!("    --max-wall-clock-ms <n>     wall-clock budget in ms (default 5000)");
+    eprintln!("    --max-parser-depth <n>      parser/AST nesting (default 128)");
+    eprintln!("    --max-value-depth <n>       runtime Value nesting (default 64)");
+    eprintln!("    --max-query-results <n>     query candidates materialized (default 10000)");
+    eprintln!("    --unlimited                 disable every budget (trusted scripts only;");
+    eprintln!("                                recursion can then overflow the native stack)");
 }
 
 fn read_stdin() -> Result<String, Box<dyn Error>> {

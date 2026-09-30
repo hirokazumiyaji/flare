@@ -15,8 +15,9 @@
 - [9. Timestamp API](#9-timestamp-api)
 - [10. CLI (`fl`)](#10-cli-fl)
 - [11. バックエンド](#11-バックエンド)
-- [12. スコープ外(MVP)](#12-スコープ外mvp)
-- [13. 既知の制限・実装メモ](#13-既知の制限実装メモ)
+- [12. 実行予算と信頼境界](#12-実行予算と信頼境界)
+- [13. スコープ外(MVP)](#13-スコープ外mvp)
+- [14. 既知の制限・実装メモ](#14-既知の制限実装メモ)
 
 ## 1. 概要
 
@@ -383,7 +384,52 @@ usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
 - 両バックエンドは同じ可視挙動(値の往復・クエリ順序・batch/transaction の原子性)を持たなければならない。
 - ただし emulator 側に firelang 外の型(`double` / `reference` / `geo_point` / `bytes`)で書かれたフィールドがある場合、emulator バックエンドは `Opaque` / `DocRef` に読み替えて返す(§3)。in-memory にはそのような値は存在しない。
 
-## 12. スコープ外(MVP)
+## 12. 実行予算と信頼境界
+
+`fl` は任意のスクリプトファイルを受け付ける。したがって誤ったスクリプト・無限再帰・無限ループ・巨大なネスト・巨大なクエリ結果が、スタック枯渇や無期限の停止に導かれてはならない。ランタイムは**有限の実行予算**を既定で持ち、超過時は panic ではなく、位置付きの通常のエラー(`error: <line>:<col>: ...`)で終了する。
+
+予算は 1 回の `run` / `eval_program` を単位にリセットされる(累積)。
+
+| 予算 | 既定値 | 対象・備考 |
+|------|--------|-----------|
+| 呼び出し深度 | 64 | ネストした呼び出し(ユーザー関数・組み込み)。再帰呼び出しの深さを制限する |
+| ステップ数 | 1,000,000 | 評価した文の数。`step limit exceeded` |
+| ループ反復数 | 100,000 | `while` / `each` / `map` の反復回数。実行全体で共有する。`loop iteration limit exceeded` |
+| 壁時計時間 | 5,000 ms | 字句解析・構文解析・評価の経過時間。`wall-clock limit exceeded` |
+| パーサ深度 | 128 | 括弧・マップ/配列リテラル・`else if` チェーン・`!`/`-` のネスト。`parser nesting limit exceeded` |
+| 補間深度 | 32 | ネストした `"#{...}"` |
+| 値ネスト深度 | 64 | 実行時 `Value`(Array / Map)のネスト。ルートは深さ 0。`value nesting limit exceeded` |
+| 値ノード数 | 100,000 | 実行時 `Value` の総ノード数 |
+| クエリ結果数 | 10,000 | 1 回のクエリで materialize される候補件数。`query result limit exceeded` |
+| ソース長 | 1 MiB | UTF-8 バイト数 |
+| トークン数 | 100,000 | 補間内を含む字句数 |
+| バックエンド timeout | 5,000 ms | Firestore 1 回の呼び出し。組み込み emulator が強制する |
+
+- すべての予算エラーは `ErrorKind::Runtime`(字句解析・パース由来のものは `Lex` / `Parse`)であり、失敗したトップレベル文の開始位置を持つ。評価開始前に超過した壁時計予算だけは、プログラム先頭 `1:1` を位置とする。
+- 予算超過は `batch` を 1 件も書かずに中断し、`transaction` は abort する(通常実行時エラーと同じ原子性)。commit 後に発火した予算エラーで「成功したはずの永続書き込み」を失敗として返さない。
+- **呼び出し深度はネイティブスタックを保護する**。1 段のユーザー関数呼び出しは debug ビルドで約 24 KiB のスタックを消費するため、既定値 64 は 2 MiB スタックのホスト(libtest のスレッド等)でも安全である。スタックがさらに小さいホストに埋め込む場合は `max_call_depth` を下げること。予算を無効化した場合は、深い再帰でスタックオーバーフローによるプロセス abort が発生しうる。
+- クエリ結果数の上限は**候補件数**に対するもの。`limit(n)` / `offset(n)` は実行結果に適用された上で、materialize される候補数が予算を超えるとエラーになる。
+
+### 埋め込み API
+
+予算は `RuntimeLimits` で設定できる。ライブラリ埋め込みと `fl` CLI の**双方**に有限の既定値が適用される。
+
+```rust
+let limits = RuntimeLimits::default().with_max_call_depth(64);
+let mut rt = Runtime::with_limits(backend, limits);
+let out = rt.run(source)?;
+let usage = rt.usage();   // steps / loop_iterations / max_call_depth / ...
+```
+
+予算ごとの予算値は `RuntimeLimits` の builder(`with_max_steps` / `with_max_loop_iterations` / `with_max_wall_clock` / `with_max_parser_depth` / `with_max_value_depth` / `with_max_query_results` など)で上書きできる。`Runtime::set_limits` で稼働中のランタイムを再設定できる。
+
+### 予算の無効化(信頼済みスクリプト)
+
+`Runtime::new_unlimited` / `RuntimeLimits::unlimited()` は予算をすべて無効にする**明示的なオプトイン**である。ユーザー入力・アップロードされたスクリプト・CLI には使わず、信頼済みスクリプトにのみ用いること。`fl --unlimited` は CLI 側の同等手段である。
+
+なお汎用の同期 `Firestore` トレイトは任意の実装を強制中断できないため、`backend_timeout` を強制するのは組み込み `FirestoreEmulator` である。応答しない独自バックエンドは、自身が timeout を実装すること。
+
+## 13. スコープ外(MVP)
 
 以下は明示的に**非対応**。実装しない・README で匂わせない。
 

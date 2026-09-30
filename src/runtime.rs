@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
 use crate::error::{FirelangError, Span};
-use crate::firestore::{Firestore, QueryCandidates, WriteOp};
+use crate::firestore::{Firestore, QueryCandidates, QueryResultLimitExceeded, WriteOp};
 use crate::limits::{RuntimeLimits, RuntimeUsage};
 use crate::parser::Parser;
 use crate::value::{
@@ -95,7 +95,7 @@ impl<F: Firestore> Runtime<F> {
     pub fn eval_program(&mut self, stmts: &[Stmt]) -> Result<Value, Box<dyn Error>> {
         self.start_execution()?;
         let result = self
-            .check_wall_clock()
+            .check_wall_clock_at_source()
             .and_then(|_| self.eval_block(stmts).map(ExecFlow::into_value));
         self.finish_execution();
         result
@@ -111,7 +111,7 @@ impl<F: Firestore> Runtime<F> {
     ) -> Result<Value, Box<dyn Error>> {
         self.start_execution()?;
         let result = self
-            .check_wall_clock()
+            .check_wall_clock_at_source()
             .and_then(|_| self.eval_program_with_spans_active(stmts, spans));
         self.finish_execution();
         result
@@ -147,13 +147,24 @@ impl<F: Firestore> Runtime<F> {
         // Check before lexing as well as after parsing.  This matters for a
         // zero/very-small wall-clock budget: source-size/token limits are
         // separate guards and may be intentionally disabled by an embedder.
-        self.check_wall_clock()?;
+        //
+        // A budget failure raised before evaluation has no statement to point
+        // at, so attach the start of the program.  The CLI contract is that
+        // runtime failures always carry a position.
+        self.check_wall_clock_at_source()?;
         let spanned = crate::lexer::lex_spanned_with_limits(source, self.limits.parser_limits())?;
-        self.check_wall_clock()?;
+        self.check_wall_clock_at_source()?;
         let mut parser = Parser::from_spanned_with_limits(spanned, self.limits.parser_limits());
         let (program, spans) = parser.parse_program_with_spans()?;
-        self.check_wall_clock()?;
+        self.check_wall_clock_at_source()?;
         self.eval_program_with_spans_active(&program, &spans)
+    }
+
+    /// Wall-clock check for the pre-evaluation phase, reported at the start of
+    /// the program because no statement has begun yet.
+    fn check_wall_clock_at_source(&self) -> Result<(), Box<dyn Error>> {
+        self.check_wall_clock()
+            .map_err(|e| attach_span(e, Some(Span::new(1, 1))))
     }
 
     /// 実行を開始し、budget の起点を記録する。
@@ -661,16 +672,34 @@ impl<F: Firestore> Runtime<F> {
         // The bounded hook is the resource boundary. The length check below
         // remains as a defense for legacy backends that use the trait's
         // compatibility fallback.
-        let rows = match self.limits.max_query_results {
+        //
+        // A backend that refuses to materialize more than `max` returns an
+        // error instead of a partial vector, so record the budget that was hit
+        // before propagating: budget consumption must stay observable even on
+        // the failure path.  Only the dedicated marker counts as a budget
+        // failure; a genuine backend error must not be recorded as one.
+        let max_results = self.limits.max_query_results;
+        let result = match max_results {
             Some(max) => self.fs.run_query_bounded(query, max),
             None => self.fs.run_query(query),
-        }
-        .map_err(backend_err)?;
+        };
+        let rows = match result {
+            Ok(rows) => rows,
+            Err(e) => {
+                if let Some(limit) = e.downcast_ref::<QueryResultLimitExceeded>() {
+                    self.usage.max_query_results =
+                        self.usage.max_query_results.max(limit.max_results);
+                    return Err(FirelangError::runtime(limit.to_string()).into());
+                }
+                return Err(backend_err(e));
+            }
+        };
         self.check_wall_clock()?;
 
         let count = rows.len();
-        if let Some(max) = self.limits.max_query_results {
+        if let Some(max) = max_results {
             if count > max {
+                self.usage.max_query_results = self.usage.max_query_results.max(max);
                 return Err(FirelangError::runtime(format!(
                     "query result limit exceeded (max {max})"
                 ))
@@ -1140,7 +1169,11 @@ fn builtin_transaction<F: Firestore>(
     let (flow, writes) = rt.run_staged_block(ExecCtx::Transaction { writes: vec![] }, &stmts.body);
     match flow {
         Ok(flow) => {
-            rt.check_wall_clock()?;
+            // commit 前の budget 超過でも transaction を開いたままにしない。
+            if let Err(e) = rt.check_wall_clock() {
+                let _ = rt.fs.abort_transaction();
+                return Err(e);
+            }
             if let Err(e) = rt.fs.commit_transaction(writes) {
                 let _ = rt.fs.abort_transaction();
                 return Err(backend_err(e));

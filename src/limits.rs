@@ -4,7 +4,14 @@ use std::time::Duration;
 ///
 /// The limits are intentionally finite.  Embedders that run trusted scripts
 /// can opt into [`RuntimeLimits::unlimited`] explicitly.
-pub const DEFAULT_MAX_CALL_DEPTH: usize = 128;
+///
+/// `DEFAULT_MAX_CALL_DEPTH` is deliberately well below the depth a debug build
+/// can actually reach.  Recursion consumes the *native* Rust stack, and one
+/// user-function frame costs roughly 24 KiB in a debug build, so a 128-frame
+/// default overflows on any host with a 2 MiB stack (a libtest thread, for
+/// example).  64 leaves headroom on small stacks; hosts with even less stack
+/// should lower it further.
+pub const DEFAULT_MAX_CALL_DEPTH: usize = 64;
 pub const DEFAULT_MAX_STEPS: u64 = 1_000_000;
 pub const DEFAULT_MAX_LOOP_ITERATIONS: u64 = 100_000;
 pub const DEFAULT_MAX_WALL_CLOCK_MS: u64 = 5_000;
