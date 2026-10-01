@@ -620,21 +620,25 @@ mod tests {
     #[test]
     fn writable_check_rejects_non_writable_transform_elements() {
         // array_union / array_remove の要素も保存対象になるため、書き込み
-        // 不可な値(DocRef 等)はここで拒否する。検証しないと in-memory が
-        // 保存できた値を emulator が encode 時に拒否し、挙動が割れる。
-        for transform in [
+        // 不可な値はここで拒否する。検証しないと in-memory が保存できた値を
+        // emulator が encode 時に拒否し、挙動が割れる。DocRef は in-memory が
+        // 直接保持するため許可する(emulator の write codec が拒否する)。
+        let fields = BTreeMap::from([(
+            "values".to_string(),
+            Value::ArrayRemove(vec![Value::Opaque("Double(1.5)".to_string())]),
+        )]);
+        let err = validate_firestore_fields(&fields).unwrap_err();
+        assert!(
+            format!("{err}").contains("unsupported value in write"),
+            "{err}"
+        );
+        let fields = BTreeMap::from([(
+            "values".to_string(),
             Value::ArrayUnion(vec![Value::DocRef(crate::value::DocRef {
                 path: "users/1".to_string(),
             })]),
-            Value::ArrayRemove(vec![Value::Opaque("Double(1.5)".to_string())]),
-        ] {
-            let fields = BTreeMap::from([("values".to_string(), transform)]);
-            let err = validate_firestore_fields(&fields).unwrap_err();
-            assert!(
-                format!("{err}").contains("unsupported value in write"),
-                "{err}"
-            );
-        }
+        )]);
+        assert!(validate_firestore_fields(&fields).is_ok());
         // Bytes は第一級の保存可能値。transform 要素でも許可する。
         let fields = BTreeMap::from([(
             "values".to_string(),
