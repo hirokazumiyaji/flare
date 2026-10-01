@@ -15,6 +15,19 @@ fn run_in(
     runtime.run(source)
 }
 
+fn assert_runtime_write_error(err: Box<dyn std::error::Error>) {
+    use firelang::{ErrorKind, FirelangError};
+
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("write validation should produce a FirelangError");
+    assert_eq!(ferr.kind, ErrorKind::Runtime, "{ferr}");
+    assert!(
+        ferr.message.contains("unsupported value in write"),
+        "{ferr}"
+    );
+}
+
 #[test]
 fn evals_arithmetic() {
     let out = run_script("a = 1 + 2\na + 3").unwrap();
@@ -2746,4 +2759,88 @@ fn overlapping_update_and_delete_paths_are_rejected() {
         format!("{err}").contains("overlapping field paths"),
         "{err}"
     );
+}
+
+#[test]
+fn set_rejects_unsupported_values_recursively() {
+    // `doc()` は意図的にここに入らない。in-memory は参照を直接保持し、
+    // emulator の write codec だけが `unsupported value in emulator write`
+    // で拒否する(spec §7)。同じ値を両バックエンドで違う結論にしない。
+    let cases = [
+        "fn f() { 1 }\nset(\"users/write_set_func\", {value: f})",
+        "set(\"users/write_set_collection\", {value: col(\"users\")})",
+        "set(\"users/write_set_group\", {value: col_group(\"members\")})",
+        "set(\"users/write_set_query\", {value: col(\"users\").where(\"x\", \"==\", 1)})",
+        "set(\"users/write_set_nested\", {value: {nested: [col(\"users\")]}})",
+    ];
+    for source in cases {
+        let err = run_script(source).unwrap_err();
+        assert_runtime_write_error(err);
+    }
+}
+
+#[test]
+fn update_rejects_unsupported_values_before_staging() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    run_in(&mut runtime, "set(\"users/write_update\", {value: 1})").unwrap();
+
+    let err = run_in(
+        &mut runtime,
+        "fn f() { 1 }\nupdate(\"users/write_update\", {value: f})",
+    )
+    .unwrap_err();
+    assert_runtime_write_error(err);
+    assert_eq!(
+        run_in(&mut runtime, "get(\"users/write_update\")").unwrap(),
+        map! {"value" => Value::Int(1)}
+    );
+}
+
+#[test]
+fn batch_with_unsupported_value_persists_nothing() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(
+        &mut runtime,
+        "batch { set(\"users/write_batch_good\", {ok: true})\nset(\"users/write_batch_bad\", {value: col(\"users\")}) }",
+    )
+    .unwrap_err();
+    assert_runtime_write_error(err);
+    assert_eq!(
+        run_in(&mut runtime, "get(\"users/write_batch_good\")").unwrap(),
+        Value::Nil
+    );
+    assert_eq!(
+        run_in(&mut runtime, "get(\"users/write_batch_bad\")").unwrap(),
+        Value::Nil
+    );
+}
+
+#[test]
+fn documented_values_and_direct_transforms_remain_writable() {
+    let out = run_script(
+        "set(\"users/write_allowed\", {int: 1, str: \"s\", bool: true, \"nil\": nil, array: [1, {nested: timestamp(2)}], map: {ok: false}, ts: timestamp(3), tags: array_union([\"a\"]), items: [\"x\"], remove_me: true, count: 10})\nupdate(\"users/write_allowed\", {tags: array_union([\"b\"]), items: array_remove([\"x\"]), remove_me: delete_field(), count: increment(2), updated_at: server_timestamp()})\nget(\"users/write_allowed\")",
+    )
+    .unwrap();
+    let Value::Map(fields) = out else {
+        panic!("expected document map");
+    };
+    assert_eq!(fields.get("int"), Some(&Value::Int(1)));
+    assert_eq!(fields.get("str"), Some(&Value::Str("s".to_string())));
+    assert_eq!(fields.get("bool"), Some(&Value::Bool(true)));
+    assert_eq!(fields.get("nil"), Some(&Value::Nil));
+    assert!(matches!(fields.get("ts"), Some(Value::Timestamp(_))));
+    assert_eq!(
+        fields.get("tags"),
+        Some(&Value::Array(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string())
+        ]))
+    );
+    assert_eq!(fields.get("items"), Some(&Value::Array(vec![])));
+    assert!(!fields.contains_key("remove_me"));
+    assert_eq!(fields.get("count"), Some(&Value::Int(12)));
+    assert!(matches!(
+        fields.get("updated_at"),
+        Some(Value::Timestamp(_))
+    ));
 }

@@ -86,6 +86,8 @@ Firestore 操作のための特殊な値:
 | AuthSession | `auth_sign_up(...)` / `auth_sign_in(...)` | Auth のセッション。user record と ID / refresh token の所有者を保持する。`inspect` ではトークンが redact される(§11) |
 | RedactedToken | (生成不可。`session.id_token` アクセス) | トークンの redacted 投影値(`<redacted:id_token>`)。生のトークンは決してスクリプトに現れない(§11) |
 
+センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(in-memory / emulator 共通でエラー)。`set` / `update` は write を staging する前に data_map を再帰的に検証し、`Func` / クエリ / `Opaque` など Firestore に保存できない値も backend へ送らずエラーにする(`unsupported value in write`)。
+
 センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(in-memory / emulator 共通でエラー)。
 
 emulator バックエンドで firelang が持たない型のフィールドを含むドキュメントを読んだ場合、ドキュメント全体はエラーにせず次のように読み替える:`bytes` は lossless な第一級の `Bytes` 値、`double` / `geo_point` は `Opaque` の表示専用値(例 `Double(1.5)`、`GeoPoint(35.7, 139.7)`)、`reference` は同一データベース内であれば相対パスの `DocRef`(別プロジェクトや別データベースの参照は `Reference(...)` の `Opaque` 値)。`Opaque` 値はクエリの `==` 等でマッチさせることはできず(スクリプトからは生成できない)、書き戻しはエラー(`unsupported value in emulator write`)。Storage の `bytes([...])` は `Value::Bytes` であり、ダウンロード時も要素ごとのバイト列を保持する。
@@ -295,7 +297,7 @@ while cond { ... }
 
 `data_map` の値に使えるのは: Int / Str / Bool / Nil / Array / Map / Timestamp / Bytes、および直下フィールドのセンチネル 5 種。
 
-Firestore へ書き込む値は、in-memory / emulator 共通の再帰 validator で RPC 前に検証する。Firestore の制約は次の通り:
+Firestore へ書き込む値は、runtime が write を staging する前と、in-memory / emulator 共通の再帰 validator の write 境界の両方で検証する(同じ validator を共有するため誤差は出ない)。batch / transaction の staging は 1 write でも拒否されれば何も保存されない。検証で弾かれるのは保存できない値(Func / クエリ / `Opaque`、および emulator では `DocRef`)。Firestore の制約は次の通り:
 
 - `Array` の要素として別の `Array` を直接置けない(`[[1]]` は `Nested arrays are not allowed`)。ただし `Array -> Map -> Array` の間接的な配列入れ子は許可する(例: `{rows: [{values: [1, 2]}]}`)。
 - Map / ドキュメントのフィールド名は空にできず、Firestore の予約正規表現 `__.*__` に一致してはならない。空名・予約名のチェックは Map のすべてのネストレベルで適用する(それぞれ `The property.name is the empty string.` / `field name <name> is reserved`)。フィールド名は UTF-8 で 1,500 バイト以下。
