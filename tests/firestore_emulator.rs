@@ -815,6 +815,7 @@ fn emulator_delete_field_and_increment_match_in_memory() {
             "name" => Value::Str("a".to_string()),
             "visits" => Value::Int(15)
         }
+
     );
 }
 

@@ -134,8 +134,11 @@ fn workflows_do_not_deploy_firebase_rules() {
         let path = entry.expect("workflow entry must be readable").path();
         let contents = fs::read_to_string(&path)
             .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        // `run: |` block は `\` + 改行で command が分割されうるため、
+        // 連結した文字列で `firebase deploy` を検出する。
+        let joined_commands = contents.replace("\\\n", " ");
         assert!(
-            !contents.contains("firebase deploy"),
+            !joined_commands.contains("firebase deploy"),
             "{} must not add a Firebase deployment without an explicit security review",
             path.display()
         );

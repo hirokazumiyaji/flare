@@ -528,6 +528,8 @@ Identity Toolkit のエラーコードは `:` 区切りの詳細が付くこと�
 - Firestore の両バックエンドは同じ可視挙動(値の往復・クエリ順序・batch/transaction の原子性)を持たなければならない。Storage の両バックエンドも path / metadata / content type / size / not-found の契約を共有する。Auth の両バックエンドも戻り値と typed error の契約を共有する。
 - Storage バックエンドは `Storage` トレイトを実装する。in-memory は `Vec<u8>` を保存し、emulator は Firebase Storage REST API (`/v0/b/{bucket}/o`) を同期 HTTP で呼ぶ。バケットは既定で `{project_id}.appspot.com`、`FIREBASE_STORAGE_BUCKET` で上書きできる。HTTP I/O は `StorageTransport` に分離(fake transport でネットワークなしに契約テストできる)。
 - ただし emulator 側に firelang 外の型(`double` / `reference` / `geo_point`)で書かれたフィールドがある場合、emulator バックエンドは `Opaque` / `DocRef` に読み替えて返す(§3)。`bytes` は `Bytes` として lossless に往復する。in-memory には firelang 外の型の値は存在しない。
+- ローカル実行の security rules は `firebase.emulators.json` が参照する `firestore.emulator.rules`(read/write 許可)を使う。`firebase.json` が参照する `firestore.rules` は read/write 拒否で、リモート project への誤デプロイに備えてある([Firebase rules の分離とデプロイ防止策](firebase-security.md))。
+
 
 ## 13. スコープ外(MVP)
 

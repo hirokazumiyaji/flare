@@ -10,7 +10,7 @@ firelang は認証付きの本番 Firestore と Cloud Storage に対応してい
 rules の参照先も、この設定で決まります。
 このため、deploy 用と emulator 用の config と rules を別のファイルに分けます。
 
-| 対象 | リモート project 用の設定 | Local emulator 用の設定 |
+| 対象 | リモート project 用の設定 | ローカル emulator 用の設定 |
 | --- | --- | --- |
 | Firestore | `firebase.json` → `firestore.rules`（read/write 拒否） | `firebase.emulators.json` → `firestore.emulator.rules`（read/write 許可） |
 | Cloud Storage | `firebase.json` → `storage.rules`（read/write 拒否） | `firebase.emulators.json` → `storage.emulator.rules`（read/write 許可） |
@@ -45,7 +45,8 @@ firebase emulators:exec \
 ```
 
 リポジトリには `.firebaserc` を用意していません。
-clone 直後の既定 project は未選択であり、このドキュメントのコマンドは project ID を明示します。
+clone した直後は既定 project が未選択です。
+このドキュメントのコマンドは project ID を明示します。
 
 ## Authentication と Storage の扱い
 
@@ -69,4 +70,5 @@ cargo test --test firebase_config
 ```
 
 CI では `firebase.json` 自身を使って Firestore emulator を起動し、write が `PERMISSION_DENIED` になることを検査します。
-このテストは許可 rules への参照を直接変更しないため、通常の `firebase deploy` によって production-like project が公開されることも防ぎます。
+emulator の `Bearer owner` は admin 資格で rules をバイパスするため、この検査は admin でない資格(`EmulatorAuth::EnforceRules`)で行います。
+静的テストも production 側の rules が read/write 拒否のままであることを検査するため、通常の `firebase deploy` によって production-like project が公開されることはありません。
