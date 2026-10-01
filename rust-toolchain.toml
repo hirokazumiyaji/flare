@@ -1,0 +1,5 @@
+# This file is the authoritative Rust toolchain pin for local, CI, and release builds.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

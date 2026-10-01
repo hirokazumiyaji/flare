@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::sync::Arc;
 
-use super::{Firestore, WriteOp};
-use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Timestamp, Value};
+use super::{validate_write_op, Firestore, WriteOp};
+use crate::value::{QueryRef, QuerySource, Timestamp, Value};
 
 /// in-memory backend が `server_timestamp()` の request time を取得する時計。
 ///
@@ -84,9 +84,30 @@ impl Firestore for InMemoryFirestore {
         super::validate_query_filters(&query.filters)?;
         Ok(self
             .candidates(&query.source)
-            .filter(|(_, doc)| matches_filters(doc, &query.filters))
+            .filter(|(path, doc)| super::matches_filters(path, doc, &query.filters))
             .map(|(path, doc)| (path.clone(), doc.clone()))
             .collect())
+    }
+
+    fn run_query_page(&self, query: &QueryRef) -> Result<super::QueryCandidates, Box<dyn Error>> {
+        super::validate_query_filters(&query.filters)?;
+        let rows = super::page_borrowed_candidates(
+            self.candidates(&query.source)
+                .filter(|(path, doc)| super::matches_filters(path, doc, &query.filters)),
+            query,
+        );
+        Ok(rows
+            .into_iter()
+            .map(|(path, doc)| (path.clone(), doc.clone()))
+            .collect())
+    }
+
+    fn count_query(&self, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
+        super::validate_query_filters(&query.filters)?;
+        Ok(self
+            .candidates(&query.source)
+            .filter(|(path, doc)| super::matches_filters(path, doc, &query.filters))
+            .count() as i64)
     }
 
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
@@ -105,9 +126,22 @@ impl Firestore for InMemoryFirestore {
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
-        let Some(mut next) = self.tx_snapshot.take() else {
-            return Err("not in transaction".into());
-        };
+        // Build the committed state from a copy.  A failed write (for
+        // example, an update of a missing document) must not consume the
+        // transaction state: the runtime needs to be able to abort it and a
+        // direct caller may retry after correcting the writes.
+        if writes.is_empty() {
+            // Nothing can fail, so the snapshot can be moved instead of
+            // cloned; this keeps `transaction { ... }` with no staged write
+            // from copying the whole store.
+            self.docs = self.tx_snapshot.take().ok_or("not in transaction")?;
+            return Ok(());
+        }
+        let mut next = self
+            .tx_snapshot
+            .as_ref()
+            .ok_or("not in transaction")?
+            .clone();
         // transaction も同じ commit request の clock を全 write で共有する。
         let mut request_time = RequestTime {
             clock: &self.request_clock,
@@ -117,6 +151,7 @@ impl Firestore for InMemoryFirestore {
             apply_write_to_docs(&mut next, op, &mut request_time)?;
         }
         self.docs = next;
+        self.tx_snapshot = None;
         Ok(())
     }
 
@@ -127,8 +162,8 @@ impl Firestore for InMemoryFirestore {
 }
 
 impl InMemoryFirestore {
-    /// ソースに属するドキュメント候補を列挙する。フィルタ・順序・
-    /// offset/limit・`__name__` は呼び出し側(runtime)が適用する。
+    /// ソースに属するドキュメント候補を列挙する。フィルタはバックエンド
+    /// 共通の matcher、順序・offset/limit・`__name__` は runtime が適用する。
     fn candidates<'a>(
         &'a self,
         source: &'a QuerySource,
@@ -160,6 +195,7 @@ fn apply_write_to_docs(
     op: WriteOp,
     request_time: &mut RequestTime<'_>,
 ) -> Result<(), Box<dyn Error>> {
+    validate_write_op(&op)?;
     match op {
         WriteOp::Set {
             path,
@@ -189,93 +225,19 @@ fn apply_write_to_docs(
     }
 }
 
-fn matches_filters(doc: &BTreeMap<String, Value>, filters: &[QueryFilter]) -> bool {
-    filters.iter().all(|f| {
-        // `!=` / `in` / `not-in` はフィールドの存在を要求する(存在しなければ
-        // マッチしない)。`order_by` 対象の存在チェックは sort 側で行う。
-        let segments: Vec<&str> = f.field.split('.').collect();
-        let actual = lookup_field_path(Some(doc), &segments);
-        match f.op {
-            QueryOp::Eq => actual == Some(&f.value),
-            QueryOp::Ne => actual.is_some_and(|v| v != &f.value),
-            QueryOp::Gt => compare_values(actual, &f.value, |o| o.is_gt()),
-            QueryOp::Ge => compare_values(actual, &f.value, |o| o.is_ge()),
-            QueryOp::Lt => compare_values(actual, &f.value, |o| o.is_lt()),
-            QueryOp::Le => compare_values(actual, &f.value, |o| o.is_le()),
-            QueryOp::In => match (&f.value, actual) {
-                (Value::Array(list), Some(v)) => list.contains(v),
-                _ => false,
-            },
-            QueryOp::NotIn => match (&f.value, actual) {
-                (Value::Array(list), Some(v)) => {
-                    if list.contains(&Value::Nil) {
-                        false
-                    } else {
-                        !list.contains(v)
-                    }
-                }
-                _ => false,
-            },
-            QueryOp::ArrayContains => match actual {
-                Some(Value::Array(arr)) => arr.contains(&f.value),
-                _ => false,
-            },
-            QueryOp::ArrayContainsAny => match (&f.value, actual) {
-                (Value::Array(list), Some(Value::Array(arr))) => {
-                    arr.iter().any(|x| list.contains(x))
-                }
-                _ => false,
-            },
-        }
-    })
-}
-
-/// 大小比較は同型のみを規定する(Int / Str / Bool / Timestamp)。
-/// 型が異なる・Nil は常にマッチしない(emulator の Firestore と実用上の
-/// 挙動を合わせる。異なる型同士の Firestore の型順序は未規定 = spec §13)。
-/// フィルタの文字列値は 1,500 バイト未満に制限されており(emulator の
-/// Firestore と同じ)、有効なフィルタに対しては全文比較でよい(最初の差異
-/// 位置は常にフィルタ自身の長さ以内 = 1,500 バイト未満に収まる)。
-fn compare_values(a: Option<&Value>, b: &Value, pred: impl Fn(std::cmp::Ordering) -> bool) -> bool {
-    match (a, b) {
-        (Some(Value::Int(x)), Value::Int(y)) => pred(x.cmp(y)),
-        (Some(Value::Str(x)), Value::Str(y)) => pred(x.cmp(y)),
-        (Some(Value::Bool(x)), Value::Bool(y)) => pred(x.cmp(y)),
-        (Some(Value::Timestamp(x)), Value::Timestamp(y)) => pred(x.seconds.cmp(&y.seconds)),
-        _ => false,
-    }
-}
-
 fn apply_update_map(
     current: &mut BTreeMap<String, Value>,
     updates: &mut BTreeMap<String, Value>,
     request_time: &mut RequestTime<'_>,
 ) -> Result<(), Box<dyn Error>> {
-    for (k, v) in updates.iter() {
-        super::validate_field_path(k)?;
-        reject_nested_sentinels(v, false)?;
-    }
+    let super::WriteValues {
+        plain,
+        transforms,
+        deletes,
+    } = super::plan_update_writes(updates)?;
+
     // Firestore の挙動に合わせ、1) 削除 2) 通常フィールド更新 3) フィールド変換(increment等)
     // の順序で適用する。
-    let mut deletes = vec![];
-    let mut plain = vec![];
-    let mut transforms = vec![];
-    for (k, v) in updates.iter() {
-        match v {
-            Value::DeleteField => deletes.push(k.clone()),
-            Value::ArrayUnion(_)
-            | Value::ArrayRemove(_)
-            | Value::ServerTimestamp
-            | Value::Increment(_) => transforms.push((k.clone(), v.clone())),
-            _ => plain.push((k.clone(), v.clone())),
-        }
-    }
-    super::validate_no_overlapping_paths(
-        deletes
-            .iter()
-            .map(String::as_str)
-            .chain(plain.iter().map(|(k, _)| k.as_str())),
-    )?;
     for k in &deletes {
         let segments: Vec<&str> = k.split('.').collect();
         remove_at_field_path(current, &segments)?;
@@ -332,7 +294,7 @@ fn resolve_sentinel_map(
     request_time: &mut RequestTime<'_>,
 ) -> Result<(), Box<dyn Error>> {
     for (k, v) in map.clone() {
-        reject_nested_sentinels(&v, false)?;
+        super::reject_nested_sentinels(&v, false)?;
         let segments: Vec<&str> = k.split('.').collect();
         let base = || lookup_field_path(current, &segments);
         let resolved = match v {
@@ -378,35 +340,6 @@ fn resolve_sentinel_map(
     Ok(())
 }
 
-fn reject_nested_sentinels(value: &Value, nested: bool) -> Result<(), Box<dyn Error>> {
-    if nested
-        && matches!(
-            value,
-            Value::ArrayUnion(_)
-                | Value::ArrayRemove(_)
-                | Value::ServerTimestamp
-                | Value::Increment(_)
-                | Value::DeleteField
-        )
-    {
-        return Err("field transforms cannot be nested".into());
-    }
-    match value {
-        Value::Array(items) | Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
-            for item in items {
-                reject_nested_sentinels(item, true)?;
-            }
-        }
-        Value::Map(map) => {
-            for item in map.values() {
-                reject_nested_sentinels(item, true)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 /// フィールドパスでネストした値を削除する。パスが存在しなければ何もしない。
 /// 中間が存在して Map でなければエラー(insert と同じ厳しさ)。
 fn remove_at_field_path(
@@ -444,4 +377,36 @@ fn lookup_field_path<'a>(
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_commit_keeps_transaction_until_abort() {
+        let mut fs = InMemoryFirestore::default();
+        fs.apply(vec![WriteOp::Set {
+            path: "users/existing".into(),
+            data: BTreeMap::from([("n".into(), Value::Int(1))]),
+            merge: false,
+        }])
+        .unwrap();
+        fs.begin_transaction().unwrap();
+
+        let err = fs
+            .commit_transaction(vec![WriteOp::Update {
+                path: "users/missing".into(),
+                data: BTreeMap::from([("n".into(), Value::Int(2))]),
+            }])
+            .unwrap_err();
+        assert!(err.to_string().contains("document not found"));
+        // The failed commit did not consume the snapshot, so cleanup can
+        // still be performed and a new transaction can be started afterward.
+        assert!(fs.transaction_get("users/existing").unwrap().is_some());
+
+        fs.abort_transaction().unwrap();
+        fs.begin_transaction().unwrap();
+        fs.abort_transaction().unwrap();
+    }
 }
