@@ -17,6 +17,171 @@ use std::error::Error;
 
 use crate::value::{QueryFilter, QueryOp, QueryRef, Value};
 
+/// Firestore のフィールド名の上限(UTF-8 バイト数)。
+const MAX_FIELD_NAME_BYTES: usize = 1500;
+
+/// Firestore に書き込む値の共有検証。
+///
+/// Firestore の `ArrayValue` は直接別の `ArrayValue` を含められない。ただし
+/// Array の要素が Map で、その Map の値が Array になる間接的な入れ子は許可
+/// される。Map を跨いだときは「配列の中にいる」状態を解除する。
+pub(crate) fn validate_firestore_value(value: &Value) -> Result<(), Box<dyn Error>> {
+    validate_firestore_value_at(value, false)
+}
+
+/// `value` を Array の要素として見たときの検証。配列の要素を 1 個ずつ
+/// 検証する箇所から直接呼び出すことで、要素が Array であるものを検出できる。
+pub(crate) fn validate_firestore_array_items(items: &[Value]) -> Result<(), Box<dyn Error>> {
+    for item in items {
+        validate_firestore_value_at(item, true)?;
+    }
+    Ok(())
+}
+
+fn validate_firestore_value_at(value: &Value, inside_array: bool) -> Result<(), Box<dyn Error>> {
+    match value {
+        Value::Array(items) => {
+            if inside_array {
+                return Err("Nested arrays are not allowed".into());
+            }
+            validate_firestore_array_items(items)
+        }
+        Value::Map(fields) => {
+            for (name, value) in fields {
+                validate_firestore_field_name(name)?;
+                // Map は配列と配列の間に入る境界なので、配列内の Map に
+                // 含まれる配列は直接入れ子ではなく許可する。
+                validate_firestore_value_at(value, false)?;
+            }
+            Ok(())
+        }
+        // transform の引数も、適用後の Array の要素として検証する。
+        Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
+            if inside_array {
+                return Err("Nested arrays are not allowed".into());
+            }
+            validate_firestore_array_items(items)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Firestore に保存できる値の型を検証する。query の filter operand と
+/// write data は同じ Value 型を使うため、書き込み専用の型制約はここへ分ける。
+pub(crate) fn validate_firestore_writable_value(value: &Value) -> Result<(), Box<dyn Error>> {
+    match value {
+        Value::Str(_)
+        | Value::Int(_)
+        | Value::Bool(_)
+        | Value::Nil
+        | Value::Timestamp(_)
+        | Value::Bytes(_)
+        // in-memory は参照を直接保持する。emulator の write codec が
+        // 書き込みを拒否する(`unsupported value in emulator write`)。
+        | Value::DocRef(_)
+        | Value::ServerTimestamp
+        | Value::Increment(_)
+        | Value::DeleteField => Ok(()),
+        // transform の要素も保存対象になるため、Array と同じく再帰検証する。
+        // 検証しないと in-memory が保存できた値を emulator が encode 時に
+        // 拒否し、両バックエンドで挙動が割れる。
+        Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
+            for item in items {
+                validate_firestore_writable_value(item)?;
+            }
+            Ok(())
+        }
+        Value::Array(items) => {
+            for item in items {
+                validate_firestore_writable_value(item)?;
+            }
+            Ok(())
+        }
+        Value::Map(fields) => {
+            for (name, value) in fields {
+                validate_firestore_field_name(name)?;
+                validate_firestore_writable_value(value)?;
+            }
+            Ok(())
+        }
+        _ => Err(format!("unsupported value in write: {}", value.inspect()).into()),
+    }
+}
+
+/// ドキュメント / Map の全フィールドを、バックエンド共通で検証する。
+/// フィールド名と値の両方を再帰的に検査し、フィールド transform の
+/// ネストもここで両バックエンドに同じ規則を適用する。
+#[cfg(test)]
+pub(crate) fn validate_firestore_fields(
+    fields: &BTreeMap<String, Value>,
+) -> Result<(), Box<dyn Error>> {
+    validate_firestore_fields_with_keys(fields, false)
+}
+
+fn validate_firestore_fields_with_keys(
+    fields: &BTreeMap<String, Value>,
+    keys_are_paths: bool,
+) -> Result<(), Box<dyn Error>> {
+    for (name, value) in fields {
+        if keys_are_paths {
+            validate_field_path(name)?;
+        } else {
+            validate_firestore_field_name(name)?;
+        }
+        reject_nested_sentinels(value, false)?;
+        validate_firestore_value(value)?;
+        validate_firestore_writable_value(value)?;
+    }
+    Ok(())
+}
+
+/// 1 つの `WriteOp` に対する検証 dispatch。in-memory と emulator は
+/// 同じ helper を使い、variant を追加したときの検証漏れを防ぐ。
+pub(crate) fn validate_write_op(op: &WriteOp) -> Result<(), Box<dyn Error>> {
+    match op {
+        WriteOp::Set { data, merge, .. } => {
+            validate_firestore_fields_with_keys(data, *merge)?;
+        }
+        WriteOp::Update { data, .. } => validate_firestore_fields_with_keys(data, true)?,
+        WriteOp::Delete { .. } => {}
+    }
+    Ok(())
+}
+
+/// Firestore の MapValue / Document.fields のキーとして使える名前か検証する。
+/// 予約名は `__.*__`、空文字列は禁止。フィールド名は UTF-8 1,500 バイトまで。
+pub(crate) fn validate_firestore_field_name(name: &str) -> Result<(), Box<dyn Error>> {
+    if name.is_empty() {
+        return Err("The property.name is the empty string.".into());
+    }
+    if name.len() > MAX_FIELD_NAME_BYTES {
+        return Err(format!(
+            "invalid field name: {name:?} is too large (maximum {MAX_FIELD_NAME_BYTES} UTF-8 bytes)"
+        )
+        .into());
+    }
+    // Firestore の予約正規表現 `__.*__`。`__name__` も含め、Map の
+    // すべてのネストレベルで拒否する。Datastore 由来の数値 ID
+    // (`__id[0-9]+__`)は既存参照として例外的に許可する。
+    if name.len() >= 4
+        && name.starts_with("__")
+        && name.ends_with("__")
+        && !is_legacy_datastore_numeric_id(name)
+    {
+        return Err(format!("field name {name} is reserved").into());
+    }
+    Ok(())
+}
+
+/// Datastore 由来の数値エンティティ ID(`__id` + 10進数字 + `__`)かどうか。
+/// 予約パターン `__.*__` の例外として、既存参照の読み書きに使う。
+pub(crate) fn is_legacy_datastore_numeric_id(id: &str) -> bool {
+    let Some(inner) = id.strip_prefix("__id").and_then(|s| s.strip_suffix("__")) else {
+        return false;
+    };
+    !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_digit())
+}
+
 const MAX_QUERY_STRING_BYTES: usize = 1500;
 
 /// クエリフィルタ値の共有検証。in-memory / emulator のクエリ実行前に
@@ -332,6 +497,9 @@ pub(crate) fn validate_field_path(key: &str) -> Result<(), Box<dyn Error>> {
             )
             .into());
         }
+        // 単純フィールド名でも、Firestore の予約名(`__.*__`)やサイズ制限は
+        // 適用される。update / merge set のパスではここでも検証する。
+        validate_firestore_field_name(segment)?;
     }
     Ok(())
 }
@@ -405,6 +573,110 @@ pub trait Firestore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn value_validator_rejects_only_directly_nested_arrays() {
+        let direct = Value::Array(vec![Value::Array(vec![Value::Int(1)])]);
+        let err = validate_firestore_value(&direct).unwrap_err();
+        assert!(format!("{err}").contains("Nested arrays"));
+
+        // A map between two arrays makes the second array an indirect child.
+        let indirect = Value::Array(vec![Value::Map(BTreeMap::from([(
+            "values".to_string(),
+            Value::Array(vec![Value::Int(1), Value::Int(2)]),
+        )]))]);
+        assert!(validate_firestore_value(&indirect).is_ok());
+    }
+
+    #[test]
+    fn field_name_validator_checks_empty_and_reserved_names_recursively() {
+        for (name, expected) in [
+            ("", "empty string"),
+            ("__name__", "reserved"),
+            ("__reserved__", "reserved"),
+        ] {
+            let value = Value::Map(BTreeMap::from([(name.to_string(), Value::Int(1))]));
+            let err = validate_firestore_value(&value).unwrap_err();
+            assert!(format!("{err}").contains(expected), "{err}");
+        }
+
+        let nested = Value::Map(BTreeMap::from([(
+            "outer".to_string(),
+            Value::Array(vec![Value::Map(BTreeMap::from([(
+                "__name__".to_string(),
+                Value::Int(1),
+            )]))]),
+        )]));
+        let err = validate_firestore_value(&nested).unwrap_err();
+        assert!(format!("{err}").contains("reserved"), "{err}");
+
+        let valid_nested = Value::Map(BTreeMap::from([(
+            "outer".to_string(),
+            Value::Array(vec![Value::Map(BTreeMap::from([(
+                "values".to_string(),
+                Value::Array(vec![Value::Int(1)]),
+            )]))]),
+        )]));
+        assert!(validate_firestore_value(&valid_nested).is_ok());
+    }
+
+    #[test]
+    fn writable_check_rejects_non_writable_transform_elements() {
+        // array_union / array_remove の要素も保存対象になるため、書き込み
+        // 不可な値はここで拒否する。検証しないと in-memory が保存できた値を
+        // emulator が encode 時に拒否し、挙動が割れる。DocRef は in-memory が
+        // 直接保持するため許可する(emulator の write codec が拒否する)。
+        let fields = BTreeMap::from([(
+            "values".to_string(),
+            Value::ArrayRemove(vec![Value::Opaque("Double(1.5)".to_string())]),
+        )]);
+        let err = validate_firestore_fields(&fields).unwrap_err();
+        assert!(
+            format!("{err}").contains("unsupported value in write"),
+            "{err}"
+        );
+        let fields = BTreeMap::from([(
+            "values".to_string(),
+            Value::ArrayUnion(vec![Value::DocRef(crate::value::DocRef {
+                path: "users/1".to_string(),
+            })]),
+        )]);
+        assert!(validate_firestore_fields(&fields).is_ok());
+        // Bytes は第一級の保存可能値。transform 要素でも許可する。
+        let fields = BTreeMap::from([(
+            "values".to_string(),
+            Value::ArrayUnion(vec![Value::Bytes(vec![1, 2])]),
+        )]);
+        assert!(validate_firestore_fields(&fields).is_ok());
+    }
+
+    #[test]
+    fn legacy_datastore_numeric_field_names_are_accepted() {
+        let fields = BTreeMap::from([("__id123__".to_string(), Value::Int(1))]);
+        assert!(validate_firestore_fields(&fields).is_ok());
+        let fields = BTreeMap::from([("__reserved__".to_string(), Value::Int(1))]);
+        let err = validate_firestore_fields(&fields).unwrap_err();
+        assert!(format!("{err}").contains("reserved"), "{err}");
+    }
+
+    #[test]
+    fn transform_arguments_use_array_aware_validation() {
+        let fields = BTreeMap::from([(
+            "values".to_string(),
+            Value::ArrayUnion(vec![Value::Array(vec![Value::Int(1)])]),
+        )]);
+        let err = validate_firestore_fields(&fields).unwrap_err();
+        assert!(format!("{err}").contains("Nested arrays"), "{err}");
+
+        let valid = BTreeMap::from([(
+            "values".to_string(),
+            Value::ArrayUnion(vec![Value::Map(BTreeMap::from([(
+                "items".to_string(),
+                Value::Array(vec![Value::Int(1)]),
+            )]))]),
+        )]);
+        assert!(validate_firestore_fields(&valid).is_ok());
+    }
 
     fn filter(op: QueryOp, value: Value) -> QueryFilter {
         QueryFilter {

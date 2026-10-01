@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 
-use super::{Firestore, WriteOp};
+use super::{validate_write_op, Firestore, WriteOp};
 use crate::value::{QueryRef, QuerySource, Timestamp, Value};
 
 #[derive(Default)]
@@ -112,6 +112,7 @@ fn apply_write_to_docs(
     docs: &mut HashMap<String, BTreeMap<String, Value>>,
     op: WriteOp,
 ) -> Result<(), Box<dyn Error>> {
+    validate_write_op(&op)?;
     match op {
         WriteOp::Set {
             path,
@@ -152,6 +153,7 @@ fn apply_update_map(
         transforms,
         deletes,
     } = super::plan_update_writes(updates)?;
+
 
     // Firestore の挙動に合わせ、1) 削除 2) 通常フィールド更新 3) フィールド変換(increment等)
     // の順序で適用する。

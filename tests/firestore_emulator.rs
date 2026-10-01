@@ -275,6 +275,53 @@ get("{path}")"#
 }
 
 #[test]
+fn emulator_value_validation_matches_in_memory() {
+    // The preflight validator must reject these before the emulator RPC, with
+    // the same rules as the in-memory backend.
+    let run = unique("values");
+    for (source, expected) in [
+        (
+            format!(r#"set("users/{run}/docs/direct", {{values: [[1]]}})"#),
+            "Nested arrays",
+        ),
+        (
+            format!(r#"set("users/{run}/docs/empty", {{"": 1}})"#),
+            "empty string",
+        ),
+        (
+            format!(r#"set("users/{run}/docs/reserved", {{__name__: 1}})"#),
+            "reserved",
+        ),
+        (
+            format!(r#"set("users/{run}/docs/nested", {{outer: [{{"__secret__": 1}}]}})"#),
+            "reserved",
+        ),
+    ] {
+        let Some(fs) = emulator() else {
+            eprintln!("skip: no emulator");
+            return;
+        };
+        let err = run_script_with_firestore(&source, fs).unwrap_err();
+        assert!(format!("{err}").contains(expected), "{source}: {err}");
+    }
+
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let path = format!("users/{run}/docs/valid");
+    let source = format!(
+        r#"set("{path}", {{rows: [{{values: [1, 2]}}, {{values: [3]}}]}})
+get("{path}")"#
+    );
+    let out = run_script_with_firestore(&source, fs).unwrap();
+    assert_eq!(
+        out.inspect(),
+        "{\"rows\" => [{\"values\" => [1, 2]}, {\"values\" => [3]}]}"
+    );
+}
+
+#[test]
 fn emulator_bytes_roundtrip_and_query_equality() {
     let Some(fs) = emulator() else {
         eprintln!("skip: no emulator");

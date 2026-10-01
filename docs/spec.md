@@ -83,7 +83,7 @@ Firestore 操作のための特殊な値:
 | Increment | `increment(n)` | 数値加算センチネル |
 | Opaque | (生成不可。emulator 読み取りのみ) | `double` / `geo_point` など、firelang が持たないフィールド型の表示専用値(`Double(1.5)` 等)。書き込みには使えない |
 
-センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(emulator バックエンドではエラー)。
+センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(in-memory / emulator 共通でエラー)。
 
 emulator バックエンドで firelang が持たない型のフィールドを含むドキュメントを読んだ場合、ドキュメント全体はエラーにせず次のように読み替える:`bytes` は lossless な第一級の `Bytes` 値、`double` / `geo_point` は `Opaque` の表示専用値(例 `Double(1.5)`、`GeoPoint(35.7, 139.7)`)、`reference` は同一データベース内であれば相対パスの `DocRef`(別プロジェクトや別データベースの参照は `Reference(...)` の `Opaque` 値)。`Opaque` 値はクエリの `==` 等でマッチさせることはできず(スクリプトからは生成できない)、書き戻しはエラー(`unsupported value in emulator write`)。Storage の `bytes([...])` は `Value::Bytes` であり、ダウンロード時も要素ごとのバイト列を保持する。
 
@@ -291,6 +291,12 @@ while cond { ... }
 | `transaction { ... }` | ブロックの値 | 8 章参照 |
 
 `data_map` の値に使えるのは: Int / Str / Bool / Nil / Array / Map / Timestamp / Bytes、および直下フィールドのセンチネル 5 種。
+
+Firestore へ書き込む値は、in-memory / emulator 共通の再帰 validator で RPC 前に検証する。Firestore の制約は次の通り:
+
+- `Array` の要素として別の `Array` を直接置けない(`[[1]]` は `Nested arrays are not allowed`)。ただし `Array -> Map -> Array` の間接的な配列入れ子は許可する(例: `{rows: [{values: [1, 2]}]}`)。
+- Map / ドキュメントのフィールド名は空にできず、Firestore の予約正規表現 `__.*__` に一致してはならない。空名・予約名のチェックは Map のすべてのネストレベルで適用する(それぞれ `The property.name is the empty string.` / `field name <name> is reserved`)。フィールド名は UTF-8 で 1,500 バイト以下。
+- update / merge `set` のフィールドパスでは、単純フィールド名の各セグメントにも同じ名前制約を適用する(`__name__` などの予約名は不可)。
 
 センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(エラー: `field transforms cannot be nested`)。`delete_field()` は `update` と merge `set` でのみ使え、置換の `set` ではエラー(`delete_field() cannot be used with set() without merge`)。
 

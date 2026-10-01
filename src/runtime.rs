@@ -3,7 +3,7 @@ use std::error::Error;
 
 use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
 use crate::error::{FirelangError, Span};
-use crate::firestore::{Firestore, WriteOp};
+use crate::firestore::{is_legacy_datastore_numeric_id, Firestore, WriteOp};
 use crate::storage::{validate_content_type, validate_storage_path, InMemoryStorage, Storage};
 use crate::value::{
     CollectionGroupRef, CollectionRef, Direction, DocRef, QueryFilter, QueryOp, QueryRef,
@@ -1850,13 +1850,6 @@ fn is_reserved_firestore_id(id: &str) -> bool {
     false
 }
 
-/// Datastore 由来の数値エンティティ ID(`__id` + 10進数字 + `__`)かどうか。
-fn is_legacy_datastore_numeric_id(id: &str) -> bool {
-    let Some(inner) = id.strip_prefix("__id").and_then(|s| s.strip_suffix("__")) else {
-        return false;
-    };
-    !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_digit())
-}
 
 /// ドキュメントパスは偶数個・コレクションパスは奇数個の非空セグメントで
 /// 構成されていなければならない(`users/1`、`teams/t1/members`)。

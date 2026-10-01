@@ -436,6 +436,25 @@ mod tests {
     }
 
     #[test]
+    fn shared_validation_rejects_nested_arrays_but_allows_map_boundaries() {
+        use crate::firestore::{validate_firestore_fields, validate_firestore_value};
+
+        let nested = Value::Array(vec![Value::Array(vec![Value::Int(1)])]);
+        assert!(validate_firestore_value(&nested).is_err());
+
+        let indirect = Value::Array(vec![Value::Map(BTreeMap::from([(
+            "inner".to_string(),
+            Value::Array(vec![Value::Int(1)]),
+        )]))]);
+        assert!(validate_firestore_value(&indirect).is_ok());
+        assert!(validate_firestore_fields(&BTreeMap::from([(
+            "__name__".to_string(),
+            Value::Int(1),
+        )]))
+        .is_err());
+    }
+
+    #[test]
     fn encode_opaque_value_is_rejected_on_write() {
         let err = encode_field_value(&Value::Opaque("Double(1.5)".to_string())).unwrap_err();
         assert!(
