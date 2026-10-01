@@ -184,7 +184,6 @@ fn local_reference_path<'a>(name: &'a str, resource_root: &str) -> Option<&'a st
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::super::path::relative_document_name;

@@ -179,5 +179,4 @@ mod tests {
         });
         assert_eq!(value, 7);
     }
-
 }

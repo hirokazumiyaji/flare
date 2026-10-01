@@ -11,7 +11,9 @@ fn emulator() -> Option<StorageEmulator> {
     match StorageEmulator::try_from_env() {
         Ok(emulator) => emulator,
         Err(error) => {
-            panic!("FIREBASE_STORAGE_EMULATOR_HOST is configured, but emulator setup failed: {error}")
+            panic!(
+                "FIREBASE_STORAGE_EMULATOR_HOST is configured, but emulator setup failed: {error}"
+            )
         }
     }
 }

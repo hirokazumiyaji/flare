@@ -450,12 +450,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
                     let Some(Value::Func(func)) = self.get_var(name).cloned() else {
                         return Err(format!("undefined function: {name}").into());
                     };
-                    validate_user_call_contract(
-                        name,
-                        &func.params,
-                        args,
-                        block.as_ref(),
-                    )?;
+                    validate_user_call_contract(name, &func.params, args, block.as_ref())?;
                 }
 
                 // `args` is one ordered sequence; splitting it into
@@ -478,7 +473,6 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
                     }
                 }
                 self.eval_call(receiver_value, name, argv, kw, block.as_ref())
-
             }
             Expr::Map(entries) => {
                 let mut out = BTreeMap::new();
@@ -529,7 +523,6 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
                 return Err("keyword args are not supported for method calls yet".into());
             }
             return self.eval_method_call(rec, name, args, kwargs, block);
-
         }
 
         // ビルトインはテーブル駆動で引く。ユーザー定義より優先されるため、
@@ -1148,9 +1141,7 @@ fn builtin_contract(name: &str) -> CallContract {
         "storage_upload" => CallContract::range(2, 3)
             .with_keywords(&["content_type"])
             .with_positional_keyword_conflicts(&[("content_type", 2)]),
-        "storage_download" | "storage_metadata" | "storage_delete" => {
-            CallContract::exact(1)
-        }
+        "storage_download" | "storage_metadata" | "storage_delete" => CallContract::exact(1),
         "auth_sign_up" | "auth_sign_in" => CallContract::exact(2),
         "auth_current_user" | "auth_sign_out" => CallContract::exact(0),
         _ => unreachable!("unknown builtin contract: {name}"),
@@ -1261,9 +1252,7 @@ fn validate_method_call(
     Err(match receiver {
         MethodReceiver::Collection(_)
         | MethodReceiver::CollectionGroup(_)
-        | MethodReceiver::Query(_) => {
-            format!("unknown query method: {name}").into()
-        }
+        | MethodReceiver::Query(_) => format!("unknown query method: {name}").into(),
         MethodReceiver::Array(_) => format!("unknown array method: {name}").into(),
         MethodReceiver::Timestamp(_) => format!("unknown timestamp method: {name}").into(),
         MethodReceiver::Bytes(_) => format!("unknown bytes method: {name}").into(),
@@ -2025,7 +2014,6 @@ fn is_reserved_firestore_id(id: &str) -> bool {
     }
     false
 }
-
 
 /// ドキュメントパスは偶数個・コレクションパスは奇数個の非空セグメントで
 /// 構成されていなければならない(`users/1`、`teams/t1/members`)。

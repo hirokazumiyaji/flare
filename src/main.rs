@@ -7,13 +7,13 @@ use std::path::PathBuf;
 #[cfg(feature = "emulator")]
 use std::time::Duration;
 
-use firelang::{
-    run_script_with_all_backends, Auth, InMemoryAuth, InMemoryFirestore, InMemoryStorage,
-    StorageEmulator,
-};
 #[cfg(feature = "emulator")]
 use firelang::{
     parse_timeout_ms as parse_library_timeout_ms, AuthEmulator, EmulatorConfig, FirestoreEmulator,
+};
+use firelang::{
+    run_script_with_all_backends, Auth, InMemoryAuth, InMemoryFirestore, InMemoryStorage,
+    StorageEmulator,
 };
 
 #[cfg(not(feature = "emulator"))]
@@ -66,7 +66,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             #[cfg(feature = "emulator")]
             Some("--emulator-timeout-ms") | Some("--timeout-ms") => {
-                let flag = args[i].to_str().unwrap_or("--emulator-timeout-ms").to_string();
+                let flag = args[i]
+                    .to_str()
+                    .unwrap_or("--emulator-timeout-ms")
+                    .to_string();
                 let value = args
                     .get(i + 1)
                     .ok_or_else(|| format!("{flag} requires a value in milliseconds"))?;
@@ -81,7 +84,9 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let b = args
                     .get(i + 1)
                     .ok_or("--auth-backend requires in-memory or emulator")?;
-                let value = b.to_str().ok_or("--auth-backend value must be valid UTF-8")?;
+                let value = b
+                    .to_str()
+                    .ok_or("--auth-backend value must be valid UTF-8")?;
                 if value != "in-memory" && value != "emulator" {
                     return Err(format!(
                         "unknown auth backend: {value} (use in-memory or emulator)"
@@ -190,7 +195,6 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "unknown storage backend: {other} (use auto, in-memory, or emulator)"
             )
             .into());
-
         }
     };
 
@@ -228,12 +232,14 @@ fn run() -> Result<(), Box<dyn Error>> {
     let selected_auth = select_auth(&auth_backend)?;
     #[cfg(feature = "emulator")]
     let out = match (backend_config, selected_storage) {
-        (None, SelectedStorage::Memory) => run_script_with_all_backends(&src, 
+        (None, SelectedStorage::Memory) => run_script_with_all_backends(
+            &src,
             InMemoryFirestore::default(),
             InMemoryStorage::default(),
             selected_auth,
         )?,
-        (Some(config), SelectedStorage::Memory) => run_script_with_all_backends(&src, 
+        (Some(config), SelectedStorage::Memory) => run_script_with_all_backends(
+            &src,
             FirestoreEmulator::new_with_timeout(
                 config.host,
                 config.project_id,
@@ -242,31 +248,37 @@ fn run() -> Result<(), Box<dyn Error>> {
             InMemoryStorage::default(),
             selected_auth,
         )?,
-        (None, SelectedStorage::Emulator(storage)) => {
-            run_script_with_all_backends(&src, InMemoryFirestore::default(), storage, selected_auth)?
-        }
-        (Some(config), SelectedStorage::Emulator(storage)) => {
-            run_script_with_all_backends(&src, 
-                FirestoreEmulator::new_with_timeout(
-                    config.host,
-                    config.project_id,
-                    emulator_timeout.unwrap_or(config.operation_timeout),
-                )?,
-                storage,
-                selected_auth,
-            )?
-        }
+        (None, SelectedStorage::Emulator(storage)) => run_script_with_all_backends(
+            &src,
+            InMemoryFirestore::default(),
+            storage,
+            selected_auth,
+        )?,
+        (Some(config), SelectedStorage::Emulator(storage)) => run_script_with_all_backends(
+            &src,
+            FirestoreEmulator::new_with_timeout(
+                config.host,
+                config.project_id,
+                emulator_timeout.unwrap_or(config.operation_timeout),
+            )?,
+            storage,
+            selected_auth,
+        )?,
     };
     #[cfg(not(feature = "emulator"))]
     let out = match selected_storage {
-        SelectedStorage::Memory => run_script_with_all_backends(&src, 
+        SelectedStorage::Memory => run_script_with_all_backends(
+            &src,
             InMemoryFirestore::default(),
             InMemoryStorage::default(),
             selected_auth,
         )?,
-        SelectedStorage::Emulator(storage) => {
-            run_script_with_all_backends(&src, InMemoryFirestore::default(), storage, selected_auth)?
-        }
+        SelectedStorage::Emulator(storage) => run_script_with_all_backends(
+            &src,
+            InMemoryFirestore::default(),
+            storage,
+            selected_auth,
+        )?,
     };
 
     println!("=> {}", out.inspect());
@@ -291,7 +303,6 @@ mod timeout_helper_tests {
         assert!(parse_timeout_ms("-1").is_err());
         assert!(parse_timeout_ms("nope").is_err());
     }
-
 }
 
 enum SelectedStorage {
@@ -344,15 +355,15 @@ fn select_auth(mode: &str) -> Result<Box<dyn Auth>, Box<dyn Error>> {
             };
             #[cfg(feature = "emulator")]
             {
-                return Ok(Box::new(AuthEmulator::new(
+                Ok(Box::new(AuthEmulator::new(
                     host,
                     project_id_from_env(true),
-                )?));
+                )?))
             }
             #[cfg(not(feature = "emulator"))]
             {
                 let _ = host;
-                return Err(EMULATOR_FEATURE_ERROR.into());
+                Err(EMULATOR_FEATURE_ERROR.into())
             }
         }
         other => Err(format!("unknown auth backend: {other} (use in-memory or emulator)").into()),
@@ -448,7 +459,6 @@ fn resolve_project_id(prefer_firebase: bool, lookup: impl Fn(&str) -> Option<Str
     lookup(first)
         .or_else(|| lookup(second))
         .unwrap_or_else(|| "firelang-test".to_string())
-
 }
 
 fn read_stdin() -> Result<String, Box<dyn Error>> {

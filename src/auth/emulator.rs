@@ -45,8 +45,7 @@ impl AuthEmulator {
         let Some(host) = host else {
             return Ok(None);
         };
-        let project_id =
-            project_id_from_env()?.unwrap_or_else(|| DEFAULT_PROJECT_ID.to_string());
+        let project_id = project_id_from_env()?.unwrap_or_else(|| DEFAULT_PROJECT_ID.to_string());
         Self::new(host, project_id).map(Some)
     }
 

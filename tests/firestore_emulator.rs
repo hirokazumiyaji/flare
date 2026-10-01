@@ -219,15 +219,15 @@ fn emulator_document_name_filters_match_relative_paths() {
         return;
     };
     let id = unique("name");
-    let first = format!("users/{id}_1");
-    let second = format!("users/{id}_2");
+    let first = format!("users/{id}/docs/1");
+    let second = format!("users/{id}/docs/2");
     let script = format!(
         r#"set("{first}", {{n: 1}})
 set("{second}", {{n: 2}})
 [
-  col("users").where("__name__", "==", "{first}").get().len(),
-  col("users").where("__name__", "!=", "{first}").get().len(),
-  col("users").where("__name__", "in", ["{first}", "{second}"]).get().len()
+  col("users/{id}/docs").where("__name__", "==", "{first}").get().len(),
+  col("users/{id}/docs").where("__name__", "!=", "{first}").get().len(),
+  col("users/{id}/docs").where("__name__", "in", ["{first}", "{second}"]).get().len()
 ]"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
@@ -330,16 +330,16 @@ fn emulator_bytes_roundtrip_and_query_equality() {
     let run = unique("bytes");
     let script = format!(
         r#"
-set("files/{run}/a", {{payload: bytes([0, 255]), parts: [bytes(""), bytes([0, 127, 128, 255])], meta: {{checksum: bytes([1, 2])}}}})
-set("files/{run}/b", {{payload: bytes([1, 0])}})
-set("files/{run}/c", {{payload: bytes([0, 255, 1])}})
-rows = col("files/{run}").where("payload", "==", bytes([0, 255])).get()
+set("files/{run}/docs/a", {{payload: bytes([0, 255]), parts: [bytes(""), bytes([0, 127, 128, 255])], meta: {{checksum: bytes([1, 2])}}}})
+set("files/{run}/docs/b", {{payload: bytes([1, 0])}})
+set("files/{run}/docs/c", {{payload: bytes([0, 255, 1])}})
+rows = col("files/{run}/docs").where("payload", "==", bytes([0, 255])).get()
 [
-  get("files/{run}/a")["payload"],
-  get("files/{run}/a")["parts"],
+  get("files/{run}/docs/a")["payload"],
+  get("files/{run}/docs/a")["parts"],
   rows[0]["meta"],
   rows.len(),
-  col("files/{run}").order_by("payload", "asc").get().map {{ |row| row["__name__"] }},
+  col("files/{run}/docs").order_by("payload", "asc").get().map {{ |row| row["__name__"] }},
 ]
 "#
     );
@@ -355,9 +355,9 @@ rows = col("files/{run}").where("payload", "==", bytes([0, 255])).get()
             map! {"checksum" => Value::Bytes(vec![1, 2])},
             Value::Int(1),
             Value::Array(vec![
-                Value::Str(format!("files/{run}/a")),
-                Value::Str(format!("files/{run}/c")),
-                Value::Str(format!("files/{run}/b")),
+                Value::Str(format!("files/{run}/docs/a")),
+                Value::Str(format!("files/{run}/docs/c")),
+                Value::Str(format!("files/{run}/docs/b")),
             ]),
         ])
     );

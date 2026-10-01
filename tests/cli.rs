@@ -64,6 +64,7 @@ fn run_fl_script(name: &str, source: &str) -> std::process::Output {
 #[test]
 fn fl_handles_script_with_non_utf8_path() {
     use std::ffi::OsString;
+    use std::io::Write;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     // Same exclusive-creation contract as create_temp_script, but the name
@@ -239,7 +240,6 @@ fn run_fl_with_piped_stdin(args: &[&str], stdin_text: &str) -> std::process::Out
         .expect("write stdin");
     child.wait_with_output().expect("wait fl")
 }
-
 
 #[test]
 fn fl_dash_reads_script_from_stdin() {

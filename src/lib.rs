@@ -12,9 +12,9 @@ use std::error::Error;
 
 use runtime::Runtime;
 
-pub use auth::{Auth, AuthError, AuthErrorKind, AuthSession, AuthToken, AuthUser, InMemoryAuth};
 #[cfg(feature = "emulator")]
 pub use auth::AuthEmulator;
+pub use auth::{Auth, AuthError, AuthErrorKind, AuthSession, AuthToken, AuthUser, InMemoryAuth};
 pub use error::{ErrorKind, FirelangError, Span};
 #[cfg(feature = "emulator")]
 pub use firestore::{

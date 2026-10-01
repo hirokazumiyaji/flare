@@ -142,8 +142,6 @@ fn apply_write_to_docs(
     }
 }
 
-
-
 fn apply_update_map(
     current: &mut BTreeMap<String, Value>,
     updates: &BTreeMap<String, Value>,
@@ -153,7 +151,6 @@ fn apply_update_map(
         transforms,
         deletes,
     } = super::plan_update_writes(updates)?;
-
 
     // Firestore の挙動に合わせ、1) 削除 2) 通常フィールド更新 3) フィールド変換(increment等)
     // の順序で適用する。
