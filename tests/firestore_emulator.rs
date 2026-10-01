@@ -784,6 +784,7 @@ fn emulator_delete_field_and_increment_match_in_memory() {
         "set(\"users/{run}\", {{name: \"a\", age: 1, visits: 10}})\nupdate(\"users/{run}\", {{age: delete_field(), visits: increment(5)}})\nget(\"users/{run}\")"
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
+
     // The expected value omitted `name`, which the script sets, so this could
     // never pass wherever the emulator actually ran - it only looked green
     // because the suite skips without FIRESTORE_EMULATOR_HOST. Both backends
@@ -840,6 +841,38 @@ set("users/{run}/rows/r6", {{other: 1}})
 }
 
 #[test]
+fn emulator_count_and_path_page_handle_large_payloads() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let run = unique("payload");
+    let payload = "x".repeat(32 * 1024);
+    let script = format!(
+        r#"set("users/{run}/rows/z", {{kind: "match", payload: "{payload}"}})
+set("users/{run}/rows/a", {{kind: "match", payload: "{payload}"}})
+set("users/{run}/rows/m", {{kind: "match", payload: "{payload}"}})
+set("users/{run}/rows/other", {{kind: "skip", payload: "{payload}"}})
+[
+  col("users/{run}/rows").where("kind", "==", "match").order_by("payload", "asc").offset(99).limit(1).count(),
+  col("users/{run}/rows").where("kind", "==", "match").offset(1).limit(1).get().map {{ |r| [r["__name__"], len(r["payload"])] }},
+]"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    // `map` は行ごとにブロックの値を 1 つ返すため、2 番目の要素は行の配列。
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(3),
+            Value::Array(vec![Value::Array(vec![
+                Value::Str(format!("users/{run}/rows/m")),
+                Value::Int((32 * 1024) as i64),
+            ])]),
+        ])
+    );
+}
+
+#[test]
 fn emulator_membership_null_and_empty_array_queries_match_in_memory() {
     // This is the parity matrix for the filters that must not be delegated
     // wholesale to Firestore.  In particular, null is a value in firelang and
@@ -891,6 +924,7 @@ set("users/{run}/rows/n5", {{v: 2, tags: [1, 2]}})
         ])
     );
 }
+
 
 #[test]
 fn emulator_query_encodes_doc_refs_and_ignores_external_references() {

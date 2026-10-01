@@ -10,14 +10,17 @@ use std::error::Error;
 use std::time::Duration;
 
 use gcloud_sdk::google::firestore::v1::{
-    batch_get_documents_request, batch_get_documents_response, run_query_request, structured_query,
+    batch_get_documents_request, batch_get_documents_response, run_aggregation_query_request,
+    run_query_request, structured_aggregation_query, structured_query, value as firestore_value,
     BatchGetDocumentsRequest, BeginTransactionRequest, GetDocumentRequest, RollbackRequest,
-    RunQueryRequest, StructuredQuery,
+    RunAggregationQueryRequest, RunQueryRequest, StructuredAggregationQuery, StructuredQuery,
 };
 use gcloud_sdk::tonic::{Code, Request};
 
-use super::{Firestore, QueryCandidates, WriteOp};
+use super::{apply_query_shape, Firestore, QueryCandidates, WriteOp};
 use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Value};
+
+const COUNT_ALIAS: &str = "all";
 
 pub use client::EmulatorAuth;
 
@@ -359,6 +362,71 @@ impl Firestore for FirestoreEmulator {
         }
     }
 
+    fn run_query_page(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
+        super::validate_query_filters(&query.filters)?;
+        let server_filters = server_prefilters(&query.filters);
+        let (parent, mut sq) = match &query.source {
+            QuerySource::Collection(path) => {
+                let (parent, collection_id) = path::split_collection_path(path)?;
+                (
+                    parent,
+                    structured_query(
+                        &self.client.project_id,
+                        collection_id,
+                        false,
+                        &server_filters,
+                    )?,
+                )
+            }
+            QuerySource::CollectionGroup(id) => (
+                None,
+                structured_query(&self.client.project_id, id, true, &server_filters)?,
+            ),
+        };
+        if query.limit == Some(0) {
+            return Ok(vec![]);
+        }
+        let parent = parent.as_deref();
+
+        if can_push_path_page(query) {
+            push_path_page(query, &mut sq)?;
+            run_query_candidates(self, parent, sq, &query.filters)
+        } else {
+            let rows = run_query_candidates(self, parent, sq, &query.filters)?;
+            Ok(apply_query_shape(rows, query))
+        }
+    }
+
+    fn count_query(&self, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
+        super::validate_query_filters(&query.filters)?;
+        let server_filters = server_prefilters(&query.filters);
+        let (parent, aggregation) = match &query.source {
+            QuerySource::Collection(path) => {
+                let (parent, collection_id) = path::split_collection_path(path)?;
+                let sq = structured_query(
+                    &self.client.project_id,
+                    collection_id,
+                    false,
+                    &server_filters,
+                )?;
+                (parent, count_aggregation_query(sq)?)
+            }
+            QuerySource::CollectionGroup(id) => {
+                let sq =
+                    structured_query(&self.client.project_id, id, true, &server_filters)?;
+                (None, count_aggregation_query(sq)?)
+            }
+        };
+
+        if let Some(count) = run_count_aggregation(self, parent.as_deref(), aggregation)? {
+            return Ok(count);
+        }
+        // 古い emulator が aggregation RPC を実装しない場合は、__name__ だけを
+        // 返す projection query へフォールバックし、全フィールドを materialize
+        // せずに件数を取得する。
+        run_count_fallback(self, query)
+    }
+
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
         if self.transaction_id.is_some() {
             return Err("already in transaction".into());
@@ -499,6 +567,111 @@ impl Firestore for FirestoreEmulator {
     }
 }
 
+/// サーバ側へ `__name__` の順序と offset/limit を渡せる条件。
+/// 範囲比較を含む filter は Firestore が同フィールドの先頭 order_by を
+/// 要求するため、既存の結果順 path へ push しない。値の範囲も proto の
+/// i32 に収まる場合だけ page 全体だけを push する。
+fn can_push_path_page(query: &QueryRef) -> bool {
+    let has_page = query.offset.is_some() || query.limit.is_some();
+    let has_order_requiring_filter = query.filters.iter().any(|filter| {
+        matches!(
+            filter.op,
+            QueryOp::Gt | QueryOp::Ge | QueryOp::Lt | QueryOp::Le | QueryOp::Ne | QueryOp::NotIn
+        )
+    });
+    has_page
+        && matches!(query.source, QuerySource::Collection(_))
+        && query.order_by.is_empty()
+        && !has_order_requiring_filter
+        && query.offset.unwrap_or(0) <= i32::MAX as usize
+        && query.limit.is_none_or(|limit| limit <= i32::MAX as usize)
+}
+
+fn push_path_page(
+    query: &QueryRef,
+    structured_query: &mut StructuredQuery,
+) -> Result<(), Box<dyn Error>> {
+    structured_query.order_by = vec![structured_query::Order {
+        field: Some(structured_query::FieldReference {
+            field_path: "__name__".to_string(),
+        }),
+        direction: structured_query::Direction::Ascending as i32,
+    }];
+    structured_query.offset = i32::try_from(query.offset.unwrap_or(0))?;
+    structured_query.limit = query.limit.map(i32::try_from).transpose()?;
+    Ok(())
+}
+
+fn count_aggregation_query(
+    query: StructuredQuery,
+) -> Result<StructuredAggregationQuery, Box<dyn Error>> {
+    Ok(StructuredAggregationQuery {
+        aggregations: vec![structured_aggregation_query::Aggregation {
+            alias: COUNT_ALIAS.to_string(),
+            operator: Some(structured_aggregation_query::aggregation::Operator::Count(
+                structured_aggregation_query::aggregation::Count { up_to: None },
+            )),
+        }],
+        query_type: Some(structured_aggregation_query::QueryType::StructuredQuery(
+            query,
+        )),
+    })
+}
+
+/// `None` は aggregation RPC 非対応、または aggregation row を返さない場合。
+/// 呼び出し側はこの印字を全件クエリへのフォールバックに使う。
+fn run_count_aggregation(
+    fs: &FirestoreEmulator,
+    parent: Option<&str>,
+    query: StructuredAggregationQuery,
+) -> Result<Option<i64>, Box<dyn Error>> {
+    let db = &fs.client.db;
+    let parent = path::parent_path(&fs.client.project_id, parent);
+    let values = fs.client.runtime.block_on(async move {
+        let response = match db
+            .client()
+            .get()
+            .run_aggregation_query(Request::new(RunAggregationQueryRequest {
+                parent,
+                explain_options: None,
+                query_type: Some(
+                    run_aggregation_query_request::QueryType::StructuredAggregationQuery(query),
+                ),
+                consistency_selector: None,
+            }))
+            .await
+        {
+            Ok(response) => response,
+            Err(status) if status.code() == Code::Unimplemented => return Ok(vec![]),
+            Err(status) => return Err(status),
+        };
+        let mut stream = response.into_inner();
+        let mut values = vec![];
+        loop {
+            match stream.message().await {
+                Ok(Some(row)) => {
+                    if let Some(result) = row.result {
+                        values.extend(result.aggregate_fields.into_values());
+                    }
+                }
+                Ok(None) => break,
+                Err(status) if status.code() == Code::Unimplemented => return Ok(vec![]),
+                Err(status) => return Err(status),
+            }
+        }
+        Ok::<_, gcloud_sdk::tonic::Status>(values)
+    })?;
+
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => match &value.value_type {
+            Some(firestore_value::ValueType::IntegerValue(count)) => Ok(Some(*count)),
+            _ => Err("count aggregation must return an integer".into()),
+        },
+        _ => Err("count aggregation returned multiple results".into()),
+    }
+}
+
 fn run_query_candidates(
     fs: &FirestoreEmulator,
     parent: Option<&str>,
@@ -556,13 +729,6 @@ fn run_query_candidates(
     Ok(out)
 }
 
-/// Server へ渡す候補絞り込みを、最大一つの安全な predicate だけにする。
-///
-/// Firestore の server filter は候補を減らす最適化であり、firelang の
-/// `where` 契約の source of truth ではない。複数の server filter を組むと
-/// Firestore 固有の複合制約でリクエスト全体が失敗し得るので、local matcher
-/// と結果が一致する一つだけを送る。異型 / Nil / Array / Map の大小比較は
-/// そもそも server へ送らず、すべての候補を local で判定する。
 fn is_not_found(error: &(dyn Error + 'static)) -> bool {
     error
         .downcast_ref::<gcloud_sdk::tonic::Status>()
@@ -573,7 +739,6 @@ fn server_prefilters(filters: &[QueryFilter]) -> Vec<QueryFilter> {
     filters
         .iter()
         .find(|filter| is_server_prefilter_safe(filter))
-
         .cloned()
         .into_iter()
         .collect()
@@ -604,6 +769,58 @@ fn is_server_prefilter_safe(filter: &QueryFilter) -> bool {
         | QueryOp::ArrayContains
         | QueryOp::ArrayContainsAny => false,
     }
+}
+
+fn run_count_fallback(fs: &FirestoreEmulator, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
+    let server_filters = server_prefilters(&query.filters);
+    let (parent, mut sq) = match &query.source {
+        QuerySource::Collection(path) => {
+            let (parent, collection_id) = path::split_collection_path(path)?;
+            (
+                parent,
+                structured_query(
+                    &fs.client.project_id,
+                    collection_id,
+                    false,
+                    &server_filters,
+                )?,
+            )
+        }
+        QuerySource::CollectionGroup(id) => (
+            None,
+            structured_query(&fs.client.project_id, id, true, &server_filters)?,
+        ),
+    };
+    sq.select = Some(structured_query::Projection {
+        fields: vec![structured_query::FieldReference {
+            field_path: "__name__".to_string(),
+        }],
+    });
+    let db = &fs.client.db;
+    let parent = path::parent_path(&fs.client.project_id, parent.as_deref());
+    let count = fs.client.runtime.block_on(async move {
+        let response = db
+            .client()
+            .get()
+            .run_query(Request::new(RunQueryRequest {
+                parent,
+                explain_options: None,
+                query_type: Some(run_query_request::QueryType::StructuredQuery(sq)),
+                consistency_selector: None,
+            }))
+            .await?;
+        let mut stream = response.into_inner();
+        let mut count = 0_i64;
+        while let Some(row) = stream.message().await? {
+            if row.document.is_some() {
+                count = count.checked_add(1).ok_or_else(|| {
+                    gcloud_sdk::tonic::Status::resource_exhausted("query count overflow")
+                })?;
+            }
+        }
+        Ok::<_, gcloud_sdk::tonic::Status>(count)
+    })?;
+    Ok(count)
 }
 
 
@@ -692,6 +909,70 @@ mod tests {
             Ok(_) => panic!("expected connection failure"),
             Err(e) => assert!(!format!("{e}").is_empty()),
         }
+    }
+
+    fn query() -> QueryRef {
+        QueryRef {
+            source: QuerySource::Collection("users".to_string()),
+            filters: vec![],
+            order_by: vec![],
+            offset: Some(2),
+            limit: Some(3),
+        }
+    }
+
+    #[test]
+    fn path_page_pushdown_is_limited_to_semantically_safe_queries() {
+        let mut query = query();
+        assert!(can_push_path_page(&query));
+
+        let mut sq = structured_query("p", "users", false, &[]).unwrap();
+        push_path_page(&query, &mut sq).unwrap();
+        assert_eq!(sq.offset, 2);
+        assert_eq!(sq.limit, Some(3));
+        assert_eq!(sq.order_by.len(), 1);
+        assert_eq!(
+            sq.order_by[0]
+                .field
+                .as_ref()
+                .map(|field| field.field_path.as_str()),
+            Some("__name__")
+        );
+
+        query.filters.push(QueryFilter {
+            field: "age".to_string(),
+            op: QueryOp::Ge,
+            value: Value::Int(20),
+        });
+        assert!(!can_push_path_page(&query));
+
+        query.filters.clear();
+        query
+            .order_by
+            .push(("ord".to_string(), crate::value::Direction::Asc));
+        assert!(!can_push_path_page(&query));
+    }
+
+    #[test]
+    fn count_aggregation_uses_unshaped_count_star_query() {
+        let aggregation =
+            count_aggregation_query(structured_query("p", "users", false, &[]).unwrap()).unwrap();
+        assert_eq!(aggregation.aggregations.len(), 1);
+        assert_eq!(aggregation.aggregations[0].alias, COUNT_ALIAS);
+        assert!(matches!(
+            aggregation.aggregations[0].operator.as_ref(),
+            Some(structured_aggregation_query::aggregation::Operator::Count(
+                structured_aggregation_query::aggregation::Count { up_to: None }
+            ))
+        ));
+        let Some(structured_aggregation_query::QueryType::StructuredQuery(query)) =
+            aggregation.query_type
+        else {
+            panic!("expected structured count query");
+        };
+        assert_eq!(query.offset, 0);
+        assert_eq!(query.limit, None);
+        assert!(query.order_by.is_empty());
     }
 
     #[test]

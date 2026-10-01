@@ -33,6 +33,27 @@ impl Firestore for InMemoryFirestore {
             .collect())
     }
 
+    fn run_query_page(&self, query: &QueryRef) -> Result<super::QueryCandidates, Box<dyn Error>> {
+        super::validate_query_filters(&query.filters)?;
+        let rows = super::page_borrowed_candidates(
+            self.candidates(&query.source)
+                .filter(|(path, doc)| super::matches_filters(path, doc, &query.filters)),
+            query,
+        );
+        Ok(rows
+            .into_iter()
+            .map(|(path, doc)| (path.clone(), doc.clone()))
+            .collect())
+    }
+
+    fn count_query(&self, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
+        super::validate_query_filters(&query.filters)?;
+        Ok(self
+            .candidates(&query.source)
+            .filter(|(path, doc)| super::matches_filters(path, doc, &query.filters))
+            .count() as i64)
+    }
+
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
         if self.tx_snapshot.is_some() {
             return Err("already in transaction".into());
