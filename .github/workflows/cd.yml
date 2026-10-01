@@ -35,6 +35,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
 
       - name: Validate tag against Cargo metadata
         # validate-release-tag.sh compares the tag with the package version
@@ -60,6 +62,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: stable
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
