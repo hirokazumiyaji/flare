@@ -4,7 +4,7 @@ use std::error::Error;
 use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
 use crate::auth::{Auth, AuthError, InMemoryAuth};
 use crate::error::{FirelangError, Span};
-use crate::firestore::{is_legacy_datastore_numeric_id, Firestore, WriteOp};
+use crate::firestore::{is_legacy_datastore_numeric_id, validate_write_data, Firestore, WriteOp};
 use crate::storage::{validate_content_type, validate_storage_path, InMemoryStorage, Storage};
 use crate::value::{
     CollectionGroupRef, CollectionRef, Direction, DocRef, QueryFilter, QueryOp, QueryRef,
@@ -1701,6 +1701,7 @@ fn builtin_set<F: Firestore, S: Storage>(
 ) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_doc_path(args.first())?.to_string();
     let data = expect_map(args.get(1))?.clone();
+    validate_write_data(&data)?;
     let merge = match (args.get(2), kwargs.get("merge")) {
         (_, Some(Value::Bool(v))) => *v,
         (Some(Value::Bool(v)), None) => *v,
@@ -1719,6 +1720,7 @@ fn builtin_update<F: Firestore, S: Storage>(
 ) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_doc_path(args.first())?.to_string();
     let data = expect_map(args.get(1))?.clone();
+    validate_write_data(&data)?;
     rt.dispatch_write(WriteOp::Update { path, data })?;
     Ok(ExecFlow::Value(Value::Nil))
 }

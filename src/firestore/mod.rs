@@ -184,6 +184,25 @@ pub(crate) fn is_legacy_datastore_numeric_id(id: &str) -> bool {
 
 const MAX_QUERY_STRING_BYTES: usize = 1500;
 
+/// 1 つの `set` / `update` data_map を、staging 前に検証する。
+///
+/// ここで使うのは `validate_write_op` と同じ共有 validator なので、runtime が
+/// staging を拒否する条件と各 backend が write 境界で拒绝する条件は 1 箇所に
+/// 集約されている。キーをフィールドパスとして扱うかフィールド名として扱うかは
+/// backend に委ねるため、ここでは検証しない。
+///
+/// DocRef は両バックエンドで同じ扱いではないため、ここでは許可する。in-memory は
+/// 参照を直接保持し、emulator の write codec が `unsupported value in emulator
+/// write` で拒否する(§7)。
+pub(crate) fn validate_write_data(data: &BTreeMap<String, Value>) -> Result<(), Box<dyn Error>> {
+    for value in data.values() {
+        reject_nested_sentinels(value, false)?;
+        validate_firestore_value(value)?;
+        validate_firestore_writable_value(value)?;
+    }
+    Ok(())
+}
+
 /// クエリフィルタ値の共有検証。in-memory / emulator のクエリ実行前に
 /// 両バックエンドが呼び、同じエラーを同じメッセージで返す。
 /// - 文字列フィルタ値は 1,500 UTF-8 バイト未満(Firestore 準拠。Map / Array
