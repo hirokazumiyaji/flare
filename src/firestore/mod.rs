@@ -314,7 +314,10 @@ fn compare_where_values(
         .is_some_and(predicate)
 }
 
-pub(crate) fn query_field_value<'a>(doc: &'a BTreeMap<String, Value>, field: &str) -> Option<&'a Value> {
+pub(crate) fn query_field_value<'a>(
+    doc: &'a BTreeMap<String, Value>,
+    field: &str,
+) -> Option<&'a Value> {
     let mut current = doc;
     let mut segments = field.split('.').peekable();
     while let Some(segment) = segments.next() {
@@ -329,7 +332,6 @@ pub(crate) fn query_field_value<'a>(doc: &'a BTreeMap<String, Value>, field: &st
     }
     None
 }
-
 
 pub(crate) fn paths_overlap(a: &str, b: &str) -> bool {
     if a == b {
@@ -878,7 +880,6 @@ mod tests {
                 err.to_string(),
                 "value for payload is too large to be used in a query"
             );
-
         }
     }
 

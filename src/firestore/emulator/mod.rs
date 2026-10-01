@@ -412,8 +412,7 @@ impl Firestore for FirestoreEmulator {
                 (parent, count_aggregation_query(sq)?)
             }
             QuerySource::CollectionGroup(id) => {
-                let sq =
-                    structured_query(&self.client.project_id, id, true, &server_filters)?;
+                let sq = structured_query(&self.client.project_id, id, true, &server_filters)?;
                 (None, count_aggregation_query(sq)?)
             }
         };
@@ -778,12 +777,7 @@ fn run_count_fallback(fs: &FirestoreEmulator, query: &QueryRef) -> Result<i64, B
             let (parent, collection_id) = path::split_collection_path(path)?;
             (
                 parent,
-                structured_query(
-                    &fs.client.project_id,
-                    collection_id,
-                    false,
-                    &server_filters,
-                )?,
+                structured_query(&fs.client.project_id, collection_id, false, &server_filters)?,
             )
         }
         QuerySource::CollectionGroup(id) => (
@@ -822,7 +816,6 @@ fn run_count_fallback(fs: &FirestoreEmulator, query: &QueryRef) -> Result<i64, B
     })?;
     Ok(count)
 }
-
 
 fn structured_query(
     project_id: &str,
