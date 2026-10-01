@@ -1,0 +1,21 @@
+# Auth Emulator vertical slice: sign-up -> current user -> sign-out.
+# Run with the local Auth emulator:
+#   FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 FIREBASE_PROJECT_ID=demo-firelang \
+#     fl --auth-backend emulator examples/scripts/11_auth_smoke.fl
+#
+# Without an emulator this still runs against the in-memory Auth backend.
+email = "firelang-example@example.com"
+password = "password123"
+
+session = auth_sign_up(email, password)
+# Tokens are owned by the session but never printed:
+#   AuthSession(user={...}, id_token=<redacted>, refresh_token=<redacted>, expires_at=...)
+puts(session.user["email"])
+
+current = auth_current_user()
+puts(current["email"])
+has_uid = current["uid"] != nil
+
+auth_sign_out()
+# Final value is a self-check: sign-out leaves no current user.
+has_uid && auth_current_user() == nil

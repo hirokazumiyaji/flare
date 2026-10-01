@@ -14,9 +14,11 @@
 - [8. batch / transaction](#8-batch--transaction)
 - [9. Timestamp API](#9-timestamp-api)
 - [10. CLI (`fl`)](#10-cli-fl)
-- [11. バックエンド](#11-バックエンド)
-- [12. スコープ外(MVP)](#12-スコープ外mvp)
-- [13. 既知の制限・実装メモ](#13-既知の制限実装メモ)
+- [11. Auth API](#11-auth-api)
+- [12. バックエンド](#12-バックエンド)
+- [13. スコープ外(MVP)](#13-スコープ外mvp)
+- [14. 既知の制限・実装メモ](#14-既知の制限実装メモ)
+- [15. Cloud Storage API](#15-cloud-storage-api)
 
 ## 1. 概要
 
@@ -31,7 +33,7 @@ puts "found #{rows}"
 ## 2. スクリプトの構造
 
 - ソースは UTF-8 テキスト。文(statement)の区切りは改行または `;`。
-- マップリテラル `{ ... }`、配列リテラル `[ ... ]`、引数リスト `( ... )`、関数・ブロックの仮引数リスト、グループ化 `( expr )`、添字 `[ ... ]` の**内側では改行を無視する**(Ruby と同じ)。要素・値・引数となる**式の途中**の改行も無視される。したがってリテラル・引数リストは複数行に書ける。**末尾カンマ**(`{a: 1,}` / `[1, 2,]` / `f(a, b,)`)も許容する:
+- マップリテラル `{ ... }`、配列リテラル `[ ... ]`、引数リスト `( ... )`、関数・ブロックの仮引数リスト、グループ化 `( expr )`、添字 `[ ... ]` の**内側では改行を無視する**(Ruby と同じ)。要素・値・引数となる**式の途中**の改行も無視される。したがってリテラル・引数リストは複数行に書ける。**二項演算子や postfix の `.` / `[]` の前後**に改行を置いても同じ式として読む。**末尾カンマ**(`{a: 1,}` / `[1, 2,]` / `f(a, b,)`)も許容する:
   ```ruby
   set("users/1", {
     name: "a",
@@ -40,12 +42,17 @@ puts "found #{rows}"
       "y",
     ],
   })
-  [1 +
-    2]   # 式の途中の改行も可
+  [1
+    + 2]
+  m = {value: 1}
+  [
+    m
+      .value
+  ]
   ```
-  ただし `fn` / `if` / `while` / ブロック付きメソッドの `{ ... }`(文の並び)では改行は文の区切りのまま。delimiter の内側では `;` は改行と同じにはならない(要素の区切りは `,` のみ。`[;1]` 等はエラー)。
+  ただし `fn` / `if` / `while` / ブロック付きメソッドの `{ ... }`(文の並び)では改行は文の区切りのまま。delimiter の外側の改行も文の区切りであり、delimiter の内側では `;` は改行と同じにはならない(要素の区切りは `,` のみ。`[;1]` 等はエラー)。
 - `#` から行末まではコメント(文字列リテラル内を除く)。
-- プログラムの評価結果は、最後に評価された文の値。`return` がトップレベルで実行された場合はその値。
+- プログラムの評価結果は、最後に評価された文の値。`return` がトップレベルで実行された場合はその値。ブロック内から持ち上がった `return` も同じで、残りのトップレベル文を中断し、その値がプログラムの結果になる。
 - `fl` CLI は評価結果を `=> <inspect表現>` 形式で標準出力に印字する。
 
 ## 3. 値と型
@@ -54,11 +61,13 @@ puts "found #{rows}"
 |----|----|------|
 | Int | `42` | 64bit 符号付き整数。**数値は整数のみ**(Float は非対応) |
 | Str | `"hello"` | UTF-8 文字列 |
+| Bytes | `bytes([0, 255])` | UTF-8 文字列とは独立した任意のバイト列。Storage の内容として無損失で往復する |
 | Bool | `true` / `false` | 真偽値 |
 | Nil | `nil` | 値なし。存在しないドキュメントの `get` も nil |
 | Array | `[1, 2, "a"]` | 任意の値の列 |
 | Map | `{name: "a", age: 1}` | 文字列キーの辞書。キー昇順で保持される |
 | Timestamp | `timestamp(100)` / `now()` | Unix 秒(整数)。ナノ秒精度なし |
+| Bytes | `bytes("fire")` / `bytes([102, 105, 114, 101])` | immutable なバイナリ列。文字列は UTF-8 バイト列、整数配列は各要素が 0..=255 |
 | Func | `fn f(a) { a }` | ユーザー定義関数 |
 
 Firestore 操作のための特殊な値:
@@ -73,11 +82,13 @@ Firestore 操作のための特殊な値:
 | ArrayUnion / ArrayRemove | `array_union([..])` / `array_remove([..])` | 配列フィールド変換センチネル |
 | DeleteField | `delete_field()` | フィールド削除センチネル(`update` / merge `set` のみ) |
 | Increment | `increment(n)` | 数値加算センチネル |
-| Opaque | (生成不可。emulator 読み取りのみ) | `double` / `geo_point` / `bytes` フィールドの表示専用値(`Double(1.5)` 等)。書き込みには使えない |
+| Opaque | (生成不可。emulator 読み取りのみ) | `double` / `geo_point` など、firelang が持たないフィールド型の表示専用値(`Double(1.5)` 等)。書き込みには使えない |
+| AuthSession | `auth_sign_up(...)` / `auth_sign_in(...)` | Auth のセッション。user record と ID / refresh token の所有者を保持する。`inspect` ではトークンが redact される(§11) |
+| RedactedToken | (生成不可。`session.id_token` アクセス) | トークンの redacted 投影値(`<redacted:id_token>`)。生のトークンは決してスクリプトに現れない(§11) |
 
-センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(emulator バックエンドではエラー)。
+センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(in-memory / emulator 共通でエラー)。
 
-emulator バックエンドで firelang が持たない型のフィールドを含むドキュメントを読んだ場合、ドキュメント全体はエラーにせず次のように読み替える:`double` / `geo_point` / `bytes` は `Opaque` の表示専用値(例 `Double(1.5)`、`GeoPoint(35.7, 139.7)`、`Bytes(00ff)`)、`reference` は同一データベース内であれば相対パスの `DocRef`(別プロジェクトや別データベースの参照は `Reference(...)` の `Opaque` 値)。`Opaque` 値はクエリの `==` 等でマッチさせることはできず(スクリプトからは生成できない)、書き戻しはエラー(`unsupported value in emulator write`)。
+emulator バックエンドで firelang が持たない型のフィールドを含むドキュメントを読んだ場合、ドキュメント全体はエラーにせず次のように読み替える:`bytes` は lossless な第一級の `Bytes` 値、`double` / `geo_point` は `Opaque` の表示専用値(例 `Double(1.5)`、`GeoPoint(35.7, 139.7)`)、`reference` は同一データベース内であれば相対パスの `DocRef`(別プロジェクトや別データベースの参照は `Reference(...)` の `Opaque` 値)。`Opaque` 値はクエリの `==` 等でマッチさせることはできず(スクリプトからは生成できない)、書き戻しはエラー(`unsupported value in emulator write`)。Storage の `bytes([...])` は `Value::Bytes` であり、ダウンロード時も要素ごとのバイト列を保持する。
 
 ### 真偽値判定(truthiness)
 
@@ -113,6 +124,10 @@ name = "fire"
 
 マップのキーは識別子または文字列リテラル。値は任意の式。
 
+### バイト列
+
+`bytes([0, 255, 128])` は `0..=255` の Int 配列から `Bytes` を作る。文字列リテラルを UTF-8 バイト列へ暗黙に変換する変換子は用意しない。
+
 ### 要素アクセス(`expr[expr]` と `m.key`)
 
 Map と Array は添字アクセスできる。メソッド呼び出しと同様の postfix として連結でき、`get()` 結果などの任意の式に対して使える:
@@ -139,7 +154,7 @@ rows[0]["__name__"]  # => "users/1"(クエリ結果 Map の要素アクセス。
 | 1(最低) | `\|\|` | 任意の値(Ruby と同じく短絡評価し、オペランドそのものを返す) |
 | 2 | `&&` | 任意の値(短絡評価し、オペランドそのものを返す) |
 | 3 | `==` `!=` | 任意の値同士(構造比較) |
-| 3 | `>` `<` `>=` `<=` | Int 同士 / Timestamp 同士のみ。他はエラー |
+| 3 | `>` `<` `>=` `<=` | Int / Timestamp / Bytes 同士(Bytes は unsigned byte の辞書順)。他はエラー |
 | 4 | `+` `-` | `+`: Int 同士 / Str 同士(連結)。`-`: Int 同士 / Timestamp − Timestamp → Int(秒差)。他はエラー |
 | 5 | `*` `/` | Int のみ。`/ 0` は "division by zero" エラー |
 | 6 | `!` `-` (単項) | `!v` は任意の値を受け `Bool(!truthy(v))`。`-v` は Int のみ(範囲外は `integer overflow`) |
@@ -153,6 +168,13 @@ rows[0]["__name__"]  # => "users/1"(クエリ結果 Map の要素アクセス。
 
 Int 同士の算術演算(`+` `-` `*` `/`)の結果が i64 の範囲を超えると `integer overflow` エラー(debug ビルドでも panic しない)。`/ 0` は "division by zero" エラー。
 
+### 呼び出しの式評価順
+
+- receiver を持つメソッド呼び出しでは、**receiver の式を先に評価する**。receiver を持たない関数呼び出しでは arguments の評価から始める。
+- arguments は positional / keyword を区別せず、**ソース上に現れた順に左から右へ**評価する。parser は両者を一つの順序付き列として保持し、混在した順序も許す。各引数の式は一度だけ評価する。
+- 評価順とパラメータへの束縛順は別である。関数呼び出しでは positional の値を仮引数の左から右へ優先して割り当て、keyword は名前で対応する仮引数を埋める。したがって `fn f(b, a) { ... }` に `f(a: first(), second())` と書けば、`first()` → `second()` の順で評価するが、positional 値が `b`、keyword 値が `a` に対応する。
+- 評価中に receiver または argument の式がエラーになったら、残りの式を評価せずそのエラーを返す。receiver の式評価、または receiver の型検証でエラーになった場合、後続 argument の副作用は起こらない。逆に receiver の評価が成功した後に argument がエラーになった場合は、receiver の評価ですでに起きた副作用は残る。
+
 ## 5. 変数・関数・制御構文
 
 ### 変数(immutable)
@@ -163,8 +185,9 @@ a = 2   # エラー: reassignment is not allowed: a
 ```
 
 - 変数は再代入不可。関数定義名も同じ名前空間を使い、再定義不可。
-- ビルトイン関数(`puts` `get` `set` `update` `delete` `batch` `transaction` `doc` `col` `col_group` `array` `len` `now` `timestamp` `server_timestamp` `array_union` `array_remove` `delete_field` `increment`)と同名の関数定義はエラー(`cannot redefine builtin: <name>`)。ビルトイン呼び出しが常に優先されるため。
+- ビルトイン関数(`puts` `get` `set` `update` `delete` `batch` `transaction` `doc` `col` `col_group` `array` `len` `now` `timestamp` `bytes` `server_timestamp` `array_union` `array_remove` `delete_field` `increment` `storage_upload` `storage_download` `storage_metadata` `storage_delete` `auth_sign_up` `auth_sign_in` `auth_current_user` `auth_sign_out`)と同名の関数定義はエラー(`cannot redefine builtin: <name>`)。ビルトイン呼び出しが常に優先されるため。
 - 関数本体内でも外側スコープに見える名前への代入はエラー(シャドーイング不可)。ただし**関数の仮引数**は外側の名前と重なってもよい。
+- 関数とブロックの仮引数名は、それぞれ同じ定義内で重複できない。重複した仮引数は parse / definition エラーになる。
 
 ### スコープ規則(静的スコープ)
 
@@ -211,10 +234,11 @@ total = len(rows)                                            # 要素数
 | `array.each { \|item\| ... }` | 各要素をブロック引数に束縛して評価。戻り値は nil。**クエリ結果(`.get()` の戻り値)にもそのまま使える** |
 | `array.map { \|item\| expr }` | 各要素のブロック評価結果からなる新しい Array |
 | `array.len()` / `len(array)` | 要素数(Int) |
-| `len(map)` / `len(str)` | Map のキー数 / Str の文字数 |
+| `len(map)` / `len(str)` / `len(bytes)` | Map のキー数 / Str の文字数 / Bytes のバイト数 |
 
 - ブロックは必須(`each()` 等はエラー)。ブロック引数の個数は呼び出し側が渡す個数と一致しなければならない(`[1].each { \|a, b\| ... }` はエラー。**空配列でも検証される**)。`each` / `map` / `len` は引数を取らない(`[1].len(99)` 等はエラー)。
 - ブロック内で外側に見える名前への代入はエラー(変数の不変性ポリシーはブロックでも同様)。
+- ブロック内の `return` はブロックを中断し、**それを囲む関数**の戻り値になる。`each` / `map` の反復もそこで止まる(次の要素を処理しない)。ブロック内から和外側の関数へ `return` が伝播するのは到此までで、関数の内部(関数本体、または本体内のブロック)で起きた `Return` はその関数の戻り値として消費される。ネストしたブロックの `return` は最も内側の**関数**へ属する。
 - `for` 文はない。反復は `each` / `map` を使う。`while` は残すが、変数が再代入不可のため反復には使えない(副作用頼みの待ち合わせ等の特殊用途向け)。
 
 ### メソッドと不変性
@@ -239,7 +263,7 @@ while cond { ... }
 
 ### 組み込み出力
 
-`puts(v, ...)` — 各値を `to_s` 形式で 1 行ずつ印字して nil を返す。`to_s` は Str を素(クォートなし)で出し、それ以外は `inspect` 形式。`inspect` 形式は Ruby 風: `[1, "x"]` / `{"a" => 1}` / `nil` / `"str"`(Str はダブルクォート付き、キー昇順)。`fl` の最終結果は `=> <inspect>` で印字される(トップレベルの Str もクォート付き)。文字列補間 `#{式}` の埋め込みは `to_s` 形式。
+`puts(v, ...)` — 各値を `to_s` 形式で 1 行ずつ印字して nil を返す。`to_s` は Str を素(クォートなし)で出し、それ以外は `inspect` 形式。`inspect` 形式は Ruby 風: `[1, "x"]` / `{"a" => 1}` / `nil` / `"str"`(Str はダブルクォート付き、キー昇順)。Bytes は `Bytes(00ff)` のように先頭から最大 32 バイトを hex 表示し、それより長い場合は `Bytes(<先頭32バイト>, <省略バイト数> more bytes)` とする(Unicode 文字列にはデコードしない)。`fl` の最終結果は `=> <inspect>` で印字される(トップレベルの Str もクォート付き)。文字列補間 `#{式}` の埋め込みは `to_s` 形式なので、Bytes も同じ bounded な `Bytes(...)` 表現になる。
 
 ## 6. Firestore API
 
@@ -247,7 +271,7 @@ while cond { ... }
 
 ドキュメントパスを取る引数(下記 `target`)には、パス文字列(`"users/1"`)または `doc(...)` の戻り値のどちらでも渡せる。
 
-**パスの検証**: ドキュメントパスは**偶数**個、コレクションパスは**奇数**個の非空セグメントで構成されていなければならない(`"users/1"`、`"teams/t1/members"`)。違反(奇偶の不一致、空セグメント、先頭・末尾の `/`)は `doc()` / `col()` / `col_group()` / `get()` / `set()` / `update()` / `delete()` の呼び出し時点でエラーになり、in-memory / emulator で同じエラーになる。
+**パスの検証**: ドキュメントパスは**偶数**個、コレクションパスは**奇数**個の非空セグメントで構成されていなければならない(`"users/1"`、`"teams/t1/members"`)。各セグメントは Firestore の document / collection ID として有効でなければならない: UTF-8 バイト数で **1,500 バイト以下**、 `/` を含まない、単一の `.` または `..` ではない、`__.*__` の予約パターンに一致しない(ただし Datastore 由来の数値 ID である `__id[0-9]+__` は既存参照として例外的に許可する)。`col_group(id)` の `id` と `col(...).doc(id)` の `id` も同じ制約を満たす。違反(奇偶の不一致、空セグメント、先頭・末尾の `/`、ID 制約違反)は `doc()` / `col()` / `col_group()` / `get()` / `set()` / `update()` / `delete()` の呼び出し時点でエラーになり、in-memory / emulator で同じエラーになる。
 
 | 関数 | 戻り値 | 説明 |
 |------|--------|------|
@@ -260,6 +284,7 @@ while cond { ... }
 | `update(target, data_map)` | Nil | フィールド更新。**ドキュメントが存在しなければエラー**(作成しない)。キーは `.` 区切りの**フィールドパス**として解釈し、ネストしたフィールドを更新する(中間 Map は必要なら作成、中間が Map でなければエラー)。パスの各セグメントは Firestore の単純フィールドパス(`[A-Za-z_][A-Za-z0-9_]*`)のみで、バッククォートによるエスケープは非対応 |
 | `delete(target)` | Nil | ドキュメント削除。存在しなくてもエラーにならない |
 | `array(...)` | Array | `[...]` リテラルと同等 |
+| `bytes(str)` / `bytes(int_array)` | Bytes | 文字列の UTF-8 バイト列、または 0..=255 の Int からなる配列を immutable なバイナリ列にする。引数は厳密に 1 個 |
 | `array_union(array)` | センチネル | 配列フィールドへの追加(重複は追加されない) |
 | `array_remove(array)` | センチネル | 配列フィールドからの除去 |
 | `server_timestamp()` | センチネル | 書き込み時にサーバ時刻に解決 |
@@ -268,7 +293,13 @@ while cond { ... }
 | `batch { ... }` | ブロックの値 | 8 章参照 |
 | `transaction { ... }` | ブロックの値 | 8 章参照 |
 
-`data_map` の値に使えるのは: Int / Str / Bool / Nil / Array / Map / Timestamp、および直下フィールドのセンチネル 5 種。
+`data_map` の値に使えるのは: Int / Str / Bool / Nil / Array / Map / Timestamp / Bytes、および直下フィールドのセンチネル 5 種。
+
+Firestore へ書き込む値は、in-memory / emulator 共通の再帰 validator で RPC 前に検証する。Firestore の制約は次の通り:
+
+- `Array` の要素として別の `Array` を直接置けない(`[[1]]` は `Nested arrays are not allowed`)。ただし `Array -> Map -> Array` の間接的な配列入れ子は許可する(例: `{rows: [{values: [1, 2]}]}`)。
+- Map / ドキュメントのフィールド名は空にできず、Firestore の予約正規表現 `__.*__` に一致してはならない。空名・予約名のチェックは Map のすべてのネストレベルで適用する(それぞれ `The property.name is the empty string.` / `field name <name> is reserved`)。フィールド名は UTF-8 で 1,500 バイト以下。
+- update / merge `set` のフィールドパスでは、単純フィールド名の各セグメントにも同じ名前制約を適用する(`__name__` などの予約名は不可)。
 
 センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(エラー: `field transforms cannot be nested`)。`delete_field()` は `update` と merge `set` でのみ使え、置換の `set` ではエラー(`delete_field() cannot be used with set() without merge`)。
 
@@ -279,7 +310,7 @@ update("users/1", {tags: array_union(["a"])})
 update("users/1", {"profile.name": "b"})              # ドット区切りのフィールドパスでネスト更新
 ```
 
-update と merge `set` のキーはフィールドパスとして解釈されるため、`{"profile.name": "b"}` は `profile` マップ内の `name` を更新する(in-memory / emulator で同じ挙動)。キーの各セグメントは単純フィールドパス([A-Za-z_][A-Za-z0-9_]*)のみで、それ以外(`` `a.b` `` のようなバッククォート、空セグメント、記号)はエラー。この検証は**センチネル値(`array_union` 等)を置いたキーにも適用される**。置換の `set` では `{"a.b": 1}` のようなキーはそのままリテラルのフィールド名として保存され、センチネル(`array_union` 等)をドット付きキーに置いた場合もリテラルキーに対して解決される(両バックエンドで同じ)。
+update と merge `set` のキーはフィールドパスとして解釈されるため、`{"profile.name": "b"}` は `profile` マップ内の `name` を更新する(in-memory / emulator で同じ挙動)。キーの各セグメントは単純フィールドパス([A-Za-z_][A-Za-z0-9_]*)のみで、それ以外(`` `a.b` `` のようなバッククォート、空セグメント、記号)はエラー。この検証は**センチネル値(`array_union` 等)を置いたキーにも適用される**。また、削除・通常値の mask 内だけで同じパスまたは祖先/子孫パスを重ねる場合は、backend へ送信する前に同じ overlap エラーにする(transform との重なりと祖先/子孫の演算順序は spec のとおり許可する)。置換の `set` では `{"a.b": 1}` のようなキーはそのままリテラルのフィールド名として保存され、単純名ではないキーにセンチネル(`array_union` 等)を置いた場合もリテラルキーに対して解決される(両バックエンドで同じ)。emulator は Firestore の quoted field path 表現に送信し、フィールド名内のバックスラッシュとバッククォートも同規約でエスケープする。
 
 ## 7. クエリ
 
@@ -294,27 +325,29 @@ col("users").doc("1")       # doc("users/1") と同等
 
 - `where(field, op, value)` — op は `"=="` `"!="` `">"` `">="` `"<"` `"<="` `"in"` `"not-in"` `"array_contains"` `"array_contains_any"` の 10 種。複数 `where` は AND。
   - 未対応の op を渡すと `where()` 呼び出し時に即エラー(`unsupported query op: ...`)。
-  - `==` は任意の値の構造比較。大小比較(`>` 等)は**同型のフィールド同士のみ**マッチ:Int は数値順、Str は辞書順、Bool は `false < true`、Timestamp は秒。型が異なる・Nil・存在しないフィールドはマッチしない。
-  - `!=` はフィールドが存在し、値が構造比較で異なる場合にマッチ(存在しないフィールドはマッチしない。型が異なる値は不一致とみなす。emulator バックエンドでは Double と Int の数値比較や Opaque 値の扱いとの整合のため、`!=` はサーバ RPC では絞り込まずクライアント側で評価される)。
+  - `==` は任意の値の構造比較(Bytes は全バイト一致)。`>` `>=` `<` `<=` は **Int / Str / Bool / Timestamp / Bytes の同型同士だけ**を比較する:Int は数値順、Str は辞書順、Bool は `false < true`、Timestamp は秒、Bytes は unsigned byte の辞書順。異型、Nil、Array、Map は大小比較ではマッチしない(Array / Map は同じ型同士でも `where` の順序付けを持たない)。存在しないフィールドもマッチしない。
+  - `!=` はフィールドが存在し、値が構造比較で異なる場合にマッチする。フィールド値が `nil` の場合は `!= nil` にマッチしないが、`== nil` にはマッチする。存在しないフィールドはマッチしない。型が異なる値は不一致とみなす。emulator バックエンドでは Double と Int の数値比較や Opaque 値の扱いとの整合のため、`!=` はサーバ RPC では絞り込まずクライアント側で評価される。
   - `in` / `not-in` — `value` は Array(要素は最大 10 個)。`in` はフィールド値がいずれかの要素と等しい場合、`not-in` はフィールドが存在し、どの要素とも等しくない場合にマッチ(ただし Firestore 仕様に準拠し、比較配列に `nil` が含まれる `not-in` は何もマッチしない)。空配列の `in` は何もマッチせず、空配列の `not-in` はフィールドを持つ全ドキュメントにマッチする。Array でない値を渡すとクエリ実行時にエラー。
   - `array_contains` — フィールドが Array で `value` を要素に含む場合にマッチ。`array_contains_any` — `value` は Array(要素は最大 10 個)で、フィールドの Array と 1 つ以上共通の要素を持つ場合にマッチ(空配列は何もマッチしない)。Array でない値を渡すとクエリ実行時にエラー。
-  - **文字列フィルタ値のサイズ制限**: Firestore と同様に、`where` の文字列フィルタ値は **1,500 UTF-8 バイト未満**であること(`in` 等の配列要素・`array_contains` の要素を含む。1,500 バイト以上のフィルタ値はクエリ実行時にエラー:`value for {field} is too large to be used in a query`)。**保存値には長さ制限がない**。有効なフィルタ(< 1,500 バイト)に対しては、保存値との最初の差異位置が常にフィルタ自身の長さ以内に収まるため、全文比較で Firestore と同じ結果になる。in-memory / emulator は同じ検証をクエリ実行時に行う。
-  - `where` の値には `doc("users/1")` などの `DocRef` も指定可能(同一データベース内の参照型フィールドに対する `==` や `in`、`array_contains` 等のクエリ。emulator バックエンドでは同一プロジェクト・同一データベースの完全リソース名へエンコードされて実行される)。
-  - 異なる型同士の比較は未規定(§13)。in-memory ではマッチしない。
+  - **文字列フィルタ値のサイズ制限**: Firestore と同様に、`where` の文字列フィルタ値は **1,500 UTF-8 バイト未満**であること(`in` 等の配列要素・`array_contains` の要素・Map / Array のネストを含む。1,500 バイト以上のフィルタ値はクエリ実行時にエラー:`value for {field} is too large to be used in a query`)。**保存値には長さ制限がない**。有効なフィルタ(< 1,500 バイト)に対しては、保存値との最初の差異位置が常にフィルタ自身の長さ以内に収まるため、全文比較で Firestore と同じ結果になる。in-memory / emulator は同じ検証をクエリ実行時に行う。
+  - `where` の値には `doc("users/1")` などの `DocRef` も指定可能(同一データベース内の参照型フィールドに対する `==` や `in`、`array_contains` 等のクエリ。emulator バックエンドでは同一プロジェクト・同一データベースの完全リソース名へエンコードされて実行される。Array / Map のネストも同じ規則で再帰的に encode される)。`DocRef` はクエリフィルタ値としては利用可能だが、emulator の write codec は書き込みを許可せず `unsupported value in emulator write` を返す。サーバで絞った候補に対する最終判定は、相対パス表現に正規化した共通 matcher で行う。
+  - emulator は Firestore の server filter を候補を絞るためにだけ使用できるが、`where` の最終判定は in-memory と共通の実装をクライアント側で行う。したがって Firestore の異型大小比較の型順序は firelang の結果に影響せず、in-memory / emulator は同じ結果を返す。
   - フィールドが存在しないドキュメントはマッチしない(`!=` / `not-in` を含む)。
-- `order_by(field, dir)` — `dir` は `"asc"` / `"desc"`(それ以外は呼び出し時にエラー)。複数回呼ぶと順に適用される。対象フィールドを持たないドキュメントは結果から除外される(`__name__` は全ドキュメントが持つ)。同値は firelang 相対ドキュメントパス文字列の辞書順でタイブレークする。同型の値は where と同じ順序(Int 数値順 / Str 辞書順 / Bool `false < true` / Timestamp 秒)で比べ、型が異なる値同士は Nil < Bool < Int < Timestamp < Str < Array < Map の順に並べる(両バックエンド共通)。順序付けは取得後に両バックエンド共通の比較器で適用するため、サーバ側の複合インデックス制約は受けない。
+- `order_by(field, dir)` — `dir` は `"asc"` / `"desc"`(それ以外は呼び出し時にエラー)。複数回呼ぶと順に適用される。対象フィールドを持たないドキュメントは結果から除外される(`__name__` は全ドキュメントが持つ)。同値は firelang 相対ドキュメントパス文字列の辞書順でタイブレークする。同型の値は where と同じ順序(Int 数値順 / Str 辞書順 / Bool `false < true` / Timestamp 秒 / Bytes の unsigned byte 辞書順)で比べ、型が異なる値同士は Nil < Bool < Int < Timestamp < Str < Bytes < Array < Map < その他の順に並べる(両バックエンド共通)。順序付けは取得後に両バックエンド共通の比較器で適用するため、サーバ側の複合インデックス制約は受けない。
+
 - `limit(n)` — 件数上限。後勝ち(複数回呼ぶと最後の値)。`n` は 0 以上で、負数はエラー(`limit must be >= 0`)。
 - `offset(n)` — 先頭から `n` 件を飛ばす。後勝ち。`n` は 0 以上で、負数はエラー(`offset must be >= 0`)。件数を超える offset は空結果になる。
 - `get()` — 実行して `Array<Map>` を返す。各 Map には `__name__` キーで**相対ドキュメントパス**(例 `"users/1"`)が入る。
-- `count()` — フィルタに一致する件数を Int で返す。順序・offset・limit は無視する。
+- `count()` — フィルタに一致する件数を Int で返す。順序・offset・limit は無視する。in-memory では保存済みドキュメントへの参照を直接数え、emulator では `COUNT(*)` aggregation query を使う。
 - **決定的順序**: `order_by` がなければ結果は firelang 相対ドキュメントパス文字列の辞書順(`users/a` < `users/b`)。`order_by` があれば上記の順序。`offset` → `limit` の順に適用される。
+- **クエリ実行経路**: in-memory の `get()` は候補への参照を順序付けしてから page に含まれるフィールドだけを複製する。emulator は `order_by` がなく、範囲比較 filter がなく、offset/limit が protobuf の i32 範囲に収まる場合にだけ `__name__` の順序と page 条件をサーバへ渡す。その他の `get()`、または aggregation RPC 非対応 emulator の `count()` は全候補を返す安全なフォールバックを使い、page 外の document payload を取得する。
 - `col()` のクエリは**直下のドキュメントのみ**対象(サブコレクション内は含まない)。`col_group(id)` はパス中のいずれかの階層でコレクション名が `id` に一致するドキュメントすべてが対象。
 - クエリの**構築**(`.where()` / `.order_by()` / `.offset()` / `.limit()`)は `batch` / `transaction` 内でも可。**実行**(`.get()` / `.count()`)のみ不可。
 - カーソル(`start_after` 等)は非対応(12 章)。ページネーションは `order_by` + `offset` + `limit` で行う。
 
 ## 8. batch / transaction
 
-どちらも `{ ... }` ブロックが必須で、ブロックの最後の値を返す。ネスト(batch/transaction 内での batch/transaction)は不可(エラーメッセージ: `batch cannot be nested inside batch/transaction` / `transaction cannot be nested inside batch/transaction`)。
+どちらも `{ ... }` ブロックが必須で、ブロックの最後の値を返す。ブロックは**字句的な子スコープ**で評価され、呼び出し元(外側のスコープ)の変数は読める。ただし、見える外側の名前への代入は変数の不変性規則によりエラーになる。ブロック内で定義した変数・関数はブロック外へ公開されず、成功時だけでなくランタイムエラーやバックエンドエラー時も子スコープが破棄される。したがって、失敗後に同じ Runtime で再度 `batch` / `transaction` を実行できる。ブロック内の `return` は書き込みの commit / rollback を済ませてから外の関数へ伝播するので、`x = batch { ...; return }` のように値を束縛する形では値は得られない(囲む関数がその場で抜ける)。ネスト(batch/transaction 内での batch/transaction)は不可(エラーメッセージ: `batch cannot be nested inside batch/transaction` / `transaction cannot be nested inside batch/transaction`)。
 
 ### batch
 
@@ -347,57 +380,218 @@ transaction {
 | `timestamp("2026-02-01T00:00:00+09:00")` | RFC3339 文字列から生成。オフセットは `Z` または `±HH:MM`。小数秒は非対応 |
 | `ts.to_unix()` | Int(Unix 秒)を返す |
 | `ts.to_rfc3339()` | RFC3339 文字列(UTC、`+00:00`)を返す |
-| `ts.add_seconds(n)` | n 秒後の**新しい** Timestamp を返す |
+| `ts.add_seconds(n)` | n 秒後の**新しい** Timestamp を返す。範囲外は `integer overflow` エラー |
 | `t1 > t2` / `<` / `>=` / `<=` / `==` / `!=` | Timestamp 同士の比較(秒で比較) |
 | `t2 - t1` | 秒差を Int で返す。範囲外は `integer overflow` エラー |
 
 ## 10. CLI (`fl`)
 
 ```
-usage: fl [--backend in-memory|emulator] (<script-file> | - | -e <script>)
+usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] (<script-file> | - | -e <script>)
 ```
 
-- スクリプトの指定はちょうど 1 つ:ファイルパス / `-`(stdin) / `-e <script>`(ワンライナー。複数回指定時は改行で連結)。引数なしで stdin がパイプ接続されている場合も stdin から読む(端末直結の引数なしは usage 表示で終了)。`-e` とファイル/`-` の併用はエラー。`--help` / `-h` で usage 表示。未知のオプション・未知のバックエンドはエラー終了。
+- スクリプトの指定はちょうど 1 つ:ファイルパス / `-`(stdin) / `-e <script>`(ワンライナー。複数回指定時は改行で連結)。引数なしで stdin がパイプ接続されている場合も stdin から読む(端末直結の引数なしは usage 表示で終了)。`-e` とファイル/`-` の併用はエラー。`--help` / `-h` で usage 表示。未知のオプション・未知のバックエンド(`--backend` / `--auth-backend` 両方)はエラー終了。
   ```sh
   fl script.fl
-  echo 'get("users/1")' | fl --backend emulator -
+  cargo run --features emulator --bin fl -- --backend emulator script.fl
+  echo 'get("users/1")' | cargo run --features emulator --bin fl -- --backend emulator -
   fl -e 'col("users").get().len()'
   ```
-- `--backend emulator` のとき:
+- `--backend emulator` を使うバイナリは `emulator` feature を有効にして
+  ビルドする必要がある。feature なしで指定した場合は
+  `emulator backend requires the \`emulator\` Cargo feature; rebuild with --features emulator`
+  を表示して終了する。
+- `--backend emulator` のとき(`emulator` feature 有効時):
   - `FIRESTORE_EMULATOR_HOST` — **必須**。未設定なら即エラー。
-  - `FIRESTORE_PROJECT_ID` — 省略時 `firelang-test`。
+  - `FIRESTORE_PROJECT_ID` — 省略時 `firelang-test`(`FIREBASE_PROJECT_ID` が設定されていればそちらを使う)。
+- `--storage-backend` は Storage の選択で、`auto`(既定)、`in-memory`、`emulator` を取る。`auto` は `FIREBASE_STORAGE_EMULATOR_HOST` があれば Storage emulator、なければ in-memory を使う。`emulator` を明示した場合は `FIREBASE_STORAGE_EMULATOR_HOST` が必須で、project ID は `FIREBASE_PROJECT_ID` → `GCLOUD_PROJECT` → `FIRESTORE_PROJECT_ID` → `firelang-test` の順で読む。
+- `--auth-backend emulator` のとき:
+  - `FIREBASE_AUTH_EMULATOR_HOST` — **必須**。未設定なら即エラー。
+  - project ID は `FIREBASE_PROJECT_ID` → `FIRESTORE_PROJECT_ID` → `firelang-test` の順で読む。
+- Firestore と Auth の backend は同じ 2 つの変数名を受け取るが、それぞれ優先する名前が異なる(Firestore は `FIRESTORE_PROJECT_ID`、Auth は `FIREBASE_PROJECT_ID`)。そのため既存の Firestore 環境の優先順位は変わらない。
+- Firestore backend と Auth backend は独立に選べる。両方を `emulator` にすると両方のエミュレータへ同時に接続する。
+- バックエンドの検証は stdin / ファイルを読む前に行われる(不正な指定で stdin を待たされない)。
 - 実行結果は `=> <inspect表現>` で印字。
 - エラーは `error: <line>:<col>: <message>` を stderr に印字して exit 1。lex / parse エラーは該当トークンの位置、runtime / backend エラーは失敗したトップレベル文の開始位置。位置が付かない場合(補間内の単一式制約違反など)は `error: <message>`。
 
-## 11. バックエンド
+## 11. Auth API
 
-| エントリポイント | `in-memory` | `emulator` |
-|------------------|-------------|------------|
-| `run_script` | ○(固定) | × |
-| `run_script_with_firestore` | ○ | ○(`FirestoreEmulator` を渡す) |
-| `fl` CLI | ○(デフォルト) | ○(`--backend emulator`) |
+認証は Firestore と同じ global 関数として提供する。Auth backend は Firestore backend とは独立で、デフォルトは in-memory(`--auth-backend emulator` / `AuthEmulator` で emulator に切り替え)。
+
+| 関数 | 戻り値 | 説明 |
+|------|--------|------|
+| `auth_sign_up(email, password)` | AuthSession | email/password ユーザーを新規作成してサインインする。既に存在する場合はエラー |
+| `auth_sign_in(email, password)` | AuthSession | 既存ユーザーでサインインする |
+| `auth_current_user()` | Map / Nil | 現在のセッションの user record。未サインインなら `nil` |
+| `auth_sign_out()` | Nil | ローカルセッションを破棄する。冪等(未サインインでもエラーにならない) |
+
+```ruby
+session = auth_sign_up("mail@example.com", "password")
+session.user["email"]   # => "mail@example.com"
+auth_current_user()["uid"]
+auth_sign_out()
+auth_current_user()      # => nil
+```
+
+### AuthSession とトークンの redaction
+
+`auth_sign_up` / `auth_sign_in` は AuthSession を返す。AuthSession は user record と **ID token / refresh token の所有者**を明示的に保持する専用の値であり、Map ではない。
+
+- トークンは **スクリプトへ生文字列として公開しない**。`inspect` / `puts` / `fl` の最終結果、`Debug` 出力のいずれにも現れない。表示は必ず次の形になる:
+  ```
+  AuthSession(user={"email" => "mail@example.com", "uid" => "...", ...}, id_token=<redacted>, refresh_token=<redacted>, expires_at=1769907600)
+  ```
+- トークンへフィールドアクセスした場合も redacted な投影値(`<redacted:id_token>` / `<redacted:refresh_token>`)が返る。生のトークン文字列を取り出す API はスクリプトに存在しない。
+- AuthSession は **ドキュメントへ書き込めない**。`set` / `update` の data_map に AuthSession やトークン投影値が含まれる場合は、バックエンドへ送る前にエラーになる(in-memory が token を保存してしまうのを防ぐ)。
+- トークンの実値は Rust 側の `AuthSession.id_token` / `refresh_token`(`AuthToken`)だけが保持し、`AuthToken::expose()` で明示的に取得できる。`Debug` / `Display` は redact される。
+
+### セッションの寿命と sign-out
+
+- セッションは ID token の有効期限(`expires_at`、Unix 秒)を持つ。emulator から返された `expiresIn` から算出し(emulator 応答の `expiresIn` は文字列でも数値でも受理する)、期限切れのセッションは `auth_current_user()` で `nil` になる。
+- `auth_sign_out()` はローカルで保持しているセッションとトークンを破棄する。**サーバ側のトークン revoke は行わない**(MVP スコープ外)。idempotent なので、未サインイン状態で呼んでもエラーにならない。
+- 新しい `auth_sign_up` / `auth_sign_in` は既存のセッションを差し替える。
+
+### Auth user record の Map/Value 表現
+
+`auth_current_user()` と `session.user` は同じ user record を返す。Map であり、次のキーを持ちうる(Auth emulator のフィールド名を正規化したもの):
+
+| キー | 型 | 説明 |
+|------|----|------|
+| `uid` | Str | Firebase user ID |
+| `email` | Str | canonical 化(小文字)済みの email |
+| `emailVerified` | Bool | 常に含まれる(未検証なら `false`) |
+| `disabled` | Bool | 常に含まれる(有効なら `false`) |
+| `displayName` | Str | 存在するときのみ |
+| `photoUrl` | Str | 存在するときのみ |
+| `createdAt` / `lastLoginAt` | Str | 存在するときのみ |
+| `providerId` | Str | 存在するときのみ(`"password"` など) |
+
+password hash や provider secret は **含まれない**。
+
+### typed error
+
+Auth backend の失敗は型付きのカテゴリを持ち、in-memory / emulator で同じカテゴリを返す。スクリプトからは通常の backend エラーとして `error: <line>:<col>: <message>` で報告される。
+
+| カテゴリ | トリガー例 |
+|----------|-----------|
+| `UserNotFound` | 存在しない email で `auth_sign_in`(emulator の `EMAIL_NOT_FOUND`) |
+| `InvalidCredentials` | password 不一致(`INVALID_PASSWORD` / `INVALID_LOGIN_CREDENTIALS`) |
+| `UserAlreadyExists` | 既存 email で `auth_sign_up`(`EMAIL_EXISTS`) |
+| `InvalidEmail` | email 形式不正(`INVALID_EMAIL`) |
+| `WeakPassword` | 6 文字未満の password(`WEAK_PASSWORD`) |
+| `Network` | Auth emulator へ接続できない・タイムアウト |
+| `InvalidResponse` | emulator 応答が壊れている・未知のエラーコード |
+| `Configuration` | ホスト / project ID が不正、または host が未設定 |
+
+Identity Toolkit のエラーコードは `:` 区切りの詳細が付くことがある(`WEAK_PASSWORD : Password should be at least 6 characters`)ため、先頭のコード部分で一致させる。
+
+### 検証
+
+- `auth_sign_up` / `auth_sign_in` は email / password が **文字列**であること(email は `@` と `.` を含む形式、password は 6 文字以上)を検証し、backend へ到達する前に型エラーや validation エラーを返す。
+- email は canonical 化(前後空白の除去 + 小文字化)してから照合する。
+- `auth_current_user` / `auth_sign_out` は引数・キーワード引数・ブロックを受け取らない。
+- 未知のキーワード引数・余分な位置引数・ブロック指定はエラー。
+
+## 12. バックエンド
+
+| エントリポイント | `in-memory` | `emulator` feature |
+|------------------|-------------|--------------------|
+| `run_script` | Firestore / Storage とも in-memory(固定) | × |
+| `run_script_with_firestore` | Firestore を指定、Storage は in-memory | ○(`FirestoreEmulator` を渡す。Storage は in-memory) |
+| `run_script_with_storage` | Firestore は in-memory、Storage を指定 | Storage を指定可能(Firestore は in-memory) |
+| `run_script_with_backends` | Firestore と Storage を別々に指定 | 同左 |
+| `run_script_with_auth` | Auth を指定(Firestore / Storage は in-memory) | ○(`AuthEmulator` を渡す) |
+| `run_script_with_all_backends` | 3 backend を別々に指定 | 同左 |
+| `fl` CLI | ○(デフォルト) | Firestore は `--backend emulator`、Storage は `--storage-backend`、Auth は `--auth-backend emulator` |
+
+### build feature と公開 API
+
+- 既定の feature は空です。`cargo build` / `cargo test` は in-memory
+  backend とライブラリ API だけをビルドし、Firestore SDK・gRPC・TLS の
+  依存層をリンクしません。
+- `emulator` feature を有効にすると、Firestore / Storage / Auth の emulator
+  client が有効になります: `cargo build --features emulator`。
+- `Firestore`、`InMemoryFirestore`、`run_script`、
+  `run_script_with_firestore` は feature なしで利用できるため、in-memory
+  の custom backend を埋め込む consumer は SDK を引き込まない。
+- `FirestoreEmulator` / `StorageEmulator` / `AuthEmulator` は feature なしの
+  build では公開されない。CLI は feature なしでも `--backend emulator` を
+  指定できるが、環境変数の検証後に feature を有効にする方法を案内する明確
+  なエラーになる。
+- 将来的な client も、emulator と同様のサービス別 feature
+  group に分離する前提とする。
 
 - 認証付きの**本番 Firestore は非対応**(スコープ外)。
-- ランタイムは `Firestore` トレイトでバックエンドを抽象化する。デフォルトは `InMemoryFirestore`。
-- emulator バックエンドは Firestore Rust SDK(`firestore` crate)の gRPC クライアントで Firestore API を呼ぶ。database は `(default)` 固定。
-- 両バックエンドは同じ可視挙動(値の往復・クエリ順序・batch/transaction の原子性)を持たなければならない。
-- ただし emulator 側に firelang 外の型(`double` / `reference` / `geo_point` / `bytes`)で書かれたフィールドがある場合、emulator バックエンドは `Opaque` / `DocRef` に読み替えて返す(§3)。in-memory にはそのような値は存在しない。
+- ランタイムは `Firestore` トレイトと `Auth` トレイトでバックエンドを抽象化する。デフォルトは `InMemoryFirestore` と `InMemoryAuth`。
+- Firestore emulator バックエンドは Firestore Rust SDK(`firestore` crate)の gRPC クライアントで Firestore API を呼ぶ。database は `(default)` 固定。
+- Auth emulator バックエンドは Identity Toolkit のローカル REST API(`accounts:signUp` / `accounts:signInWithPassword`)を HTTP で呼ぶ。本番 Firebase SDK は使わないので、本番資格情報へ暗黙に到達することはない。
+  - public エンドポイントは API key query(`?key=...`)で認証する。**OAuth2 `Authorization` ヘッダは送らない** — emulator はそのヘッダを Admin SDK 呼び出しと解釈し、sign-up 応答からトークンを発行しない。
+  - `FIREBASE_API_KEY` を指定すれば API key を上書きできる(既定は emulator 慣例の `fake-api-key`)。
+- Firestore の両バックエンドは同じ可視挙動(値の往復・クエリ順序・batch/transaction の原子性)を持たなければならない。Storage の両バックエンドも path / metadata / content type / size / not-found の契約を共有する。Auth の両バックエンドも戻り値と typed error の契約を共有する。
+- Storage バックエンドは `Storage` トレイトを実装する。in-memory は `Vec<u8>` を保存し、emulator は Firebase Storage REST API (`/v0/b/{bucket}/o`) を同期 HTTP で呼ぶ。バケットは既定で `{project_id}.appspot.com`、`FIREBASE_STORAGE_BUCKET` で上書きできる。HTTP I/O は `StorageTransport` に分離(fake transport でネットワークなしに契約テストできる)。
+- ただし emulator 側に firelang 外の型(`double` / `reference` / `geo_point`)で書かれたフィールドがある場合、emulator バックエンドは `Opaque` / `DocRef` に読み替えて返す(§3)。`bytes` は `Bytes` として lossless に往復する。in-memory には firelang 外の型の値は存在しない。
+- ローカル実行の security rules は `firebase.emulators.json` が参照する `firestore.emulator.rules`(read/write 許可)を使う。`firebase.json` が参照する `firestore.rules` は read/write 拒否で、リモート project への誤デプロイに備えてある([Firebase rules の分離とデプロイ防止策](firebase-security.md))。
 
-## 12. スコープ外(MVP)
+
+## 13. スコープ外(MVP)
 
 以下は明示的に**非対応**。実装しない・README で匂わせない。
 
 - Float(数値は Int のみ)
 - 本番 Firestore への認証付きアクセス
+- 本番 Cloud Storage への認証付きアクセス(ID token の自動取得・OAuth など)。emulator client は明示的な bearer token をテスト用の Option として渡せるだけで、未設定なら未認証リクエストとして local rules に委ねる。
+- **本番 Firebase Authentication への接続**(`AuthEmulator` は local emulator のみ)
+- Auth の sign-out 時のサーバ側トークン revoke
+- ID token の refresh(`auth_refresh` 等は無い。期限切れ後は `auth_sign_in` する)
+- Auth provider 以外の sign-in 方式(OAuth / anonymous / MFA)
+- Auth による Firestore ルール評価(token を Firestore request に付与する機能)
 - transaction の自動リトライ
 - カーソルによるページネーション(`start_after` 等。`order_by` + `offset` + `limit` で代替)
 - リスナー(リアルタイム購読)・インデックス依存機能
 - ドキュメントに書かれたサブセットを超える mruby 互換
 
-## 13. 既知の制限・実装メモ
+## 14. 既知の制限・実装メモ
 
-実装済みコードから確認された、仕様としては保証しない・将来直す予定の挙動。
+## 15. Cloud Storage API
 
+Cloud Storage の MVP CRUD はグローバル関数として提供する。Firestore の `doc()` / `col()` とは別の object path を使う。
+
+### 15.1 値・パス
+
+- `bytes([0, 255, 128])` は `Value::Bytes` を作る。配列の要素は `0..=255` の Int だけ。文字列を暗黙に UTF-8 に変換しないため、ダウンロードした任意バイト列を `storage_download()` から比較できる。
+- Storage object path は 1 個以上の非空セグメントを `/` で連結したものなので、`"avatars/alice.png"`、`"a/b/c"` は有効。Firestore のドキュメントのような偶数/奇数セグメント規則は適用しない。先頭・末尾の `/`、`//`、空 path、NUL/制御文字は `invalid storage object path` になる。
+- path と content type は in-memory / emulator で同じ検証を行う。content type を省略した場合は `application/octet-stream` とする。
+
+### 15.2 CRUD
+
+| 関数 | 戻り値 | 説明 |
+|------|--------|------|
+| `storage_upload(path, bytes_value, content_type: "image/png")` | Metadata Map | object を作成または置換する。content type は位置引数にも渡せるが、位置引数と keyword の同時指定は不可。戻り値の `name` / `bucket` / `content_type` / `size`  等を検査できる |
+| `storage_download(path)` | Bytes | object の内容をそのまま返す。HTTP の body を UTF-8 化しない |
+| `storage_metadata(path)` | Metadata Map | object の metadata を返す。`generation` / `metageneration` / `size` / `content_type` を含む |
+| `storage_delete(path)` | Nil | object を削除する。存在しない object は `storage object not found` |
+
+Metadata Map のキーは snake_case (`name`, `bucket`, `content_type`, `size`, `generation`, `metageneration`, `time_created`, `updated`, `md5_hash`, `crc32c`, `etag`, `cache_control`, `content_disposition`, `metadata`) で、サーバが返さない optional 値は `nil` になる。`size` はアップロードしたバイト数と一致することを emulator adapter でも検証する。Storage API は Firestore の `batch` / `transaction` の staging 対象ではなく、それらの中では `storage APIs are not allowed inside ...` エラーになる。
+
+### 15.3 エラー・認証
+
+- path は `invalid storage object path: ...`、不正な MIME type は `invalid storage content type: ...`、malformed JSON は `invalid storage metadata ...`、size 不一致は `storage metadata size mismatch ...` になる。
+- download / metadata / delete の 404 は backend にかかわらず `storage object not found: <path>` に正規化する。
+- `StorageEmulator` は `FIREBASE_STORAGE_EMULATOR_HOST` と project ID から作る。認証 header を明示しない場合は未認証で、Storage emulator の rules に委ねる。Rust client の `with_auth_token()`、または CLI の `FIREBASE_STORAGE_AUTH_TOKEN` は rules テスト用の bearer header を追加するが、本番認証や token の自動取得は MVP のスコープ外。
+
+### 15.4 ローカル quickstart
+
+```bash
+export FIREBASE_PROJECT_ID=demo-firelang
+firebase emulators:exec --only storage --project demo-firelang \
+  'cargo test --test storage_emulator -- --nocapture'
+```
+
+`firebase.json` の `storage.rules` はローカルの CRUD fixture として全 object を許可する。実際の production rules、list、resumable upload、public URL、object generation 操作、認証付き本番接続は別途扱う。
+
+現在、§7 の `where` 異型比較（含める Nil / Array / Map / 欠損フィールドの扱い）
+について未解決の制限はない。emulator では Firestore の server filter を候補絞りに
+利用しても、最終判定は §7 の共通 client-side matcher が行う。
 | 項目 | 現状の挙動 | 予定 |
 |------|-----------|------|
-| `where` の異なる型同士の大小比較 | in-memory ではマッチしない。emulator では Firestore の型順序で比較される(§7 は同型のみを規定) | backlog |
+| Auth セッションの永続化 | セッションはプロセス内のメモリにのみ保持される。スクリプト実行をまたぐ永続化は行わない | backlog |

@@ -1,0 +1,5 @@
+payload = bytes([0, 255, 128, 10])
+storage_upload("examples/storage.bin", payload, content_type: "application/octet-stream")
+content = storage_download("examples/storage.bin")
+metadata = storage_metadata("examples/storage.bin")
+[content, metadata["content_type"], metadata["size"]]
