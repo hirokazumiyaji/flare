@@ -289,7 +289,23 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         }
     }
 
+    /// Validate that a staged write carries only document-representable
+    /// values, then hand it to the active execution context.
+    ///
+    /// Auth sessions and their token projections are deliberately rejected
+    /// here rather than in a backend: they hold secrets, and letting the
+    /// in-memory backend accept what the emulator would refuse would persist
+    /// tokens into documents and split the backends' behavior.
     fn dispatch_write(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
+        let data = match &op {
+            WriteOp::Set { data, .. } | WriteOp::Update { data, .. } => Some(data),
+            WriteOp::Delete { .. } => None,
+        };
+        if let Some(data) = data {
+            for (field, value) in data {
+                reject_non_document_value(field, value)?;
+            }
+        }
         match &mut self.exec {
             ExecCtx::Normal => self.fs.apply(vec![op]).map_err(backend_err),
             ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => {
@@ -2154,6 +2170,31 @@ fn lookup_field_path<'a>(
 /// always uses `usize`.
 fn checked_array_index<T: TryFrom<i64>>(index: i64) -> Option<T> {
     T::try_from(index).ok()
+}
+
+/// Reject values that carry Auth secrets before they can reach any backend.
+///
+/// Only the secret-bearing Auth variants are checked here.  Broader
+/// "writable value" validation (issue #67) is deliberately left to the
+/// Firestore layer so this check stays a small, security-focused guard.
+fn reject_non_document_value(field: &str, value: &Value) -> Result<(), Box<dyn Error>> {
+    match value {
+        Value::AuthSession(_) => Err(format!(
+            "cannot write auth session to field {field:?}: auth sessions are runtime-only values"
+        )
+        .into()),
+        Value::RedactedToken(_) => Err(format!(
+            "cannot write auth token to field {field:?}: auth tokens are runtime-only values"
+        )
+        .into()),
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| reject_non_document_value(field, item)),
+        Value::Map(map) => map
+            .values()
+            .try_for_each(|item| reject_non_document_value(field, item)),
+        _ => Ok(()),
+    }
 }
 
 fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {

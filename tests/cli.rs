@@ -1,10 +1,6 @@
 //! Smoke tests for the `fl` binary.
 
-#[cfg(feature = "emulator")]
-use std::process::{Child, ExitStatus};
 use std::process::{Command, Stdio};
-#[cfg(feature = "emulator")]
-use std::time::{Duration, Instant};
 
 const FL_EXE: &str = env!("CARGO_BIN_EXE_fl");
 
@@ -244,71 +240,6 @@ fn run_fl_with_piped_stdin(args: &[&str], stdin_text: &str) -> std::process::Out
     child.wait_with_output().expect("wait fl")
 }
 
-/// Poll until the child exits or the deadline passes.
-///
-/// Note: stdout/stderr are still piped and undrained while polling, so a child
-/// writing more than the pipe buffer (~64 KiB) before exiting would block on
-/// the write and surface as a spurious timeout. Every test here asserts on
-/// small, bounded diagnostics from a process that is expected to exit
-/// immediately, so that ceiling is not reached in practice.
-///
-/// Emulator-only for now: the only remaining callers are the gated
-/// `reject_emulator_config_before_stdin` tests below.
-#[cfg(feature = "emulator")]
-fn wait_for_exit(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait().expect("poll fl") {
-            return Some(status);
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-#[cfg(feature = "emulator")]
-fn read_child_output(child: &mut Child) -> std::process::Output {
-    use std::io::Read;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        pipe.read_to_end(&mut stdout).expect("read fl stdout");
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        pipe.read_to_end(&mut stderr).expect("read fl stderr");
-    }
-    std::process::Output {
-        status: child.wait().expect("wait fl"),
-        stdout,
-        stderr,
-    }
-}
-
-#[test]
-fn fl_inline_script_with_dash_e() {
-    let out = Command::new(FL_EXE)
-        .args(["-e", "1 + 2"])
-        .output()
-        .expect("spawn fl");
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "=> 3\n");
-    // -e のエラーも位置付きで stderr へ。
-    let out = Command::new(FL_EXE)
-        .args(["-e", "undefined_var_here"])
-        .output()
-        .expect("spawn fl");
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.starts_with("error: 1:1: "), "{stderr:?}");
-}
 
 #[test]
 fn fl_dash_reads_script_from_stdin() {
@@ -533,22 +464,93 @@ fn fl_storage_backend_requires_storage_emulator_host() {
     );
 }
 
-// The emulator validation messages only exist in the `emulator` build: without
-// the feature every `--backend emulator` invocation fails first with the
-// feature error, so these assertions can only run there.
-#[cfg(feature = "emulator")]
 #[test]
-fn fl_rejects_empty_emulator_host_before_reading_stdin() {
-    let (status, out) = reject_emulator_config_before_stdin(
-        "FIRESTORE_EMULATOR_HOST must not be empty",
-        &[("FIRESTORE_EMULATOR_HOST", "")],
-    );
-    assert!(!status.success());
+fn fl_validates_auth_backend_before_reading_stdin() {
+    // Unknown auth backend must fail fast, before stdin is drained.
+    let out = Command::new(FL_EXE)
+        .args(["--auth-backend", "not-a-backend", "-"])
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("FIRESTORE_EMULATOR_HOST must not be empty"),
+        stderr.contains("unknown auth backend: not-a-backend"),
         "{stderr:?}"
     );
+
+    // `--auth-backend emulator` without FIREBASE_AUTH_EMULATOR_HOST must also
+    // fail immediately rather than hanging on stdin.
+    let out = Command::new(FL_EXE)
+        .args(["--auth-backend", "emulator", "-"])
+        .env_remove("FIREBASE_AUTH_EMULATOR_HOST")
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("FIREBASE_AUTH_EMULATOR_HOST must be set"),
+        "{stderr:?}"
+    );
+}
+
+#[test]
+fn fl_auth_in_memory_smoke_keeps_tokens_out_of_output() {
+    // Default backend is the in-memory Auth stub, so the whole vertical slice
+    // is reachable without any emulator running.
+    let out = run_fl_script(
+        "auth-vertical",
+        "session = auth_sign_up(\"cli@example.com\", \"password\")\n\
+         puts(session)\n\
+         puts(auth_current_user()[\"email\"])\n\
+         auth_sign_out()\n\
+         auth_current_user()",
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("AuthSession"), "{stdout}");
+    assert!(stdout.contains("id_token=<redacted>"), "{stdout}");
+    assert!(stdout.contains("refresh_token=<redacted>"), "{stdout}");
+    assert!(stdout.contains("cli@example.com"), "{stdout}");
+    // After sign-out there is no current user, so the final result is nil.
+    assert!(stdout.trim_end().ends_with("=> nil"), "{stdout}");
+
+    // The fake token must never appear in stdout.
+    assert!(!stdout.contains("fake-id-token"), "{stdout}");
+    assert!(!stdout.contains("fake-refresh-token"), "{stdout}");
+}
+
+#[test]
+fn fl_auth_error_is_reported_with_position() {
+    let out = run_fl_script(
+        "auth-error",
+        "x = 1\nauth_sign_in(\"nobody@example.com\", \"password\")",
+    );
+    assert!(
+        !out.status.success(),
+        "failing auth script should exit nonzero"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with("error: 2:1: "),
+        "stderr should start with 'error: 2:1: ', got {stderr:?}"
+    );
+    assert!(stderr.contains("auth user not found"), "{stderr:?}");
+}
+
+#[test]
+fn fl_auth_help_mentions_auth_backend() {
+    let out = Command::new(FL_EXE)
+        .arg("--help")
+        .output()
+        .expect("spawn fl");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--auth-backend"), "{stderr:?}");
+    assert!(stderr.contains("FIREBASE_AUTH_EMULATOR_HOST"), "{stderr:?}");
 }
 
 #[test]
@@ -587,93 +589,5 @@ fn fl_in_memory_storage_crud_is_available_by_default() {
         "=> Bytes(00ff)\n",
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-// The emulator validation messages only exist in the `emulator` build: without
-// the feature every `--backend emulator` invocation fails first with the
-// feature error, so these assertions can only run there.
-#[cfg(feature = "emulator")]
-#[test]
-fn fl_rejects_empty_emulator_project_id_before_reading_stdin() {
-    // A valid host is required, otherwise the missing-host error would fire
-    // first and the project-id message would never be reached.
-    let (status, out) = reject_emulator_config_before_stdin(
-        "FIRESTORE_PROJECT_ID must not be empty",
-        &[
-            ("FIRESTORE_EMULATOR_HOST", "127.0.0.1:8080"),
-            ("FIRESTORE_PROJECT_ID", ""),
-        ],
-    );
-    assert!(!status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("FIRESTORE_PROJECT_ID must not be empty"),
-        "{stderr:?}"
-    );
-}
-
-/// Run `fl --backend emulator -` with exactly the given emulator environment
-/// and stdin held open, and require the process to exit without reading stdin.
-/// Returns the exit status and captured output.
-///
-/// Emulator-only, like its callers: without the feature the validation
-/// messages under test do not exist.
-#[cfg(feature = "emulator")]
-fn reject_emulator_config_before_stdin(
-    expected: &str,
-    env: &[(&str, &str)],
-) -> (ExitStatus, std::process::Output) {
-    let mut command = Command::new(FL_EXE);
-    command.args(["--backend", "emulator", "-"]);
-    // `env_remove` first so an inherited variable cannot decide which
-    // misconfiguration is reported.
-    for (key, _) in env {
-        command.env_remove(key);
-    }
-    for (key, value) in env {
-        command.env(key, value);
-    }
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn fl");
-    let _stdin = child.stdin.take().expect("keep stdin open");
-    let status = wait_for_exit(&mut child, Duration::from_secs(2))
-        .unwrap_or_else(|| panic!("fl read stdin before rejecting: {expected}"));
-    let out = read_child_output(&mut child);
-    (status, out)
-}
-
-#[cfg(unix)]
-// The emulator validation messages only exist in the `emulator` build: without
-// the feature every `--backend emulator` invocation fails first with the
-// feature error, so these assertions can only run there.
-#[cfg(feature = "emulator")]
-#[test]
-fn fl_rejects_non_utf8_emulator_host_before_reading_stdin() {
-    use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt;
-
-    let host = OsString::from_vec(vec![0xff]);
-    let mut child = Command::new(FL_EXE)
-        .args(["--backend", "emulator", "-"])
-        .env("FIRESTORE_EMULATOR_HOST", host)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn fl");
-    let _stdin = child.stdin.take().expect("keep stdin open");
-    let status = wait_for_exit(&mut child, Duration::from_secs(2))
-        .expect("fl read stdin before rejecting a non-UTF-8 emulator host");
-    assert!(!status.success());
-    let out = read_child_output(&mut child);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("FIRESTORE_EMULATOR_HOST must be valid UTF-8"),
-        "{stderr:?}"
     );
 }

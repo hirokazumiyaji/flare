@@ -143,6 +143,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             FirestoreEmulator::config_from_env()?
                 .ok_or("FIRESTORE_EMULATOR_HOST must be set when using --backend emulator")?,
         ),
+
         other => {
             return Err(format!("unknown backend: {other} (use in-memory or emulator)").into());
         }
@@ -189,6 +190,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "unknown storage backend: {other} (use auto, in-memory, or emulator)"
             )
             .into());
+
         }
     };
 
@@ -327,16 +329,32 @@ fn select_storage(
 fn select_auth(mode: &str) -> Result<Box<dyn Auth>, Box<dyn Error>> {
     match mode {
         "in-memory" => Ok(Box::new(InMemoryAuth::default())),
-        #[cfg(feature = "emulator")]
-        "emulator" => Ok(Box::new(
-            AuthEmulator::from_env()
-                .map_err(|e| -> Box<dyn Error> { Box::new(e) })?
-                .ok_or(
-                    "FIREBASE_AUTH_EMULATOR_HOST must be set when using --auth-backend emulator",
-                )?,
-        )),
-        #[cfg(not(feature = "emulator"))]
-        "emulator" => Err(EMULATOR_FEATURE_ERROR.into()),
+        "emulator" => {
+            let host = match env::var("FIREBASE_AUTH_EMULATOR_HOST") {
+                Ok(host) => host,
+                Err(env::VarError::NotPresent) => {
+                    return Err(
+                        "FIREBASE_AUTH_EMULATOR_HOST must be set when using --auth-backend emulator"
+                            .into(),
+                    );
+                }
+                Err(env::VarError::NotUnicode(_)) => {
+                    return Err("FIREBASE_AUTH_EMULATOR_HOST must be valid UTF-8".into());
+                }
+            };
+            #[cfg(feature = "emulator")]
+            {
+                return Ok(Box::new(AuthEmulator::new(
+                    host,
+                    project_id_from_env(true),
+                )?));
+            }
+            #[cfg(not(feature = "emulator"))]
+            {
+                let _ = host;
+                return Err(EMULATOR_FEATURE_ERROR.into());
+            }
+        }
         other => Err(format!("unknown auth backend: {other} (use in-memory or emulator)").into()),
     }
 }
@@ -363,7 +381,7 @@ fn print_usage() {
     eprintln!("    -e <script>   run an inline script (repeatable, joined by newlines)");
     eprintln!("    (no args)     read from stdin when piped, otherwise show this usage");
     eprintln!();
-    eprintln!("  Backends:");
+    eprintln!("  Firestore backend:");
     eprintln!("    in-memory   (default) use the in-memory Firestore stub");
     // Keep the help honest about this build's own capabilities: a binary
     // compiled with the feature enabled does accept --backend emulator, and
@@ -396,10 +414,92 @@ fn print_usage() {
     eprintln!("  Auth backends:");
     eprintln!("    in-memory  (default) use the in-memory Auth stub");
     eprintln!("    emulator   require FIREBASE_AUTH_EMULATOR_HOST");
+    eprintln!();
+    eprintln!("  Auth backend:");
+    eprintln!("    in-memory   (default) use the in-memory Auth stub");
+    eprintln!("    emulator    use FIREBASE_AUTH_EMULATOR_HOST and optional FIREBASE_PROJECT_ID");
+}
+
+/// Resolve the Firebase project ID from the environment.
+///
+/// Each backend keeps its documented precedence so existing Firestore setups
+/// are unaffected:
+/// - Firestore (`prefer_firebase = false`): `FIRESTORE_PROJECT_ID`,
+///   then `FIREBASE_PROJECT_ID`, then `firelang-test`.
+/// - Auth (`prefer_firebase = true`): `FIREBASE_PROJECT_ID`,
+///   then `FIRESTORE_PROJECT_ID`, then `firelang-test`.
+///
+/// Reading both names lets one Firebase CLI project (`--project X`) drive the
+/// Firestore and Auth emulators together without exporting a second variable.
+#[cfg(feature = "emulator")]
+fn project_id_from_env(prefer_firebase: bool) -> String {
+    resolve_project_id(prefer_firebase, |key| env::var(key).ok())
+}
+
+/// Pure precedence rule behind [`project_id_from_env`], split out so it can be
+/// tested without mutating process-wide environment state.
+#[cfg(feature = "emulator")]
+fn resolve_project_id(prefer_firebase: bool, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let (first, second) = if prefer_firebase {
+        ("FIREBASE_PROJECT_ID", "FIRESTORE_PROJECT_ID")
+    } else {
+        ("FIRESTORE_PROJECT_ID", "FIREBASE_PROJECT_ID")
+    };
+    lookup(first)
+        .or_else(|| lookup(second))
+        .unwrap_or_else(|| "firelang-test".to_string())
+
 }
 
 fn read_stdin() -> Result<String, Box<dyn Error>> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
     Ok(buf)
+}
+
+#[cfg(all(test, feature = "emulator"))]
+mod tests {
+    use super::resolve_project_id;
+
+    fn lookup<'a>(values: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            values
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
+    #[test]
+    fn firestore_backend_keeps_firestore_project_id_precedence() {
+        let both = lookup(&[
+            ("FIRESTORE_PROJECT_ID", "from-firestore"),
+            ("FIREBASE_PROJECT_ID", "from-firebase"),
+        ]);
+        assert_eq!(resolve_project_id(false, both), "from-firestore");
+    }
+
+    #[test]
+    fn auth_backend_prefers_firebase_project_id() {
+        let both = lookup(&[
+            ("FIRESTORE_PROJECT_ID", "from-firestore"),
+            ("FIREBASE_PROJECT_ID", "from-firebase"),
+        ]);
+        assert_eq!(resolve_project_id(true, both), "from-firebase");
+    }
+
+    #[test]
+    fn each_backend_falls_back_to_the_other_name() {
+        let only_firebase = lookup(&[("FIREBASE_PROJECT_ID", "shared")]);
+        assert_eq!(resolve_project_id(false, only_firebase), "shared");
+        let only_firestore = lookup(&[("FIRESTORE_PROJECT_ID", "shared")]);
+        assert_eq!(resolve_project_id(true, only_firestore), "shared");
+    }
+
+    #[test]
+    fn default_project_id_is_used_when_unset() {
+        let empty = lookup(&[]);
+        assert_eq!(resolve_project_id(false, &empty), "firelang-test");
+        assert_eq!(resolve_project_id(true, &empty), "firelang-test");
+    }
 }

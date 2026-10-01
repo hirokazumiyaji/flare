@@ -780,7 +780,6 @@ fn emulator_delete_field_and_increment_match_in_memory() {
     // never pass wherever the emulator actually ran - it only looked green
     // because the suite skips without FIRESTORE_EMULATOR_HOST. Both backends
     // remove `age` and keep `name`; this now matches the sibling in-memory test.
-
     assert_eq!(
         out,
         map! {

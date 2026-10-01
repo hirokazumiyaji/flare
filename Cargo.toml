@@ -35,3 +35,8 @@ path = "src/main.rs"
 name = "firestore_emulator"
 path = "tests/firestore_emulator.rs"
 required-features = ["emulator"]
+
+[[test]]
+name = "auth_emulator"
+path = "tests/auth_emulator.rs"
+required-features = ["emulator"]
