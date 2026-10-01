@@ -16,8 +16,9 @@ service cloud.firestore {
 const PRODUCTION_STORAGE_RULES: &str = "rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
+    // Deploy config must fail closed until an authenticated production
+    // policy is implemented. Local emulator runs use storage.emulator.rules.
     match /{allPaths=**} {
-      // Fail closed until an authenticated production policy is implemented.
       allow read, write: if false;
     }
   }
