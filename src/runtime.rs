@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 
-use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
+use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
 use crate::error::{FirelangError, Span};
-use crate::firestore::{Firestore, WriteOp};
+use crate::firestore::{is_legacy_datastore_numeric_id, Firestore, WriteOp};
+use crate::storage::{validate_content_type, validate_storage_path, InMemoryStorage, Storage};
 use crate::value::{
     CollectionGroupRef, CollectionRef, Direction, DocRef, QueryFilter, QueryOp, QueryRef,
     Timestamp, UserFunc, Value,
@@ -15,18 +16,46 @@ enum ExecCtx {
     Transaction { writes: Vec<WriteOp> },
 }
 
-pub struct Runtime<F: Firestore> {
-    scopes: Vec<HashMap<String, Value>>,
-    fs: F,
-    exec: ExecCtx,
+enum MethodReceiver {
+    Collection(CollectionRef),
+    CollectionGroup(CollectionGroupRef),
+    Query(QueryRef),
+    Array(Vec<Value>),
+    Timestamp(Timestamp),
+    Bytes(Vec<u8>),
+    Map(BTreeMap<String, Value>),
 }
 
-impl<F: Firestore> Runtime<F> {
+pub struct Runtime<F: Firestore, S: Storage = InMemoryStorage> {
+    scopes: Vec<HashMap<String, Value>>,
+    fs: F,
+    storage: S,
+    exec: ExecCtx,
+    /// Set when a best-effort rollback failed, so the backend still holds the
+    /// transaction open. The next `transaction` block retries the rollback
+    /// before beginning a new one; otherwise a single failed Rollback RPC
+    /// would make every later `transaction` fail with "already in
+    /// transaction" and nothing in a script could clear the state.
+    pending_rollback: bool,
+}
+
+impl<F: Firestore> Runtime<F, InMemoryStorage> {
     pub fn new(fs: F) -> Self {
+        Self::with_storage(fs, InMemoryStorage::default())
+    }
+}
+
+impl<F: Firestore, S: Storage> Runtime<F, S> {
+    /// Construct a runtime with an independent Storage backend. Firestore and
+    /// Storage deliberately remain separate services; the default runtime
+    /// uses [`InMemoryStorage`].
+    pub fn with_storage(fs: F, storage: S) -> Self {
         Self {
             scopes: vec![HashMap::new()],
             fs,
+            storage,
             exec: ExecCtx::Normal,
+            pending_rollback: false,
         }
     }
 
@@ -65,7 +94,7 @@ impl<F: Firestore> Runtime<F> {
 
     fn eval_stmt(&mut self, stmt: &Stmt) -> Result<ExecFlow, Box<dyn Error>> {
         match stmt {
-            Stmt::Expr(e) => Ok(ExecFlow::Value(self.eval_expr(e)?)),
+            Stmt::Expr(e) => self.eval_expr(e),
             Stmt::Assign { name, value } => {
                 // ビルトイン関数名と同じ名前の変数定義(例: set = 5)は許可する。
                 // 呼び出し時(Expr::Call)はビルトインディスパッチが常に優先され、
@@ -75,11 +104,16 @@ impl<F: Firestore> Runtime<F> {
                 if self.var_exists(name) {
                     return Err(format!("reassignment is not allowed: {name}").into());
                 }
-                let v = self.eval_expr(value)?;
+                let flow = self.eval_expr(value)?;
+                let v = match flow {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                };
                 self.set_var(name, v.clone())?;
                 Ok(ExecFlow::Value(v))
             }
             Stmt::Def { name, params, body } => {
+                validate_unique_params(params, "function")?;
                 if is_builtin_name(name) {
                     return Err(format!("cannot redefine builtin: {name}").into());
                 }
@@ -95,25 +129,38 @@ impl<F: Firestore> Runtime<F> {
                 )?;
                 Ok(ExecFlow::Value(Value::Nil))
             }
-            Stmt::Return(e) => Ok(ExecFlow::Return(match e {
-                Some(e) => self.eval_expr(e)?,
-                None => Value::Nil,
-            })),
+            Stmt::Return(e) => {
+                let value = match e {
+                    Some(e) => match self.eval_expr(e)? {
+                        ExecFlow::Value(v) => v,
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    },
+                    None => Value::Nil,
+                };
+                Ok(ExecFlow::Return(value))
+            }
             Stmt::If {
                 cond,
                 then_body,
                 else_body,
             } => {
-                let body = if self.eval_expr(cond)?.truthy() {
-                    then_body
-                } else {
-                    else_body
+                let cond = match self.eval_expr(cond)? {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
                 };
+                let body = if cond.truthy() { then_body } else { else_body };
                 self.eval_block(body)
             }
             Stmt::While { cond, body } => {
                 let mut last = Value::Nil;
-                while self.eval_expr(cond)?.truthy() {
+                loop {
+                    let cond = match self.eval_expr(cond)? {
+                        ExecFlow::Value(v) => v,
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    };
+                    if !cond.truthy() {
+                        break;
+                    }
                     match self.eval_block(body)? {
                         ExecFlow::Value(v) => last = v,
                         ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
@@ -135,15 +182,33 @@ impl<F: Firestore> Runtime<F> {
         Ok(ExecFlow::Value(last))
     }
 
-    /// `exec` をステージング用 ctx に差し替えてブロックを評価し、元の ctx に
-    /// 戻してステージされた writes を返す。ブロックの成否にかかわらず復元する。
+    /// `exec` をステージング用 ctx に差し替え、子スコープでブロックを評価する。
+    /// ブロックの成否にかかわらず元の ctx とスコープへ戻し、ステージされた
+    /// writes を返す。
     fn run_staged_block(
         &mut self,
         ctx: ExecCtx,
         body: &[Stmt],
     ) -> (Result<ExecFlow, Box<dyn Error>>, Vec<WriteOp>) {
         let prev = std::mem::replace(&mut self.exec, ctx);
+        // batch / transaction は呼び出し元を読める字句的な子スコープで
+        // 評価する。ブロック内で定義した変数・関数は外へ漏れず、成功・
+        // ランタイムエラー/backend エラーのどちらでも同じスコープを片付ける。
+        // Scope frames are balanced by eval_call/call_block before any
+        // fallible work is performed. Record only the caller's depth instead
+        // of deep-cloning every global and local value for each staged block.
+        let caller_scope_depth = self.scopes.len();
+        self.scopes.push(HashMap::new());
         let flow = self.eval_block(body);
+        // `truncate` would silently discard a frame leaked by a nested call,
+        // so assert the balance explicitly. This only runs in debug builds,
+        // which is where the test suite executes.
+        debug_assert_eq!(
+            self.scopes.len(),
+            caller_scope_depth + 1,
+            "staged block must leave the scope stack balanced"
+        );
+        self.scopes.truncate(caller_scope_depth);
         let writes = match std::mem::replace(&mut self.exec, prev) {
             ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => writes,
             ExecCtx::Normal => unreachable!("exec ctx changed inside batch/transaction"),
@@ -159,6 +224,32 @@ impl<F: Firestore> Runtime<F> {
         }
     }
 
+    /// Abort is cleanup, not the error being reported by a transaction.
+    /// Keeping the call non-propagating is important: if the block or commit
+    /// already failed, that original error must reach the caller even when
+    /// rollback also fails. A failed rollback is remembered so the next
+    /// `transaction` block retries it; see `retry_pending_rollback`.
+    fn abort_transaction_best_effort(&mut self) {
+        if self.fs.abort_transaction().is_err() {
+            // The backend kept the transaction open. Remember it: a script
+            // has no other way to reach the backend and clear the state.
+            self.pending_rollback = true;
+        }
+    }
+
+    /// Retry a rollback that previously failed. Called before every
+    /// `begin_transaction`. If the retry also fails, `begin_transaction`
+    /// surfaces its own "already in transaction" error, which is at least an
+    /// honest report of a backend that is still busy.
+    fn retry_pending_rollback(&mut self) {
+        if !self.pending_rollback {
+            return;
+        }
+        if self.fs.abort_transaction().is_ok() {
+            self.pending_rollback = false;
+        }
+    }
+
     fn dispatch_write(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
         match &mut self.exec {
             ExecCtx::Normal => self.fs.apply(vec![op]).map_err(backend_err),
@@ -169,114 +260,221 @@ impl<F: Firestore> Runtime<F> {
         }
     }
 
-    fn eval_expr(&mut self, expr: &Expr) -> Result<Value, Box<dyn Error>> {
+    fn eval_expr(&mut self, expr: &Expr) -> Result<ExecFlow, Box<dyn Error>> {
         match expr {
-            Expr::Int(i) => Ok(Value::Int(*i)),
-            Expr::Str(s) => Ok(Value::Str(s.clone())),
+            Expr::Int(i) => Ok(ExecFlow::Value(Value::Int(*i))),
+            Expr::Str(s) => Ok(ExecFlow::Value(Value::Str(s.clone()))),
             Expr::StrInterp(pieces) => {
                 let mut out = String::new();
                 for piece in pieces {
                     match piece {
                         StrPiece::Lit(s) => out.push_str(s),
                         StrPiece::Expr(e) => {
-                            let v = self.eval_expr(e)?;
+                            let v = match self.eval_expr(e)? {
+                                ExecFlow::Value(v) => v,
+                                flow @ ExecFlow::Return(_) => return Ok(flow),
+                            };
                             out.push_str(&v.to_string());
                         }
                     }
                 }
-                Ok(Value::Str(out))
+                Ok(ExecFlow::Value(Value::Str(out)))
             }
-            Expr::Bool(b) => Ok(Value::Bool(*b)),
-            Expr::Nil => Ok(Value::Nil),
+            Expr::Bool(b) => Ok(ExecFlow::Value(Value::Bool(*b))),
+            Expr::Nil => Ok(ExecFlow::Value(Value::Nil)),
             Expr::Var(name) => self
                 .get_var(name)
                 .cloned()
+                .map(ExecFlow::Value)
                 .ok_or_else(|| format!("undefined variable: {name}").into()),
             Expr::Binary { left, op, right } => {
+                let l = match self.eval_expr(left)? {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                };
                 // `&&` / `||` は短絡評価し、Ruby と同じくオペランドそのものを返す。
                 match op {
                     BinOp::And => {
-                        let l = self.eval_expr(left)?;
                         if !l.truthy() {
-                            Ok(l)
+                            Ok(ExecFlow::Value(l))
                         } else {
                             self.eval_expr(right)
                         }
                     }
                     BinOp::Or => {
-                        let l = self.eval_expr(left)?;
                         if l.truthy() {
-                            Ok(l)
+                            Ok(ExecFlow::Value(l))
                         } else {
                             self.eval_expr(right)
                         }
                     }
-                    _ => eval_binary(self.eval_expr(left)?, *op, self.eval_expr(right)?),
+                    _ => {
+                        let r = match self.eval_expr(right)? {
+                            ExecFlow::Value(v) => v,
+                            flow @ ExecFlow::Return(_) => return Ok(flow),
+                        };
+                        eval_binary(l, *op, r).map(ExecFlow::Value)
+                    }
                 }
             }
             Expr::Unary { op, expr } => {
-                let v = self.eval_expr(expr)?;
-                Ok(match op {
+                let v = match self.eval_expr(expr)? {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                };
+                Ok(ExecFlow::Value(match op {
                     UnOp::Not => Value::Bool(!v.truthy()),
                     UnOp::Neg => match v {
                         Value::Int(i) => Value::Int(i.checked_neg().ok_or("integer overflow")?),
                         _ => return Err("unsupported unary - operand".into()),
                     },
-                })
+                }))
             }
             Expr::Call {
                 receiver,
                 name,
                 args,
-                kwargs,
                 block,
             } => {
+                // Validate the call shape before evaluating argument
+                // expressions.  Invalid calls must not be able to perform
+                // writes (or other side effects) before their contract error
+                // is reported.  Keyword values are irrelevant for this
+                // pre-check; only their names and arity are needed.
+                validate_unique_keywords(args)?;
+                if receiver.is_some() {
+                    // Keyword arguments are not part of any method contract.
+                    // Reject them before evaluating the receiver, which may
+                    // itself contain a staged or immediate write.
+                    if has_keyword_args(args) {
+                        return Err(unknown_keyword_names(args));
+                    }
+                    if let Some(block) = block.as_ref() {
+                        if name == "each" || name == "map" {
+                            check_block_arity(block, 1)?;
+                        } else {
+                            return Err(format!("method {name} does not take a block").into());
+                        }
+                    }
+                }
+                // A receiver is the first expression in a method call.  Keep
+                // this evaluation here (rather than in `eval_call`) so a
+                // receiver failure is returned before any argument expression
+                // can run.
+                let receiver_value = match receiver.as_deref() {
+                    Some(expr) => Some(into_method_receiver(match self.eval_expr(expr)? {
+                        ExecFlow::Value(v) => v,
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    })?),
+                    None => None,
+                };
+
+                // The method contract needs the receiver value; plain-call
+                // contracts were already checked above without evaluation.
+                // Either way this runs before any argument expression, so a
+                // contract error preempts argument side effects.
+                if let Some(rec) = receiver_value.as_ref() {
+                    let keyword_names = keyword_names(args);
+                    validate_method_call(
+                        rec,
+                        name,
+                        positional_arg_count(args),
+                        &keyword_names,
+                        block.as_ref(),
+                    )?;
+                } else if lookup_builtin::<F, S>(name).is_some() {
+                    let keyword_names = keyword_names(args);
+                    validate_call_contract(
+                        name,
+                        positional_arg_count(args),
+                        &keyword_names,
+                        block.as_ref(),
+                        builtin_contract(name),
+                    )?;
+                } else {
+                    let Some(Value::Func(func)) = self.get_var(name).cloned() else {
+                        return Err(format!("undefined function: {name}").into());
+                    };
+                    validate_user_call_contract(
+                        name,
+                        &func.params,
+                        args,
+                        block.as_ref(),
+                    )?;
+                }
+
+                // `args` is one ordered sequence; splitting it into
+                // positional/keyword collections for binding must not change
+                // the order in which the expressions above are evaluated.
                 let mut argv = vec![];
-                for arg in args {
-                    argv.push(self.eval_expr(arg)?);
-                }
                 let mut kw = BTreeMap::new();
-                for (k, vexpr) in kwargs {
-                    kw.insert(k.clone(), self.eval_expr(vexpr)?);
+                for arg in args {
+                    match arg {
+                        CallArg::Positional(expr) => match self.eval_expr(expr)? {
+                            ExecFlow::Value(v) => argv.push(v),
+                            flow @ ExecFlow::Return(_) => return Ok(flow),
+                        },
+                        CallArg::Keyword { name, value } => match self.eval_expr(value)? {
+                            ExecFlow::Value(v) => {
+                                kw.insert(name.clone(), v);
+                            }
+                            flow @ ExecFlow::Return(_) => return Ok(flow),
+                        },
+                    }
                 }
-                self.eval_call(receiver.as_deref(), name, argv, kw, block.as_ref())
+                self.eval_call(receiver_value, name, argv, kw, block.as_ref())
+
             }
             Expr::Map(entries) => {
                 let mut out = BTreeMap::new();
                 for (k, expr) in entries {
-                    out.insert(k.clone(), self.eval_expr(expr)?);
+                    match self.eval_expr(expr)? {
+                        ExecFlow::Value(v) => {
+                            out.insert(k.clone(), v);
+                        }
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    }
                 }
-                Ok(Value::Map(out))
+                Ok(ExecFlow::Value(Value::Map(out)))
             }
             Expr::Array(items) => {
                 let mut out = vec![];
                 for item in items {
-                    out.push(self.eval_expr(item)?);
+                    match self.eval_expr(item)? {
+                        ExecFlow::Value(v) => out.push(v),
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    }
                 }
-                Ok(Value::Array(out))
+                Ok(ExecFlow::Value(Value::Array(out)))
             }
             Expr::Index { base, index } => {
-                let base = self.eval_expr(base)?;
-                let index = self.eval_expr(index)?;
-                eval_index(base, index)
+                let base = match self.eval_expr(base)? {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                };
+                let index = match self.eval_expr(index)? {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                };
+                eval_index(base, index).map(ExecFlow::Value)
             }
         }
     }
 
     fn eval_call(
         &mut self,
-        receiver: Option<&Expr>,
+        receiver: Option<MethodReceiver>,
         name: &str,
         args: Vec<Value>,
         kwargs: BTreeMap<String, Value>,
         block: Option<&Block>,
-    ) -> Result<Value, Box<dyn Error>> {
-        if let Some(r) = receiver {
-            let rec = self.eval_expr(r)?;
+    ) -> Result<ExecFlow, Box<dyn Error>> {
+        if let Some(rec) = receiver {
             if !kwargs.is_empty() {
                 return Err("keyword args are not supported for method calls yet".into());
             }
-            return self.eval_method_call(rec, name, args, block);
+            return self.eval_method_call(rec, name, args, kwargs, block);
+
         }
 
         // ビルトインはテーブル駆動で引く。ユーザー定義より優先されるため、
@@ -289,63 +487,87 @@ impl<F: Firestore> Runtime<F> {
             return Err(format!("undefined function: {name}").into());
         };
         let bound = bind_function_args(&func.params, args, kwargs)?;
-        // 関数はグローバルスコープと仮引数のみを見える(静的スコープ)。
         // 呼び出し元のローカル変数・呼び出された関数自身のローカルは隠す。
-        let mut saved = self.scopes.split_off(1);
-        self.scopes.push(HashMap::new());
+        //
+        // caller scope の保存と frame の破棄を guard に任せる。引数の
+        // binding、本体の runtime error、panic unwind のいずれでも同じ復元が
+        // 進み、手動の cleanup 処理に依存しない。
+        let scope = ScopeGuard::function(self);
         for (param, value) in bound {
-            self.set_var(&param, value)?;
+            scope.runtime.set_var(&param, value)?;
         }
-        let res = self.eval_block(&func.body);
-        self.scopes.pop();
-        self.scopes.append(&mut saved);
-        Ok(match res? {
-            ExecFlow::Value(v) | ExecFlow::Return(v) => v,
-        })
+        let result = scope.runtime.eval_block(&func.body);
+        drop(scope);
+        // 関数呼び出しは制御フロー境界。関数本体(または本体内のブロック)からの
+        // Return は、この関数の戻り値として消費する。外側のブロックへ伝播するのは
+        // call_block や batch/transaction のブロックから直接来た Return だけ。
+        result.map(|flow| ExecFlow::Value(flow.into_value()))
     }
 
     fn eval_method_call(
         &mut self,
-        receiver: Value,
+        receiver: MethodReceiver,
         name: &str,
         args: Vec<Value>,
+        kwargs: BTreeMap<String, Value>,
         block: Option<&Block>,
-    ) -> Result<Value, Box<dyn Error>> {
+    ) -> Result<ExecFlow, Box<dyn Error>> {
+        validate_method_call(&receiver, name, args.len(), &kwargs, block)?;
+        self.eval_method_call_unchecked(receiver, name, args, kwargs, block)
+    }
+
+    fn eval_method_call_unchecked(
+        &mut self,
+        receiver: MethodReceiver,
+        name: &str,
+        args: Vec<Value>,
+        _kwargs: BTreeMap<String, Value>,
+        block: Option<&Block>,
+    ) -> Result<ExecFlow, Box<dyn Error>> {
         match receiver {
-            Value::CollectionRef(collection) if name == "doc" => {
+            MethodReceiver::Collection(collection) if name == "doc" => {
                 let id = expect_string(args.first())?;
-                if id.is_empty() || id.contains('/') {
-                    return Err(format!("invalid document id: {id}").into());
-                }
-                Ok(Value::DocRef(DocRef {
+                validate_document_id(id)?;
+                Ok(ExecFlow::Value(Value::DocRef(DocRef {
                     path: format!("{}/{}", collection.path, id),
-                }))
+                })))
             }
-            Value::CollectionRef(collection) => {
-                self.eval_query_method(collection.to_query(), name, args)
-            }
-            Value::CollectionGroupRef(group) => {
-                self.eval_query_method(group.to_query(), name, args)
-            }
-            Value::QueryRef(query) => self.eval_query_method(query, name, args),
-            Value::Array(items) => self.eval_array_method(items, name, args, block),
-            Value::Timestamp(ts) => match name {
-                "to_unix" => Ok(Value::Int(ts.seconds)),
-                "to_rfc3339" => Ok(Value::Str(ts.to_rfc3339()?)),
-                "add_seconds" => Ok(Value::Timestamp(Timestamp {
-                    seconds: ts.seconds + expect_int(args.first())?,
-                })),
+            MethodReceiver::Collection(collection) => self
+                .eval_query_method(collection.to_query(), name, args)
+                .map(ExecFlow::Value),
+            MethodReceiver::CollectionGroup(group) => self
+                .eval_query_method(group.to_query(), name, args)
+                .map(ExecFlow::Value),
+            MethodReceiver::Query(query) => self
+                .eval_query_method(query, name, args)
+                .map(ExecFlow::Value),
+            MethodReceiver::Array(items) => self.eval_array_method(items, name, args, block),
+            MethodReceiver::Timestamp(ts) => match name {
+                "to_unix" => Ok(ExecFlow::Value(Value::Int(ts.seconds))),
+                "to_rfc3339" => Ok(ExecFlow::Value(Value::Str(ts.to_rfc3339()?))),
+                "add_seconds" => Ok(ExecFlow::Value(Value::Timestamp(Timestamp {
+                    seconds: ts
+                        .seconds
+                        .checked_add(expect_int(args.first())?)
+                        .ok_or("integer overflow")?,
+                }))),
+
                 _ => Err(format!("unknown timestamp method: {name}").into()),
             },
-            Value::Map(map) => {
+            MethodReceiver::Bytes(bytes) if name == "len" && args.is_empty() => {
+                Ok(ExecFlow::Value(Value::Int(bytes.len() as i64)))
+            }
+            MethodReceiver::Bytes(_) => Err(format!("unknown bytes method: {name}").into()),
+            MethodReceiver::Map(map) => {
                 // Map レシーバは `m.key` 形式のキーアクセス(Ruby の OpenStruct 風)のみ。
                 // 引数を取るメソッドは持たないので、Args がある場合はエラーにする。
                 if !args.is_empty() {
                     return Err(format!("unknown map method: {name}").into());
                 }
-                Ok(map.get(name).cloned().unwrap_or(Value::Nil))
+                Ok(ExecFlow::Value(
+                    map.get(name).cloned().unwrap_or(Value::Nil),
+                ))
             }
-            _ => Err("unsupported method receiver".into()),
         }
     }
 
@@ -355,7 +577,7 @@ impl<F: Firestore> Runtime<F> {
         name: &str,
         args: Vec<Value>,
         block: Option<&Block>,
-    ) -> Result<Value, Box<dyn Error>> {
+    ) -> Result<ExecFlow, Box<dyn Error>> {
         if !args.is_empty() {
             return Err(format!("array method {name} does not take arguments").into());
         }
@@ -368,9 +590,12 @@ impl<F: Firestore> Runtime<F> {
                 // ループの前にブロック引数の個数を検証する。
                 check_block_arity(block, 1)?;
                 for item in items {
-                    self.call_block(block, vec![item])?;
+                    match self.call_block(block, vec![item])? {
+                        ExecFlow::Value(_) => {}
+                        ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
+                    }
                 }
-                Ok(Value::Nil)
+                Ok(ExecFlow::Value(Value::Nil))
             }
             "map" => {
                 let Some(block) = block else {
@@ -379,24 +604,34 @@ impl<F: Firestore> Runtime<F> {
                 check_block_arity(block, 1)?;
                 let mut out = vec![];
                 for item in items {
-                    out.push(self.call_block(block, vec![item])?);
+                    match self.call_block(block, vec![item])? {
+                        ExecFlow::Value(v) => out.push(v),
+                        ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
+                    }
                 }
-                Ok(Value::Array(out))
+                Ok(ExecFlow::Value(Value::Array(out)))
             }
-            "len" => Ok(Value::Int(items.len() as i64)),
+            "len" => Ok(ExecFlow::Value(Value::Int(items.len() as i64))),
             _ => Err(format!("unknown array method: {name}").into()),
         }
     }
 
-    fn call_block(&mut self, block: &Block, args: Vec<Value>) -> Result<Value, Box<dyn Error>> {
+    fn call_block(&mut self, block: &Block, args: Vec<Value>) -> Result<ExecFlow, Box<dyn Error>> {
         check_block_arity(block, args.len())?;
-        self.scopes.push(HashMap::new());
-        for (param, value) in block.params.iter().cloned().zip(args) {
-            self.set_var(&param, value)?;
+        let scope = ScopeGuard::block(self);
+        // `ast::Block` is public with public fields, so a hand-built Block (via
+        // the public `eval_program`) can carry duplicate params even though the
+        // parser now rejects them. Without this, the only remaining path into
+        // duplicates reported a misleading "reassignment is not allowed: <name>".
+        validate_unique_params(&block.params, "block")?;
+        for (param, value) in block.params.iter().zip(args) {
+            scope.runtime.set_var(param, value)?;
         }
-        let res = self.eval_block(&block.body);
-        self.scopes.pop();
-        Ok(res?.into_value())
+        // `call_block` propagates Return to its caller (unlike `eval_call`,
+        // which consumes it): the `each`/`map` dispatch decides per item.
+        let result = scope.runtime.eval_block(&block.body);
+        drop(scope);
+        result
     }
 
     fn eval_query_method(
@@ -477,6 +712,137 @@ impl<F: Firestore> Runtime<F> {
     }
 }
 
+/// Convert an evaluated receiver into the exhaustive set accepted by method
+/// dispatch.  Keeping this conversion next to the dispatch match prevents a
+/// new receiver from being accepted by one path but rejected by the other.
+fn into_method_receiver(value: Value) -> Result<MethodReceiver, Box<dyn Error>> {
+    match value {
+        Value::CollectionRef(value) => Ok(MethodReceiver::Collection(value)),
+        Value::CollectionGroupRef(value) => Ok(MethodReceiver::CollectionGroup(value)),
+        Value::QueryRef(value) => Ok(MethodReceiver::Query(value)),
+        Value::Array(value) => Ok(MethodReceiver::Array(value)),
+        Value::Timestamp(value) => Ok(MethodReceiver::Timestamp(value)),
+        Value::Bytes(value) => Ok(MethodReceiver::Bytes(value)),
+        Value::Map(value) => Ok(MethodReceiver::Map(value)),
+        _ => Err("unsupported method receiver".into()),
+    }
+}
+
+fn validate_unique_keywords(args: &[CallArg]) -> Result<(), Box<dyn Error>> {
+    let mut seen = BTreeSet::<&str>::new();
+    for arg in args {
+        if let CallArg::Keyword { name, .. } = arg {
+            if !seen.insert(name.as_str()) {
+                return Err(format!("duplicate keyword argument: {name}").into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn has_keyword_args(args: &[CallArg]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg, CallArg::Keyword { .. }))
+}
+
+fn positional_arg_count(args: &[CallArg]) -> usize {
+    args.iter()
+        .filter(|arg| matches!(arg, CallArg::Positional(_)))
+        .count()
+}
+
+/// Scope cleanup guard for function and block calls.
+///
+/// A function temporarily hides all caller-local scopes while keeping the
+/// global scope visible. A block only adds one frame. In both cases the
+/// original scope stack is restored on every exit path, including `?` returns
+/// and panic unwinding.
+struct ScopeGuard<'a, F: Firestore, S: Storage> {
+    runtime: &'a mut Runtime<F, S>,
+    // `Some` is a function frame and contains the caller-local suffix. `None`
+    // is a block frame, which is removed from the end on drop.
+    saved: Option<Vec<HashMap<String, Value>>>,
+}
+
+impl<'a, F: Firestore, S: Storage> ScopeGuard<'a, F, S> {
+    fn function(runtime: &'a mut Runtime<F, S>) -> Self {
+        let saved = runtime.scopes.split_off(1);
+        runtime.scopes.push(HashMap::new());
+        Self {
+            runtime,
+            saved: Some(saved),
+        }
+    }
+
+    fn block(runtime: &'a mut Runtime<F, S>) -> Self {
+        runtime.scopes.push(HashMap::new());
+        Self {
+            runtime,
+            saved: None,
+        }
+    }
+}
+
+impl<F: Firestore, S: Storage> Drop for ScopeGuard<'_, F, S> {
+    fn drop(&mut self) {
+        if let Some(mut saved) = self.saved.take() {
+            // Keep the global frame and discard every frame created while the
+            // function was running before restoring the caller-local suffix.
+            self.runtime.scopes.truncate(1);
+            self.runtime.scopes.append(&mut saved);
+        } else {
+            self.runtime.scopes.pop();
+        }
+    }
+}
+
+fn validate_unique_params(params: &[String], kind: &str) -> Result<(), Box<dyn Error>> {
+    let mut seen = HashSet::with_capacity(params.len());
+    for param in params {
+        if !seen.insert(param.as_str()) {
+            return Err(format!("duplicate {kind} parameter: {param}").into());
+        }
+    }
+    Ok(())
+}
+
+fn keyword_names(args: &[CallArg]) -> BTreeMap<String, Value> {
+    args.iter()
+        .filter_map(|arg| match arg {
+            CallArg::Keyword { name, .. } => Some((name.clone(), Value::Nil)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn unknown_keyword_names(args: &[CallArg]) -> Box<dyn Error> {
+    let keys: Vec<&str> = args
+        .iter()
+        .filter_map(|arg| match arg {
+            CallArg::Keyword { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    format!("unknown keyword arguments: {}", keys.join(", ")).into()
+}
+
+fn validate_user_call_contract(
+    name: &str,
+    params: &[String],
+    args: &[CallArg],
+    block: Option<&Block>,
+) -> Result<(), Box<dyn Error>> {
+    if block.is_some() {
+        return Err(format!("{name} does not take a block (block is not allowed)").into());
+    }
+    bind_function_args(
+        params,
+        vec![Value::Nil; positional_arg_count(args)],
+        keyword_names(args),
+    )
+    .map(|_| ())
+}
+
 fn bind_function_args(
     params: &[String],
     positional: Vec<Value>,
@@ -489,6 +855,12 @@ fn bind_function_args(
     let mut idx = 0;
     for param in params {
         if idx < positional.len() {
+            if kwargs.contains_key(param) {
+                return Err(format!(
+                    "duplicate argument {param}: specified both positionally and as a keyword"
+                )
+                .into());
+            }
             out.push((param.clone(), positional[idx].clone()));
             idx += 1;
             continue;
@@ -506,6 +878,326 @@ fn bind_function_args(
     Ok(out)
 }
 
+/// `bytes(...)` の引数エラー文言。3 箇所から使うので定数にまとめる。
+const BYTES_USAGE: &str = "bytes expects one string or an array of integers from 0 to 255";
+const BYTES_ELEMENT_ERR: &str = "bytes array elements must be integers from 0 to 255";
+
+/// The positional part of a call contract.
+#[derive(Clone, Copy)]
+enum PositionalArity {
+    Exact(usize),
+    Range(usize, usize),
+    Any,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BlockPolicy {
+    Forbidden,
+    Required,
+}
+
+/// Runtime validation shared by builtin functions and built-in methods.
+///
+/// `keywords` is intentionally small: the language's builtin API is
+/// positional except for `set(..., merge: true)`.  `array` and `puts` use
+/// `PositionalArity::Any` because their variable-arity behavior is part of
+/// the API.
+#[derive(Clone, Copy)]
+struct CallContract {
+    positional: PositionalArity,
+    keywords: &'static [&'static str],
+    block: BlockPolicy,
+    /// Keywords that occupy the same slot as a positional argument.
+    positional_keyword_conflicts: &'static [(&'static str, usize)],
+    /// Optional compatibility/detail hint for a missing argument.
+    missing_hint: Option<&'static str>,
+}
+
+impl CallContract {
+    fn exact(positional: usize) -> Self {
+        Self {
+            positional: PositionalArity::Exact(positional),
+            keywords: &[],
+            block: BlockPolicy::Forbidden,
+            positional_keyword_conflicts: &[],
+            missing_hint: None,
+        }
+    }
+
+    fn range(min: usize, max: usize) -> Self {
+        Self {
+            positional: PositionalArity::Range(min, max),
+            ..Self::exact(0)
+        }
+    }
+
+    fn any() -> Self {
+        Self {
+            positional: PositionalArity::Any,
+            ..Self::exact(0)
+        }
+    }
+
+    fn with_keywords(mut self, keywords: &'static [&'static str]) -> Self {
+        self.keywords = keywords;
+        self
+    }
+
+    fn with_positional_keyword_conflicts(
+        mut self,
+        conflicts: &'static [(&'static str, usize)],
+    ) -> Self {
+        self.positional_keyword_conflicts = conflicts;
+        self
+    }
+
+    fn with_missing_hint(mut self, hint: &'static str) -> Self {
+        self.missing_hint = Some(hint);
+        self
+    }
+
+    fn requiring_block(mut self) -> Self {
+        self.block = BlockPolicy::Required;
+        self
+    }
+}
+
+fn validate_call_contract(
+    name: &str,
+    positional_len: usize,
+    kwargs: &BTreeMap<String, Value>,
+    block: Option<&Block>,
+    contract: CallContract,
+) -> Result<(), Box<dyn Error>> {
+    // Check this before arity/type checks so a call which supplies the same
+    // option in two ways always gets the actionable duplicate-argument error.
+    for (keyword, position) in contract.positional_keyword_conflicts {
+        if positional_len > *position && kwargs.contains_key(*keyword) {
+            return Err(format!(
+                "duplicate argument {keyword}: specified both positionally and as a keyword"
+            )
+            .into());
+        }
+    }
+
+    match contract.positional {
+        PositionalArity::Any => {}
+        PositionalArity::Exact(expected) => {
+            if positional_len < expected {
+                let hint = contract
+                    .missing_hint
+                    .map(|hint| format!(" ({hint})"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "{name} is missing positional arguments: expected {expected}, got {positional_len}{hint}"
+                )
+                .into());
+            }
+            if positional_len > expected {
+                return Err(too_many_positional_error(
+                    name,
+                    expected,
+                    positional_len,
+                    true,
+                ));
+            }
+        }
+        PositionalArity::Range(min, max) => {
+            if positional_len < min {
+                return Err(format!(
+                    "{name} expects at least {min} positional arguments, got {positional_len}"
+                )
+                .into());
+            }
+            if positional_len > max {
+                return Err(too_many_positional_error(name, max, positional_len, false));
+            }
+        }
+    }
+
+    let unknown: Vec<&str> = kwargs
+        .keys()
+        .filter(|key| {
+            !contract
+                .keywords
+                .iter()
+                .any(|allowed| allowed == &key.as_str())
+        })
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!("unknown keyword arguments: {}", unknown.join(", ")).into());
+    }
+
+    match (contract.block, block) {
+        (BlockPolicy::Forbidden, Some(_)) => {
+            return Err(format!("{name} does not take a block (block is not allowed)").into());
+        }
+        (BlockPolicy::Required, None) => {
+            return Err(format!("{name} requires {{ ... }} block").into());
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn too_many_positional_error(
+    name: &str,
+    expected: usize,
+    actual: usize,
+    exact: bool,
+) -> Box<dyn Error> {
+    if expected == 0 {
+        // Keep the long-standing array-method wording while making the
+        // contract failure explicit for new callers and diagnostics.
+        format!(
+            "{name} does not take arguments: too many positional arguments (expected 0, got {actual})"
+        )
+        .into()
+    } else {
+        let expectation = if exact { "exactly" } else { "at most" };
+        format!(
+            "too many positional arguments for {name} (expected {expectation} {expected}, got {actual})"
+        )
+        .into()
+    }
+}
+
+fn unknown_keyword_arguments(kwargs: &BTreeMap<String, Value>) -> Box<dyn Error> {
+    let keys: Vec<&str> = kwargs.keys().map(String::as_str).collect();
+    format!("unknown keyword arguments: {}", keys.join(", ")).into()
+}
+
+/// Contracts for all global builtins.  This is intentionally kept separate
+/// from the dispatch functions so the callable API is visible in one table.
+fn builtin_contract(name: &str) -> CallContract {
+    match name {
+        "puts" | "array" => CallContract::any(),
+        "doc" | "col" | "col_group" | "len" | "timestamp" | "bytes" | "array_union"
+        | "array_remove" | "get" | "delete" => CallContract::exact(1),
+        "increment" => CallContract::exact(1).with_missing_hint("expected int argument"),
+        "update" => CallContract::exact(2),
+        "now" | "server_timestamp" | "delete_field" => CallContract::exact(0),
+        "set" => CallContract::range(2, 3)
+            .with_keywords(&["merge"])
+            .with_positional_keyword_conflicts(&[("merge", 2)]),
+        "batch" | "transaction" => CallContract::exact(0).requiring_block(),
+        "storage_upload" => CallContract::range(2, 3)
+            .with_keywords(&["content_type"])
+            .with_positional_keyword_conflicts(&[("content_type", 2)]),
+        "storage_download" | "storage_metadata" | "storage_delete" => {
+            CallContract::exact(1)
+        }
+        _ => unreachable!("unknown builtin contract: {name}"),
+    }
+}
+
+fn query_method_contract(name: &str) -> Option<CallContract> {
+    match name {
+        "where" => Some(CallContract::exact(3)),
+        "order_by" => Some(CallContract::exact(2)),
+        "limit" | "offset" => Some(CallContract::exact(1)),
+        "count" | "get" => Some(CallContract::exact(0)),
+        _ => None,
+    }
+}
+
+fn bytes_method_contract(name: &str) -> Option<CallContract> {
+    match name {
+        "len" => Some(CallContract::exact(0)),
+        _ => None,
+    }
+}
+
+fn array_method_contract(name: &str) -> Option<CallContract> {
+    match name {
+        "each" => Some(CallContract::exact(0).requiring_block()),
+        "map" => Some(CallContract::exact(0).requiring_block()),
+        "len" => Some(CallContract::exact(0)),
+        _ => None,
+    }
+}
+
+fn timestamp_method_contract(name: &str) -> Option<CallContract> {
+    match name {
+        "to_unix" | "to_rfc3339" => Some(CallContract::exact(0)),
+        "add_seconds" => Some(CallContract::exact(1)),
+        _ => None,
+    }
+}
+
+fn method_contract(receiver: &MethodReceiver, name: &str) -> Option<CallContract> {
+    match receiver {
+        MethodReceiver::Collection(_) if name == "doc" => Some(CallContract::exact(1)),
+        MethodReceiver::Collection(_)
+        | MethodReceiver::CollectionGroup(_)
+        | MethodReceiver::Query(_) => query_method_contract(name),
+        MethodReceiver::Array(_) => array_method_contract(name),
+        MethodReceiver::Timestamp(_) => timestamp_method_contract(name),
+        MethodReceiver::Bytes(_) => bytes_method_contract(name),
+        // `m.key` is map key access rather than a fixed set of methods.  It
+        // still has a strict zero-argument/no-block contract.
+        MethodReceiver::Map(_) => Some(CallContract::exact(0)),
+    }
+}
+
+fn method_call_label(receiver: &MethodReceiver, name: &str) -> String {
+    match receiver {
+        MethodReceiver::Collection(_) if name == "doc" => format!("collection method {name}"),
+        MethodReceiver::Collection(_)
+        | MethodReceiver::CollectionGroup(_)
+        | MethodReceiver::Query(_) => format!("query method {name}"),
+        MethodReceiver::Array(_) => format!("array method {name}"),
+        MethodReceiver::Timestamp(_) => format!("timestamp method {name}"),
+        MethodReceiver::Bytes(_) => format!("bytes method {name}"),
+        MethodReceiver::Map(_) => format!("map key access {name}"),
+    }
+}
+
+fn validate_method_call(
+    receiver: &MethodReceiver,
+    name: &str,
+    positional_len: usize,
+    kwargs: &BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(contract) = method_contract(receiver, name) {
+        return validate_call_contract(
+            &method_call_label(receiver, name),
+            positional_len,
+            kwargs,
+            block,
+            contract,
+        );
+    }
+
+    // Even an unknown method must not silently accept keyword arguments or a
+    // block.  The eventual dispatch error (unknown method / unsupported
+    // receiver) is returned only after these contract-level mistakes.
+    if !kwargs.is_empty() {
+        return Err(unknown_keyword_arguments(kwargs));
+    }
+    if block.is_some() {
+        return Err(format!(
+            "{} does not take a block (block is not allowed)",
+            method_call_label(receiver, name)
+        )
+        .into());
+    }
+    Err(match receiver {
+        MethodReceiver::Collection(_)
+        | MethodReceiver::CollectionGroup(_)
+        | MethodReceiver::Query(_) => {
+            format!("unknown query method: {name}").into()
+        }
+        MethodReceiver::Array(_) => format!("unknown array method: {name}").into(),
+        MethodReceiver::Timestamp(_) => format!("unknown timestamp method: {name}").into(),
+        MethodReceiver::Bytes(_) => format!("unknown bytes method: {name}").into(),
+        MethodReceiver::Map(_) => format!("unknown map method: {name}").into(),
+    })
+}
+
 /// ビルトイン関数名の一覧。`lookup_builtin` のテーブルと対応する。
 /// 同名の `fn` 定義は `cannot redefine builtin: <name>` エラーになる。
 const BUILTIN_NAMES: &[&str] = &[
@@ -517,6 +1209,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "len",
     "now",
     "timestamp",
+    "bytes",
     "server_timestamp",
     "array_union",
     "array_remove",
@@ -528,17 +1221,21 @@ const BUILTIN_NAMES: &[&str] = &[
     "delete",
     "batch",
     "transaction",
+    "storage_upload",
+    "storage_download",
+    "storage_metadata",
+    "storage_delete",
 ];
 
-type Builtin<F> = fn(
-    &mut Runtime<F>,
+type Builtin<F, S> = fn(
+    &mut Runtime<F, S>,
     Vec<Value>,
     BTreeMap<String, Value>,
     Option<&Block>,
-) -> Result<Value, Box<dyn Error>>;
+) -> Result<ExecFlow, Box<dyn Error>>;
 
 /// ビルトインの対応テーブル。
-fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 19] {
+fn builtin_entries<F: Firestore, S: Storage>() -> [(&'static str, Builtin<F, S>); 24] {
     [
         ("puts", builtin_puts),
         ("doc", builtin_doc),
@@ -548,6 +1245,7 @@ fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 19] {
         ("len", builtin_len),
         ("now", builtin_now),
         ("timestamp", builtin_timestamp),
+        ("bytes", builtin_bytes),
         ("server_timestamp", builtin_server_timestamp),
         ("array_union", builtin_array_union),
         ("array_remove", builtin_array_remove),
@@ -559,12 +1257,16 @@ fn builtin_entries<F: Firestore>() -> [(&'static str, Builtin<F>); 19] {
         ("delete", builtin_delete),
         ("batch", builtin_batch),
         ("transaction", builtin_transaction),
+        ("storage_upload", builtin_storage_upload),
+        ("storage_download", builtin_storage_download),
+        ("storage_metadata", builtin_storage_metadata),
+        ("storage_delete", builtin_storage_delete),
     ]
 }
 
 /// ビルトインのテーブル引き。
-fn lookup_builtin<F: Firestore>(name: &str) -> Option<Builtin<F>> {
-    builtin_entries::<F>()
+fn lookup_builtin<F: Firestore, S: Storage>(name: &str) -> Option<Builtin<F, S>> {
+    builtin_entries::<F, S>()
         .into_iter()
         .find(|(n, _)| *n == name)
         .map(|(_, f)| f)
@@ -574,153 +1276,330 @@ fn is_builtin_name(name: &str) -> bool {
     BUILTIN_NAMES.contains(&name)
 }
 
-fn builtin_puts<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_puts<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     for v in args {
         println!("{v}");
     }
-    Ok(Value::Nil)
+    Ok(ExecFlow::Value(Value::Nil))
 }
 
-fn builtin_doc<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_doc<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_string(args.first())?;
     validate_doc_path(path)?;
-    Ok(Value::DocRef(DocRef {
+    Ok(ExecFlow::Value(Value::DocRef(DocRef {
         path: path.to_string(),
-    }))
+    })))
 }
 
-fn builtin_col<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_col<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_string(args.first())?;
     validate_collection_path(path)?;
-    Ok(Value::CollectionRef(CollectionRef {
+    Ok(ExecFlow::Value(Value::CollectionRef(CollectionRef {
         path: path.to_string(),
-    }))
+    })))
 }
 
-fn builtin_col_group<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_col_group<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let id = expect_string(args.first())?;
-    if id.is_empty() || id.contains('/') {
-        return Err(format!("invalid collection group id: {id}").into());
-    }
-    Ok(Value::CollectionGroupRef(CollectionGroupRef {
-        id: id.to_string(),
-    }))
+    validate_collection_group_id(id)?;
+    Ok(ExecFlow::Value(Value::CollectionGroupRef(
+        CollectionGroupRef { id: id.to_string() },
+    )))
 }
 
-fn builtin_array<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_array<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::Array(args))
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::Array(args)))
 }
 
-fn builtin_len<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_len<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     match args.first() {
-        Some(Value::Array(a)) => Ok(Value::Int(a.len() as i64)),
-        Some(Value::Map(m)) => Ok(Value::Int(m.len() as i64)),
-        Some(Value::Str(s)) => Ok(Value::Int(s.chars().count() as i64)),
-        _ => Err("len expects array, map, or string".into()),
+        Some(Value::Array(a)) => Ok(ExecFlow::Value(Value::Int(a.len() as i64))),
+        Some(Value::Map(m)) => Ok(ExecFlow::Value(Value::Int(m.len() as i64))),
+        Some(Value::Str(s)) => Ok(ExecFlow::Value(Value::Int(s.chars().count() as i64))),
+        Some(Value::Bytes(bytes)) => Ok(ExecFlow::Value(Value::Int(bytes.len() as i64))),
+        _ => Err("len expects array, map, string, or bytes".into()),
     }
 }
 
-fn builtin_now<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_now<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::Timestamp(Timestamp::now()?))
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::Timestamp(Timestamp::now()?)))
 }
 
-fn builtin_timestamp<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_timestamp<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::Timestamp(Timestamp {
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::Timestamp(Timestamp {
         seconds: parse_timestamp_arg(args.first())?,
-    }))
+    })))
 }
 
-fn builtin_server_timestamp<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_bytes<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    if args.len() != 1 || !kwargs.is_empty() || block.is_some() {
+        return Err(BYTES_USAGE.into());
+    }
+    // `args.len() == 1` は上で保証されているので `next()` は必ず `Some`。
+    // 取り出しを下の `match` にまとめ、到達不能な `ok_or` 分岐を作らない。
+    let bytes = match args.into_iter().next() {
+        Some(Value::Str(s)) => s.into_bytes(),
+        Some(Value::Array(items)) => items
+            .into_iter()
+            .map(|value| match value {
+                Value::Int(byte) => u8::try_from(byte).map_err(|_| BYTES_ELEMENT_ERR.to_string()),
+                _ => Err(BYTES_ELEMENT_ERR.to_string()),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(BYTES_USAGE.into()),
+    };
+    Ok(ExecFlow::Value(Value::Bytes(bytes)))
+}
+
+fn builtin_server_timestamp<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::ServerTimestamp)
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::ServerTimestamp))
 }
 
-fn builtin_array_union<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_array_union<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::ArrayUnion(expect_array(args.first())?.clone()))
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::ArrayUnion(
+        expect_array(args.first())?.clone(),
+    )))
 }
 
-fn builtin_array_remove<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_array_remove<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::ArrayRemove(expect_array(args.first())?.clone()))
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::ArrayRemove(
+        expect_array(args.first())?.clone(),
+    )))
 }
 
-fn builtin_delete_field<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_delete_field<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::DeleteField)
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::DeleteField))
 }
 
-fn builtin_increment<F: Firestore>(
-    _rt: &mut Runtime<F>,
+fn builtin_increment<F: Firestore, S: Storage>(
+    _rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
-    Ok(Value::Increment(expect_int(args.first())?))
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::Increment(expect_int(args.first())?)))
 }
 
-fn builtin_get<F: Firestore>(
-    rt: &mut Runtime<F>,
+fn builtin_storage_upload<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    forbid_storage_in_batch_or_transaction(rt)?;
+    reject_unknown_kwargs("storage_upload", &kwargs, &["content_type"])?;
+    if args.len() > 3 {
+        return Err("storage_upload expects path, bytes, and optional content_type".into());
+    }
+    let path = expect_storage_path(args.first())?;
+    let content = expect_storage_bytes(args.get(1))?;
+    let content_type = match (args.get(2), kwargs.get("content_type")) {
+        (Some(Value::Str(value)), None) => value.as_str(),
+        (None, Some(Value::Str(value))) => value.as_str(),
+        (None, None) => "application/octet-stream",
+        (Some(_), Some(_)) => {
+            return Err(
+                "storage_upload received content_type twice (positional and keyword)".into(),
+            )
+        }
+        (Some(_), None) => return Err("storage_upload content_type must be a string".into()),
+        (None, Some(_)) => return Err("storage_upload content_type must be a string".into()),
+    };
+    validate_storage_path(path)?;
+    validate_content_type(content_type)?;
+    rt.storage
+        .upload(path, content, content_type)
+        .map(|metadata| ExecFlow::Value(metadata.to_value()))
+        .map_err(backend_err)
+}
+
+fn builtin_storage_download<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    forbid_storage_in_batch_or_transaction(rt)?;
+    reject_storage_kwargs("storage_download", &kwargs)?;
+    expect_storage_arity("storage_download", &args, 1)?;
+    let path = expect_storage_path(args.first())?;
+    validate_storage_path(path)?;
+    rt.storage
+        .download(path)
+        .map(|bytes| ExecFlow::Value(Value::Bytes(bytes)))
+        .map_err(backend_err)
+}
+
+fn builtin_storage_metadata<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    forbid_storage_in_batch_or_transaction(rt)?;
+    reject_storage_kwargs("storage_metadata", &kwargs)?;
+    expect_storage_arity("storage_metadata", &args, 1)?;
+    let path = expect_storage_path(args.first())?;
+    validate_storage_path(path)?;
+    rt.storage
+        .metadata(path)
+        .map(|metadata| ExecFlow::Value(metadata.to_value()))
+        .map_err(backend_err)
+}
+
+fn builtin_storage_delete<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    forbid_storage_in_batch_or_transaction(rt)?;
+    reject_storage_kwargs("storage_delete", &kwargs)?;
+    expect_storage_arity("storage_delete", &args, 1)?;
+    let path = expect_storage_path(args.first())?;
+    validate_storage_path(path)?;
+    rt.storage.delete(path).map_err(backend_err)?;
+    Ok(ExecFlow::Value(Value::Nil))
+}
+
+fn forbid_storage_in_batch_or_transaction<F: Firestore, S: Storage>(
+    rt: &Runtime<F, S>,
+) -> Result<(), Box<dyn Error>> {
+    match rt.exec {
+        ExecCtx::Batch { .. } => Err("storage APIs are not allowed inside batch".into()),
+        ExecCtx::Transaction { .. } => {
+            Err("storage APIs are not allowed inside transaction".into())
+        }
+        ExecCtx::Normal => Ok(()),
+    }
+}
+
+fn reject_storage_kwargs(
+    name: &str,
+    kwargs: &BTreeMap<String, Value>,
+) -> Result<(), Box<dyn Error>> {
+    if kwargs.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{name} does not take keyword arguments").into())
+    }
+}
+
+fn reject_unknown_kwargs(
+    name: &str,
+    kwargs: &BTreeMap<String, Value>,
+    allowed: &[&str],
+) -> Result<(), Box<dyn Error>> {
+    let unknown: Vec<&str> = kwargs
+        .keys()
+        .filter(|key| !allowed.contains(&key.as_str()))
+        .map(String::as_str)
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name} received unknown keyword arguments: {}",
+            unknown.join(", ")
+        )
+        .into())
+    }
+}
+
+fn expect_storage_arity(name: &str, args: &[Value], expected: usize) -> Result<(), Box<dyn Error>> {
+    if args.len() == expected {
+        Ok(())
+    } else {
+        Err(format!("{name} expects {expected} argument(s), got {}", args.len()).into())
+    }
+}
+
+fn expect_storage_path(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
+    match v {
+        Some(Value::Str(path)) => Ok(path),
+        _ => Err("storage API expects an object path string".into()),
+    }
+}
+
+fn expect_storage_bytes(v: Option<&Value>) -> Result<&[u8], Box<dyn Error>> {
+    match v {
+        Some(Value::Bytes(bytes)) => Ok(bytes),
+        Some(_) => Err("storage_upload expects bytes(...) content".into()),
+        None => Err("storage_upload requires bytes(...) content".into()),
+    }
+}
+
+fn builtin_get<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_doc_path(args.first())?;
     let v = match &rt.exec {
         ExecCtx::Batch { .. } => {
@@ -736,15 +1615,15 @@ fn builtin_get<F: Firestore>(
             .unwrap_or(Value::Nil),
         ExecCtx::Normal => rt.fs.get(path).map_err(backend_err)?.unwrap_or(Value::Nil),
     };
-    Ok(v)
+    Ok(ExecFlow::Value(v))
 }
 
-fn builtin_set<F: Firestore>(
-    rt: &mut Runtime<F>,
+fn builtin_set<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_doc_path(args.first())?.to_string();
     let data = expect_map(args.get(1))?.clone();
     let merge = match (args.get(2), kwargs.get("merge")) {
@@ -754,38 +1633,38 @@ fn builtin_set<F: Firestore>(
         _ => return Err("set merge must be bool".into()),
     };
     rt.dispatch_write(WriteOp::Set { path, data, merge })?;
-    Ok(Value::Nil)
+    Ok(ExecFlow::Value(Value::Nil))
 }
 
-fn builtin_update<F: Firestore>(
-    rt: &mut Runtime<F>,
+fn builtin_update<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_doc_path(args.first())?.to_string();
     let data = expect_map(args.get(1))?.clone();
     rt.dispatch_write(WriteOp::Update { path, data })?;
-    Ok(Value::Nil)
+    Ok(ExecFlow::Value(Value::Nil))
 }
 
-fn builtin_delete<F: Firestore>(
-    rt: &mut Runtime<F>,
+fn builtin_delete<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
     args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     _block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_doc_path(args.first())?.to_string();
     rt.dispatch_write(WriteOp::Delete { path })?;
-    Ok(Value::Nil)
+    Ok(ExecFlow::Value(Value::Nil))
 }
 
-fn builtin_batch<F: Firestore>(
-    rt: &mut Runtime<F>,
+fn builtin_batch<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let Some(stmts) = block else {
         return Err("batch requires { ... } block".into());
     };
@@ -798,15 +1677,15 @@ fn builtin_batch<F: Firestore>(
     let (flow, writes) = rt.run_staged_block(ExecCtx::Batch { writes: vec![] }, &stmts.body);
     let flow = flow?;
     rt.fs.apply(writes).map_err(backend_err)?;
-    Ok(flow.into_value())
+    Ok(flow)
 }
 
-fn builtin_transaction<F: Firestore>(
-    rt: &mut Runtime<F>,
+fn builtin_transaction<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
     _args: Vec<Value>,
     _kwargs: BTreeMap<String, Value>,
     block: Option<&Block>,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<ExecFlow, Box<dyn Error>> {
     let Some(stmts) = block else {
         return Err("transaction requires { ... } block".into());
     };
@@ -816,21 +1695,23 @@ fn builtin_transaction<F: Firestore>(
     if !matches!(rt.exec, ExecCtx::Normal) {
         return Err("transaction cannot be nested inside batch/transaction".into());
     }
+    // A previous transaction may have left the backend with an open
+    // transaction because its rollback failed. Clear it before starting a
+    // new one, otherwise the begin below fails forever.
+    rt.retry_pending_rollback();
     rt.fs.begin_transaction().map_err(backend_err)?;
     let (flow, writes) = rt.run_staged_block(ExecCtx::Transaction { writes: vec![] }, &stmts.body);
     match flow {
         Ok(flow) => {
             if let Err(e) = rt.fs.commit_transaction(writes) {
-                let _ = rt.fs.abort_transaction();
+                rt.abort_transaction_best_effort();
                 return Err(backend_err(e));
             }
-            Ok(flow.into_value())
+            Ok(flow)
         }
         Err(e) => {
-            // Rollback は best-effort: 元のブロックエラーを優先し、
-            // rollback 自体の失敗は無視する(サーバ側タイムアウトが
-            // 最終的な後ろ盾になる)。
-            let _ = rt.fs.abort_transaction();
+            // Preserve the block error if rollback also fails.
+            rt.abort_transaction_best_effort();
             Err(e)
         }
     }
@@ -896,13 +1777,83 @@ fn expect_doc_path(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
             validate_doc_path(s)?;
             Ok(s)
         }
-        Some(Value::DocRef(d)) => Ok(&d.path),
+        Some(Value::DocRef(d)) => {
+            // DocRef は通常 doc() / col().doc() で作られ、その時点で検証済み。
+            // 外部から渡された値でも同じ runtime 制約を適用する。
+            validate_doc_path(&d.path)?;
+            Ok(&d.path)
+        }
         _ => Err("expected document path string or doc object".into()),
     }
 }
 
+/// Firestore の document / collection ID は UTF-8 バイト数で 1,500 以下。
+/// Rust の `str::len()` は文字数ではなく UTF-8 のバイト数を返すため、
+/// 日本語などの ID でも Firestore と同じ単位で判定できる。
+const MAX_FIRESTORE_ID_BYTES: usize = 1_500;
+
+/// 単一 ID 引数(`col().doc()` / `col_group()`)を検証する。
+fn validate_document_id(id: &str) -> Result<(), Box<dyn Error>> {
+    validate_standalone_id(id, "document id")
+}
+
+fn validate_collection_group_id(id: &str) -> Result<(), Box<dyn Error>> {
+    validate_standalone_id(id, "collection group id")
+}
+
+fn validate_standalone_id(id: &str, kind: &str) -> Result<(), Box<dyn Error>> {
+    // 空文字と `/` は既存の error format を保ちつつ、他の ID 制約も同じ
+    // runtime エラーにする。
+    if id.is_empty() || id.contains('/') {
+        return Err(format!("invalid {kind}: {id}").into());
+    }
+    if let Err(reason) = validate_firestore_id(id) {
+        return Err(format!("invalid {kind}: {id} ({reason})").into());
+    }
+    Ok(())
+}
+
+/// Firestore の ID 固有の制約。パス上のセグメントと単一 ID 引数で共有する。
+///
+/// spec §6 の通り、document ID と collection ID で制約は同一。予約パターン
+/// `__.*__` の検査も document だけを対象にせず両方に適用する(片方だけだと
+/// `col("__meta__")` が通るが `doc("users/__x__")` は弾くというズレが
+/// in-memory / emulator の食い違いの原因になる)。
+fn validate_firestore_id(id: &str) -> Result<(), &'static str> {
+    if id.is_empty() {
+        return Err("must not be empty");
+    }
+    if id.contains('/') {
+        return Err("must not contain '/'");
+    }
+    if id.len() > MAX_FIRESTORE_ID_BYTES {
+        return Err("must be at most 1,500 UTF-8 bytes");
+    }
+    if id == "." || id == ".." {
+        return Err("must not be \".\" or \"..\"");
+    }
+    if is_reserved_firestore_id(id) {
+        return Err("must not match the reserved pattern __.*__");
+    }
+    Ok(())
+}
+
+/// Firestore の予約 ID 正規表現 `^__.*__$` 相当。
+///
+/// Datastore 由来の数値 ID(`__id123__` 形式)は既存ドキュメントの参照として
+/// 扱うため例外とする。クエリや参照フィールドで返されたドキュメントを
+/// `get` / `update` / `delete` に渡せなくなるのを避ける。
+fn is_reserved_firestore_id(id: &str) -> bool {
+    if id.len() >= 4 && id.starts_with("__") && id.ends_with("__") {
+        return !is_legacy_datastore_numeric_id(id);
+    }
+    false
+}
+
+
 /// ドキュメントパスは偶数個・コレクションパスは奇数個の非空セグメントで
 /// 構成されていなければならない(`users/1`、`teams/t1/members`)。
+/// 各セグメントは Firestore の document / collection ID 制約も満たす。
 /// runtime 層で検証するため、in-memory / emulator のどちらのバックエンド
 /// でも同じエラーになる。
 fn validate_doc_path(path: &str) -> Result<(), Box<dyn Error>> {
@@ -926,6 +1877,24 @@ fn validate_path(path: &str, collection: bool) -> Result<(), Box<dyn Error>> {
             "invalid {kind} path: {path} (expected an {expected} number of segments)"
         )
         .into());
+    }
+
+    let path_kind = if collection { "collection" } else { "document" };
+    for (index, segment) in segments.iter().enumerate() {
+        // 偶数番目は collection ID、奇数番目は document ID。ID 制約自体は
+        // 両者で同一(spec §6)だが、エラー文でどのセグメントが不正かを
+        // 区別するため id_kind は残す。
+        let id_kind = if index % 2 == 0 {
+            "collection"
+        } else {
+            "document"
+        };
+        if let Err(reason) = validate_firestore_id(segment) {
+            return Err(format!(
+                "invalid {path_kind} path: {path} (segment {segment:?} is an invalid {id_kind} id: {reason})"
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -1019,14 +1988,23 @@ fn lookup_field_path<'a>(
     None
 }
 
+/// Convert an array index to the host index type. Generic over `T` so a test
+/// can instantiate a narrower target width on a 64-bit host and exercise the
+/// real `TryFrom` conversion rather than a test-only limit check. Production
+/// always uses `usize`.
+fn checked_array_index<T: TryFrom<i64>>(index: i64) -> Option<T> {
+    T::try_from(index).ok()
+}
+
 fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {
     match (base, index) {
         (Value::Map(map), Value::Str(key)) => Ok(map.get(&key).cloned().unwrap_or(Value::Nil)),
         (Value::Array(items), Value::Int(i)) => {
-            if i < 0 {
-                return Ok(Value::Nil);
-            }
-            Ok(items.get(i as usize).cloned().unwrap_or(Value::Nil))
+            let index = match checked_array_index::<usize>(i) {
+                Some(index) => index,
+                None => return Ok(Value::Nil),
+            };
+            Ok(items.get(index).cloned().unwrap_or(Value::Nil))
         }
         (Value::Map(_), _) => Err("map index must be a string".into()),
         (Value::Array(_), _) => Err("array index must be an int".into()),
@@ -1066,21 +2044,25 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
         BinOp::Gt => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a > b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds > b.seconds),
+            (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a > b),
             _ => return Err("unsupported > operands".into()),
         },
         BinOp::Lt => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a < b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds < b.seconds),
+            (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a < b),
             _ => return Err("unsupported < operands".into()),
         },
         BinOp::Ge => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a >= b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds >= b.seconds),
+            (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a >= b),
             _ => return Err("unsupported >= operands".into()),
         },
         BinOp::Le => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a <= b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds <= b.seconds),
+            (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a <= b),
             _ => return Err("unsupported <= operands".into()),
         },
         // `eval_expr` 側で短絡評価するため、ここに来るのは両辺評価済みの場合のみ。
@@ -1165,6 +2147,29 @@ impl ExecFlow {
 mod tests {
     use super::*;
     use crate::firestore::InMemoryFirestore;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn array_index_conversion_respects_target_width() {
+        // A 64-bit host would accept 2^32 as a usize index, so instantiate the
+        // conversion at the narrower width to prove the narrowing is rejected
+        // by a real `TryFrom` and not only by a host-specific bound.
+        assert_eq!(
+            checked_array_index::<u32>(4_294_967_295),
+            Some(4_294_967_295)
+        );
+        assert_eq!(checked_array_index::<u32>(4_294_967_296), None);
+        assert_eq!(checked_array_index::<u32>(4_294_967_297), None);
+        assert_eq!(checked_array_index::<u32>(-1), None);
+        assert_eq!(checked_array_index::<u16>(65_536), None);
+        assert_eq!(checked_array_index::<usize>(0), Some(0));
+        // The host width still accepts the full i64 range that fits it.
+        assert_eq!(
+            checked_array_index::<usize>(i64::MAX),
+            Some(i64::MAX as usize)
+        );
+        assert_eq!(checked_array_index::<usize>(-1), None);
+    }
 
     #[test]
     fn builtin_table_matches_name_list() {
@@ -1173,7 +2178,7 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), BUILTIN_NAMES.len(), "duplicate builtin names");
-        for (name, _) in builtin_entries::<InMemoryFirestore>() {
+        for (name, _) in builtin_entries::<InMemoryFirestore, InMemoryStorage>() {
             assert!(
                 is_builtin_name(name),
                 "{name} is implemented but missing from BUILTIN_NAMES"
@@ -1181,18 +2186,20 @@ mod tests {
         }
         for name in BUILTIN_NAMES {
             assert!(
-                lookup_builtin::<InMemoryFirestore>(name).is_some(),
+                lookup_builtin::<InMemoryFirestore, InMemoryStorage>(name).is_some(),
                 "{name} is listed but has no implementation"
             );
             assert!(is_builtin_name(name));
         }
         assert!(!is_builtin_name("undefined_fn"));
-        assert!(lookup_builtin::<InMemoryFirestore>("undefined_fn").is_none());
+        assert!(lookup_builtin::<InMemoryFirestore, InMemoryStorage>("undefined_fn").is_none());
     }
 
     struct FailingCommitFirestore {
         in_tx: bool,
         aborted: bool,
+        abort_calls: usize,
+        abort_failures_remaining: usize,
     }
 
     impl Firestore for FailingCommitFirestore {
@@ -1222,31 +2229,193 @@ mod tests {
             Err("commit failed".into())
         }
         fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+            self.abort_calls += 1;
+            if !self.in_tx {
+                return Ok(());
+            }
+            if self.abort_failures_remaining > 0 {
+                self.abort_failures_remaining -= 1;
+                return Err("abort failed".into());
+            }
             self.in_tx = false;
             self.aborted = true;
             Ok(())
         }
     }
 
-    #[test]
-    fn transaction_aborts_on_commit_failure() {
-        let fs = FailingCommitFirestore {
-            in_tx: false,
-            aborted: false,
-        };
-        let mut runtime = Runtime::new(fs);
-        let res = runtime.eval_program(&[Stmt::Expr(Expr::Call {
+    fn empty_transaction_stmt() -> Stmt {
+        Stmt::Expr(Expr::Call {
             receiver: None,
             name: "transaction".into(),
             args: vec![],
-            kwargs: vec![],
             block: Some(Block {
                 params: vec![],
                 body: vec![],
             }),
-        })]);
+        })
+    }
+
+    fn failing_commit_runtime(abort_failures_remaining: usize) -> Runtime<FailingCommitFirestore> {
+        Runtime::new(FailingCommitFirestore {
+            in_tx: false,
+            aborted: false,
+            abort_calls: 0,
+            abort_failures_remaining,
+        })
+    }
+
+    #[test]
+    fn transaction_aborts_on_commit_failure() {
+        let mut runtime = failing_commit_runtime(0);
+        let res = runtime.eval_program(&[empty_transaction_stmt()]);
         assert!(res.is_err());
+        assert_eq!(runtime.fs.abort_calls, 1);
         assert!(runtime.fs.aborted);
         assert!(!runtime.fs.in_tx);
+    }
+
+    #[test]
+    fn transaction_keeps_commit_error_when_abort_also_fails() {
+        let mut runtime = failing_commit_runtime(1);
+        let err = runtime
+            .eval_program(&[empty_transaction_stmt()])
+            .unwrap_err();
+        assert_eq!(err.to_string(), "commit failed");
+        assert_eq!(runtime.fs.abort_calls, 1);
+        // A failed rollback leaves the transaction available for retry.
+        assert!(runtime.fs.in_tx);
+    }
+
+    #[test]
+    fn transaction_keeps_block_error_when_abort_also_fails() {
+        let mut runtime = failing_commit_runtime(1);
+        let err = runtime.run("transaction { undefined_var }").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("undefined variable: undefined_var"));
+        assert_eq!(runtime.fs.abort_calls, 1);
+        assert!(runtime.fs.in_tx);
+    }
+
+    #[test]
+    fn next_transaction_retries_a_failed_rollback() {
+        // Only the first rollback fails, so the retry before the next
+        // `transaction` block succeeds and the block reaches commit instead of
+        // failing with "already in transaction".
+        let mut runtime = failing_commit_runtime(1);
+        assert!(runtime.eval_program(&[empty_transaction_stmt()]).is_err());
+        assert!(runtime.fs.in_tx);
+        assert!(runtime.pending_rollback);
+
+        // The fake commit always fails, so this run still errors — but with
+        // the commit error, which proves the stale transaction was cleared
+        // before `begin_transaction`.
+        let err = runtime
+            .eval_program(&[empty_transaction_stmt()])
+            .unwrap_err();
+        assert_eq!(err.to_string(), "commit failed");
+        // Abort calls: the failed transaction's rollback, the retry before the
+        // new begin, and the rollback after this commit failed too.
+        assert_eq!(runtime.fs.abort_calls, 3);
+        assert!(!runtime.fs.in_tx);
+    }
+
+    #[test]
+    fn transaction_reports_backend_still_busy_when_rollback_keeps_failing() {
+        // Every rollback fails, so the retry cannot clear the state. The next
+        // block must still surface an honest error instead of succeeding.
+        let mut runtime = failing_commit_runtime(usize::MAX);
+        assert!(runtime.eval_program(&[empty_transaction_stmt()]).is_err());
+        let err = runtime
+            .eval_program(&[empty_transaction_stmt()])
+            .unwrap_err();
+        assert!(err.to_string().contains("already in transaction"), "{err}");
+        assert!(runtime.pending_rollback);
+    }
+
+    #[test]
+    fn transaction_abort_can_be_retried() {
+        let mut runtime = failing_commit_runtime(1);
+        runtime.fs.begin_transaction().unwrap();
+        assert_eq!(
+            runtime.fs.abort_transaction().unwrap_err().to_string(),
+            "abort failed"
+        );
+        assert!(runtime.fs.in_tx);
+        runtime.fs.abort_transaction().unwrap();
+        assert!(!runtime.fs.in_tx);
+        runtime.fs.begin_transaction().unwrap();
+    }
+
+    struct PanicQueryFirestore;
+
+    impl Firestore for PanicQueryFirestore {
+        fn get(&self, _path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+            Ok(None)
+        }
+        fn apply(&mut self, _writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+        fn run_query(
+            &self,
+            _query: &QueryRef,
+        ) -> Result<crate::firestore::QueryCandidates, Box<dyn Error>> {
+            panic!("query panic")
+        }
+        fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+        fn transaction_get(&self, _path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+            Ok(None)
+        }
+        fn commit_transaction(&mut self, _writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+        fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn scope_guards_restore_after_binding_error() {
+        let mut runtime = Runtime::new(InMemoryFirestore::default());
+        runtime.scopes.push(std::collections::HashMap::from([(
+            "caller".to_string(),
+            Value::Int(7),
+        )]));
+
+        {
+            let scope = ScopeGuard::function(&mut runtime);
+            scope.runtime.set_var("param", Value::Int(1)).unwrap();
+            assert!(scope.runtime.set_var("param", Value::Int(2)).is_err());
+        }
+        assert_eq!(runtime.get_var("caller"), Some(&Value::Int(7)));
+        assert!(runtime.get_var("param").is_none());
+
+        {
+            let scope = ScopeGuard::block(&mut runtime);
+            scope.runtime.set_var("item", Value::Int(1)).unwrap();
+            assert!(scope.runtime.set_var("item", Value::Int(2)).is_err());
+        }
+        assert_eq!(runtime.get_var("caller"), Some(&Value::Int(7)));
+        assert!(runtime.get_var("item").is_none());
+        runtime.scopes.pop();
+    }
+
+    #[test]
+    fn scope_guards_restore_after_panic_unwind() {
+        let mut runtime = Runtime::new(PanicQueryFirestore);
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            runtime.run("fn f(param) { col(\"things\").get() }\nf(1)")
+        }));
+        assert!(result.is_err());
+        assert!(runtime.run("param").is_err());
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            runtime.run("[1].map { |item| col(\"things\").get() }")
+        }));
+        assert!(result.is_err());
+        assert!(runtime.run("item").is_err());
     }
 }
