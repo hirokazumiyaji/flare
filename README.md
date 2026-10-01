@@ -24,11 +24,27 @@ content = storage_download("avatars/alice.bin")
 - [リリースチェックリスト](docs/release-checklist.md)
 - [過去の MVP 計画資料(アーカイブ)](docs/archive/mvp/)
 
+## 再現可能なビルド
+
+Rust は [`rust-toolchain.toml`](rust-toolchain.toml) で **1.98.1** に固定されています。
+依存関係を更新しない限り、Cargo の依存解決を変更するコマンドには `--locked` を付けてください。CI と CD は同じ toolchain と `Cargo.lock` を使い、runner image も `ubuntu-24.04` に固定しています。
+
+Firestore エミュレータの CI は Node **24.11.0**、Temurin Java **21.0.8**、Firebase CLI **15.31.0** を使い、ジョブログに各バージョンを表示します。
+ローカルでも同じ Firebase CLI を使う場合は、明示的にインストールして `firebase --version` で確認してください。
+
+```bash
+npm install --global firebase-tools@15.31.0
+firebase --version  # 15.31.0 と表示されること
+```
+
+GitHub Actions は full commit SHA で固定されています。
+更新は [Dependabot](.github/dependabot.yml) が Rust 依存関係と Action 更新を別々の pull request で提案します。
+
 ## 使い方
 
 ```bash
 # 既定ビルド(in-memory のみ。emulator SDK はリンクされない)
-cargo run --bin fl -- path/to/script.fl
+cargo run --locked --bin fl -- path/to/script.fl
 ```
 
 Firestore エミュレータバックエンドは `emulator` feature を明示して有効にします(`FIRESTORE_EMULATOR_HOST` が必須。プロジェクト ID は省略時 `firelang-test`):
@@ -36,7 +52,7 @@ Firestore エミュレータバックエンドは `emulator` feature を明示�
 ```bash
 export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080
 export FIRESTORE_PROJECT_ID=firelang-test
-cargo run --features emulator --bin fl -- --backend emulator path/to/script.fl
+cargo run --locked --features emulator --bin fl -- --backend emulator path/to/script.fl
 ```
 
 エミュレータは Firebase CLI で起動します。
@@ -65,7 +81,7 @@ consumer は `cargo build --no-default-features` でも同じ in-memory API を�
 
 ```bash
 firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang \
-  'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator -- --nocapture'
+  'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --locked -- --nocapture'
 ```
 
 本番 Firestore および本番 Cloud Storage(認証付き)は非対応です。詳細は [仕様のバックエンド](docs/spec.md#12-バックエンド) と [Cloud Storage API](docs/spec.md#15-cloud-storage-api) を参照してください。
@@ -79,7 +95,7 @@ Storage の MVP CRUD は `storage_upload` / `storage_download` / `storage_metada
 ```bash
 export FIREBASE_PROJECT_ID=demo-firelang
 firebase emulators:exec --config firebase.emulators.json --only storage --project demo-firelang \
-  'cargo test --test storage_emulator -- --nocapture'
+  'cargo test --features emulator --test storage_emulator --locked -- --nocapture'
 ```
 
 Firestore と Storage を同時に使う場合は `--only firestore,storage` を指定します。`fl` は `--storage-backend emulator` で `FIREBASE_STORAGE_EMULATOR_HOST` を明示的に要求でき、未指定の `auto` では host があれば Storage emulator、なければ in-memory を使います。`FIREBASE_PROJECT_ID`（未設定時は `GCLOUD_PROJECT` / `FIRESTORE_PROJECT_ID` / `firelang-test`）からバケットを導出します。必要なら `FIREBASE_STORAGE_BUCKET` と、local rules テスト用の明示的な `FIREBASE_STORAGE_AUTH_TOKEN` も設定できます。本番 token の自動取得は MVP の対象外です。
@@ -88,7 +104,7 @@ Auth エミュレータに接続する場合(`FIREBASE_AUTH_EMULATOR_HOST` が�
 ```bash
 export FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099
 export FIREBASE_PROJECT_ID=firelang-test
-cargo run --features emulator --bin fl -- --auth-backend emulator path/to/script.fl
+cargo run --locked --features emulator --bin fl -- --auth-backend emulator path/to/script.fl
 ```
 
 `--backend` と `--auth-backend` は独立で、両方を `emulator` にすると両方のエミュレータへ同時に接続します。**トークンは `inspect` / `puts` / `fl` の出力には現れません**(`AuthSession(user={...}, id_token=<redacted>, refresh_token=<redacted>, expires_at=...)`)。
@@ -97,10 +113,10 @@ cargo run --features emulator --bin fl -- --auth-backend emulator path/to/script
 
 ```bash
 firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang \
-  'FIRESTORE_PROJECT_ID=demo-firelang cargo test --test firestore_emulator -- --nocapture'
+  'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --locked -- --nocapture'
 
 firebase emulators:exec --config firebase.emulators.json --only auth --project demo-firelang \
-  'FIREBASE_PROJECT_ID=demo-firelang cargo test --test auth_emulator -- --nocapture'
+  'FIREBASE_PROJECT_ID=demo-firelang cargo test --features emulator --test auth_emulator --locked -- --nocapture'
 ```
 
 本番 Firestore / 本番 Firebase Authentication への接続は非対応です。詳細は [仕様の 12-13 章](docs/spec.md#12-バックエンド) を参照してください。
@@ -108,28 +124,28 @@ firebase emulators:exec --config firebase.emulators.json --only auth --project d
 ## テスト
 
 ```bash
-cargo test --all-targets            # ユニット + 統合テスト
-cargo test --test example_scripts   # サンプルスクリプト一括実行
-cargo test --test cli               # CLI スモークテスト
-cargo test --test release           # release tag/package の検証
-cargo test --test auth              # Auth の in-memory contract テスト
-cargo test --test firebase_config   # Firebase deploy guard
+cargo test --all-targets --locked            # ユニット + 統合テスト
+cargo test --locked --test example_scripts   # サンプルスクリプト一括実行
+cargo test --locked --test cli               # CLI スモークテスト
+cargo test --locked --test release           # release tag/package の検証
+cargo test --locked --test auth              # Auth の in-memory contract テスト
+cargo test --locked --test firebase_config   # Firebase deploy guard
 
 # 既定 feature なし: in-memory のみ
-cargo check --no-default-features --all-targets
-cargo test --no-default-features --all-targets
+cargo check --locked --no-default-features --all-targets
+cargo test --locked --no-default-features --all-targets
 
 # emulator SDK を有効にしたビルド
-cargo check --features emulator --all-targets
-cargo test --features emulator --all-targets
+cargo check --locked --features emulator --all-targets
+cargo test --locked --features emulator --all-targets
 ```
 
 エミュレータ統合テスト(`firestore_emulator` / `storage_emulator` / `auth_emulator`)は対応する emulator host 変数が未設定なら早期 return でスキップされます。`emulator` feature を有効にして、実際に叩くには上記の `firebase emulators:exec` を使うか、エミュレータ起動後に環境変数を設定して:
 
 ```bash
-cargo test --features emulator --test firestore_emulator -- --nocapture
-cargo test --features emulator --test storage_emulator -- --nocapture   # FIREBASE_STORAGE_EMULATOR_HOST 未設定なら skip
-cargo test --features emulator --test auth_emulator -- --nocapture      # FIREBASE_AUTH_EMULATOR_HOST 未設定なら skip
+cargo test --locked --features emulator --test firestore_emulator -- --nocapture
+cargo test --locked --features emulator --test storage_emulator -- --nocapture   # FIREBASE_STORAGE_EMULATOR_HOST 未設定なら skip
+cargo test --locked --features emulator --test auth_emulator -- --nocapture      # FIREBASE_AUTH_EMULATOR_HOST 未設定なら skip
 ```
 
 `Firestore` / `InMemoryFirestore` / `run_script` は feature に依存せず利用できます。
@@ -139,9 +155,9 @@ cargo test --features emulator --test auth_emulator -- --nocapture      # FIREBA
 
 ## CI / CD (GitHub Actions)
 
-- **`test` ジョブ**: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --all-targets`, `cargo build --release --bin fl` を実行
+- **`test` ジョブ**: 固定された Rust toolchain と `Cargo.lock` で `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --all-targets --locked`, `cargo build --release --bin fl --locked` を実行し、tool version をログに出力
 - **`feature-builds` ジョブ**: default / `--no-default-features` / `--features emulator` のビルド境界を検証
-- **`integration-emulator` ジョブ**: Firestore / Storage / Auth エミュレータを起動して各統合テストを実行
+- **`integration-emulator` ジョブ**: Firebase CLI 15.31.0 の Firestore / Storage / Auth エミュレータを起動し、tool version をログに出力してから各統合テストを実行
 - CI は reusable workflow になっており、`v*` タグを押した CD も同じジョブ群（integration test を含む）を必ず実行します。CD の release ジョブはこの gate と tag version check に依存するため、branch CI を飛ばした tag でも公開できません。
 - **CD**: tag の `v` を除いた部分（例: `v0.1.0` → `0.1.0`）が `cargo metadata --no-deps` の `firelang` package version と一致する場合だけ、`fl` の Linux バイナリを `--features emulator` でビルドして release します。
 - release asset は raw binary ではなく `firelang-<version>-linux-x86_64.tar.gz` と SHA-256 `.sha256` sidecar です。tarball には実行権限付きの `fl`、`README.md`、`LICENSE`、`docs/spec.md`、ファイル単位の `SHA256SUMS` が含まれます。
@@ -154,6 +170,7 @@ tar -xzf firelang-0.1.0-linux-x86_64.tar.gz
 (cd firelang-0.1.0-linux-x86_64 && sha256sum -c SHA256SUMS)
 ```
 
+- 同じ release には `tool-versions.txt` も添付されます。Rust/Cargo のバージョン、`Cargo.lock` の SHA-256、runner image、CI が使う Firebase CLI version が記録されています。
 - CI の deploy 用 `firebase.json` が write を拒否することも `integration-emulator` ジョブで確認します。
 
 

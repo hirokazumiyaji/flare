@@ -15,6 +15,11 @@ concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
   cancel-in-progress: false
 
+# This is the Firebase CLI version used by the CI emulator job.  Keep it in
+# sync with ci.yml and record it with every release.
+env:
+  FIREBASE_TOOLS_VERSION: "15.31.0"
+
 jobs:
   quality-gate:
     name: Required CI checks
@@ -25,7 +30,7 @@ jobs:
 
   validate-version:
     name: Validate release tag
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -36,7 +41,10 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
-          toolchain: stable
+          # This action version fails when `toolchain` is empty and has no
+          # rust-toolchain.toml fallback, so keep this equal to the file's channel.
+          toolchain: 1.98.1
+          components: rustfmt, clippy
 
       - name: Validate tag against Cargo metadata
         # validate-release-tag.sh compares the tag with the package version
@@ -52,7 +60,7 @@ jobs:
       - validate-version
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -63,10 +71,35 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
-          toolchain: stable
+          # This action version fails when `toolchain` is empty and has no
+          # rust-toolchain.toml fallback, so keep this equal to the file's channel.
+          toolchain: 1.98.1
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Record build toolchain
+        # Shipped next to the archive so a downloaded release can be traced
+        # back to the exact tool versions and lockfile that produced it.
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          {
+            echo "release_tag=${GITHUB_REF_NAME}"
+            echo "commit=${GITHUB_SHA}"
+            echo "runner_os=${RUNNER_OS}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "image_os=${ImageOS:-unknown}"
+            echo "image_version=${ImageVersion:-unknown}"
+            rustup show active-toolchain
+            echo "rust=$(rustc --version)"
+            echo "cargo=$(cargo --version)"
+            echo "target=x86_64-unknown-linux-gnu"
+            echo "cargo_lock_sha256=$(sha256sum Cargo.lock | awk '{print $1}')"
+            echo "firebase-tools=${FIREBASE_TOOLS_VERSION}"
+          } > dist/tool-versions.txt
+          cat dist/tool-versions.txt
 
       - name: Build release binary
         run: cargo build --release --features emulator --bin fl --locked
@@ -106,6 +139,7 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+            dist/tool-versions.txt
           if-no-files-found: error
 
       - name: Publish GitHub Release assets
@@ -115,5 +149,6 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+            dist/tool-versions.txt
           fail_on_unmatched_files: true
           generate_release_notes: true

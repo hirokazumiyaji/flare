@@ -17,9 +17,14 @@ concurrency:
   group: "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}"
   cancel-in-progress: true
 
+# Keep the Firebase version in sync with docs/release-checklist.md.  The jobs
+# below log their tools so a runner image or tool update is visible in the log.
+env:
+  FIREBASE_TOOLS_VERSION: "15.31.0"
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -28,12 +33,32 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
-          toolchain: stable
+          # This action version fails when `toolchain` is empty and has no
+          # rust-toolchain.toml fallback, so keep this equal to the file's channel.
+          toolchain: 1.98.1
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      - name: Record Rust toolchain
+        run: |
+          set -euo pipefail
+          echo "runner_os=${RUNNER_OS}"
+          echo "runner_arch=${RUNNER_ARCH}"
+          echo "image_os=${ImageOS:-unknown}"
+          echo "image_version=${ImageVersion:-unknown}"
+          rustup show active-toolchain
+          rustc --version --verbose
+          cargo --version --verbose
+          echo "cargo_lock_sha256=$(sha256sum Cargo.lock | awk '{print $1}')"
+
+      - name: Verify locked dependency graph
+        run: cargo metadata --locked --no-deps --format-version 1 >/dev/null
+
       - name: Format check
+        # cargo fmt has no dependency resolver; the --locked metadata check above
+        # is the lockfile gate for this step.
         run: cargo fmt --check
 
       - name: Clippy
@@ -63,7 +88,7 @@ jobs:
   # Keep the optional dependency boundary covered in CI.  The default build
   # is in-memory-only; `emulator` is the explicit opt-in build.
   feature-builds:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
@@ -87,26 +112,29 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
-          toolchain: stable
+          # This action version fails when `toolchain` is empty and has no
+          # rust-toolchain.toml fallback, so keep this equal to the file's channel.
+          toolchain: 1.98.1
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Test ${{ matrix.name }} build
-        run: cargo test --all-targets ${{ matrix.cargo_args }}
+        run: cargo test --all-targets --locked ${{ matrix.cargo_args }}
 
       - name: Lint ${{ matrix.name }} build
-        run: cargo clippy --all-targets ${{ matrix.cargo_args }} -- -D warnings
+        run: cargo clippy --all-targets ${{ matrix.cargo_args }} --locked -- -D warnings
 
       - name: Build release emulator binary
         if: matrix.name == 'emulator'
-        run: cargo build --release --features emulator --bin fl
+        run: cargo build --release --features emulator --bin fl --locked
 
   # Firestore and Storage emulator integration tests.  This job is also run
   # when the workflow is called by CD, so a release cannot skip the emulator
   # suite.
   integration-emulator:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Checkout
@@ -115,21 +143,47 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
-          toolchain: stable
+          # This action version fails when `toolchain` is empty and has no
+          # rust-toolchain.toml fallback, so keep this equal to the file's channel.
+          toolchain: 1.98.1
+          components: rustfmt, clippy
 
       - name: Setup Java
         uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
           distribution: temurin
-          java-version: "21"
+          java-version: "21.0.8"
 
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: "20"
+          node-version: "24.11.0"
 
       - name: Install firebase-tools
-        run: npm install -g firebase-tools@15.31.0
+        run: |
+          set -euo pipefail
+          # Keep this explicit package spec in sync with FIREBASE_TOOLS_VERSION.
+          npm install --global --no-fund --no-audit firebase-tools@15.31.0
+          firebase_cli_version="$(firebase --version)"
+          echo "firebase_cli=${firebase_cli_version}"
+          test "${firebase_cli_version}" = "${FIREBASE_TOOLS_VERSION}"
+
+      - name: Record emulator toolchain
+        run: |
+          set -euo pipefail
+          echo "runner_os=${RUNNER_OS}"
+          echo "runner_arch=${RUNNER_ARCH}"
+          echo "image_os=${ImageOS:-unknown}"
+          echo "image_version=${ImageVersion:-unknown}"
+          rustup show active-toolchain
+          rustc --version --verbose
+          cargo --version --verbose
+          node --version
+          npm --version
+          java -version 2>&1 || true
+          echo "firebase_tools=${FIREBASE_TOOLS_VERSION}"
+          echo "firebase_cli=$(firebase --version)"
+          echo "cargo_lock_sha256=$(sha256sum Cargo.lock | awk '{print $1}')"
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

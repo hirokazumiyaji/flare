@@ -1,0 +1,18 @@
+version: 2
+
+updates:
+  # Keep action pin updates separate from Rust dependency updates so each
+  # change can be reviewed (and, if needed, rolled back) independently.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+
+  # Rust and Firebase CLI versions are changed deliberately in a separate
+  # tool-update change, never as part of a dependency update.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
