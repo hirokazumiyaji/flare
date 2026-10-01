@@ -1,0 +1,9 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /{allPaths=**} {
+      // LOCAL EMULATOR ONLY. Never deploy this file to a remote project.
+      allow read, write: if true;
+    }
+  }
+}

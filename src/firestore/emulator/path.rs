@@ -2,25 +2,89 @@
 
 use std::error::Error;
 
+/// この adapter が接続する database id。
+///
+/// resource name を組み立てる `document_root` / `document_name` /
+/// `parent_path` と、デコード時に resource name を解釈する
+/// `relative_document_name_for` が同じ値を共有する必要がある。ずれると
+/// 参照が `Opaque` に化ける、あるいは正当な document を拒否する。
+pub(super) const DEFAULT_DATABASE_ID: &str = "(default)";
+
+/// `projects/{project_id}/databases/(default)/documents` を返す。
+///
+/// Firestore の reference をローカルの相対パスへ変換するときは、decode 側が
+/// 渡す `resource_root` がこの形と一致している必要がある。decode の呼び出し側は
+/// SDK の `db.get_documents_path()` をそのまま渡すので、この関数が唯一の定義先で
+/// あるこの文字列を `document_name` / `parent_path` にも共有させている。
+pub(super) fn document_root(project_id: &str) -> String {
+    format!("projects/{project_id}/databases/{DEFAULT_DATABASE_ID}/documents")
+}
+
 /// `projects/{project_id}/databases/(default)/documents/{path}` を組み立てる。
 pub(super) fn document_name(project_id: &str, path: &str) -> String {
-    format!("projects/{project_id}/databases/(default)/documents/{path}")
+    format!("{}/{path}", document_root(project_id))
 }
 
 pub(super) fn parent_path(project_id: &str, relative_parent: Option<&str>) -> String {
     match relative_parent {
-        Some(parent) if !parent.is_empty() => {
-            format!("projects/{project_id}/databases/(default)/documents/{parent}")
-        }
-        _ => format!("projects/{project_id}/databases/(default)/documents"),
+        Some(parent) if !parent.is_empty() => document_name(project_id, parent),
+        _ => document_root(project_id),
     }
 }
 
 pub(super) fn relative_document_name(name: &str) -> Result<String, Box<dyn Error>> {
-    let (_, rel) = name
-        .split_once("/documents/")
-        .ok_or("invalid document name")?;
-    Ok(rel.to_string())
+    let (_, _, relative) = parse_resource_name(name)?;
+    Ok(relative.to_string())
+}
+
+pub(super) fn relative_document_name_for(
+    name: &str,
+    project_id: &str,
+    database_id: &str,
+) -> Result<String, Box<dyn Error>> {
+    let (project, database, relative) = parse_resource_name(name)?;
+    if project != project_id || database != database_id {
+        return Err(format!("document belongs to another project/database: {name}").into());
+    }
+    Ok(relative.to_string())
+}
+
+/// `projects/{p}/databases/{db}/documents/{relative}` を 1 回だけ走査して分解する。
+///
+/// 返り値はすべて `name` からの借用で、追加の確保がない。
+/// 相対パスは `documents/` 以降の連続した部分文字列なので、
+/// `splitn(6, '/')` の 6 番目がそのまま相対パスになる(`Vec` への収集と
+/// `join("/")` による再構築が不要になる)。この関数は decode / query の
+/// ホットパスで 1 ドキュメント 1 回・`ReferenceValue` ごとに呼ばれる。
+fn parse_resource_name(name: &str) -> Result<(&str, &str, &str), Box<dyn Error>> {
+    let invalid = || format!("invalid document name: {name}");
+    let mut segments = name.splitn(6, '/');
+    let Some("projects") = segments.next() else {
+        return Err(invalid().into());
+    };
+    let Some(project) = segments.next().filter(|s| !s.is_empty()) else {
+        return Err(invalid().into());
+    };
+    let Some("databases") = segments.next() else {
+        return Err(invalid().into());
+    };
+    let Some(database) = segments.next().filter(|s| !s.is_empty()) else {
+        return Err(invalid().into());
+    };
+    let Some("documents") = segments.next() else {
+        return Err(invalid().into());
+    };
+    // 6 番目は残りの全部(相対パス)。`documents/` が 5 セグメント目に
+    // 固定されているので、ここが相対パスの先頭になる。
+    let relative = segments.next().unwrap_or_default();
+    if relative.is_empty()
+        || relative.split('/').any(|segment| segment.is_empty())
+        // 文書パスは collection/document の 2 セグメント単位。
+        || !relative.split('/').count().is_multiple_of(2)
+    {
+        return Err(invalid().into());
+    }
+    Ok((project, database, relative))
 }
 
 pub(super) fn split_collection_path(path: &str) -> Result<(Option<String>, &str), Box<dyn Error>> {
@@ -42,9 +106,104 @@ mod tests {
     use super::*;
 
     #[test]
+    fn document_root_is_the_single_source_for_every_assembled_path() {
+        // document_name and parent_path must delegate, so a future database-id
+        // change cannot update the query parent but not the read/write target.
+        let root = document_root("p");
+        assert_eq!(root, "projects/p/databases/(default)/documents");
+        assert_eq!(document_name("p", "users/a"), format!("{root}/users/a"));
+        assert_eq!(parent_path("p", None), root);
+        assert_eq!(parent_path("p", Some("")), root);
+        assert_eq!(parent_path("p", Some("users")), format!("{root}/users"));
+    }
+
+    #[test]
     fn split_collection_path_supports_subcollections() {
         let (parent, collection_id) = split_collection_path("teams/t1/members").unwrap();
         assert_eq!(parent.as_deref(), Some("teams/t1"));
         assert_eq!(collection_id, "members");
+    }
+
+    #[test]
+    fn parse_resource_name_borrows_project_and_database() {
+        let (project, database, relative) =
+            parse_resource_name("projects/p1/databases/(default)/documents/teams/t1").unwrap();
+        assert_eq!(project, "p1");
+        assert_eq!(database, DEFAULT_DATABASE_ID);
+        assert_eq!(relative, "teams/t1");
+    }
+
+    #[test]
+    fn parse_resource_name_accepts_nested_collection_documents() {
+        // `documents` はパス中に再度現れても正常なサブコレクション。
+        let (_, _, relative) =
+            parse_resource_name("projects/p1/databases/(default)/documents/teams/t1/documents/x1")
+                .unwrap();
+        assert_eq!(relative, "teams/t1/documents/x1");
+    }
+
+    #[test]
+    fn parse_resource_name_rejects_malformed_prefixes() {
+        for name in [
+            "",
+            "projects",
+            "projects//databases/(default)/documents/a/b",
+            "projects/p1/database/(default)/documents/a/b",
+            "projects/p1/databases//documents/a/b",
+            "projects/p1/databases/(default)",
+            "projects/p1/databases/(default)/doc",
+        ] {
+            assert!(
+                parse_resource_name(name).is_err(),
+                "expected error for {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_resource_name_rejects_odd_or_empty_relative_paths() {
+        for name in [
+            // 空の相対パス
+            "projects/p1/databases/(default)/documents",
+            // 奇数セグメント(ドキュメントが閉じられていない)
+            "projects/p1/databases/(default)/documents/teams",
+            // 空セグメント
+            "projects/p1/databases/(default)/documents/teams//t1",
+            // 奇数セグメント(コレクションの途中で切れている)
+            "projects/p1/databases/(default)/documents/teams/t1/x",
+        ] {
+            assert!(
+                parse_resource_name(name).is_err(),
+                "expected error for {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_document_name_for_rejects_foreign_project() {
+        let err = relative_document_name_for(
+            "projects/other/databases/(default)/documents/a/b",
+            "p1",
+            DEFAULT_DATABASE_ID,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("another project/database"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn relative_document_name_for_rejects_foreign_database() {
+        let err = relative_document_name_for(
+            "projects/p1/databases/other-db/documents/a/b",
+            "p1",
+            DEFAULT_DATABASE_ID,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("another project/database"),
+            "{err}"
+        );
     }
 }
