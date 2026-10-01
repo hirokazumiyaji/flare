@@ -5,9 +5,11 @@
 //! default runtime, while [`AuthEmulator`] talks to the local Firebase Auth
 //! Emulator over its Identity Toolkit HTTP API.
 
+#[cfg(feature = "emulator")]
 mod emulator;
 mod memory;
 
+#[cfg(feature = "emulator")]
 pub use emulator::AuthEmulator;
 pub use memory::InMemoryAuth;
 
@@ -233,6 +235,23 @@ pub trait Auth {
     fn sign_in(&mut self, email: &str, password: &str) -> Result<AuthSession, AuthError>;
     fn current_user(&self) -> Result<Option<AuthUser>, AuthError>;
     fn sign_out(&mut self) -> Result<(), AuthError>;
+}
+
+/// Forwarding adapter so boxed backends (CLI selection, service builders)
+/// satisfy the same bound as concrete backends.
+impl<T: Auth + ?Sized> Auth for Box<T> {
+    fn sign_up(&mut self, email: &str, password: &str) -> Result<AuthSession, AuthError> {
+        (**self).sign_up(email, password)
+    }
+    fn sign_in(&mut self, email: &str, password: &str) -> Result<AuthSession, AuthError> {
+        (**self).sign_in(email, password)
+    }
+    fn current_user(&self) -> Result<Option<AuthUser>, AuthError> {
+        (**self).current_user()
+    }
+    fn sign_out(&mut self) -> Result<(), AuthError> {
+        (**self).sign_out()
+    }
 }
 
 pub(crate) fn validate_email(email: &str) -> Result<String, AuthError> {

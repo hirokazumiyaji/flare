@@ -40,12 +40,13 @@ impl AuthEmulator {
                 AuthError::Configuration("FIREBASE_AUTH_EMULATOR_HOST is not valid UTF-8".into())
             })?),
         };
-        let project_id = project_id_from_env()?;
-
+        // Optional detection must not fail on unrelated project configuration:
+        // only look at project variables once a host is actually present.
         let Some(host) = host else {
             return Ok(None);
         };
-        let project_id = project_id.unwrap_or_else(|| DEFAULT_PROJECT_ID.to_string());
+        let project_id =
+            project_id_from_env()?.unwrap_or_else(|| DEFAULT_PROJECT_ID.to_string());
         Self::new(host, project_id).map(Some)
     }
 

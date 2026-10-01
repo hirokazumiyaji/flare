@@ -40,6 +40,14 @@ fn runs_example_scripts_successfully() {
             "examples/scripts/10_iteration.fl",
             Value::Array(vec![Value::Int(2), Value::Int(4), Value::Int(6)]),
         ),
+        (
+            "examples/scripts/11_storage_crud.fl",
+            Value::Array(vec![
+                Value::Bytes(vec![0, 255, 128, 10]),
+                Value::Str("application/octet-stream".to_string()),
+                Value::Int(4),
+            ]),
+        ),
     ];
 
     for (path, expected) in cases {

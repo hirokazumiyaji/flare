@@ -1,0 +1,10 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Local emulator fixture only. Production Storage authentication and
+    // deployable rules are intentionally outside the firelang MVP.
+    match /{allPaths=**} {
+      allow read, write: if true;
+    }
+  }
+}
