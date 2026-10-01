@@ -9,6 +9,7 @@ Use before tagging a release or publishing binaries.
    - `cargo check --no-default-features --all-targets`
    - `cargo check --features emulator --all-targets`
    - `cargo test --all-targets`
+   - `cargo test --test firebase_config`
    - `cargo build --release --features emulator --bin fl`
 
    These are the same required checks run by the reusable CI workflow. A
@@ -16,6 +17,11 @@ Use before tagging a release or publishing binaries.
 
 2. **Firestore / Storage emulators (required release gate)**
    - Install [Firebase CLI](https://firebase.google.com/docs/cli) and Java 11+.
+   - From the repo root, use the explicit local-only config and `demo-firelang` project:
+     `firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang 'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --locked -- --nocapture'`
+   - Never run `firebase deploy --config firebase.emulators.json`.
+   - Same emulator test runs in CI (`.github/workflows/ci.yml`, job `integration-emulator`).
+
    - From the repo root:  
      `firebase emulators:exec --only firestore,storage --project demo-firelang 'FIRESTORE_PROJECT_ID=demo-firelang FIREBASE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --test storage_emulator --locked -- --nocapture'`
    - Storage-only quickstart: `firebase emulators:exec --only storage --project demo-firelang 'FIREBASE_STORAGE_EMULATOR_HOST=localhost:9199 cargo test --features emulator --test storage_emulator --locked -- --nocapture'`
@@ -26,6 +32,7 @@ Use before tagging a release or publishing binaries.
    - From the repo root:  
      `firebase emulators:exec --only auth --project demo-firelang 'FIREBASE_PROJECT_ID=demo-firelang cargo test --test auth_emulator -- --nocapture'`
    - Same command runs in CI (`.github/workflows/ci.yml`, job `integration-emulator`).
+>>>>>>> origin/main
 
 4. **Smoke**
    - `./target/release/fl --help`

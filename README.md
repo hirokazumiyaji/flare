@@ -20,6 +20,7 @@ content = storage_download("avatars/alice.bin")
 
 - [言語仕様 / API リファレンス](docs/spec.md) — 言語・Firestore / Storage API・batch/transaction セマンティクス・Auth API の正式仕様
 - [examples/scripts/](examples/scripts/) — 動くサンプルスクリプト集
+- [Firebase rules の分離とデプロイ防止策](docs/firebase-security.md)
 - [リリースチェックリスト](docs/release-checklist.md)
 - [過去の MVP 計画資料(アーカイブ)](docs/archive/mvp/)
 
@@ -38,6 +39,27 @@ export FIRESTORE_PROJECT_ID=firelang-test
 cargo run --features emulator --bin fl -- --backend emulator path/to/script.fl
 ```
 
+エミュレータは Firebase CLI で起動します。
+Local emulator には allow-all rules を持つ `firebase.emulators.json` を明示し、project ID には `demo-firelang` を指定します。
+
+```bash
+firebase emulators:start --config firebase.emulators.json --only firestore --project demo-firelang
+```
+
+ワンショットで統合テストを実行する例:
+
+```bash
+firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang \
+  'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --locked -- --nocapture'
+```
+
+`firebase.json` は deploy 用であり、Firestore と Storage の read/write を拒否します。
+`firebase deploy --config firebase.emulators.json` は実行しないでください。
+詳細は [Firebase rules の分離とデプロイ防止策](docs/firebase-security.md) を参照してください。
+
+本番 Firestore（認証付き）と Cloud Storage は非対応です。
+詳細は [仕様の 11-12 章](docs/spec.md#11-バックエンド) を参照してください。
+=======
 `fl --backend emulator` は feature なしで実行すると、SDK を読み込まずに
 `emulator` feature の有効化方法を案内して終了します。in-memory 専用の
 consumer は `cargo build --no-default-features` でも同じ in-memory API を利用できます。
@@ -86,6 +108,7 @@ firebase emulators:exec --only auth --project demo-firelang \
 
 本番 Firestore / 本番 Firebase Authentication への接続は非対応です。詳細は [仕様の 12-13 章](docs/spec.md#12-バックエンド) を参照してください。
 
+>>>>>>> origin/main
 
 ## テスト
 
@@ -95,6 +118,7 @@ cargo test --test example_scripts   # サンプルスクリプト一括実行
 cargo test --test cli               # CLI スモークテスト
 cargo test --test release           # release tag/package の検証
 cargo test --test auth              # Auth の in-memory contract テスト
+cargo test --test firebase_config   # Firebase deploy guard
 
 # 既定 feature なし: in-memory のみ
 cargo check --no-default-features --all-targets
@@ -103,6 +127,7 @@ cargo test --no-default-features --all-targets
 # emulator SDK を有効にしたビルド
 cargo check --features emulator --all-targets
 cargo test --features emulator --all-targets
+>>>>>>> origin/main
 ```
 
 エミュレータ統合テスト(`firestore_emulator` / `storage_emulator` / `auth_emulator`)は対応する emulator host 変数が未設定なら早期 return でスキップされます。`emulator` feature を有効にして、実際に叩くには上記の `firebase emulators:exec` を使うか、エミュレータ起動後に環境変数を設定して:
@@ -134,6 +159,8 @@ sha256sum -c firelang-0.1.0-linux-x86_64.tar.gz.sha256
 tar -xzf firelang-0.1.0-linux-x86_64.tar.gz
 (cd firelang-0.1.0-linux-x86_64 && sha256sum -c SHA256SUMS)
 ```
+
+- CI の deploy 用 `firebase.json` が write を拒否することも `integration-emulator` ジョブで確認します。
 
 
 ## ライセンス

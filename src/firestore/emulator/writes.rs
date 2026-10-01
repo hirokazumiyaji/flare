@@ -173,6 +173,7 @@ fn build_masked_write(
 ) -> Result<Write, Box<dyn Error>> {
     let split = plan_update_writes(data)?;
     // DeleteField は update_mask に含めつつ fields から除外する。
+
     let mut field_paths: Vec<String> = split.plain.keys().cloned().collect();
     field_paths.extend(split.deletes);
     let fields = encode_fields(&nest_field_paths(split.plain)?)?;

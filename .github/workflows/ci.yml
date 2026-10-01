@@ -134,6 +134,31 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      - name: Run integration tests with allow-all emulator rules
+        run: |
+          firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang \
+            'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --locked -- --nocapture'
+
+      - name: Verify deploy config denies Firestore writes
+        run: |
+          set -euo pipefail
+          # `--exact` は対象テストが 0 件でも終了コード 0 になるため、
+          # 名前が変わっていないことを先に確認する。
+          cargo test --features emulator --test firestore_emulator --locked -- --list \
+            | grep -Fqx 'production_config_denies_firestore_writes: test'
+          # テストは FIRELANG_FIRESTORE_RULES が "deny" でなければ黙って
+          # 成功する。変数名をどちらかの側で変更すると、この検査が
+          # assertion を一度も実行しないまま緑になってしまうため、
+          # テストと同じシェルで変数が実際に渡っていることを確認する.
+          firebase emulators:exec --config firebase.json --only firestore --project demo-firelang \
+            'FIRESTORE_PROJECT_ID=demo-firelang FIRELANG_FIRESTORE_RULES=deny sh -c '"'"'
+               test "$FIRELANG_FIRESTORE_RULES" = deny || {
+                 echo "FIRELANG_FIRESTORE_RULES did not reach the test process" >&2
+                 exit 1
+               }
+               cargo test --features emulator --test firestore_emulator --locked production_config_denies_firestore_writes -- --exact --nocapture
+             '"'"''
+
       - name: Run integration tests with Firestore and Storage emulators
         run: |
           firebase emulators:exec --only firestore,storage --project demo-firelang \

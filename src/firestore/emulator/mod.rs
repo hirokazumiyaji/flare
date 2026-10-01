@@ -19,6 +19,8 @@ use gcloud_sdk::tonic::{Code, Request};
 use super::{Firestore, QueryCandidates, WriteOp};
 use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Value};
 
+pub use client::EmulatorAuth;
+
 /// Default application-level deadline for one emulator RPC.
 ///
 /// The deadline is deliberately owned by the firelang adapter rather than the
@@ -117,6 +119,19 @@ impl FirestoreEmulator {
         Self::try_from_env().ok().flatten()
     }
 
+    /// `FIRESTORE_EMULATOR_HOST` から作る。`auth` で資格情報を選ぶ。
+    /// rules 検証用に EnforceRules で接続したいテスト向け。
+    pub fn from_env_with_auth(auth: client::EmulatorAuth) -> Option<Self> {
+        let config = Self::config_from_env().ok()??;
+        Self::new_with_auth_and_timeout(
+            config.host,
+            config.project_id,
+            auth,
+            config.operation_timeout,
+        )
+        .ok()
+    }
+
     /// Fallible environment constructor. `Ok(None)` means that
     /// `FIRESTORE_EMULATOR_HOST` is not set; a configured but invalid or
     /// unreachable emulator is returned as an error.
@@ -175,6 +190,38 @@ impl FirestoreEmulator {
         Self::new_with_timeout(host, project_id, DEFAULT_OPERATION_TIMEOUT)
     }
 
+    /// 接続を確立して作る。`auth = EnforceRules` なら admin 資格を使わず
+    /// security rules を評価させる(deploy rules の検証用)。
+    pub fn new_with_auth(
+        host: String,
+        project_id: String,
+        auth: client::EmulatorAuth,
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::new_with_auth_and_timeout(host, project_id, auth, DEFAULT_OPERATION_TIMEOUT)
+    }
+
+    /// auth と timeout の両方を指定する完全版。
+    pub fn new_with_auth_and_timeout(
+        host: String,
+        project_id: String,
+        auth: client::EmulatorAuth,
+        operation_timeout: Duration,
+    ) -> Result<Self, Box<dyn Error>> {
+        validate_config("FIRESTORE_EMULATOR_HOST", &host)?;
+        validate_config("FIRESTORE_PROJECT_ID", &project_id)?;
+
+        let client = match client::connect(&host, &project_id, auth, operation_timeout) {
+            Ok(client) => client,
+            Err(source) => {
+                return Err(Box::new(EmulatorConnectionError { host, source }));
+            }
+        };
+        Ok(Self {
+            client,
+            transaction_id: None,
+        })
+    }
+
     /// Construct with an embedding-level per-operation timeout override.
     pub fn new_with_timeout(
         host: String,
@@ -193,19 +240,12 @@ impl FirestoreEmulator {
         project_id: String,
         options: FirestoreEmulatorOptions,
     ) -> Result<Self, Box<dyn Error>> {
-        validate_config("FIRESTORE_EMULATOR_HOST", &host)?;
-        validate_config("FIRESTORE_PROJECT_ID", &project_id)?;
-
-        let client = match client::connect(&host, &project_id, options.operation_timeout) {
-            Ok(client) => client,
-            Err(source) => {
-                return Err(Box::new(EmulatorConnectionError { host, source }));
-            }
-        };
-        Ok(Self {
-            client,
-            transaction_id: None,
-        })
+        Self::new_with_auth_and_timeout(
+            host,
+            project_id,
+            client::EmulatorAuth::Owner,
+            options.operation_timeout,
+        )
     }
 
     /// Override the timeout after construction without replacing the SDK client

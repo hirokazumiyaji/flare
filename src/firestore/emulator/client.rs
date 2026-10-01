@@ -17,9 +17,22 @@ pub(super) struct EmulatorClient {
     pub(super) operation_timeout: Duration,
 }
 
+/// Firestore emulator に対して使う資格情報。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmulatorAuth {
+    /// `Bearer owner`。emulator の admin 資格で、security rules を
+    /// 完全にバイパスする。通常の開発・テストではこちらを使う。
+    Owner,
+    /// 権限のない(未認証の)資格情報。emulator が security rules を
+    /// 評価するようになるので、rules が deny している場合は
+    /// `PERMISSION_DENIED` が返る。rules の検証に使わなければならない。
+    EnforceRules,
+}
+
 pub(super) fn connect(
     host: &str,
     project_id: &str,
+    auth: EmulatorAuth,
     operation_timeout: Duration,
 ) -> Result<EmulatorClient, Box<dyn Error>> {
     let runtime = RuntimeBuilder::new_current_thread()
@@ -37,7 +50,7 @@ pub(super) fn connect(
         FirestoreDb::with_options_token_source(
             options,
             gcloud_sdk::GCP_DEFAULT_SCOPES.clone(),
-            emulator_token_source(),
+            emulator_token_source(auth),
         ),
     )?;
     Ok(EmulatorClient {
@@ -98,12 +111,27 @@ fn ensure_url_scheme(host: &str) -> String {
     }
 }
 
-fn emulator_token_source() -> gcloud_sdk::TokenSourceType {
+/// `alg: none` の未署名 JWT。header `{"alg":"none"}` / payload
+/// `{"sub":"unauthenticated"}` を base64url で並べたもの。
+///
+/// emulator 側で「有効な JWT 形式だが admin ではない」資格として扱われ、
+/// security rules を評価させる。`owner` は admin で rules をバイパスし、
+/// `unauthenticated` のような素の文字列は `invalid jwt` で 400 になるため、
+/// rules 検証にはこの形式が必要になる(実測で 403 PERMISSION_DENIED を確認)。
+const NON_ADMIN_JWT: &str = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1bmF1dGhvcmljYXRlZCJ9.";
+
+fn emulator_token_source(auth: EmulatorAuth) -> gcloud_sdk::TokenSourceType {
+    // `owner` は admin 資格で rules をバイパスする。rules を検証したい
+    // ときは admin でない token を送る必要がある。
+    let token = match auth {
+        EmulatorAuth::Owner => "owner",
+        EmulatorAuth::EnforceRules => NON_ADMIN_JWT,
+    };
     gcloud_sdk::TokenSourceType::ExternalSource(Box::new(
-        gcloud_sdk::ExternalJwtFunctionSource::new(|| {
+        gcloud_sdk::ExternalJwtFunctionSource::new(move || {
             std::future::ready(Ok(gcloud_sdk::Token::new(
                 "Bearer".to_string(),
-                "owner".into(),
+                token.into(),
                 chrono::DateTime::<chrono::Utc>::from_timestamp(4_102_444_800, 0)
                     .expect("valid token expiry"),
             )))

@@ -27,6 +27,9 @@ reqwest = { version = "0.13", default-features = false, features = ["json"], opt
 serde_json = "1"
 tokio = { version = "1", features = ["net", "rt", "time"], optional = true }
 
+[dev-dependencies]
+serde_json = "1"
+
 [[bin]]
 name = "fl"
 path = "src/main.rs"
