@@ -355,10 +355,10 @@ fn select_auth(mode: &str) -> Result<Box<dyn Auth>, Box<dyn Error>> {
             };
             #[cfg(feature = "emulator")]
             {
-                return Ok(Box::new(AuthEmulator::new(
+                Ok(Box::new(AuthEmulator::new(
                     host,
                     project_id_from_env(true),
-                )?));
+                )?))
             }
             #[cfg(not(feature = "emulator"))]
             {
