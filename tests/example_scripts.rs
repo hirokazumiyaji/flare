@@ -40,6 +40,14 @@ fn runs_example_scripts_successfully() {
             "examples/scripts/10_iteration.fl",
             Value::Array(vec![Value::Int(2), Value::Int(4), Value::Int(6)]),
         ),
+        (
+            "examples/scripts/11_storage_crud.fl",
+            Value::Array(vec![
+                Value::Bytes(vec![0, 255, 128, 10]),
+                Value::Str("application/octet-stream".to_string()),
+                Value::Int(4),
+            ]),
+        ),
     ];
 
     for (path, expected) in cases {
@@ -83,4 +91,24 @@ fn emulator_smoke_example_round_trips_in_memory() {
     };
     assert_eq!(m.get("ok"), Some(&Value::Bool(true)));
     assert!(matches!(m.get("checked_at"), Some(Value::Timestamp(_))));
+}
+
+#[test]
+fn auth_smoke_example_round_trips_in_memory_without_printing_tokens() {
+    let src = std::fs::read_to_string("examples/scripts/11_auth_smoke.fl").unwrap();
+    // The example prints via `puts`, so capture is not needed: assert only on
+    // the final value, and re-check the redaction rule separately below.
+    let out = run_script(&src).unwrap();
+    assert_eq!(
+        out,
+        Value::Bool(true),
+        "sign-out should leave no current user"
+    );
+
+    let session =
+        run_script("auth_sign_up(\"example-check@example.com\", \"password123\")").unwrap();
+    let inspected = session.inspect();
+    assert!(inspected.contains("id_token=<redacted>"), "{inspected}");
+    assert!(!inspected.contains("fake-id-token"), "{inspected}");
+    assert!(!inspected.contains("fake-refresh-token"), "{inspected}");
 }
