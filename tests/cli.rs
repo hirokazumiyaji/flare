@@ -64,6 +64,7 @@ fn run_fl_script(name: &str, source: &str) -> std::process::Output {
 #[test]
 fn fl_handles_script_with_non_utf8_path() {
     use std::ffi::OsString;
+    use std::io::Write;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     // Same exclusive-creation contract as create_temp_script, but the name
