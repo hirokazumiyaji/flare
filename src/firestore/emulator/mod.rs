@@ -312,12 +312,7 @@ impl Firestore for FirestoreEmulator {
                 run_query_candidates(self, parent.as_deref(), sq, &query.filters)
             }
             QuerySource::CollectionGroup(id) => {
-                let sq = structured_query(
-                    &self.client.project_id,
-                    id,
-                    true,
-                    &server_filters,
-                )?;
+                let sq = structured_query(&self.client.project_id, id, true, &server_filters)?;
                 run_query_candidates(self, None, sq, &query.filters)
             }
         }

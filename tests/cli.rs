@@ -240,7 +240,6 @@ fn run_fl_with_piped_stdin(args: &[&str], stdin_text: &str) -> std::process::Out
     child.wait_with_output().expect("wait fl")
 }
 
-
 #[test]
 fn fl_dash_reads_script_from_stdin() {
     let out = run_fl_with_piped_stdin(&["-"], "puts(\"hi\")\nputs(1 + 1)");

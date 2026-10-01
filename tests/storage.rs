@@ -72,10 +72,8 @@ fn storage_paths_and_content_have_clear_errors() {
 fn firestore_accepts_bytes_fields() {
     // `Bytes` is a first-class Firestore value: writes and query filters
     // accept it on both backends.
-    let out = run_script(
-        "set(\"users/a\", {data: bytes([1])})\nget(\"users/a\")[\"data\"]",
-    )
-    .unwrap();
+    let out =
+        run_script("set(\"users/a\", {data: bytes([1])})\nget(\"users/a\")[\"data\"]").unwrap();
     assert_eq!(out, Value::Bytes(vec![1]));
     let out = run_script(
         "set(\"users/a\", {data: bytes([1])})\ncol(\"users\").where(\"data\", \"==\", bytes([1])).get().len()",

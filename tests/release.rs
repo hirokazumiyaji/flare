@@ -116,7 +116,10 @@ mod unix {
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr)
             .contains("release package tag must have the form vX.Y.Z"));
-        assert!(!output_dir.exists(), "invalid tag must not create output paths");
+        assert!(
+            !output_dir.exists(),
+            "invalid tag must not create output paths"
+        );
     }
 
     #[test]
