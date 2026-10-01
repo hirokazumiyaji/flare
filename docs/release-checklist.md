@@ -22,7 +22,12 @@ Use before tagging a release or publishing binaries.
    - The `integration-emulator` job runs this suite for branch/PR CI and is
      also run by CD. The release therefore does not omit emulator coverage.
 
-3. **Smoke**
+3. **Auth emulator (optional but recommended)**
+   - From the repo root:  
+     `firebase emulators:exec --only auth --project demo-firelang 'FIREBASE_PROJECT_ID=demo-firelang cargo test --test auth_emulator -- --nocapture'`
+   - Same command runs in CI (`.github/workflows/ci.yml`, job `integration-emulator`).
+
+4. **Smoke**
    - `./target/release/fl --help`
    - `./target/release/fl examples/scripts/01_basic.fl`
    - With emulator: set `FIRESTORE_EMULATOR_HOST` and `FIRESTORE_PROJECT_ID` (plus `FIREBASE_STORAGE_EMULATOR_HOST` for storage), then run the feature-enabled binary with `./target/release/fl --backend emulator examples/scripts/01_basic.fl` (the release workflow builds with `--features emulator`).
@@ -43,3 +48,6 @@ Use before tagging a release or publishing binaries.
    - Extract it and run `sha256sum -c SHA256SUMS` from the extracted directory.
    - Confirm `./fl --help` runs, then publish the GitHub Release only after the
      checks above pass.
+   - With Auth emulator: set `FIREBASE_AUTH_EMULATOR_HOST` and `FIREBASE_PROJECT_ID`, then `./target/release/fl --auth-backend emulator examples/scripts/11_auth_smoke.fl`
+   - Confirm no token appears in output: the run must print `id_token=<redacted>` / `refresh_token=<redacted>`, never a raw token.
+

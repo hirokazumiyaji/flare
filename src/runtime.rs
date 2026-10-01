@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
 
 use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
+use crate::auth::{Auth, AuthError, InMemoryAuth};
 use crate::error::{FirelangError, Span};
 use crate::firestore::{is_legacy_datastore_numeric_id, Firestore, WriteOp};
 use crate::storage::{validate_content_type, validate_storage_path, InMemoryStorage, Storage};
@@ -23,6 +24,7 @@ enum MethodReceiver {
     Array(Vec<Value>),
     Timestamp(Timestamp),
     Bytes(Vec<u8>),
+    AuthSession(crate::auth::AuthSession),
     Map(BTreeMap<String, Value>),
 }
 
@@ -30,6 +32,7 @@ pub struct Runtime<F: Firestore, S: Storage = InMemoryStorage> {
     scopes: Vec<HashMap<String, Value>>,
     fs: F,
     storage: S,
+    auth: Box<dyn Auth>,
     exec: ExecCtx,
     /// Set when a best-effort rollback failed, so the backend still holds the
     /// transaction open. The next `transaction` block retries the rollback
@@ -43,6 +46,21 @@ impl<F: Firestore> Runtime<F, InMemoryStorage> {
     pub fn new(fs: F) -> Self {
         Self::with_storage(fs, InMemoryStorage::default())
     }
+
+    /// Construct a runtime with an explicit authentication backend.
+    ///
+    /// Defined on the default-storage specialization so the `S` parameter
+    /// never needs an annotation: `Runtime::new_with_auth(fs, auth)` infers
+    /// `S = InMemoryStorage`. Hosts that need a different Storage backend
+    /// can use [`Self::with_storage_and_auth`].
+    pub fn new_with_auth<A: Auth + 'static>(fs: F, auth: A) -> Self {
+        Self::with_storage_and_auth(fs, InMemoryStorage::default(), auth)
+    }
+
+    /// Alias for [`Runtime::new_with_auth`] that reads naturally at call sites.
+    pub fn with_auth<A: Auth + 'static>(fs: F, auth: A) -> Self {
+        Self::new_with_auth(fs, auth)
+    }
 }
 
 impl<F: Firestore, S: Storage> Runtime<F, S> {
@@ -54,9 +72,30 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
             scopes: vec![HashMap::new()],
             fs,
             storage,
+            auth: Box::new(InMemoryAuth::default()),
             exec: ExecCtx::Normal,
             pending_rollback: false,
         }
+    }
+
+    /// Construct a runtime with explicit Storage and Auth backends.
+    pub fn with_storage_and_auth<A: Auth + 'static>(fs: F, storage: S, auth: A) -> Self {
+        Self {
+            scopes: vec![HashMap::new()],
+            fs,
+            storage,
+            auth: Box::new(auth),
+            exec: ExecCtx::Normal,
+            pending_rollback: false,
+        }
+    }
+
+    pub fn auth(&self) -> &dyn Auth {
+        self.auth.as_ref()
+    }
+
+    pub fn auth_mut(&mut self) -> &mut dyn Auth {
+        self.auth.as_mut()
     }
 
     pub fn eval_program(&mut self, stmts: &[Stmt]) -> Result<Value, Box<dyn Error>> {
@@ -250,7 +289,23 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         }
     }
 
+    /// Validate that a staged write carries only document-representable
+    /// values, then hand it to the active execution context.
+    ///
+    /// Auth sessions and their token projections are deliberately rejected
+    /// here rather than in a backend: they hold secrets, and letting the
+    /// in-memory backend accept what the emulator would refuse would persist
+    /// tokens into documents and split the backends' behavior.
     fn dispatch_write(&mut self, op: WriteOp) -> Result<(), Box<dyn Error>> {
+        let data = match &op {
+            WriteOp::Set { data, .. } | WriteOp::Update { data, .. } => Some(data),
+            WriteOp::Delete { .. } => None,
+        };
+        if let Some(data) = data {
+            for (field, value) in data {
+                reject_non_document_value(field, value)?;
+            }
+        }
         match &mut self.exec {
             ExecCtx::Normal => self.fs.apply(vec![op]).map_err(backend_err),
             ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => {
@@ -568,6 +623,12 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
                     map.get(name).cloned().unwrap_or(Value::Nil),
                 ))
             }
+            MethodReceiver::AuthSession(session) => {
+                if !args.is_empty() {
+                    return Err(format!("unknown auth session method: {name}").into());
+                }
+                Ok(ExecFlow::Value(auth_session_field(&session, name)))
+            }
         }
     }
 
@@ -723,6 +784,7 @@ fn into_method_receiver(value: Value) -> Result<MethodReceiver, Box<dyn Error>> 
         Value::Array(value) => Ok(MethodReceiver::Array(value)),
         Value::Timestamp(value) => Ok(MethodReceiver::Timestamp(value)),
         Value::Bytes(value) => Ok(MethodReceiver::Bytes(value)),
+        Value::AuthSession(value) => Ok(MethodReceiver::AuthSession(value)),
         Value::Map(value) => Ok(MethodReceiver::Map(value)),
         _ => Err("unsupported method receiver".into()),
     }
@@ -1089,6 +1151,8 @@ fn builtin_contract(name: &str) -> CallContract {
         "storage_download" | "storage_metadata" | "storage_delete" => {
             CallContract::exact(1)
         }
+        "auth_sign_up" | "auth_sign_in" => CallContract::exact(2),
+        "auth_current_user" | "auth_sign_out" => CallContract::exact(0),
         _ => unreachable!("unknown builtin contract: {name}"),
     }
 }
@@ -1101,6 +1165,13 @@ fn query_method_contract(name: &str) -> Option<CallContract> {
         "count" | "get" => Some(CallContract::exact(0)),
         _ => None,
     }
+}
+
+fn auth_session_method_contract(name: &str) -> Option<CallContract> {
+    // Field-style access has no fixed method set; any name with no args is a
+    // field read, anything else is rejected by dispatch.
+    let _ = name;
+    Some(CallContract::exact(0))
 }
 
 fn bytes_method_contract(name: &str) -> Option<CallContract> {
@@ -1136,6 +1207,7 @@ fn method_contract(receiver: &MethodReceiver, name: &str) -> Option<CallContract
         MethodReceiver::Array(_) => array_method_contract(name),
         MethodReceiver::Timestamp(_) => timestamp_method_contract(name),
         MethodReceiver::Bytes(_) => bytes_method_contract(name),
+        MethodReceiver::AuthSession(_) => auth_session_method_contract(name),
         // `m.key` is map key access rather than a fixed set of methods.  It
         // still has a strict zero-argument/no-block contract.
         MethodReceiver::Map(_) => Some(CallContract::exact(0)),
@@ -1151,6 +1223,7 @@ fn method_call_label(receiver: &MethodReceiver, name: &str) -> String {
         MethodReceiver::Array(_) => format!("array method {name}"),
         MethodReceiver::Timestamp(_) => format!("timestamp method {name}"),
         MethodReceiver::Bytes(_) => format!("bytes method {name}"),
+        MethodReceiver::AuthSession(_) => format!("auth session method {name}"),
         MethodReceiver::Map(_) => format!("map key access {name}"),
     }
 }
@@ -1194,6 +1267,7 @@ fn validate_method_call(
         MethodReceiver::Array(_) => format!("unknown array method: {name}").into(),
         MethodReceiver::Timestamp(_) => format!("unknown timestamp method: {name}").into(),
         MethodReceiver::Bytes(_) => format!("unknown bytes method: {name}").into(),
+        MethodReceiver::AuthSession(_) => format!("unknown auth session method: {name}").into(),
         MethodReceiver::Map(_) => format!("unknown map method: {name}").into(),
     })
 }
@@ -1225,6 +1299,10 @@ const BUILTIN_NAMES: &[&str] = &[
     "storage_download",
     "storage_metadata",
     "storage_delete",
+    "auth_sign_up",
+    "auth_sign_in",
+    "auth_current_user",
+    "auth_sign_out",
 ];
 
 type Builtin<F, S> = fn(
@@ -1235,7 +1313,7 @@ type Builtin<F, S> = fn(
 ) -> Result<ExecFlow, Box<dyn Error>>;
 
 /// ビルトインの対応テーブル。
-fn builtin_entries<F: Firestore, S: Storage>() -> [(&'static str, Builtin<F, S>); 24] {
+fn builtin_entries<F: Firestore, S: Storage>() -> [(&'static str, Builtin<F, S>); 28] {
     [
         ("puts", builtin_puts),
         ("doc", builtin_doc),
@@ -1261,6 +1339,10 @@ fn builtin_entries<F: Firestore, S: Storage>() -> [(&'static str, Builtin<F, S>)
         ("storage_download", builtin_storage_download),
         ("storage_metadata", builtin_storage_metadata),
         ("storage_delete", builtin_storage_delete),
+        ("auth_sign_up", builtin_auth_sign_up),
+        ("auth_sign_in", builtin_auth_sign_in),
+        ("auth_current_user", builtin_auth_current_user),
+        ("auth_sign_out", builtin_auth_sign_out),
     ]
 }
 
@@ -1717,6 +1799,100 @@ fn builtin_transaction<F: Firestore, S: Storage>(
     }
 }
 
+fn builtin_auth_sign_up<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    reject_auth_call_args("auth_sign_up", &args, &kwargs, block)?;
+    let email = expect_string(args.first())?.to_string();
+    let password = expect_string(args.get(1))?.to_string();
+    let session = rt
+        .auth
+        .sign_up(&email, &password)
+        .map_err(auth_backend_err)?;
+    Ok(ExecFlow::Value(Value::AuthSession(session)))
+}
+
+fn builtin_auth_sign_in<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    reject_auth_call_args("auth_sign_in", &args, &kwargs, block)?;
+    let email = expect_string(args.first())?.to_string();
+    let password = expect_string(args.get(1))?.to_string();
+    let session = rt
+        .auth
+        .sign_in(&email, &password)
+        .map_err(auth_backend_err)?;
+    Ok(ExecFlow::Value(Value::AuthSession(session)))
+}
+
+fn builtin_auth_current_user<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    reject_auth_call_args("auth_current_user", &args, &kwargs, block)?;
+    Ok(ExecFlow::Value(
+        rt.auth
+            .current_user()
+            .map_err(auth_backend_err)?
+            .map(|user| user.to_value())
+            .unwrap_or(Value::Nil),
+    ))
+}
+
+fn builtin_auth_sign_out<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
+    args: Vec<Value>,
+    kwargs: BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    reject_auth_call_args("auth_sign_out", &args, &kwargs, block)?;
+    rt.auth.sign_out().map_err(auth_backend_err)?;
+    Ok(ExecFlow::Value(Value::Nil))
+}
+
+fn reject_auth_call_args(
+    name: &str,
+    args: &[Value],
+    kwargs: &BTreeMap<String, Value>,
+    block: Option<&Block>,
+) -> Result<(), Box<dyn Error>> {
+    if (name == "auth_current_user" || name == "auth_sign_out") && !args.is_empty() {
+        return Err(format!("{name} does not take arguments").into());
+    }
+    if args.len() > 2 {
+        return Err(format!("{name} takes at most 2 arguments").into());
+    }
+    if !kwargs.is_empty() {
+        return Err(format!("{name} does not accept keyword arguments").into());
+    }
+    if block.is_some() {
+        return Err(format!("{name} does not accept a block").into());
+    }
+    Ok(())
+}
+
+fn auth_backend_err(error: AuthError) -> Box<dyn Error> {
+    FirelangError::auth(error.kind(), error.to_string()).into()
+}
+
+fn auth_session_field(session: &crate::auth::AuthSession, name: &str) -> Value {
+    match name {
+        "user" => session.user_value(),
+        "id_token" => Value::RedactedToken("id_token"),
+        "refresh_token" => Value::RedactedToken("refresh_token"),
+        "expires_at" => Value::Int(session.expires_at),
+        _ => Value::Nil,
+    }
+}
+
 fn parse_timestamp_arg(v: Option<&Value>) -> Result<i64, Box<dyn Error>> {
     match v {
         Some(Value::Int(i)) => Ok(*i),
@@ -1996,9 +2172,35 @@ fn checked_array_index<T: TryFrom<i64>>(index: i64) -> Option<T> {
     T::try_from(index).ok()
 }
 
+/// Reject values that carry Auth secrets before they can reach any backend.
+///
+/// Only the secret-bearing Auth variants are checked here.  Broader
+/// "writable value" validation (issue #67) is deliberately left to the
+/// Firestore layer so this check stays a small, security-focused guard.
+fn reject_non_document_value(field: &str, value: &Value) -> Result<(), Box<dyn Error>> {
+    match value {
+        Value::AuthSession(_) => Err(format!(
+            "cannot write auth session to field {field:?}: auth sessions are runtime-only values"
+        )
+        .into()),
+        Value::RedactedToken(_) => Err(format!(
+            "cannot write auth token to field {field:?}: auth tokens are runtime-only values"
+        )
+        .into()),
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| reject_non_document_value(field, item)),
+        Value::Map(map) => map
+            .values()
+            .try_for_each(|item| reject_non_document_value(field, item)),
+        _ => Ok(()),
+    }
+}
+
 fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {
     match (base, index) {
         (Value::Map(map), Value::Str(key)) => Ok(map.get(&key).cloned().unwrap_or(Value::Nil)),
+        (Value::AuthSession(session), Value::Str(key)) => Ok(auth_session_field(&session, &key)),
         (Value::Array(items), Value::Int(i)) => {
             let index = match checked_array_index::<usize>(i) {
                 Some(index) => index,

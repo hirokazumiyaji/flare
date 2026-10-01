@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod auth;
 pub mod error;
 pub mod firestore;
 pub mod lexer;
@@ -11,6 +12,9 @@ use std::error::Error;
 
 use runtime::Runtime;
 
+pub use auth::{Auth, AuthError, AuthErrorKind, AuthSession, AuthToken, AuthUser, InMemoryAuth};
+#[cfg(feature = "emulator")]
+pub use auth::AuthEmulator;
 pub use error::{ErrorKind, FirelangError, Span};
 #[cfg(feature = "emulator")]
 pub use firestore::{
@@ -34,6 +38,24 @@ pub fn run_script_with_firestore<F: Firestore>(
     firestore: F,
 ) -> Result<Value, Box<dyn Error>> {
     Runtime::new(firestore).run(source)
+}
+
+/// Run a script with the default in-memory Firestore backend and an explicit
+/// Auth backend.
+pub fn run_script_with_auth<A: Auth + 'static>(
+    source: &str,
+    auth: A,
+) -> Result<Value, Box<dyn Error>> {
+    Runtime::new_with_auth(InMemoryFirestore::default(), auth).run(source)
+}
+
+/// Descriptive alias for callers that prefer the backend-oriented name.
+pub fn run_script_with_firestore_and_auth<F: Firestore, A: Auth + 'static>(
+    source: &str,
+    firestore: F,
+    auth: A,
+) -> Result<Value, Box<dyn Error>> {
+    Runtime::new_with_auth(firestore, auth).run(source)
 }
 
 /// Run a script with the in-memory Firestore backend and the supplied Storage
@@ -62,4 +84,15 @@ pub fn run_script_with_firestore_and_storage<F: Firestore, S: Storage>(
     storage: S,
 ) -> Result<Value, Box<dyn Error>> {
     run_script_with_backends(source, firestore, storage)
+}
+
+/// Run a script with independently selected Firestore, Storage, and Auth
+/// backends.
+pub fn run_script_with_all_backends<F: Firestore, S: Storage, A: Auth + 'static>(
+    source: &str,
+    firestore: F,
+    storage: S,
+    auth: A,
+) -> Result<Value, Box<dyn Error>> {
+    Runtime::with_storage_and_auth(firestore, storage, auth).run(source)
 }

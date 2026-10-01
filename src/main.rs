@@ -7,10 +7,13 @@ use std::path::PathBuf;
 #[cfg(feature = "emulator")]
 use std::time::Duration;
 
-use firelang::{run_script_with_backends, InMemoryFirestore, InMemoryStorage, StorageEmulator};
+use firelang::{
+    run_script_with_all_backends, Auth, InMemoryAuth, InMemoryFirestore, InMemoryStorage,
+    StorageEmulator,
+};
 #[cfg(feature = "emulator")]
 use firelang::{
-    parse_timeout_ms as parse_library_timeout_ms, EmulatorConfig, FirestoreEmulator,
+    parse_timeout_ms as parse_library_timeout_ms, AuthEmulator, EmulatorConfig, FirestoreEmulator,
 };
 
 #[cfg(not(feature = "emulator"))]
@@ -29,6 +32,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let mut backend = "in-memory";
     let mut storage_backend = "auto";
+    let mut auth_backend = "in-memory".to_string();
     #[cfg(feature = "emulator")]
     let mut emulator_timeout: Option<Duration> = None;
     #[cfg(feature = "emulator")]
@@ -50,6 +54,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 backend = b.to_str().ok_or("--backend value must be valid UTF-8")?;
                 i += 2;
             }
+
             Some("--storage-backend") => {
                 let b = args
                     .get(i + 1)
@@ -70,6 +75,20 @@ fn run() -> Result<(), Box<dyn Error>> {
                     .ok_or_else(|| format!("{flag} value must be valid UTF-8"))?;
                 emulator_timeout = Some(parse_timeout_ms(value)?);
                 emulator_timeout_flag = Some(flag);
+                i += 2;
+            }
+            Some("--auth-backend") => {
+                let b = args
+                    .get(i + 1)
+                    .ok_or("--auth-backend requires in-memory or emulator")?;
+                let value = b.to_str().ok_or("--auth-backend value must be valid UTF-8")?;
+                if value != "in-memory" && value != "emulator" {
+                    return Err(format!(
+                        "unknown auth backend: {value} (use in-memory or emulator)"
+                    )
+                    .into());
+                }
+                auth_backend = value.to_string();
                 i += 2;
             }
             Some("-e") => {
@@ -124,6 +143,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             FirestoreEmulator::config_from_env()?
                 .ok_or("FIRESTORE_EMULATOR_HOST must be set when using --backend emulator")?,
         ),
+
         other => {
             return Err(format!("unknown backend: {other} (use in-memory or emulator)").into());
         }
@@ -170,6 +190,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "unknown storage backend: {other} (use auto, in-memory, or emulator)"
             )
             .into());
+
         }
     };
 
@@ -204,42 +225,47 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let selected_storage = select_storage(storage_backend, storage_config)?;
+    let selected_auth = select_auth(&auth_backend)?;
     #[cfg(feature = "emulator")]
     let out = match (backend_config, selected_storage) {
-        (None, SelectedStorage::Memory) => run_script_with_backends(
-            &src,
+        (None, SelectedStorage::Memory) => run_script_with_all_backends(&src, 
             InMemoryFirestore::default(),
             InMemoryStorage::default(),
+            selected_auth,
         )?,
-        (Some(config), SelectedStorage::Memory) => run_script_with_backends(
-            &src,
+        (Some(config), SelectedStorage::Memory) => run_script_with_all_backends(&src, 
             FirestoreEmulator::new_with_timeout(
                 config.host,
                 config.project_id,
                 emulator_timeout.unwrap_or(config.operation_timeout),
             )?,
             InMemoryStorage::default(),
+            selected_auth,
         )?,
         (None, SelectedStorage::Emulator(storage)) => {
-            run_script_with_backends(&src, InMemoryFirestore::default(), storage)?
+            run_script_with_all_backends(&src, InMemoryFirestore::default(), storage, selected_auth)?
         }
-        (Some(config), SelectedStorage::Emulator(storage)) => run_script_with_backends(
-            &src,
-            FirestoreEmulator::new_with_timeout(
-                config.host,
-                config.project_id,
-                emulator_timeout.unwrap_or(config.operation_timeout),
-            )?,
-            storage,
-        )?,
+        (Some(config), SelectedStorage::Emulator(storage)) => {
+            run_script_with_all_backends(&src, 
+                FirestoreEmulator::new_with_timeout(
+                    config.host,
+                    config.project_id,
+                    emulator_timeout.unwrap_or(config.operation_timeout),
+                )?,
+                storage,
+                selected_auth,
+            )?
+        }
     };
     #[cfg(not(feature = "emulator"))]
     let out = match selected_storage {
-        SelectedStorage::Memory => {
-            run_script_with_backends(&src, InMemoryFirestore::default(), InMemoryStorage::default())?
-        }
+        SelectedStorage::Memory => run_script_with_all_backends(&src, 
+            InMemoryFirestore::default(),
+            InMemoryStorage::default(),
+            selected_auth,
+        )?,
         SelectedStorage::Emulator(storage) => {
-            run_script_with_backends(&src, InMemoryFirestore::default(), storage)?
+            run_script_with_all_backends(&src, InMemoryFirestore::default(), storage, selected_auth)?
         }
     };
 
@@ -297,6 +323,42 @@ fn select_storage(
     }
 }
 
+/// Resolve `--auth-backend`. Unlike Storage's best-effort `auto` mode there
+/// is no ambient detection: `emulator` requires `FIREBASE_AUTH_EMULATOR_HOST`
+/// and fails loudly when it is missing or invalid.
+fn select_auth(mode: &str) -> Result<Box<dyn Auth>, Box<dyn Error>> {
+    match mode {
+        "in-memory" => Ok(Box::new(InMemoryAuth::default())),
+        "emulator" => {
+            let host = match env::var("FIREBASE_AUTH_EMULATOR_HOST") {
+                Ok(host) => host,
+                Err(env::VarError::NotPresent) => {
+                    return Err(
+                        "FIREBASE_AUTH_EMULATOR_HOST must be set when using --auth-backend emulator"
+                            .into(),
+                    );
+                }
+                Err(env::VarError::NotUnicode(_)) => {
+                    return Err("FIREBASE_AUTH_EMULATOR_HOST must be valid UTF-8".into());
+                }
+            };
+            #[cfg(feature = "emulator")]
+            {
+                return Ok(Box::new(AuthEmulator::new(
+                    host,
+                    project_id_from_env(true),
+                )?));
+            }
+            #[cfg(not(feature = "emulator"))]
+            {
+                let _ = host;
+                return Err(EMULATOR_FEATURE_ERROR.into());
+            }
+        }
+        other => Err(format!("unknown auth backend: {other} (use in-memory or emulator)").into()),
+    }
+}
+
 fn make_storage(host: String, project_id: String) -> Result<StorageEmulator, Box<dyn Error>> {
     let mut storage = StorageEmulator::new(host, project_id)?;
     if let Ok(bucket) = env::var("FIREBASE_STORAGE_BUCKET") {
@@ -310,7 +372,7 @@ fn make_storage(host: String, project_id: String) -> Result<StorageEmulator, Box
 
 fn print_usage() {
     eprintln!(
-        "usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--emulator-timeout-ms <ms>] (<script-file> | - | -e <script>)"
+        "usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] (<script-file> | - | -e <script>)"
     );
     eprintln!();
     eprintln!("  Script source (exactly one):");
@@ -319,7 +381,7 @@ fn print_usage() {
     eprintln!("    -e <script>   run an inline script (repeatable, joined by newlines)");
     eprintln!("    (no args)     read from stdin when piped, otherwise show this usage");
     eprintln!();
-    eprintln!("  Backends:");
+    eprintln!("  Firestore backend:");
     eprintln!("    in-memory   (default) use the in-memory Firestore stub");
     // Keep the help honest about this build's own capabilities: a binary
     // compiled with the feature enabled does accept --backend emulator, and
@@ -348,10 +410,96 @@ fn print_usage() {
     eprintln!("    auto       use the Storage emulator when FIREBASE_STORAGE_EMULATOR_HOST is set");
     eprintln!("    in-memory  (default when auto has no host) use the in-memory Storage stub");
     eprintln!("    emulator   require FIREBASE_STORAGE_EMULATOR_HOST");
+    eprintln!();
+    eprintln!("  Auth backends:");
+    eprintln!("    in-memory  (default) use the in-memory Auth stub");
+    eprintln!("    emulator   require FIREBASE_AUTH_EMULATOR_HOST");
+    eprintln!();
+    eprintln!("  Auth backend:");
+    eprintln!("    in-memory   (default) use the in-memory Auth stub");
+    eprintln!("    emulator    use FIREBASE_AUTH_EMULATOR_HOST and optional FIREBASE_PROJECT_ID");
+}
+
+/// Resolve the Firebase project ID from the environment.
+///
+/// Each backend keeps its documented precedence so existing Firestore setups
+/// are unaffected:
+/// - Firestore (`prefer_firebase = false`): `FIRESTORE_PROJECT_ID`,
+///   then `FIREBASE_PROJECT_ID`, then `firelang-test`.
+/// - Auth (`prefer_firebase = true`): `FIREBASE_PROJECT_ID`,
+///   then `FIRESTORE_PROJECT_ID`, then `firelang-test`.
+///
+/// Reading both names lets one Firebase CLI project (`--project X`) drive the
+/// Firestore and Auth emulators together without exporting a second variable.
+#[cfg(feature = "emulator")]
+fn project_id_from_env(prefer_firebase: bool) -> String {
+    resolve_project_id(prefer_firebase, |key| env::var(key).ok())
+}
+
+/// Pure precedence rule behind [`project_id_from_env`], split out so it can be
+/// tested without mutating process-wide environment state.
+#[cfg(feature = "emulator")]
+fn resolve_project_id(prefer_firebase: bool, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let (first, second) = if prefer_firebase {
+        ("FIREBASE_PROJECT_ID", "FIRESTORE_PROJECT_ID")
+    } else {
+        ("FIRESTORE_PROJECT_ID", "FIREBASE_PROJECT_ID")
+    };
+    lookup(first)
+        .or_else(|| lookup(second))
+        .unwrap_or_else(|| "firelang-test".to_string())
+
 }
 
 fn read_stdin() -> Result<String, Box<dyn Error>> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
     Ok(buf)
+}
+
+#[cfg(all(test, feature = "emulator"))]
+mod tests {
+    use super::resolve_project_id;
+
+    fn lookup<'a>(values: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            values
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
+    #[test]
+    fn firestore_backend_keeps_firestore_project_id_precedence() {
+        let both = lookup(&[
+            ("FIRESTORE_PROJECT_ID", "from-firestore"),
+            ("FIREBASE_PROJECT_ID", "from-firebase"),
+        ]);
+        assert_eq!(resolve_project_id(false, both), "from-firestore");
+    }
+
+    #[test]
+    fn auth_backend_prefers_firebase_project_id() {
+        let both = lookup(&[
+            ("FIRESTORE_PROJECT_ID", "from-firestore"),
+            ("FIREBASE_PROJECT_ID", "from-firebase"),
+        ]);
+        assert_eq!(resolve_project_id(true, both), "from-firebase");
+    }
+
+    #[test]
+    fn each_backend_falls_back_to_the_other_name() {
+        let only_firebase = lookup(&[("FIREBASE_PROJECT_ID", "shared")]);
+        assert_eq!(resolve_project_id(false, only_firebase), "shared");
+        let only_firestore = lookup(&[("FIRESTORE_PROJECT_ID", "shared")]);
+        assert_eq!(resolve_project_id(true, only_firestore), "shared");
+    }
+
+    #[test]
+    fn default_project_id_is_used_when_unset() {
+        let empty = lookup(&[]);
+        assert_eq!(resolve_project_id(false, &empty), "firelang-test");
+        assert_eq!(resolve_project_id(true, &empty), "firelang-test");
+    }
 }

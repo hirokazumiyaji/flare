@@ -300,6 +300,7 @@ dependencies = [
  "firestore",
  "gcloud-sdk",
  "prost-types",
+ "reqwest",
  "serde_json",
  "tokio",
 ]
