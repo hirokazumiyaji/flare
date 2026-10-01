@@ -1,4 +1,4 @@
 # Emulator smoke: run with
-#   FIRESTORE_EMULATOR_HOST=... FIRESTORE_PROJECT_ID=... fl --backend emulator examples/scripts/09_emulator_smoke.fl
+#   FIRESTORE_EMULATOR_HOST=... FIRESTORE_PROJECT_ID=... cargo run --features emulator --bin fl -- --backend emulator examples/scripts/09_emulator_smoke.fl
 set("smoke/fl", {ok: true, checked_at: server_timestamp()})
 get("smoke/fl")
