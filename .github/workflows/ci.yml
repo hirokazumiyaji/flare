@@ -161,10 +161,10 @@ jobs:
 
       - name: Run integration tests with Firestore and Storage emulators
         run: |
-          firebase emulators:exec --only firestore,storage --project demo-firelang \
+          firebase emulators:exec --config firebase.emulators.json --only firestore,storage --project demo-firelang \
             'FIRESTORE_PROJECT_ID=demo-firelang FIREBASE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --test storage_emulator --locked -- --nocapture'
 
       - name: Run integration tests with Auth emulator
         run: |
-          firebase emulators:exec --only auth --project demo-firelang \
+          firebase emulators:exec --config firebase.emulators.json --only auth --project demo-firelang \
             'FIREBASE_PROJECT_ID=demo-firelang cargo test --features emulator --test auth_emulator --locked -- --nocapture'

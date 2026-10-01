@@ -64,7 +64,7 @@ consumer は `cargo build --no-default-features` でも同じ in-memory API を�
 エミュレータは Firebase CLI で起動します(別ターミナルで `firebase emulators:start --only firestore` など)。リポジトリ直下の `firebase.json` を使ってワンショットで試す例:
 
 ```bash
-firebase emulators:exec --only firestore --project demo-firelang \
+firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang \
   'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator -- --nocapture'
 ```
 
@@ -78,7 +78,7 @@ Storage の MVP CRUD は `storage_upload` / `storage_download` / `storage_metada
 
 ```bash
 export FIREBASE_PROJECT_ID=demo-firelang
-firebase emulators:exec --only storage --project demo-firelang \
+firebase emulators:exec --config firebase.emulators.json --only storage --project demo-firelang \
   'cargo test --test storage_emulator -- --nocapture'
 ```
 
@@ -96,10 +96,10 @@ cargo run --features emulator --bin fl -- --auth-backend emulator path/to/script
 エミュレータは Firebase CLI で起動します(別ターミナルで `firebase emulators:start` など)。リポジトリ直下の `firebase.json` を使ってワンショットで試す例:
 
 ```bash
-firebase emulators:exec --only firestore --project demo-firelang \
+firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang \
   'FIRESTORE_PROJECT_ID=demo-firelang cargo test --test firestore_emulator -- --nocapture'
 
-firebase emulators:exec --only auth --project demo-firelang \
+firebase emulators:exec --config firebase.emulators.json --only auth --project demo-firelang \
   'FIREBASE_PROJECT_ID=demo-firelang cargo test --test auth_emulator -- --nocapture'
 ```
 

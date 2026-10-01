@@ -23,14 +23,14 @@ Use before tagging a release or publishing binaries.
    - Firestore:
      `firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang 'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --locked -- --nocapture'`
    - Firestore + Storage:
-     `firebase emulators:exec --only firestore,storage --project demo-firelang 'FIRESTORE_PROJECT_ID=demo-firelang FIREBASE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --test storage_emulator --locked -- --nocapture'`
-   - Storage-only quickstart: `firebase emulators:exec --only storage --project demo-firelang 'FIREBASE_STORAGE_EMULATOR_HOST=localhost:9199 cargo test --features emulator --test storage_emulator --locked -- --nocapture'`
+     `firebase emulators:exec --config firebase.emulators.json --only firestore,storage --project demo-firelang 'FIRESTORE_PROJECT_ID=demo-firelang FIREBASE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --test storage_emulator --locked -- --nocapture'`
+   - Storage-only quickstart: `firebase emulators:exec --config firebase.emulators.json --only storage --project demo-firelang 'FIREBASE_STORAGE_EMULATOR_HOST=localhost:9199 cargo test --features emulator --test storage_emulator --locked -- --nocapture'`
    - The `integration-emulator` job runs this suite for branch/PR CI and is
      also run by CD. The release therefore does not omit emulator coverage.
 
 3. **Auth emulator (optional but recommended)**
    - From the repo root:  
-     `firebase emulators:exec --only auth --project demo-firelang 'FIREBASE_PROJECT_ID=demo-firelang cargo test --test auth_emulator -- --nocapture'`
+     `firebase emulators:exec --config firebase.emulators.json --only auth --project demo-firelang 'FIREBASE_PROJECT_ID=demo-firelang cargo test --test auth_emulator -- --nocapture'`
    - Same command runs in CI (`.github/workflows/ci.yml`, job `integration-emulator`).
 
 4. **Smoke**
