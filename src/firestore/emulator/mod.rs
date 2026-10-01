@@ -353,6 +353,7 @@ impl Firestore for FirestoreEmulator {
             }
             QuerySource::CollectionGroup(id) => {
                 let sq = structured_query(&self.client.project_id, id, true, &server_filters)?;
+
                 run_query_candidates(self, None, sq, &query.filters)
             }
         }
@@ -548,6 +549,10 @@ fn run_query_candidates(
             out.push((rel, fields));
         }
     }
+    // The server query is only a candidate-generation optimization.  Re-run
+    // every predicate with the same matcher used by the in-memory backend so
+    // server-specific null and structural-value behavior cannot leak through.
+    out.retain(|(rel, fields)| super::matches_filters(rel, fields, &filters));
     Ok(out)
 }
 
@@ -568,6 +573,7 @@ fn server_prefilters(filters: &[QueryFilter]) -> Vec<QueryFilter> {
     filters
         .iter()
         .find(|filter| is_server_prefilter_safe(filter))
+
         .cloned()
         .into_iter()
         .collect()
@@ -599,6 +605,7 @@ fn is_server_prefilter_safe(filter: &QueryFilter) -> bool {
         | QueryOp::ArrayContainsAny => false,
     }
 }
+
 
 fn structured_query(
     project_id: &str,

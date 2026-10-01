@@ -58,6 +58,18 @@ fn supports_timestamp_and_query() {
 }
 
 #[test]
+fn document_name_filter_ordering_operators_match_nothing() {
+    // `==` / `!=` / `in` counts are covered by
+    // `document_name_filters_match_relative_paths`; ordering operators have
+    // no document-name ordering, so they match nothing on both backends.
+    let out = run_script(
+        "set(doc(\"users/a\"), {n: 1})\ncol(\"users\").where(\"__name__\", \">\", \"users/a\").get()",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![]));
+}
+
+#[test]
 fn where_supports_doc_ref_values_for_reference_operators() {
     // The in-memory backend can hold DocRef values directly; the emulator
     // fixture for the same query is seeded through the SDK because its
@@ -2619,6 +2631,51 @@ fn where_supports_array_contains_operators() {
     assert!(
         format!("{err}").contains("array_contains_any filter requires an array value"),
         "{err}"
+    );
+}
+
+#[test]
+fn membership_null_and_empty_array_queries_match_emulator_matrix() {
+    // Keep this matrix in lockstep with
+    // `emulator_membership_null_and_empty_array_queries_match_in_memory`.
+    let script = r#"set("items/n1", {v: 1, tags: [1, nil]})
+set("items/n2", {v: nil, tags: [nil]})
+set("items/n3", {v: "1", tags: []})
+set("items/n4", {tags: [2]})
+set("items/n5", {v: 2, tags: [1, 2]})
+[
+  col("items").where("v", "!=", nil).get().len(),
+  col("items").where("v", "!=", 1).get().len(),
+  col("items").where("v", "not-in", [1]).get().len(),
+  col("items").where("v", "in", [nil]).get().len(),
+  col("items").where("v", "not-in", []).get().len(),
+  col("items").where("v", "not-in", [1, nil]).get().len(),
+  col("items").where("tags", "array_contains", nil).get().len(),
+  col("items").where("tags", "array_contains_any", [nil]).get().len(),
+  col("items").where("tags", "array_contains_any", []).get().len(),
+  col("items").where("v", "in", []).get().len(),
+  col("items").where("v", "!=", 1).where("v", "!=", 2).get().len(),
+  col("items").where("v", "in", [1, 2]).where("v", "not-in", [2]).get().len(),
+  col("items").where("tags", "array_contains_any", [1]).where("tags", "array_contains_any", [2]).get().len(),
+]"#;
+    let out = run_script(script).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(3),
+            Value::Int(3),
+            Value::Int(3),
+            Value::Int(1),
+            Value::Int(4),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(2),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(1),
+            Value::Int(1),
+        ])
     );
 }
 

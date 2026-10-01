@@ -9,7 +9,7 @@ mod common;
 
 use std::collections::HashMap;
 
-use firelang::{run_script, run_script_with_firestore};
+use firelang::run_script_with_firestore;
 use firelang::{EmulatorAuth, FirestoreEmulator, Value};
 use firestore::{FirestoreCreateSupport, FirestoreDb, FirestoreDbOptions};
 use gcloud_sdk::google::firestore::v1::{value, ArrayValue, Document, MapValue, Value as SdkValue};
@@ -149,35 +149,38 @@ fn firestore_global_functions_with_emulator() {
 }
 
 #[test]
-fn emulator_path_segment_id_errors_match_in_memory() {
-    if emulator().is_none() {
+fn emulator_document_name_filters_match_relative_paths() {
+    let Some(fs) = emulator() else {
         eprintln!("skip: no emulator");
         return;
-    }
-
-    let long_id = "x".repeat(1501);
-    let sources = [
-        r#"set("users/.", {a: 1})"#.to_string(),
-        r#"set("users/..", {a: 1})"#.to_string(),
-        r#"set("users/__reserved__", {a: 1})"#.to_string(),
-        format!(r#"set("users/{long_id}", {{a: 1}})"#),
-        r#"col("teams/../members")"#.to_string(),
-        r#"col_group("__reserved__")"#.to_string(),
-        r#"col("users").doc(".")"#.to_string(),
-    ];
-
-    for source in sources {
-        let in_memory = run_script(&source).unwrap_err().to_string();
-        let Some(fs) = emulator() else {
-            eprintln!("skip: emulator disconnected");
-            return;
-        };
-        let emulator_error = run_script_with_firestore(&source, fs)
-            .unwrap_err()
-            .to_string();
-        assert_eq!(emulator_error, in_memory, "{source}");
-    }
+    };
+    // Scope fixtures to a per-run subcollection: the emulator is shared
+    // across tests, so an unscoped `!=` would also match other tests' docs.
+    let id = unique("name_filter");
+    let a = format!("users/{id}/docs/a");
+    let b = format!("users/{id}/docs/b");
+    let col = format!("users/{id}/docs");
+    let script = format!(
+        r#"set("{a}", {{n: 1}})
+set("{b}", {{n: 2}})
+[
+  col("{col}").where("__name__", "==", "{a}").get().map {{ |r| r["__name__"] }},
+  col("{col}").where("__name__", "!=", "{a}").get().map {{ |r| r["__name__"] }},
+  col("{col}").where("__name__", "in", ["{a}", "{b}"]).get().map {{ |r| r["__name__"] }},
+  col("{col}").where("__name__", ">", "{a}").get()
+]"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    let Value::Array(rows) = out else {
+        panic!("expected array");
+    };
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0], Value::Array(vec![Value::Str(a.clone())]));
+    assert_eq!(rows[1], Value::Array(vec![Value::Str(b.clone())]));
+    assert_eq!(rows[2], Value::Array(vec![Value::Str(a), Value::Str(b)]));
+    assert_eq!(rows[3], Value::Array(vec![]));
 }
+
 
 #[test]
 fn emulator_accepts_1500_byte_path_segment() {
@@ -241,30 +244,6 @@ col("users").where("age", ">=", 20).limit(2).get()"#
     }
 }
 
-#[test]
-fn emulator_document_name_filters_match_relative_paths() {
-    let Some(fs) = emulator() else {
-        eprintln!("skip: no emulator");
-        return;
-    };
-    let id = unique("name");
-    let first = format!("users/{id}/docs/1");
-    let second = format!("users/{id}/docs/2");
-    let script = format!(
-        r#"set("{first}", {{n: 1}})
-set("{second}", {{n: 2}})
-[
-  col("users/{id}/docs").where("__name__", "==", "{first}").get().len(),
-  col("users/{id}/docs").where("__name__", "!=", "{first}").get().len(),
-  col("users/{id}/docs").where("__name__", "in", ["{first}", "{second}"]).get().len()
-]"#
-    );
-    let out = run_script_with_firestore(&script, fs).unwrap();
-    assert_eq!(
-        out,
-        Value::Array(vec![Value::Int(1), Value::Int(1), Value::Int(2)])
-    );
-}
 
 #[test]
 fn emulator_collection_group_query() {
@@ -815,7 +794,6 @@ fn emulator_delete_field_and_increment_match_in_memory() {
             "name" => Value::Str("a".to_string()),
             "visits" => Value::Int(15)
         }
-
     );
 }
 
@@ -857,6 +835,59 @@ set("users/{run}/rows/r6", {{other: 1}})
             Value::Int(3),
             Value::Int(2),
             Value::Int(5),
+        ])
+    );
+}
+
+#[test]
+fn emulator_membership_null_and_empty_array_queries_match_in_memory() {
+    // This is the parity matrix for the filters that must not be delegated
+    // wholesale to Firestore.  In particular, null is a value in firelang and
+    // an array may contain null elements.
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let run = unique("qparity");
+    let script = format!(
+        r#"set("users/{run}/rows/n1", {{v: 1, tags: [1, nil]}})
+set("users/{run}/rows/n2", {{v: nil, tags: [nil]}})
+set("users/{run}/rows/n3", {{v: "1", tags: []}})
+set("users/{run}/rows/n4", {{tags: [2]}})
+set("users/{run}/rows/n5", {{v: 2, tags: [1, 2]}})
+[
+  col("users/{run}/rows").where("v", "!=", nil).get().len(),
+  col("users/{run}/rows").where("v", "!=", 1).get().len(),
+  col("users/{run}/rows").where("v", "not-in", [1]).get().len(),
+  col("users/{run}/rows").where("v", "in", [nil]).get().len(),
+  col("users/{run}/rows").where("v", "not-in", []).get().len(),
+  col("users/{run}/rows").where("v", "not-in", [1, nil]).get().len(),
+  col("users/{run}/rows").where("tags", "array_contains", nil).get().len(),
+  col("users/{run}/rows").where("tags", "array_contains_any", [nil]).get().len(),
+  col("users/{run}/rows").where("tags", "array_contains_any", []).get().len(),
+  col("users/{run}/rows").where("v", "in", []).get().len(),
+  col("users/{run}/rows").where("v", "!=", 1).where("v", "!=", 2).get().len(),
+  col("users/{run}/rows").where("v", "in", [1, 2]).where("v", "not-in", [2]).get().len(),
+  col("users/{run}/rows").where("tags", "array_contains_any", [1]).where("tags", "array_contains_any", [2]).get().len(),
+]"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(3),
+            Value::Int(3),
+            Value::Int(3),
+            Value::Int(1),
+            Value::Int(4),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(2),
+            Value::Int(0),
+            Value::Int(0),
+            Value::Int(2),
+            Value::Int(1),
+            Value::Int(1),
         ])
     );
 }

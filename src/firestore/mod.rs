@@ -284,22 +284,6 @@ pub(crate) fn matches_filters(
     })
 }
 
-fn query_field_value<'a>(doc: &'a BTreeMap<String, Value>, field: &str) -> Option<&'a Value> {
-    let mut current = doc;
-    let mut segments = field.split('.').peekable();
-    while let Some(segment) = segments.next() {
-        let value = current.get(segment)?;
-        if segments.peek().is_none() {
-            return Some(value);
-        }
-        current = match value {
-            Value::Map(inner) => inner,
-            _ => return None,
-        };
-    }
-    None
-}
-
 fn matches_document_name_filter(path: &str, filter: &QueryFilter) -> bool {
     let is_path = |value: &Value| matches!(value, Value::Str(actual) if actual == path);
     match filter.op {
@@ -329,6 +313,23 @@ fn compare_where_values(
         .and_then(|value| value.cmp_for_where(filter))
         .is_some_and(predicate)
 }
+
+pub(crate) fn query_field_value<'a>(doc: &'a BTreeMap<String, Value>, field: &str) -> Option<&'a Value> {
+    let mut current = doc;
+    let mut segments = field.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let value = current.get(segment)?;
+        if segments.peek().is_none() {
+            return Some(value);
+        }
+        current = match value {
+            Value::Map(inner) => inner,
+            _ => return None,
+        };
+    }
+    None
+}
+
 
 pub(crate) fn paths_overlap(a: &str, b: &str) -> bool {
     if a == b {
@@ -544,7 +545,9 @@ pub enum WriteOp {
 }
 
 /// クエリ候補: フィルタに一致した (相対ドキュメントパス, フィールド) の列。
-/// 順序・offset/limit・`__name__` は未適用(runtime が付ける)。
+/// 順序・offset/limit と結果行への `__name__` 付与は未適用(runtime が行う)。
+/// ただし `__name__` を対象とする filter 自体は backend の共有 matcher が
+/// 相対パスに対して評価する。
 pub type QueryCandidates = Vec<(String, BTreeMap<String, Value>)>;
 
 pub trait Firestore {
@@ -552,8 +555,9 @@ pub trait Firestore {
     /// Apply writes atomically: either all writes persist or none do.
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>>;
     /// Returns filter-matching candidates as (relative path, document fields).
-    /// Ordering, offset/limit, and `__name__` are NOT applied here; the runtime
-    /// applies them uniformly for both backends (spec §7).
+    /// Ordering, offset/limit, and insertion of the synthetic `__name__` field
+    /// are applied by the runtime. A filter on `__name__` itself is evaluated
+    /// against the relative path by the shared backend matcher (spec §7).
     fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>>;
 
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>>;
