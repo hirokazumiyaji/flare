@@ -181,7 +181,6 @@ set("{b}", {{n: 2}})
     assert_eq!(rows[3], Value::Array(vec![]));
 }
 
-
 #[test]
 fn emulator_accepts_1500_byte_path_segment() {
     let Some(fs) = emulator() else {
@@ -243,7 +242,6 @@ col("users").where("age", ">=", 20).limit(2).get()"#
         );
     }
 }
-
 
 #[test]
 fn emulator_collection_group_query() {
@@ -924,7 +922,6 @@ set("users/{run}/rows/n5", {{v: 2, tags: [1, 2]}})
         ])
     );
 }
-
 
 #[test]
 fn emulator_query_encodes_doc_refs_and_ignores_external_references() {

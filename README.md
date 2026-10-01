@@ -57,9 +57,6 @@ firebase emulators:exec --config firebase.emulators.json --only firestore --proj
 `firebase deploy --config firebase.emulators.json` は実行しないでください。
 詳細は [Firebase rules の分離とデプロイ防止策](docs/firebase-security.md) を参照してください。
 
-本番 Firestore（認証付き）と Cloud Storage は非対応です。
-詳細は [仕様の 11-12 章](docs/spec.md#11-バックエンド) を参照してください。
-=======
 `fl --backend emulator` は feature なしで実行すると、SDK を読み込まずに
 `emulator` feature の有効化方法を案内して終了します。in-memory 専用の
 consumer は `cargo build --no-default-features` でも同じ in-memory API を利用できます。
@@ -67,7 +64,7 @@ consumer は `cargo build --no-default-features` でも同じ in-memory API を�
 エミュレータは Firebase CLI で起動します(別ターミナルで `firebase emulators:start --only firestore` など)。リポジトリ直下の `firebase.json` を使ってワンショットで試す例:
 
 ```bash
-firebase emulators:exec --only firestore --project demo-firelang \
+firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang \
   'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator -- --nocapture'
 ```
 
@@ -81,7 +78,7 @@ Storage の MVP CRUD は `storage_upload` / `storage_download` / `storage_metada
 
 ```bash
 export FIREBASE_PROJECT_ID=demo-firelang
-firebase emulators:exec --only storage --project demo-firelang \
+firebase emulators:exec --config firebase.emulators.json --only storage --project demo-firelang \
   'cargo test --test storage_emulator -- --nocapture'
 ```
 
@@ -99,16 +96,14 @@ cargo run --features emulator --bin fl -- --auth-backend emulator path/to/script
 エミュレータは Firebase CLI で起動します(別ターミナルで `firebase emulators:start` など)。リポジトリ直下の `firebase.json` を使ってワンショットで試す例:
 
 ```bash
-firebase emulators:exec --only firestore --project demo-firelang \
+firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang \
   'FIRESTORE_PROJECT_ID=demo-firelang cargo test --test firestore_emulator -- --nocapture'
 
-firebase emulators:exec --only auth --project demo-firelang \
+firebase emulators:exec --config firebase.emulators.json --only auth --project demo-firelang \
   'FIREBASE_PROJECT_ID=demo-firelang cargo test --test auth_emulator -- --nocapture'
 ```
 
 本番 Firestore / 本番 Firebase Authentication への接続は非対応です。詳細は [仕様の 12-13 章](docs/spec.md#12-バックエンド) を参照してください。
-
->>>>>>> origin/main
 
 ## テスト
 
@@ -127,7 +122,6 @@ cargo test --no-default-features --all-targets
 # emulator SDK を有効にしたビルド
 cargo check --features emulator --all-targets
 cargo test --features emulator --all-targets
->>>>>>> origin/main
 ```
 
 エミュレータ統合テスト(`firestore_emulator` / `storage_emulator` / `auth_emulator`)は対応する emulator host 変数が未設定なら早期 return でスキップされます。`emulator` feature を有効にして、実際に叩くには上記の `firebase emulators:exec` を使うか、エミュレータ起動後に環境変数を設定して:

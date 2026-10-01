@@ -17,29 +17,28 @@ Use before tagging a release or publishing binaries.
 
 2. **Firestore / Storage emulators (required release gate)**
    - Install [Firebase CLI](https://firebase.google.com/docs/cli) and Java 11+.
-   - From the repo root, use the explicit local-only config and `demo-firelang` project:
+   - Local runs use the explicit local-only config and the `demo-firelang`
+     project. Never run `firebase deploy --config firebase.emulators.json`:
+     `firebase.json` is the deploy config and denies every read/write.
+   - Firestore:
      `firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang 'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --locked -- --nocapture'`
-   - Never run `firebase deploy --config firebase.emulators.json`.
-   - Same emulator test runs in CI (`.github/workflows/ci.yml`, job `integration-emulator`).
-
-   - From the repo root:  
-     `firebase emulators:exec --only firestore,storage --project demo-firelang 'FIRESTORE_PROJECT_ID=demo-firelang FIREBASE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --test storage_emulator --locked -- --nocapture'`
-   - Storage-only quickstart: `firebase emulators:exec --only storage --project demo-firelang 'FIREBASE_STORAGE_EMULATOR_HOST=localhost:9199 cargo test --features emulator --test storage_emulator --locked -- --nocapture'`
+   - Firestore + Storage:
+     `firebase emulators:exec --config firebase.emulators.json --only firestore,storage --project demo-firelang 'FIRESTORE_PROJECT_ID=demo-firelang FIREBASE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --test storage_emulator --locked -- --nocapture'`
+   - Storage-only quickstart: `firebase emulators:exec --config firebase.emulators.json --only storage --project demo-firelang 'FIREBASE_STORAGE_EMULATOR_HOST=localhost:9199 cargo test --features emulator --test storage_emulator --locked -- --nocapture'`
    - The `integration-emulator` job runs this suite for branch/PR CI and is
      also run by CD. The release therefore does not omit emulator coverage.
 
 3. **Auth emulator (optional but recommended)**
    - From the repo root:  
-     `firebase emulators:exec --only auth --project demo-firelang 'FIREBASE_PROJECT_ID=demo-firelang cargo test --test auth_emulator -- --nocapture'`
+     `firebase emulators:exec --config firebase.emulators.json --only auth --project demo-firelang 'FIREBASE_PROJECT_ID=demo-firelang cargo test --test auth_emulator -- --nocapture'`
    - Same command runs in CI (`.github/workflows/ci.yml`, job `integration-emulator`).
->>>>>>> origin/main
 
 4. **Smoke**
    - `./target/release/fl --help`
    - `./target/release/fl examples/scripts/01_basic.fl`
    - With emulator: set `FIRESTORE_EMULATOR_HOST` and `FIRESTORE_PROJECT_ID` (plus `FIREBASE_STORAGE_EMULATOR_HOST` for storage), then run the feature-enabled binary with `./target/release/fl --backend emulator examples/scripts/01_basic.fl` (the release workflow builds with `--features emulator`).
 
-4. **Tag and package**
+5. **Tag and package**
    - Confirm the tag is `v<Cargo package version>` and not merely any `v*` tag. The validator compares it with `cargo metadata --no-deps --format-version 1`:
      `scripts/validate-release-tag.sh v0.1.0`
    - Push the tag. CD calls the reusable CI workflow, validates the version,
@@ -49,7 +48,7 @@ Use before tagging a release or publishing binaries.
      `README.md`, `LICENSE`, `docs/spec.md`, and `SHA256SUMS`. CD also
      publishes the archive's `.sha256` sidecar.
 
-5. **Verify a downloaded release**
+6. **Verify a downloaded release**
    - Put the `.tar.gz` and `.tar.gz.sha256` files in the same directory.
    - Run `sha256sum -c firelang-<version>-linux-x86_64.tar.gz.sha256`.
    - Extract it and run `sha256sum -c SHA256SUMS` from the extracted directory.

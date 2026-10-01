@@ -2086,7 +2086,6 @@ fn wrap_doc(path: &str, doc: &BTreeMap<String, Value>) -> Value {
     Value::Map(out)
 }
 
-
 /// Convert an array index to the host index type. Generic over `T` so a test
 /// can instantiate a narrower target width on a 64-bit host and exercise the
 /// real `TryFrom` conversion rather than a test-only limit check. Production
