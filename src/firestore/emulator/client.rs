@@ -58,6 +58,10 @@ pub(super) fn connect(
     // dedicated connect deadline so an embedding caller is not forced to wait
     // for the SDK's transport default.
     let connect_timeout = operation_timeout.min(CONNECT_TIMEOUT);
+    // One deadline for the whole connection sequence.  Client creation and the
+    // probe run back to back, so a separate full timeout for each would let a
+    // constructor configured for 5 seconds block for nearly 10.
+    let sequence_started = Instant::now();
     let db = run_operation(
         &runtime,
         connect_timeout,
@@ -68,6 +72,7 @@ pub(super) fn connect(
             emulator_token_source(auth),
         ),
     )?;
+    let probe_timeout = remaining_budget(connect_timeout, sequence_started.elapsed());
 
     // The SDK's channel can be created after the TCP socket is accepted even
     // when the peer never completes the HTTP/2 handshake.  Probe one harmless
@@ -99,16 +104,22 @@ pub(super) fn connect(
                 .await
         }
     };
-    match runtime.block_on(async move { tokio::time::timeout(connect_timeout, probe).await }) {
+    match runtime.block_on(async move { tokio::time::timeout(probe_timeout, probe).await }) {
         // `Err(_)` is the deadline firing; the status itself is reported below.
         Err(_) => {
             return Err(FirelangError::backend(format!(
-                "Firestore emulator connection probe timed out after {}ms",
+                "Firestore emulator connection probe timed out after {}ms (connect budget {}ms)",
+                probe_timeout.as_millis(),
                 connect_timeout.as_millis()
             ))
             .into())
         }
         Ok(Ok(_)) => {}
+        // A denied read is expected for the EnforceRules/deny-rules setup, and
+        // the emulator also answers UNAUTHENTICATED when the owner token is
+        // refused (the rules-deployed project rejects the owner's requests
+        // with exactly that status).  All three statuses prove the peer
+        // understood a Firestore request, which is what the probe is for.
         Ok(Err(status)) if is_reachable_probe_answer(status.code()) => {}
         Ok(Err(status)) => {
             return Err(FirelangError::backend(format!(
@@ -150,7 +161,23 @@ where
     }
 }
 
+/// Budget left for the connect probe after client creation consumed part of it.
+///
+/// `connect` advertises one fail-fast deadline for the whole sequence, so the
+/// probe may only spend what the client did not.  Saturating subtraction keeps
+/// the result non-negative, which makes a stalled probe fail immediately
+/// instead of being handed a second full budget.
+fn remaining_budget(connect_timeout: Duration, elapsed: Duration) -> Duration {
+    connect_timeout.saturating_sub(elapsed)
+}
+
 /// Statuses that still prove the peer is a Firestore emulator.
+///
+/// `UNAUTHENTICATED` is deliberately **not** accepted: an authentication
+/// gateway in front of a non-Firestore gRPC service answers with it, and so
+/// does an emulator that rejected the credentials the caller asked for.
+/// Returning a client in that state would move the failure to the caller's
+/// first real operation instead of reporting it at construction time.
 ///
 /// Anything else (UNAVAILABLE, UNIMPLEMENTED, INTERNAL, ...) means the port
 /// belongs to a different service or the emulator is broken, and `connect`
@@ -158,9 +185,7 @@ where
 fn is_reachable_probe_answer(code: gcloud_sdk::tonic::Code) -> bool {
     matches!(
         code,
-        gcloud_sdk::tonic::Code::NotFound
-            | gcloud_sdk::tonic::Code::PermissionDenied
-            | gcloud_sdk::tonic::Code::Unauthenticated
+        gcloud_sdk::tonic::Code::NotFound | gcloud_sdk::tonic::Code::PermissionDenied
     )
 }
 
@@ -270,18 +295,20 @@ mod tests {
 
     #[test]
     fn probe_accepts_refusals_but_rejects_other_services() {
-        // These three still prove the peer is a Firestore emulator: the probe
-        // document is absent, the rules deny every read, or the credentials
-        // were rejected. The deny-rules CI check depends on the middle case.
+        // These two still prove the peer is a Firestore emulator: the probe
+        // document is absent, or the rules deny every read. The deny-rules CI
+        // check depends on the second case.
         for code in [
             gcloud_sdk::tonic::Code::NotFound,
             gcloud_sdk::tonic::Code::PermissionDenied,
-            gcloud_sdk::tonic::Code::Unauthenticated,
         ] {
             assert!(is_reachable_probe_answer(code), "{code:?}");
         }
-        // A port owned by a different service must still fail `connect`.
+        // A port owned by a different service, or credentials the emulator
+        // refused, must still fail `connect` instead of handing back a client
+        // whose first real operation fails.
         for code in [
+            gcloud_sdk::tonic::Code::Unauthenticated,
             gcloud_sdk::tonic::Code::Unavailable,
             gcloud_sdk::tonic::Code::Unimplemented,
             gcloud_sdk::tonic::Code::Internal,
@@ -290,6 +317,23 @@ mod tests {
         ] {
             assert!(!is_reachable_probe_answer(code), "{code:?}");
         }
+    }
+
+    #[test]
+    fn probe_only_gets_the_budget_the_client_creation_left() {
+        // Client creation plus the probe share one deadline.
+        let budget = Duration::from_millis(500);
+        assert_eq!(remaining_budget(budget, Duration::from_millis(0)), budget);
+        assert_eq!(
+            remaining_budget(budget, Duration::from_millis(200)),
+            Duration::from_millis(300)
+        );
+        // Overrunning the budget must not wrap around into a second full
+        // budget for the probe.
+        assert_eq!(
+            remaining_budget(budget, Duration::from_millis(900)),
+            Duration::ZERO
+        );
     }
 
     #[test]

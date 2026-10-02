@@ -16,6 +16,10 @@ fn fl_help_exits_zero() {
     assert!(status.success(), "fl --help should exit 0");
 }
 
+// The compiled `fl` only accepts `--backend emulator` with the feature
+// enabled, so a default or `--no-default-features` build must skip this test
+// even when `FIRESTORE_EMULATOR_HOST` happens to be exported.
+#[cfg(feature = "emulator")]
 #[test]
 fn fl_emulator_backend_set_get_round_trip() {
     let Ok(host) = std::env::var("FIRESTORE_EMULATOR_HOST") else {
