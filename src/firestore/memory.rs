@@ -1,13 +1,74 @@
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
+use std::sync::Arc;
 
 use super::{prepare_query_filters, validate_write_op, Firestore, WriteOp};
 use crate::value::{QueryRef, QuerySource, Timestamp, Value};
 
-#[derive(Default)]
+/// in-memory backend が `server_timestamp()` の request time を取得する時計。
+///
+/// 実運用では [`Timestamp::now`] を使い、テストでは commit ごとに異なる固定値を
+/// 返すクロージャーを注入できる。
+///
+/// コミット処理はこのクロージャーを**高々 1 回**呼ぶ。request time は
+/// `server_timestamp()` を含む sentinel を解決するときだけ必要になるため、
+/// timestamp を含まない write や空の transaction commit では **0 回**である。
+/// 呼び出し側が「1 commit = 1 回」のように回数で状態を返す closure を
+/// 書かないこと: 同一 commit 内の複数 sentinel は 1 つの request time を
+/// 共有し、commit ごとに値が同じでも次の commit でまた呼ばれる。
+pub type RequestClock = Arc<dyn Fn() -> Result<Timestamp, Box<dyn Error>> + Send + Sync + 'static>;
+
+struct RequestTime<'a> {
+    clock: &'a RequestClock,
+    value: Option<Timestamp>,
+}
+
+impl RequestTime<'_> {
+    fn get(&mut self) -> Result<&Timestamp, Box<dyn Error>> {
+        if self.value.is_none() {
+            self.value = Some((self.clock)()?);
+        }
+        self.value
+            .as_ref()
+            .ok_or_else(|| "request time was not initialized".into())
+    }
+}
+
 pub struct InMemoryFirestore {
     docs: HashMap<String, BTreeMap<String, Value>>,
     tx_snapshot: Option<HashMap<String, BTreeMap<String, Value>>>,
+    request_clock: RequestClock,
+}
+
+impl Default for InMemoryFirestore {
+    fn default() -> Self {
+        Self::with_clock(Timestamp::now)
+    }
+}
+
+impl InMemoryFirestore {
+    /// `server_timestamp()` を使う request time を注入して in-memory
+    /// Firestore を作る。
+    ///
+    /// `clock` は 1 回の write / batch / transaction commit につき**高々 1 回**、
+    /// そしてその commit が `server_timestamp()` を含むときだけ呼ばれる。
+    /// timestamp を含まない write や空の commit では呼ばれないので、呼び出し
+    /// 回数を前提にした状態を進めないこと(値は commit ごとに 1 つ共有される)。
+    pub fn with_clock<F>(clock: F) -> Self
+    where
+        F: Fn() -> Result<Timestamp, Box<dyn Error>> + Send + Sync + 'static,
+    {
+        Self {
+            docs: HashMap::new(),
+            tx_snapshot: None,
+            request_clock: Arc::new(clock),
+        }
+    }
+
+    /// 常に同じ request time を返す、決定論的な clock を注入する。
+    pub fn with_fixed_timestamp(seconds: i64) -> Self {
+        Self::with_clock(move || Ok(Timestamp { seconds }))
+    }
 }
 
 impl Firestore for InMemoryFirestore {
@@ -16,9 +77,15 @@ impl Firestore for InMemoryFirestore {
     }
 
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        // Sample REQUEST_TIME lazily: ordinary writes must not depend on a
+        // fallible clock callback, and all sentinels in one commit share it.
+        let mut request_time = RequestTime {
+            clock: &self.request_clock,
+            value: None,
+        };
         let mut next = self.docs.clone();
         for op in writes {
-            apply_write_to_docs(&mut next, op)?;
+            apply_write_to_docs(&mut next, op, &mut request_time)?;
         }
         self.docs = next;
         Ok(())
@@ -96,8 +163,13 @@ impl Firestore for InMemoryFirestore {
             .as_ref()
             .ok_or("not in transaction")?
             .clone();
+        // transaction も同じ commit request の clock を全 write で共有する。
+        let mut request_time = RequestTime {
+            clock: &self.request_clock,
+            value: None,
+        };
         for op in writes {
-            apply_write_to_docs(&mut next, op)?;
+            apply_write_to_docs(&mut next, op, &mut request_time)?;
         }
         self.docs = next;
         self.tx_snapshot = None;
@@ -142,6 +214,7 @@ fn path_in_group(id: &str, doc_path: &str) -> bool {
 fn apply_write_to_docs(
     docs: &mut HashMap<String, BTreeMap<String, Value>>,
     op: WriteOp,
+    request_time: &mut RequestTime<'_>,
 ) -> Result<(), Box<dyn Error>> {
     validate_write_op(&op)?;
     match op {
@@ -152,18 +225,18 @@ fn apply_write_to_docs(
         } => {
             if merge {
                 let current = docs.entry(path).or_default();
-                apply_update_map(current, &data)?;
+                apply_update_map(current, &mut data, request_time)?;
             } else {
-                resolve_sentinel_map(&mut data, None)?;
+                resolve_sentinel_map(&mut data, None, request_time)?;
                 docs.insert(path, data);
             }
             Ok(())
         }
-        WriteOp::Update { path, data } => {
+        WriteOp::Update { path, mut data } => {
             let current = docs
                 .get_mut(&path)
                 .ok_or_else(|| format!("document not found: {path}"))?;
-            apply_update_map(current, &data)?;
+            apply_update_map(current, &mut data, request_time)?;
             Ok(())
         }
         WriteOp::Delete { path } => {
@@ -175,7 +248,8 @@ fn apply_write_to_docs(
 
 fn apply_update_map(
     current: &mut BTreeMap<String, Value>,
-    updates: &BTreeMap<String, Value>,
+    updates: &mut BTreeMap<String, Value>,
+    request_time: &mut RequestTime<'_>,
 ) -> Result<(), Box<dyn Error>> {
     let super::WriteValues {
         plain,
@@ -216,7 +290,7 @@ fn apply_update_map(
                 };
                 Value::Array(arr.into_iter().filter(|v| !values.contains(v)).collect())
             }
-            Value::ServerTimestamp => Value::Timestamp(Timestamp::now()?),
+            Value::ServerTimestamp => Value::Timestamp(request_time.get()?.clone()),
             Value::Increment(n) => match base {
                 Some(Value::Int(cur)) => Value::Int(cur.checked_add(n).unwrap_or_else(|| {
                     if n.is_negative() {
@@ -238,6 +312,7 @@ fn apply_update_map(
 fn resolve_sentinel_map(
     map: &mut BTreeMap<String, Value>,
     current: Option<&BTreeMap<String, Value>>,
+    request_time: &mut RequestTime<'_>,
 ) -> Result<(), Box<dyn Error>> {
     for (k, v) in map.clone() {
         super::reject_nested_sentinels(&v, false)?;
@@ -263,7 +338,7 @@ fn resolve_sentinel_map(
                 };
                 Value::Array(arr.into_iter().filter(|v| !values.contains(v)).collect())
             }
-            Value::ServerTimestamp => Value::Timestamp(Timestamp::now()?),
+            Value::ServerTimestamp => Value::Timestamp(request_time.get()?.clone()),
             Value::Increment(n) => match base() {
                 Some(Value::Int(cur)) => Value::Int(cur.checked_add(n).unwrap_or_else(|| {
                     if n.is_negative() {

@@ -934,10 +934,16 @@ mod tests {
 
     #[test]
     fn new_fails_fast_without_emulator() {
-        // 接続は構築時に確立する。届かない相手には即エラーになる。
-        // (9番ポートは discard のため emulator がいることはない)
+        // OS に一時的に確保させ、接続していない loopback port を取得する。
+        // discard port のように「通常誰も使わない」固定 port には依存しない。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        // 接続は構築時に確立する。届かない相手には connect deadline までに
+        // エラーになる。
         let res = FirestoreEmulator::new_with_timeout(
-            "127.0.0.1:9".to_string(),
+            host,
             "p".to_string(),
             std::time::Duration::from_millis(50),
         );

@@ -21,12 +21,13 @@ pub use firestore::{
     parse_timeout_ms, EmulatorAuth, EmulatorConfig, EmulatorConnectionError, FirestoreEmulator,
     FirestoreEmulatorOptions, DEFAULT_OPERATION_TIMEOUT, OPERATION_TIMEOUT_ENV,
 };
-pub use firestore::{Firestore, InMemoryFirestore};
+pub use firestore::{Firestore, InMemoryFirestore, RequestClock};
 pub use storage::{
     HttpStorageTransport, HttpTransport, InMemoryStorage, Storage, StorageEmulator, StorageError,
     StorageErrorKind, StorageHttpTransport, StorageMetadata, StorageRequest, StorageResponse,
     StorageTransport,
 };
+
 pub use value::Value;
 
 pub fn run_script(source: &str) -> Result<Value, Box<dyn Error>> {
