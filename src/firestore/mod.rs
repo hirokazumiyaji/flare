@@ -173,6 +173,46 @@ pub(crate) fn validate_firestore_field_name(name: &str) -> Result<(), Box<dyn Er
     Ok(())
 }
 
+/// Firestore の ID 固有の制約。パス上のセグメントと単一 ID 引数で共有する。
+///
+/// spec §6 の通り、document ID と collection ID で制約は同一。予約パターン
+/// `__.*__` の検査も document だけを対象にせず両方に適用する(片方だけだと
+/// `col("__meta__")` が通るが `doc("users/__x__")` は弾くというズレが
+/// in-memory / emulator の食い違いの原因になる)。
+///
+/// `__name__` クエリフィルタの document path 検証もここを使うので、
+/// `get` / `doc` / write と name フィルタが同じパスを受け入れる。
+pub(crate) fn validate_firestore_id(id: &str) -> Result<(), &'static str> {
+    if id.is_empty() {
+        return Err("must not be empty");
+    }
+    if id.contains('/') {
+        return Err("must not contain '/'");
+    }
+    if id.len() > MAX_FIELD_NAME_BYTES {
+        return Err("must be at most 1,500 UTF-8 bytes");
+    }
+    if id == "." || id == ".." {
+        return Err("must not be \".\" or \"..\"");
+    }
+    if is_reserved_firestore_id(id) {
+        return Err("must not match the reserved pattern __.*__");
+    }
+    Ok(())
+}
+
+/// Firestore の予約 ID 正規表現 `^__.*__$` 相当。
+///
+/// Datastore 由来の数値 ID(`__id123__` 形式)は既存ドキュメントの参照として
+/// 扱うため例外とする。クエリや参照フィールドで返されたドキュメントを
+/// `get` / `update` / `delete` に渡せなくなるのを避ける。
+pub(crate) fn is_reserved_firestore_id(id: &str) -> bool {
+    if id.len() >= 4 && id.starts_with("__") && id.ends_with("__") {
+        return !is_legacy_datastore_numeric_id(id);
+    }
+    false
+}
+
 /// Datastore 由来の数値エンティティ ID(`__id` + 10進数字 + `__`)かどうか。
 /// 予約パターン `__.*__` の例外として、既存参照の読み書きに使う。
 pub(crate) fn is_legacy_datastore_numeric_id(id: &str) -> bool {
@@ -493,23 +533,18 @@ fn validate_document_id_filter_value(field: &str, value: &Value) -> Result<(), B
 /// document / collection ID と同じ 1,500 UTF-8 バイト制限を ID 単位で課す。
 fn validate_document_filter_path(field: &str, path: &str) -> Result<(), Box<dyn Error>> {
     let segments: Vec<&str> = path.split('/').collect();
+    // `doc()` / `get()` / write と同じ document path 規則を使う。collection
+    // セグメントも検査する(片側だけ検査すると `doc()` では通らない path が
+    // name フィルタだけ通ってしまう)ので、index で分ける処理はしない。
     if segments.is_empty() || !segments.len().is_multiple_of(2) {
         return Err(format!("invalid document path in {field} filter: {path}").into());
     }
-    for (index, segment) in segments.iter().enumerate() {
-        let reserved_document_id = index % 2 == 1
-            && segment.len() >= 4
-            && segment.starts_with("__")
-            && segment.ends_with("__");
-        if segment.is_empty() || *segment == "." || *segment == ".." || reserved_document_id {
-            return Err(format!("invalid document path in {field} filter: {path}").into());
-        }
-        if segment.len() > MAX_FIELD_NAME_BYTES {
-            return Err(format!(
-                "invalid document path in {field} filter: {path:?} is too large (maximum {MAX_FIELD_NAME_BYTES} UTF-8 bytes)"
+    for segment in &segments {
+        validate_firestore_id(segment).map_err(|reason| {
+            format!(
+                "invalid document path in {field} filter: {path} (segment {segment:?}: {reason})"
             )
-            .into());
-        }
+        })?;
     }
     Ok(())
 }
@@ -1092,14 +1127,49 @@ mod tests {
         };
         validate_query_filters(std::slice::from_ref(&filter)).unwrap();
 
-        // 1 ID だけ上限を超える reference は拒否する。
+        // 1 ID だけ上限を超える reference は拒否する。拒否理由は `doc()` /
+        // `get()` / write と同じ共有规则的文言になる。
         let filter = QueryFilter {
             field: "__name__".to_string(),
             op: QueryOp::Eq,
             value: Value::Str(format!("{deep}/{}", "y".repeat(MAX_FIELD_NAME_BYTES + 1))),
         };
         let err = validate_query_filters(std::slice::from_ref(&filter)).unwrap_err();
-        assert!(format!("{err}").contains("too large"), "{err}");
+        assert!(
+            format!("{err}").contains("must be at most 1,500 UTF-8 bytes"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn document_name_filter_paths_follow_the_shared_path_rules() {
+        let accept = |path: &str| {
+            let filter = QueryFilter {
+                field: "__name__".to_string(),
+                op: QueryOp::Eq,
+                value: Value::Str(path.to_string()),
+            };
+            validate_query_filters(std::slice::from_ref(&filter))
+        };
+        // Datastore 由来の数値 ID は `set` / `get` / `doc()` が受け付ける
+        // 既存参照なので、name フィルタも同じく通す。
+        accept("users/__id123__").unwrap();
+        // collection セグメントも同じ規則で検査する(片側だけ検査すると
+        // `doc()` では通らない path が name フィルタだけ通ってしまう)。
+        for reserved in [
+            "__meta__/1",
+            "users/1/__name__",
+            "users/1/__id1__",
+            "users/1/.",
+            "users/1/..",
+            "users//1",
+            "users",
+        ] {
+            assert!(
+                accept(reserved).is_err(),
+                "expected {reserved:?} to be rejected"
+            );
+        }
     }
 
     #[test]
