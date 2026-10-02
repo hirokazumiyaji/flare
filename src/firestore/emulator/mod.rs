@@ -12,13 +12,14 @@ use std::time::Duration;
 use gcloud_sdk::google::firestore::v1::{
     batch_get_documents_request, batch_get_documents_response, run_aggregation_query_request,
     run_query_request, structured_aggregation_query, structured_query, value as firestore_value,
-    BatchGetDocumentsRequest, BeginTransactionRequest, GetDocumentRequest, RollbackRequest,
-    RunAggregationQueryRequest, RunQueryRequest, StructuredAggregationQuery, StructuredQuery,
+    BatchGetDocumentsRequest, BeginTransactionRequest, Document, GetDocumentRequest,
+    RollbackRequest, RunAggregationQueryRequest, RunQueryRequest, StructuredAggregationQuery,
+    StructuredQuery,
 };
 use gcloud_sdk::tonic::{Code, Request};
 
-use super::{apply_query_shape, Firestore, QueryCandidates, WriteOp};
-use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Value};
+use super::{apply_query_shape, parse_query_field_path, Firestore, QueryCandidates, WriteOp};
+use crate::value::{DocRef, QueryFilter, QueryOp, QueryRef, QuerySource, Value};
 
 const COUNT_ALIAS: &str = "all";
 
@@ -38,20 +39,26 @@ pub const OPERATION_TIMEOUT_ENV: &str = "FIRESTORE_EMULATOR_TIMEOUT_MS";
 /// Optional constructor settings for [`FirestoreEmulator`].
 #[derive(Debug, Clone, Copy)]
 pub struct FirestoreEmulatorOptions {
-    pub operation_timeout: Duration,
+    pub operation_timeout: Option<Duration>,
 }
 
 impl Default for FirestoreEmulatorOptions {
     fn default() -> Self {
         Self {
-            operation_timeout: DEFAULT_OPERATION_TIMEOUT,
+            operation_timeout: Some(DEFAULT_OPERATION_TIMEOUT),
         }
     }
 }
 
 impl FirestoreEmulatorOptions {
     pub fn with_operation_timeout(mut self, operation_timeout: Duration) -> Self {
-        self.operation_timeout = operation_timeout;
+        self.operation_timeout = Some(operation_timeout);
+        self
+    }
+
+    /// Explicitly disable the adapter deadline.
+    pub fn without_operation_timeout(mut self) -> Self {
+        self.operation_timeout = None;
         self
     }
 }
@@ -66,6 +73,10 @@ pub struct FirestoreEmulator {
     //   Some --preparation/commit/abort failure--> Some
     //   None --abort--> None
     transaction_id: Option<Vec<u8>>,
+    /// Maximum `Value` nesting the recursive codec may traverse.  Bounding the
+    /// codec is what actually prevents a deeply nested stored document from
+    /// overflowing the stack; validating after the fact would be too late.
+    max_value_depth: usize,
 }
 
 /// A validated emulator configuration. Holding this costs nothing and opens no
@@ -130,7 +141,7 @@ impl FirestoreEmulator {
             config.host,
             config.project_id,
             auth,
-            config.operation_timeout,
+            Some(config.operation_timeout),
         )
         .ok()
     }
@@ -144,7 +155,7 @@ impl FirestoreEmulator {
             Some(config) => Ok(Some(Self::new_with_timeout(
                 config.host,
                 config.project_id,
-                config.operation_timeout,
+                Some(config.operation_timeout),
             )?)),
         }
     }
@@ -190,7 +201,7 @@ impl FirestoreEmulator {
 
     /// Construct using the configured application default.
     pub fn new(host: String, project_id: String) -> Result<Self, Box<dyn Error>> {
-        Self::new_with_timeout(host, project_id, DEFAULT_OPERATION_TIMEOUT)
+        Self::new_with_timeout(host, project_id, Some(DEFAULT_OPERATION_TIMEOUT))
     }
 
     /// 接続を確立して作る。`auth = EnforceRules` なら admin 資格を使わず
@@ -200,7 +211,7 @@ impl FirestoreEmulator {
         project_id: String,
         auth: client::EmulatorAuth,
     ) -> Result<Self, Box<dyn Error>> {
-        Self::new_with_auth_and_timeout(host, project_id, auth, DEFAULT_OPERATION_TIMEOUT)
+        Self::new_with_auth_and_timeout(host, project_id, auth, Some(DEFAULT_OPERATION_TIMEOUT))
     }
 
     /// auth と timeout の両方を指定する完全版。
@@ -208,7 +219,7 @@ impl FirestoreEmulator {
         host: String,
         project_id: String,
         auth: client::EmulatorAuth,
-        operation_timeout: Duration,
+        operation_timeout: Option<Duration>,
     ) -> Result<Self, Box<dyn Error>> {
         validate_config("FIRESTORE_EMULATOR_HOST", &host)?;
         validate_config("FIRESTORE_PROJECT_ID", &project_id)?;
@@ -222,14 +233,19 @@ impl FirestoreEmulator {
         Ok(Self {
             client,
             transaction_id: None,
+            max_value_depth: crate::limits::DEFAULT_MAX_VALUE_DEPTH,
         })
     }
 
     /// Construct with an embedding-level per-operation timeout override.
+    /// Construct with an embedding-level per-operation timeout override.
+    ///
+    /// `None` explicitly disables the adapter deadline, which is what
+    /// `RuntimeLimits::unlimited()` means for this backend.
     pub fn new_with_timeout(
         host: String,
         project_id: String,
-        operation_timeout: Duration,
+        operation_timeout: Option<Duration>,
     ) -> Result<Self, Box<dyn Error>> {
         Self::new_with_options(
             host,
@@ -252,22 +268,31 @@ impl FirestoreEmulator {
     }
 
     /// Override the timeout after construction without replacing the SDK client
-    /// or its reusable runtime.
-    pub fn with_operation_timeout(mut self, operation_timeout: Duration) -> Self {
+    /// or its reusable runtime. `None` disables the adapter deadline.
+    pub fn with_operation_timeout(mut self, operation_timeout: Option<Duration>) -> Self {
         self.client.operation_timeout = operation_timeout;
         self
     }
 
     /// Short alias for [`Self::with_operation_timeout`].
-    pub fn with_timeout(self, operation_timeout: Duration) -> Self {
+    pub fn with_timeout(self, operation_timeout: Option<Duration>) -> Self {
         self.with_operation_timeout(operation_timeout)
     }
 
-    pub fn set_operation_timeout(&mut self, operation_timeout: Duration) {
+    /// Set the per-operation deadline used by all subsequent emulator RPCs.
+    /// This is also the hook `Runtime` calls when it propagates
+    /// `RuntimeLimits::backend_timeout`.
+    pub fn set_operation_timeout(&mut self, operation_timeout: Option<Duration>) {
         self.client.operation_timeout = operation_timeout;
     }
 
-    pub fn operation_timeout(&self) -> Duration {
+    /// Return the maximum `Value` nesting depth the codec will traverse.
+    pub fn max_value_depth(&self) -> usize {
+        self.max_value_depth
+    }
+
+    /// Return the currently configured per-operation deadline.
+    pub fn operation_timeout(&self) -> Option<Duration> {
         self.client.operation_timeout
     }
 }
@@ -318,17 +343,23 @@ impl Firestore for FirestoreEmulator {
             },
         );
         match result {
-            Ok(resp) => {
-                codec::decode_document(&resp.into_inner(), self.client.db.get_documents_path())
-                    .map(Some)
-            }
+            Ok(resp) => codec::decode_document_bounded(
+                &resp.into_inner(),
+                self.client.db.get_documents_path(),
+                self.max_value_depth,
+            )
+            .map(Some),
             Err(error) if is_not_found(error.as_ref()) => Ok(None),
             Err(error) => Err(error),
         }
     }
 
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
-        let sdk_writes = writes::write_ops_to_sdk_writes(&self.client.project_id, &writes)?;
+        let sdk_writes = writes::write_ops_to_sdk_writes(
+            &self.client.project_id,
+            &writes,
+            self.max_value_depth,
+        )?;
         writes::commit_writes(
             &self.client.db,
             &self.client.runtime,
@@ -340,6 +371,10 @@ impl Firestore for FirestoreEmulator {
 
     fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
+        // Parse every filter before constructing/sending the RPC.  This keeps
+        // malformed paths from reaching Firestore and gives both backends the
+        // same validation error.
+        super::prepare_query_filters(&query.filters)?;
         // Firestore の server filter は候補を減らすためだけに使ってよい。
         // 最終的な一致判定は必ず共通の local matcher で行う(特に異型の
         // 大小比較を Firestore の型順序に委ねない)。
@@ -357,7 +392,6 @@ impl Firestore for FirestoreEmulator {
             }
             QuerySource::CollectionGroup(id) => {
                 let sq = structured_query(&self.client.project_id, id, true, &server_filters)?;
-
                 run_query_candidates(self, None, sq, &query.filters)
             }
         }
@@ -394,8 +428,64 @@ impl Firestore for FirestoreEmulator {
             run_query_candidates(self, parent, sq, &query.filters)
         } else {
             let rows = run_query_candidates(self, parent, sq, &query.filters)?;
-            Ok(apply_query_shape(rows, query))
+            let order_by = super::parse_order_by(query)?;
+            Ok(apply_query_shape(rows, query, &order_by))
         }
+    }
+
+    /// Run a query while refusing to walk more than `max_results` candidates.
+    ///
+    /// The stream is consumed with a bounded collector, so the extra row that
+    /// proves the budget was exceeded is never decoded or retained.  The
+    /// query's own `order_by` / `offset` / `limit` shape is applied to the
+    /// collected candidates afterwards, exactly as in `run_query_page`: the
+    /// budget bounds the server-side work, the query shape bounds the page.
+    fn run_query_bounded(
+        &self,
+        query: &QueryRef,
+        max_results: usize,
+    ) -> Result<QueryCandidates, Box<dyn Error>> {
+        super::validate_query_filters(&query.filters)?;
+        let server_filters = server_prefilters(&query.filters);
+        let (parent, sq) = match &query.source {
+            QuerySource::Collection(path) => {
+                let (parent, collection_id) = path::split_collection_path(path)?;
+                (
+                    parent,
+                    structured_query(
+                        &self.client.project_id,
+                        collection_id,
+                        false,
+                        &server_filters,
+                    )?,
+                )
+            }
+            QuerySource::CollectionGroup(id) => (
+                None,
+                structured_query(&self.client.project_id, id, true, &server_filters)?,
+            ),
+        };
+        if query.limit == Some(0) {
+            return Ok(vec![]);
+        }
+        let rows =
+            run_query_candidates_bounded(self, parent.as_deref(), sq, &query.filters, max_results)?;
+        let order_by = super::parse_order_by(query)?;
+        Ok(apply_query_shape(rows, query, &order_by))
+    }
+
+    /// Apply `RuntimeLimits::backend_timeout` to every subsequent RPC.
+    fn set_timeout(&mut self, timeout: Option<Duration>) {
+        self.set_operation_timeout(timeout);
+    }
+
+    /// Apply `RuntimeLimits::max_value_depth` to the recursive codec.
+    fn set_max_value_depth(&mut self, max_depth: usize) {
+        self.max_value_depth = max_depth;
+    }
+
+    fn supports_backend_timeout(&self) -> bool {
+        true
     }
 
     fn count_query(&self, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
@@ -492,7 +582,13 @@ impl Firestore for FirestoreEmulator {
         )?;
         result
             .as_ref()
-            .map(|doc| codec::decode_document(doc, self.client.db.get_documents_path()))
+            .map(|doc| {
+                codec::decode_document_bounded(
+                    doc,
+                    self.client.db.get_documents_path(),
+                    self.max_value_depth,
+                )
+            })
             .transpose()
     }
 
@@ -507,7 +603,11 @@ impl Firestore for FirestoreEmulator {
         // pending-rollback path) instead of dropping the id and risking a
         // non-idempotent retry.
         let tid = self.transaction_id.clone().ok_or("not in transaction")?;
-        let sdk_writes = writes::write_ops_to_sdk_writes(&self.client.project_id, &writes)?;
+        let sdk_writes = writes::write_ops_to_sdk_writes(
+            &self.client.project_id,
+            &writes,
+            self.max_value_depth,
+        )?;
         let result = writes::commit_writes(
             &self.client.db,
             &self.client.runtime,
@@ -682,10 +782,141 @@ fn run_query_candidates(
     query: StructuredQuery,
     filters: &[QueryFilter],
 ) -> Result<QueryCandidates, Box<dyn Error>> {
+    let docs = run_query_candidate_documents(fs, parent, query)?;
+    decode_query_documents(fs, docs, filters)
+}
+
+/// Consume a server-streaming query, decoding and matching rows as they
+/// arrive and stopping as soon as more than `max_results` candidates match.
+///
+/// The matcher runs inside the stream loop on purpose: the server's own
+/// filtering can be looser than the shared contract (missing fields,
+/// cross-type comparisons), so counting the stream rows would let the emulator
+/// reject queries the in-memory backend accepts.  Counting the same quantity
+/// on both backends keeps the budget's meaning identical everywhere.  The
+/// document that proves the budget was exceeded is not retained, and dropping
+/// the stream cancels the remaining RPC.
+fn run_query_candidates_bounded(
+    fs: &FirestoreEmulator,
+    parent: Option<&str>,
+    query: StructuredQuery,
+    filters: &[QueryFilter],
+    max_results: usize,
+) -> Result<QueryCandidates, Box<dyn Error>> {
     let db = &fs.client.db;
     let parent = path::parent_path(&fs.client.project_id, parent);
+    // The shared matcher needs the parsed field paths (quoted names, the
+    // `__name__` pseudo-field) and the normalized document-name filter values.
+    // Both are derived once per query, not per document.
+    let (field_paths, normalized_values) = super::prepare_query_filters(filters)?;
+    let project_id = fs.client.project_id.clone();
+    let resource_root = db.get_documents_path();
+    let max_value_depth = fs.max_value_depth;
     let filters = filters.to_vec();
-    let docs = client::run_operation(
+    let (rows, exceeded) = client::run_operation(
+        &fs.client.runtime,
+        fs.client.operation_timeout,
+        "query",
+        async move {
+            let response = db
+                .client()
+                .get()
+                .run_query(Request::new(RunQueryRequest {
+                    parent,
+                    explain_options: None,
+                    query_type: Some(run_query_request::QueryType::StructuredQuery(query)),
+                    consistency_selector: None,
+                    request_options: None,
+                }))
+                .await?;
+            let mut stream = response.into_inner();
+            let mut rows: QueryCandidates = Vec::new();
+            let mut exceeded = false;
+            while let Some(row) = stream.message().await? {
+                let Some(doc) = row.document else {
+                    continue;
+                };
+                let rel = path::relative_document_name_for(
+                    &doc.name,
+                    &project_id,
+                    path::DEFAULT_DATABASE_ID,
+                )?;
+                let Value::Map(fields) =
+                    codec::decode_document_bounded(&doc, resource_root, max_value_depth)?
+                else {
+                    return Err(QueryStreamError::Local("query result must be a map".into()));
+                };
+                if !super::matches_filters(
+                    &rel,
+                    &fields,
+                    &filters,
+                    &field_paths,
+                    &normalized_values,
+                ) {
+                    continue;
+                }
+                if rows.len() >= max_results {
+                    exceeded = true;
+                    break;
+                }
+                rows.push((rel, fields));
+            }
+            Ok::<_, QueryStreamError>((rows, exceeded))
+        },
+    )?;
+    if exceeded {
+        return Err(super::query_result_limit_error(max_results));
+    }
+    Ok(rows)
+}
+
+/// Either a transport error or a decode/match error raised while consuming a
+/// query stream.  Decoding inside the stream loop needs both, and gRPC's
+/// `Status` cannot carry a firelang-side message faithfully.
+#[derive(Debug)]
+enum QueryStreamError {
+    Rpc(gcloud_sdk::tonic::Status),
+    Local(Box<dyn Error>),
+}
+
+impl std::fmt::Display for QueryStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rpc(status) => write!(f, "{status}"),
+            Self::Local(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl Error for QueryStreamError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Rpc(_) => None,
+            Self::Local(error) => Some(error.as_ref()),
+        }
+    }
+}
+
+impl From<gcloud_sdk::tonic::Status> for QueryStreamError {
+    fn from(status: gcloud_sdk::tonic::Status) -> Self {
+        Self::Rpc(status)
+    }
+}
+
+impl From<Box<dyn Error>> for QueryStreamError {
+    fn from(error: Box<dyn Error>) -> Self {
+        Self::Local(error)
+    }
+}
+
+fn run_query_candidate_documents(
+    fs: &FirestoreEmulator,
+    parent: Option<&str>,
+    query: StructuredQuery,
+) -> Result<Vec<Document>, Box<dyn Error>> {
+    let db = &fs.client.db;
+    let parent = path::parent_path(&fs.client.project_id, parent);
+    client::run_operation(
         &fs.client.runtime,
         fs.client.operation_timeout,
         "query",
@@ -710,9 +941,20 @@ fn run_query_candidates(
             }
             Ok::<_, gcloud_sdk::tonic::Status>(docs)
         },
-    )?;
+    )
+}
 
-    let mut out = vec![];
+/// Decode collected documents and re-apply the complete predicate with the
+/// same matcher the in-memory backend uses, so server-specific null and
+/// structural-value behavior cannot leak through.  The server query is only a
+/// candidate-generation optimization.
+fn decode_query_documents(
+    fs: &FirestoreEmulator,
+    docs: Vec<Document>,
+    filters: &[QueryFilter],
+) -> Result<QueryCandidates, Box<dyn Error>> {
+    let (field_paths, normalized_values) = super::prepare_query_filters(filters)?;
+    let mut out = Vec::with_capacity(docs.len());
     let resource_root = fs.client.db.get_documents_path();
     for doc in docs {
         let rel = path::relative_document_name_for(
@@ -720,17 +962,18 @@ fn run_query_candidates(
             &fs.client.project_id,
             path::DEFAULT_DATABASE_ID,
         )?;
-        let Value::Map(fields) = codec::decode_document(&doc, resource_root)? else {
+        let Value::Map(fields) =
+            codec::decode_document_bounded(&doc, resource_root, fs.max_value_depth)?
+        else {
             return Err("query result must be a map".into());
         };
-        if super::matches_filters(&rel, &fields, &filters) {
+        if super::matches_filters(&rel, &fields, filters, &field_paths, &normalized_values) {
             out.push((rel, fields));
         }
     }
-    // The server query is only a candidate-generation optimization.  Re-run
-    // every predicate with the same matcher used by the in-memory backend so
-    // server-specific null and structural-value behavior cannot leak through.
-    out.retain(|(rel, fields)| super::matches_filters(rel, fields, &filters));
+    out.retain(|(rel, fields)| {
+        super::matches_filters(rel, fields, filters, &field_paths, &normalized_values)
+    });
     Ok(out)
 }
 
@@ -854,6 +1097,7 @@ fn build_where(
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
     let mut parts = vec![];
     for f in filters {
+        let field_path = parse_query_field_path(&f.field)?;
         let op = match f.op {
             QueryOp::Eq => structured_query::field_filter::Operator::Equal,
             QueryOp::Ne => structured_query::field_filter::Operator::NotEqual,
@@ -866,14 +1110,19 @@ fn build_where(
             QueryOp::ArrayContains => structured_query::field_filter::Operator::ArrayContains,
             QueryOp::ArrayContainsAny => structured_query::field_filter::Operator::ArrayContainsAny,
         };
+        let value = if field_path.is_document_id() {
+            encode_document_id_query_value(project_id, &f.value)?
+        } else {
+            codec::encode_query_value(project_id, &f.value)?
+        };
         parts.push(structured_query::Filter {
             filter_type: Some(structured_query::filter::FilterType::FieldFilter(
                 structured_query::FieldFilter {
                     field: Some(structured_query::FieldReference {
-                        field_path: f.field.clone(),
+                        field_path: field_path.wire().to_string(),
                     }),
                     op: op.into(),
-                    value: Some(codec::encode_query_value(project_id, &f.value)?),
+                    value: Some(value),
                 },
             )),
         });
@@ -892,18 +1141,51 @@ fn build_where(
     })
 }
 
+/// `__name__` is a document reference on the wire, while the public API uses
+/// a relative path string.  Convert both strings and DocRefs recursively so
+/// `==`, `in`, and nested membership values have the same meaning.
+fn encode_document_id_query_value(
+    project_id: &str,
+    value: &Value,
+) -> Result<gcloud_sdk::google::firestore::v1::Value, Box<dyn Error>> {
+    match value {
+        Value::Str(path) => {
+            codec::encode_query_value(project_id, &Value::DocRef(DocRef { path: path.clone() }))
+        }
+        Value::Array(items) => Ok(gcloud_sdk::google::firestore::v1::Value {
+            value_type: Some(
+                gcloud_sdk::google::firestore::v1::value::ValueType::ArrayValue(
+                    gcloud_sdk::google::firestore::v1::ArrayValue {
+                        values: items
+                            .iter()
+                            .map(|item| encode_document_id_query_value(project_id, item))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    },
+                ),
+            ),
+        }),
+        other => codec::encode_query_value(project_id, other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn new_fails_fast_without_emulator() {
-        // 接続は構築時に確立する。届かない相手には即エラーになる。
-        // (9番ポートは discard のため emulator がいることはない)
+        // OS に一時的に確保させ、接続していない loopback port を取得する。
+        // discard port のように「通常誰も使わない」固定 port には依存しない。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        // 接続は構築時に確立する。届かない相手には connect deadline までに
+        // エラーになる。
         let res = FirestoreEmulator::new_with_timeout(
-            "127.0.0.1:9".to_string(),
+            host,
             "p".to_string(),
-            std::time::Duration::from_millis(50),
+            Some(std::time::Duration::from_millis(50)),
         );
         match res {
             Ok(_) => panic!("expected connection failure"),

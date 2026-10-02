@@ -4,7 +4,6 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
-#[cfg(feature = "emulator")]
 use std::time::Duration;
 
 #[cfg(feature = "emulator")]
@@ -12,8 +11,8 @@ use firelang::{
     parse_timeout_ms as parse_library_timeout_ms, AuthEmulator, EmulatorConfig, FirestoreEmulator,
 };
 use firelang::{
-    run_script_with_all_backends, Auth, InMemoryAuth, InMemoryFirestore, InMemoryStorage,
-    StorageEmulator,
+    run_script_with_all_backends_and_limits, Auth, InMemoryAuth, InMemoryFirestore,
+    InMemoryStorage, RuntimeLimits, StorageEmulator,
 };
 
 #[cfg(not(feature = "emulator"))]
@@ -40,6 +39,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut paths: Vec<PathBuf> = vec![];
     let mut inline: Vec<String> = vec![];
     let mut use_stdin = false;
+    // Every budget is finite by default: `fl` accepts arbitrary scripts, so an
+    // unbounded recursion, loop, or nested value must be a reported error
+    // rather than a hang or a stack overflow.
+    let mut limits = RuntimeLimits::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].to_str() {
@@ -96,6 +99,44 @@ fn run() -> Result<(), Box<dyn Error>> {
                 auth_backend = value.to_string();
                 i += 2;
             }
+            Some("--max-call-depth") => {
+                limits.max_call_depth = Some(parse_u64(&args, i, "--max-call-depth")? as usize);
+                i += 2;
+            }
+            Some("--max-steps") => {
+                limits.max_steps = Some(parse_u64(&args, i, "--max-steps")?);
+                i += 2;
+            }
+            Some("--max-loop-iterations") => {
+                limits.max_loop_iterations = Some(parse_u64(&args, i, "--max-loop-iterations")?);
+                i += 2;
+            }
+            Some("--max-wall-clock-ms") => {
+                limits.max_wall_clock = Some(Duration::from_millis(parse_u64(
+                    &args,
+                    i,
+                    "--max-wall-clock-ms",
+                )?));
+                i += 2;
+            }
+            Some("--max-parser-depth") => {
+                limits.max_parser_depth = Some(parse_u64(&args, i, "--max-parser-depth")? as usize);
+                i += 2;
+            }
+            Some("--max-value-depth") => {
+                limits.max_value_depth = Some(parse_u64(&args, i, "--max-value-depth")? as usize);
+                i += 2;
+            }
+            Some("--max-query-results") => {
+                limits.max_query_results =
+                    Some(parse_u64(&args, i, "--max-query-results")? as usize);
+                i += 2;
+            }
+            Some("--unlimited") => {
+                limits = RuntimeLimits::unlimited();
+                i += 1;
+            }
+
             Some("-e") => {
                 let script = args.get(i + 1).ok_or("-e requires a script argument")?;
                 inline.push(
@@ -232,57 +273,76 @@ fn run() -> Result<(), Box<dyn Error>> {
     let selected_auth = select_auth(&auth_backend)?;
     #[cfg(feature = "emulator")]
     let out = match (backend_config, selected_storage) {
-        (None, SelectedStorage::Memory) => run_script_with_all_backends(
+        (None, SelectedStorage::Memory) => run_script_with_all_backends_and_limits(
             &src,
             InMemoryFirestore::default(),
             InMemoryStorage::default(),
             selected_auth,
+            limits,
         )?,
-        (Some(config), SelectedStorage::Memory) => run_script_with_all_backends(
+        (Some(config), SelectedStorage::Memory) => run_script_with_all_backends_and_limits(
             &src,
             FirestoreEmulator::new_with_timeout(
                 config.host,
                 config.project_id,
-                emulator_timeout.unwrap_or(config.operation_timeout),
+                Some(emulator_timeout.unwrap_or(config.operation_timeout)),
             )?,
             InMemoryStorage::default(),
             selected_auth,
+            limits,
         )?,
-        (None, SelectedStorage::Emulator(storage)) => run_script_with_all_backends(
+        (None, SelectedStorage::Emulator(storage)) => run_script_with_all_backends_and_limits(
             &src,
             InMemoryFirestore::default(),
             storage,
             selected_auth,
+            limits,
         )?,
-        (Some(config), SelectedStorage::Emulator(storage)) => run_script_with_all_backends(
-            &src,
-            FirestoreEmulator::new_with_timeout(
-                config.host,
-                config.project_id,
-                emulator_timeout.unwrap_or(config.operation_timeout),
-            )?,
-            storage,
-            selected_auth,
-        )?,
+        (Some(config), SelectedStorage::Emulator(storage)) => {
+            run_script_with_all_backends_and_limits(
+                &src,
+                FirestoreEmulator::new_with_timeout(
+                    config.host,
+                    config.project_id,
+                    Some(emulator_timeout.unwrap_or(config.operation_timeout)),
+                )?,
+                storage,
+                selected_auth,
+                limits,
+            )?
+        }
     };
     #[cfg(not(feature = "emulator"))]
     let out = match selected_storage {
-        SelectedStorage::Memory => run_script_with_all_backends(
+        SelectedStorage::Memory => run_script_with_all_backends_and_limits(
             &src,
             InMemoryFirestore::default(),
             InMemoryStorage::default(),
             selected_auth,
+            limits,
         )?,
-        SelectedStorage::Emulator(storage) => run_script_with_all_backends(
+        SelectedStorage::Emulator(storage) => run_script_with_all_backends_and_limits(
             &src,
             InMemoryFirestore::default(),
             storage,
             selected_auth,
+            limits,
         )?,
     };
 
     println!("=> {}", out.inspect());
     Ok(())
+}
+
+/// Parse a non-negative budget value for `--<name> <n>`.
+fn parse_u64(args: &[OsString], i: usize, name: &str) -> Result<u64, Box<dyn Error>> {
+    let raw = args
+        .get(i + 1)
+        .ok_or_else(|| format!("{name} requires a number"))?;
+    raw.to_str()
+        .ok_or_else(|| format!("{name} value must be valid UTF-8"))?
+        .parse::<u64>()
+        .map_err(|_| format!("{name} requires a non-negative integer").into())
 }
 
 #[cfg(feature = "emulator")]
@@ -383,7 +443,7 @@ fn make_storage(host: String, project_id: String) -> Result<StorageEmulator, Box
 
 fn print_usage() {
     eprintln!(
-        "usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] (<script-file> | - | -e <script>)"
+        "usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] [budget options] (<script-file> | - | -e <script>)"
     );
     eprintln!();
     eprintln!("  Script source (exactly one):");
@@ -416,6 +476,38 @@ fn print_usage() {
     eprintln!("    --timeout-ms <ms>          alias for --emulator-timeout-ms");
     #[cfg(feature = "emulator")]
     eprintln!("    FIRESTORE_EMULATOR_TIMEOUT_MS  environment override for the default");
+    eprintln!();
+    eprintln!("  Budgets (all optional; finite defaults protect untrusted input):");
+    eprintln!(
+        "    --max-call-depth <n>        nested call depth (default {})",
+        firelang::DEFAULT_MAX_CALL_DEPTH
+    );
+    eprintln!(
+        "    --max-steps <n>             evaluated statements (default {})",
+        firelang::DEFAULT_MAX_STEPS
+    );
+    eprintln!(
+        "    --max-loop-iterations <n>   while/each/map iterations (default {})",
+        firelang::DEFAULT_MAX_LOOP_ITERATIONS
+    );
+    eprintln!(
+        "    --max-wall-clock-ms <n>     wall-clock budget in ms (default {})",
+        firelang::DEFAULT_MAX_WALL_CLOCK_MS
+    );
+    eprintln!(
+        "    --max-parser-depth <n>      parser/AST nesting (default {})",
+        firelang::DEFAULT_MAX_PARSER_DEPTH
+    );
+    eprintln!(
+        "    --max-value-depth <n>       runtime Value nesting (default {})",
+        firelang::DEFAULT_MAX_VALUE_DEPTH
+    );
+    eprintln!(
+        "    --max-query-results <n>     query candidates materialized (default {})",
+        firelang::DEFAULT_MAX_QUERY_RESULTS
+    );
+    eprintln!("    --unlimited                 disable every budget (trusted scripts only;");
+    eprintln!("                                recursion can then overflow the native stack)");
     eprintln!();
     eprintln!("  Storage backends:");
     eprintln!("    auto       use the Storage emulator when FIREBASE_STORAGE_EMULATOR_HOST is set");

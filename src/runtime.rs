@@ -1,13 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::error::Error;
+use std::time::{Duration, Instant};
 
 use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
 use crate::auth::{Auth, AuthError, InMemoryAuth};
 use crate::error::{FirelangError, Span};
-use crate::firestore::{is_legacy_datastore_numeric_id, Firestore, WriteOp};
+use crate::firestore::{
+    normalize_query_field_path, validate_firestore_id, validate_write_data, Firestore,
+    QueryCandidates, QueryResultLimitExceeded, WriteOp,
+};
+use crate::limits::{RuntimeLimits, RuntimeUsage};
+use crate::parser::Parser;
 use crate::storage::{validate_content_type, validate_storage_path, InMemoryStorage, Storage};
 use crate::value::{
-    CollectionGroupRef, CollectionRef, Direction, DocRef, QueryFilter, QueryOp, QueryRef,
+    self, CollectionGroupRef, CollectionRef, Direction, DocRef, QueryFilter, QueryOp, QueryRef,
     Timestamp, UserFunc, Value,
 };
 
@@ -15,6 +21,22 @@ enum ExecCtx {
     Normal,
     Batch { writes: Vec<WriteOp> },
     Transaction { writes: Vec<WriteOp> },
+}
+
+/// Propagate the parts of the budget that constrain the *backend*.
+///
+/// A backend that recurses while converting values (the emulator codec) must
+/// know the depth ceiling, otherwise it overflows the native stack before the
+/// runtime can validate the result. A disabled value-depth budget still needs a
+/// finite number for that recursion guard, so the shipped default is used as
+/// the backstop.
+fn apply_backend_limits<F: Firestore>(fs: &mut F, limits: &RuntimeLimits) {
+    fs.set_timeout(limits.backend_timeout);
+    fs.set_max_value_depth(
+        limits
+            .max_value_depth
+            .unwrap_or(crate::limits::DEFAULT_MAX_VALUE_DEPTH),
+    );
 }
 
 enum MethodReceiver {
@@ -40,11 +62,31 @@ pub struct Runtime<F: Firestore, S: Storage = InMemoryStorage> {
     /// would make every later `transaction` fail with "already in
     /// transaction" and nothing in a script could clear the state.
     pending_rollback: bool,
+    limits: RuntimeLimits,
+    usage: RuntimeUsage,
+    call_depth: usize,
+    started_at: Option<Instant>,
+    execution_active: bool,
 }
 
 impl<F: Firestore> Runtime<F, InMemoryStorage> {
+    /// Construct a runtime with conservative, finite limits.
     pub fn new(fs: F) -> Self {
-        Self::with_storage(fs, InMemoryStorage::default())
+        Self::with_limits(fs, RuntimeLimits::default())
+    }
+
+    /// Construct a runtime with embedder-provided limits.
+    ///
+    /// The backend hook applies to subsequent operations. A
+    /// `FirestoreEmulator` that must also apply the same deadline while
+    /// connecting should be created with `FirestoreEmulator::new_with_timeout`.
+    pub fn with_limits(fs: F, limits: RuntimeLimits) -> Self {
+        Self::with_storage_and_limits(fs, InMemoryStorage::default(), limits)
+    }
+
+    /// Explicit constructor for trusted scripts with all budgets disabled.
+    pub fn new_unlimited(fs: F) -> Self {
+        Self::with_limits(fs, RuntimeLimits::unlimited())
     }
 
     /// Construct a runtime with an explicit authentication backend.
@@ -68,6 +110,12 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
     /// Storage deliberately remain separate services; the default runtime
     /// uses [`InMemoryStorage`].
     pub fn with_storage(fs: F, storage: S) -> Self {
+        Self::with_storage_and_limits(fs, storage, RuntimeLimits::default())
+    }
+
+    /// Construct a runtime with explicit Storage and budgets.
+    pub fn with_storage_and_limits(mut fs: F, storage: S, limits: RuntimeLimits) -> Self {
+        apply_backend_limits(&mut fs, &limits);
         Self {
             scopes: vec![HashMap::new()],
             fs,
@@ -75,19 +123,64 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
             auth: Box::new(InMemoryAuth::default()),
             exec: ExecCtx::Normal,
             pending_rollback: false,
+            limits,
+            usage: RuntimeUsage::default(),
+            call_depth: 0,
+            started_at: None,
+            execution_active: false,
         }
     }
 
     /// Construct a runtime with explicit Storage and Auth backends.
     pub fn with_storage_and_auth<A: Auth + 'static>(fs: F, storage: S, auth: A) -> Self {
-        Self {
-            scopes: vec![HashMap::new()],
-            fs,
-            storage,
-            auth: Box::new(auth),
-            exec: ExecCtx::Normal,
-            pending_rollback: false,
-        }
+        let mut rt = Self::with_storage(fs, storage);
+        rt.auth = Box::new(auth);
+        rt
+    }
+
+    /// Construct a runtime with explicit Storage, Auth, and budgets.
+    pub fn with_storage_limits_and_auth<A: Auth + 'static>(
+        fs: F,
+        storage: S,
+        auth: A,
+        limits: RuntimeLimits,
+    ) -> Self {
+        let mut rt = Self::with_storage_and_limits(fs, storage, limits);
+        rt.auth = Box::new(auth);
+        rt
+    }
+
+    pub fn limits(&self) -> RuntimeLimits {
+        self.limits
+    }
+
+    /// Report whether the configured backend can enforce `backend_timeout`.
+    /// Legacy synchronous backends may retain the trait's compatibility
+    /// no-op; the built-in emulator returns `true`.
+    pub fn backend_timeout_supported(&self) -> bool {
+        self.fs.supports_backend_timeout()
+    }
+
+    pub fn set_limits(&mut self, limits: RuntimeLimits) {
+        self.limits = limits;
+        apply_backend_limits(&mut self.fs, &self.limits);
+    }
+
+    /// Return a snapshot of the counters consumed by the most recent run.
+    pub fn usage(&self) -> RuntimeUsage {
+        let mut usage = self.usage;
+        usage.elapsed = self
+            .started_at
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
+        usage
+    }
+
+    pub fn reset_usage(&mut self) {
+        self.usage = RuntimeUsage::default();
+        self.call_depth = 0;
+        self.started_at = None;
+        self.execution_active = false;
     }
 
     pub fn auth(&self) -> &dyn Auth {
@@ -99,7 +192,11 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
     }
 
     pub fn eval_program(&mut self, stmts: &[Stmt]) -> Result<Value, Box<dyn Error>> {
-        self.eval_block(stmts).map(ExecFlow::into_value)
+        self.with_execution(|rt| {
+            rt.validate_external_ast_depth(stmts)?;
+            rt.check_wall_clock_at_source()
+                .and_then(|_| rt.eval_block(stmts).map(ExecFlow::into_value))
+        })
     }
 
     /// トップレベル文の開始位置付きで評価し、失敗した文の位置を
@@ -110,6 +207,31 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         stmts: &[Stmt],
         spans: &[Span],
     ) -> Result<Value, Box<dyn Error>> {
+        self.with_execution(|rt| {
+            rt.check_wall_clock_at_source()
+                .and_then(|_| rt.eval_program_with_spans_active(stmts, spans))
+        })
+    }
+
+    /// Externally supplied ASTs (an embedder calling the public API) may nest
+    /// far deeper than the parser would produce, so the parser-depth budget is
+    /// enforced here too. Without it, a hand-built deeply nested `Call` or
+    /// `Binary` chain would recurse into `eval_expr` without ever reaching the
+    /// parser guard.
+    fn validate_external_ast_depth(&self, stmts: &[Stmt]) -> Result<(), Box<dyn Error>> {
+        let Some(max) = self.limits.max_parser_depth else {
+            return Ok(());
+        };
+        Parser::validate_stmt_depth(stmts, max)
+            .map_err(|error| attach_span(error, Some(Span::new(1, 1))))
+    }
+
+    fn eval_program_with_spans_active(
+        &mut self,
+        stmts: &[Stmt],
+        spans: &[Span],
+    ) -> Result<Value, Box<dyn Error>> {
+        self.validate_external_ast_depth(stmts)?;
         let mut last = Value::Nil;
         for (i, stmt) in stmts.iter().enumerate() {
             let span = spans.get(i).copied();
@@ -125,13 +247,175 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
     /// ソースを字句解析・構文解析・評価する一連の処理。`lib.rs` の
     /// エントリポイントとテストの共有ヘルパー。
     pub fn run(&mut self, source: &str) -> Result<Value, Box<dyn Error>> {
-        let spanned = crate::lexer::lex_spanned(source)?;
-        let mut parser = crate::parser::Parser::from_spanned(spanned);
+        self.with_execution(|rt| rt.run_active(source))
+    }
+
+    fn run_active(&mut self, source: &str) -> Result<Value, Box<dyn Error>> {
+        // Check before lexing as well as after parsing.  This matters for a
+        // zero/very-small wall-clock budget: source-size/token limits are
+        // separate guards and may be intentionally disabled by an embedder.
+        //
+        // A budget failure raised before evaluation has no statement to point
+        // at, so attach the start of the program.  The CLI contract is that
+        // runtime failures always carry a position.
+        self.check_wall_clock_at_source()?;
+        let spanned = crate::lexer::lex_spanned_with_limits(source, self.limits.parser_limits())?;
+        self.check_wall_clock_at_source()?;
+        let mut parser = Parser::from_spanned_with_limits(spanned, self.limits.parser_limits());
         let (program, spans) = parser.parse_program_with_spans()?;
-        self.eval_program_with_spans(&program, &spans)
+        self.check_wall_clock_at_source()?;
+        self.eval_program_with_spans_active(&program, &spans)
+    }
+
+    /// Wall-clock check for the pre-evaluation phase, reported at the start of
+    /// the program because no statement has begun yet.
+    fn finish_execution(&mut self) {
+        if let Some(started_at) = self.started_at.take() {
+            self.usage.elapsed = started_at.elapsed();
+        }
+        self.call_depth = 0;
+        self.execution_active = false;
+    }
+
+    fn check_wall_clock_at_source(&self) -> Result<(), Box<dyn Error>> {
+        self.check_wall_clock()
+            .map_err(|e| attach_span(e, Some(Span::new(1, 1))))
+    }
+
+    /// 実行を開始し、budget の起点を記録する。
+    ///
+    /// 公開エントリポイント (`run` / `eval_program*`) は再入を許さない。
+    /// 許すと `start_execution` が実行中の `usage` / `started_at` を静かに
+    /// リセットし、step / value / wall-clock の budget が実質無効になる。
+    fn start_execution(&mut self) -> Result<(), Box<dyn Error>> {
+        if self.execution_active {
+            return Err(FirelangError::runtime(
+                "run() / eval_program() is already executing on this Runtime",
+            )
+            .into());
+        }
+        self.usage = RuntimeUsage::default();
+        self.call_depth = 0;
+        self.started_at = Some(Instant::now());
+        self.execution_active = true;
+        Ok(())
+    }
+
+    /// Run one public entry point with the execution state cleared on every
+    /// exit path, including an unwind.
+    ///
+    /// A backend that panics must not leave `execution_active` set: the next
+    /// `run` would then be rejected as reentrant instead of observing the
+    /// scopes that the scope guards restored while unwinding. The panic is
+    /// resumed after the reset so callers still see it.
+    fn with_execution<T>(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> Result<T, Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>> {
+        self.start_execution()?;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(self)));
+        self.finish_execution();
+        match outcome {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn check_wall_clock(&self) -> Result<(), Box<dyn Error>> {
+        let Some(limit) = self.limits.max_wall_clock else {
+            return Ok(());
+        };
+        let Some(started_at) = self.started_at else {
+            return Ok(());
+        };
+        let elapsed = started_at.elapsed();
+        if elapsed >= limit {
+            return Err(FirelangError::runtime(format!(
+                "wall-clock limit exceeded (max {})",
+                format_duration(limit)
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    fn consume_step(&mut self) -> Result<(), Box<dyn Error>> {
+        self.check_wall_clock()?;
+        if let Some(max) = self.limits.max_steps {
+            if self.usage.steps >= max {
+                return Err(
+                    FirelangError::runtime(format!("step limit exceeded (max {max})")).into(),
+                );
+            }
+        }
+        self.usage.steps = self.usage.steps.saturating_add(1);
+        Ok(())
+    }
+
+    fn consume_loop_iteration(&mut self) -> Result<(), Box<dyn Error>> {
+        self.check_wall_clock()?;
+        if let Some(max) = self.limits.max_loop_iterations {
+            if self.usage.loop_iterations >= max {
+                return Err(FirelangError::runtime(format!(
+                    "loop iteration limit exceeded (max {max})"
+                ))
+                .into());
+            }
+        }
+        self.usage.loop_iterations = self.usage.loop_iterations.saturating_add(1);
+        Ok(())
+    }
+
+    fn enter_call(&mut self) -> Result<(), Box<dyn Error>> {
+        self.check_wall_clock()?;
+        if let Some(max) = self.limits.max_call_depth {
+            if self.call_depth >= max {
+                return Err(FirelangError::runtime(format!(
+                    "call depth limit exceeded (max {max})"
+                ))
+                .into());
+            }
+        }
+        self.call_depth = self.call_depth.saturating_add(1);
+        self.usage.max_call_depth = self.usage.max_call_depth.max(self.call_depth);
+        Ok(())
+    }
+
+    fn leave_call(&mut self) {
+        self.call_depth = self.call_depth.saturating_sub(1);
+    }
+
+    /// 検証と depth 観測を 1 パスで行う。
+    ///
+    /// スカラー(数値・文字列・真偽値など)も root 1 ノードとして数える。
+    /// 子が無いので depth は 0 相当だが、ノード予算は 0 のときに「ルートが
+    /// すでに 1 ノードである」ことで拒否する。Composite 値のときは子を展開
+    /// しながら数えるので、巨大な配列を 1 ノードとして誤認しない。
+    fn check_value(&mut self, value: &Value) -> Result<(), Box<dyn Error>> {
+        if !matches!(
+            value,
+            Value::Array(_) | Value::ArrayUnion(_) | Value::ArrayRemove(_) | Value::Map(_)
+        ) {
+            // スカラー値は子が無いので depth 0 相当。ただし root 1 ノードと
+            // して数え、ノード予算が 0 のときはここで弾く。
+            value::validate_value_limits(
+                value,
+                self.limits.max_value_depth,
+                self.limits.max_value_nodes.map(|budget| budget.min(1)),
+            )?;
+            return Ok(());
+        }
+        let observed_depth = value::validate_value_limits(
+            value,
+            self.limits.max_value_depth,
+            self.limits.max_value_nodes,
+        )?;
+        self.usage.max_value_depth = self.usage.max_value_depth.max(observed_depth);
+        Ok(())
     }
 
     fn eval_stmt(&mut self, stmt: &Stmt) -> Result<ExecFlow, Box<dyn Error>> {
+        self.consume_step()?;
         match stmt {
             Stmt::Expr(e) => self.eval_expr(e),
             Stmt::Assign { name, value } => {
@@ -193,6 +477,9 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
             Stmt::While { cond, body } => {
                 let mut last = Value::Nil;
                 loop {
+                    // The condition evaluation itself is a checkpoint: a long
+                    // body must not be able to hide past the wall-clock budget.
+                    self.check_wall_clock()?;
                     let cond = match self.eval_expr(cond)? {
                         ExecFlow::Value(v) => v,
                         flow @ ExecFlow::Return(_) => return Ok(flow),
@@ -200,6 +487,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
                     if !cond.truthy() {
                         break;
                     }
+                    self.consume_loop_iteration()?;
                     match self.eval_block(body)? {
                         ExecFlow::Value(v) => last = v,
                         ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
@@ -307,7 +595,15 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
             }
         }
         match &mut self.exec {
-            ExecCtx::Normal => self.fs.apply(vec![op]).map_err(backend_err),
+            ExecCtx::Normal => {
+                self.check_wall_clock()?;
+                let result = self.fs.apply(vec![op]).map_err(backend_err);
+                // A write that already persisted must not be turned into a
+                // timeout by a later re-check: the caller would retry and apply
+                // an `increment()` twice. The RPC itself is covered by the
+                // backend deadline configured in `with_limits`.
+                result
+            }
             ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => {
                 writes.push(op);
                 Ok(())
@@ -315,7 +611,21 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         }
     }
 
+    /// Evaluate one expression and validate the resulting `Value` against the
+    /// node/depth budgets.
+    ///
+    /// The check runs on the value the script observes, so a deeply nested
+    /// result cannot be materialized and handed to the script before the
+    /// budget rejects it.
     fn eval_expr(&mut self, expr: &Expr) -> Result<ExecFlow, Box<dyn Error>> {
+        let flow = self.eval_expr_inner(expr)?;
+        if let ExecFlow::Value(value) = &flow {
+            self.check_value(value)?;
+        }
+        Ok(flow)
+    }
+
+    fn eval_expr_inner(&mut self, expr: &Expr) -> Result<ExecFlow, Box<dyn Error>> {
         match expr {
             Expr::Int(i) => Ok(ExecFlow::Value(Value::Int(*i))),
             Expr::Str(s) => Ok(ExecFlow::Value(Value::Str(s.clone()))),
@@ -385,95 +695,6 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
                     },
                 }))
             }
-            Expr::Call {
-                receiver,
-                name,
-                args,
-                block,
-            } => {
-                // Validate the call shape before evaluating argument
-                // expressions.  Invalid calls must not be able to perform
-                // writes (or other side effects) before their contract error
-                // is reported.  Keyword values are irrelevant for this
-                // pre-check; only their names and arity are needed.
-                validate_unique_keywords(args)?;
-                if receiver.is_some() {
-                    // Keyword arguments are not part of any method contract.
-                    // Reject them before evaluating the receiver, which may
-                    // itself contain a staged or immediate write.
-                    if has_keyword_args(args) {
-                        return Err(unknown_keyword_names(args));
-                    }
-                    if let Some(block) = block.as_ref() {
-                        if name == "each" || name == "map" {
-                            check_block_arity(block, 1)?;
-                        } else {
-                            return Err(format!("method {name} does not take a block").into());
-                        }
-                    }
-                }
-                // A receiver is the first expression in a method call.  Keep
-                // this evaluation here (rather than in `eval_call`) so a
-                // receiver failure is returned before any argument expression
-                // can run.
-                let receiver_value = match receiver.as_deref() {
-                    Some(expr) => Some(into_method_receiver(match self.eval_expr(expr)? {
-                        ExecFlow::Value(v) => v,
-                        flow @ ExecFlow::Return(_) => return Ok(flow),
-                    })?),
-                    None => None,
-                };
-
-                // The method contract needs the receiver value; plain-call
-                // contracts were already checked above without evaluation.
-                // Either way this runs before any argument expression, so a
-                // contract error preempts argument side effects.
-                if let Some(rec) = receiver_value.as_ref() {
-                    let keyword_names = keyword_names(args);
-                    validate_method_call(
-                        rec,
-                        name,
-                        positional_arg_count(args),
-                        &keyword_names,
-                        block.as_ref(),
-                    )?;
-                } else if lookup_builtin::<F, S>(name).is_some() {
-                    let keyword_names = keyword_names(args);
-                    validate_call_contract(
-                        name,
-                        positional_arg_count(args),
-                        &keyword_names,
-                        block.as_ref(),
-                        builtin_contract(name),
-                    )?;
-                } else {
-                    let Some(Value::Func(func)) = self.get_var(name).cloned() else {
-                        return Err(format!("undefined function: {name}").into());
-                    };
-                    validate_user_call_contract(name, &func.params, args, block.as_ref())?;
-                }
-
-                // `args` is one ordered sequence; splitting it into
-                // positional/keyword collections for binding must not change
-                // the order in which the expressions above are evaluated.
-                let mut argv = vec![];
-                let mut kw = BTreeMap::new();
-                for arg in args {
-                    match arg {
-                        CallArg::Positional(expr) => match self.eval_expr(expr)? {
-                            ExecFlow::Value(v) => argv.push(v),
-                            flow @ ExecFlow::Return(_) => return Ok(flow),
-                        },
-                        CallArg::Keyword { name, value } => match self.eval_expr(value)? {
-                            ExecFlow::Value(v) => {
-                                kw.insert(name.clone(), v);
-                            }
-                            flow @ ExecFlow::Return(_) => return Ok(flow),
-                        },
-                    }
-                }
-                self.eval_call(receiver_value, name, argv, kw, block.as_ref())
-            }
             Expr::Map(entries) => {
                 let mut out = BTreeMap::new();
                 for (k, expr) in entries {
@@ -507,6 +728,109 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
                 };
                 eval_index(base, index).map(ExecFlow::Value)
             }
+            Expr::Call {
+                receiver,
+                name,
+                args,
+                block,
+            } => {
+                // Count the call before evaluating its arguments. A deeply
+                // nested call expression must consume depth as well, so the
+                // guard is entered before the receiver runs.
+                self.enter_call()?;
+                let outcome = self.eval_call_body(receiver.as_deref(), name, args, block.as_ref());
+                self.leave_call();
+                outcome
+            }
+        }
+    }
+
+    /// Evaluate one call expression. Separated from the `match` arm so the
+    /// depth guard can pair `enter_call` with `leave_call` on every exit path.
+    fn eval_call_body(
+        &mut self,
+        receiver: Option<&Expr>,
+        name: &str,
+        args: &[CallArg],
+        block: Option<&Block>,
+    ) -> Result<ExecFlow, Box<dyn Error>> {
+        {
+            // Validate the call shape before evaluating argument
+            // expressions.  Invalid calls must not be able to perform
+            // writes (or other side effects) before their contract error
+            // is reported.  Keyword values are irrelevant for this
+            // pre-check; only their names and arity are needed.
+            validate_unique_keywords(args)?;
+            if receiver.is_some() {
+                // Keyword arguments are not part of any method contract.
+                // Reject them before evaluating the receiver, which may
+                // itself contain a staged or immediate write.
+                if has_keyword_args(args) {
+                    return Err(unknown_keyword_names(args));
+                }
+                if let Some(block) = block {
+                    if name == "each" || name == "map" {
+                        check_block_arity(block, 1)?;
+                    } else {
+                        return Err(format!("method {name} does not take a block").into());
+                    }
+                }
+            }
+            // A receiver is the first expression in a method call.  Keep
+            // this evaluation here (rather than in `eval_call`) so a
+            // receiver failure is returned before any argument expression
+            // can run.
+            let receiver_value = match receiver {
+                Some(expr) => Some(into_method_receiver(match self.eval_expr(expr)? {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                })?),
+                None => None,
+            };
+
+            // The method contract needs the receiver value; plain-call
+            // contracts were already checked above without evaluation.
+            // Either way this runs before any argument expression, so a
+            // contract error preempts argument side effects.
+            if let Some(rec) = receiver_value.as_ref() {
+                let keyword_names = keyword_names(args);
+                validate_method_call(rec, name, positional_arg_count(args), &keyword_names, block)?;
+            } else if lookup_builtin::<F, S>(name).is_some() {
+                let keyword_names = keyword_names(args);
+                validate_call_contract(
+                    name,
+                    positional_arg_count(args),
+                    &keyword_names,
+                    block,
+                    builtin_contract(name),
+                )?;
+            } else {
+                let Some(Value::Func(func)) = self.get_var(name).cloned() else {
+                    return Err(format!("undefined function: {name}").into());
+                };
+                validate_user_call_contract(name, &func.params, args, block)?;
+            }
+
+            // `args` is one ordered sequence; splitting it into
+            // positional/keyword collections for binding must not change
+            // the order in which the expressions above are evaluated.
+            let mut argv = vec![];
+            let mut kw = BTreeMap::new();
+            for arg in args {
+                match arg {
+                    CallArg::Positional(expr) => match self.eval_expr(expr)? {
+                        ExecFlow::Value(v) => argv.push(v),
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    },
+                    CallArg::Keyword { name, value } => match self.eval_expr(value)? {
+                        ExecFlow::Value(v) => {
+                            kw.insert(name.clone(), v);
+                        }
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    },
+                }
+            }
+            self.eval_call(receiver_value, name, argv, kw, block)
         }
     }
 
@@ -644,6 +968,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
                 // ループの前にブロック引数の個数を検証する。
                 check_block_arity(block, 1)?;
                 for item in items {
+                    self.consume_loop_iteration()?;
                     match self.call_block(block, vec![item])? {
                         ExecFlow::Value(_) => {}
                         ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
@@ -658,6 +983,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
                 check_block_arity(block, 1)?;
                 let mut out = vec![];
                 for item in items {
+                    self.consume_loop_iteration()?;
                     match self.call_block(block, vec![item])? {
                         ExecFlow::Value(v) => out.push(v),
                         ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
@@ -696,9 +1022,13 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
     ) -> Result<Value, Box<dyn Error>> {
         match name {
             "where" => {
+                // Field path は正規化してから保存する。in-memory の lookup と
+                // emulator の wire 表現が同じ spelling を共有する。
+                let field = normalize_query_field_path(expect_string(args.first())?)?;
+                let op = QueryOp::parse(expect_string(args.get(1))?)?;
                 query.filters.push(QueryFilter {
-                    field: expect_string(args.first())?.to_string(),
-                    op: QueryOp::parse(expect_string(args.get(1))?)?,
+                    field,
+                    op,
                     value: args.get(2).cloned().ok_or("where requires value")?,
                 });
                 Ok(Value::QueryRef(query))
@@ -716,7 +1046,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
                 Ok(Value::QueryRef(query))
             }
             "order_by" => {
-                let field = expect_string(args.first())?.to_string();
+                let field = normalize_query_field_path(expect_string(args.first())?)?;
                 let dir = Direction::parse(expect_string(args.get(1))?)?;
                 query.order_by.push((field, dir));
                 Ok(Value::QueryRef(query))
@@ -728,21 +1058,112 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
                 unpaged.order_by.clear();
                 unpaged.offset = None;
                 unpaged.limit = None;
-                Ok(Value::Int(
-                    self.fs.count_query(&unpaged).map_err(backend_err)?,
-                ))
+                // `count` returns a number, not rows. Counting still walks
+                // every match, so it must respect the candidate budget too.
+                Ok(Value::Int(self.count_query_with_budget(&unpaged)?))
             }
             "get" => {
                 self.forbid_query_in_batch_or_transaction()?;
-                let rows = self.fs.run_query_page(&query).map_err(backend_err)?;
-                Ok(Value::Array(
+                let rows = self.run_query_with_budget(&query)?;
+                let result = Value::Array(
                     rows.into_iter()
                         .map(|(path, doc)| wrap_doc(&path, &doc))
                         .collect(),
-                ))
+                );
+                // `run_query_with_budget` checks each document field, but the
+                // value handed to the script also contains the row maps, their
+                // `__name__` entries, and the enclosing array.
+                self.check_value(&result)?;
+                Ok(result)
             }
             _ => Err(format!("unknown query method: {name}").into()),
         }
+    }
+
+    /// Count query matches under the result budget.
+    ///
+    /// `count_query` returns a number, so nothing is materialized; the budget
+    /// still applies because counting walks every match.
+    fn count_query_with_budget(&mut self, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
+        self.check_wall_clock()?;
+        let max_results = self.limits.max_query_results;
+        let count = match self.fs.count_query(query) {
+            Ok(count) => count,
+            Err(e) => {
+                if let Some(limit) = e.downcast_ref::<QueryResultLimitExceeded>() {
+                    self.usage.max_query_results =
+                        self.usage.max_query_results.max(limit.max_results);
+                    return Err(FirelangError::runtime(limit.to_string()).into());
+                }
+                return Err(backend_err(e));
+            }
+        };
+        self.check_wall_clock()?;
+        let count = usize::try_from(count)
+            .map_err(|_| "query result is too large to represent as an integer".to_string())?;
+        if let Some(max) = max_results {
+            if count > max {
+                self.usage.max_query_results = self.usage.max_query_results.max(max);
+                return Err(FirelangError::runtime(format!(
+                    "query result limit exceeded (max {max})"
+                ))
+                .into());
+            }
+        }
+        self.usage.query_results = self.usage.query_results.saturating_add(count as u64);
+        self.usage.max_query_results = self.usage.max_query_results.max(count);
+        Ok(count as i64)
+    }
+
+    /// Run a query page under the result budget.
+    fn run_query_with_budget(
+        &mut self,
+        query: &QueryRef,
+    ) -> Result<QueryCandidates, Box<dyn Error>> {
+        self.check_wall_clock()?;
+        let max_results = self.limits.max_query_results;
+        // The bounded hook is the resource boundary: a backend that refuses to
+        // materialize more than `max` rows errors instead of returning a
+        // partial vector. The length check below stays as a defense for legacy
+        // backends that keep the trait's compatibility fallback.
+        let result = match max_results {
+            Some(max) => self.fs.run_query_bounded(query, max),
+            None => self.fs.run_query_page(query),
+        };
+        let rows = match result {
+            Ok(rows) => rows,
+            Err(e) => {
+                // Budget consumption stays observable on the failure path, but
+                // only for the dedicated marker: a genuine backend error must
+                // not be recorded as a budget failure.
+                if let Some(limit) = e.downcast_ref::<QueryResultLimitExceeded>() {
+                    self.usage.max_query_results =
+                        self.usage.max_query_results.max(limit.max_results);
+                    return Err(FirelangError::runtime(limit.to_string()).into());
+                }
+                return Err(backend_err(e));
+            }
+        };
+        self.check_wall_clock()?;
+
+        let count = rows.len();
+        if let Some(max) = max_results {
+            if count > max {
+                self.usage.max_query_results = self.usage.max_query_results.max(max);
+                return Err(FirelangError::runtime(format!(
+                    "query result limit exceeded (max {max})"
+                ))
+                .into());
+            }
+        }
+        self.usage.query_results = self.usage.query_results.saturating_add(count as u64);
+        self.usage.max_query_results = self.usage.max_query_results.max(count);
+        for (_, fields) in &rows {
+            for value in fields.values() {
+                self.check_value(value)?;
+            }
+        }
+        Ok(rows)
     }
 
     fn get_var(&self, name: &str) -> Option<&Value> {
@@ -1676,6 +2097,7 @@ fn builtin_get<F: Firestore, S: Storage>(
     _block: Option<&Block>,
 ) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_doc_path(args.first())?;
+    rt.check_wall_clock()?;
     let v = match &rt.exec {
         ExecCtx::Batch { .. } => {
             return Err("get is not allowed inside batch".into());
@@ -1690,6 +2112,9 @@ fn builtin_get<F: Firestore, S: Storage>(
             .unwrap_or(Value::Nil),
         ExecCtx::Normal => rt.fs.get(path).map_err(backend_err)?.unwrap_or(Value::Nil),
     };
+    // `get` only reads, so a deadline that fires afterwards cannot invalidate
+    // work the script already observed.
+    rt.check_wall_clock()?;
     Ok(ExecFlow::Value(v))
 }
 
@@ -1701,6 +2126,7 @@ fn builtin_set<F: Firestore, S: Storage>(
 ) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_doc_path(args.first())?.to_string();
     let data = expect_map(args.get(1))?.clone();
+    validate_write_data(&data)?;
     let merge = match (args.get(2), kwargs.get("merge")) {
         (_, Some(Value::Bool(v))) => *v,
         (Some(Value::Bool(v)), None) => *v,
@@ -1719,6 +2145,7 @@ fn builtin_update<F: Firestore, S: Storage>(
 ) -> Result<ExecFlow, Box<dyn Error>> {
     let path = expect_doc_path(args.first())?.to_string();
     let data = expect_map(args.get(1))?.clone();
+    validate_write_data(&data)?;
     rt.dispatch_write(WriteOp::Update { path, data })?;
     Ok(ExecFlow::Value(Value::Nil))
 }
@@ -1751,6 +2178,11 @@ fn builtin_batch<F: Firestore, S: Storage>(
     }
     let (flow, writes) = rt.run_staged_block(ExecCtx::Batch { writes: vec![] }, &stmts.body);
     let flow = flow?;
+    rt.check_wall_clock()?;
+    // `apply` は永続書き込みなので、ここでは wall-clock を再検査しない。
+    // 書き込み後の timeout 判定は「成功したはずの write」を失敗として返し、
+    // 呼び出し側の再試行と重なって二重書き込みを招く。実際の RPC には
+    // `Runtime::with_limits` が設定した backend deadline が効く。
     rt.fs.apply(writes).map_err(backend_err)?;
     Ok(flow)
 }
@@ -1774,14 +2206,33 @@ fn builtin_transaction<F: Firestore, S: Storage>(
     // transaction because its rollback failed. Clear it before starting a
     // new one, otherwise the begin below fails forever.
     rt.retry_pending_rollback();
+    rt.check_wall_clock()?;
     rt.fs.begin_transaction().map_err(backend_err)?;
+    // `begin_transaction` は遅いことがあるため、budget 超過を begin 後に
+    // 検出したら必ず abort する。さもないと server transaction が開き続け、
+    // 以降の `begin_transaction` が "already in transaction" で失敗する。
+    if let Err(e) = rt.check_wall_clock() {
+        rt.abort_transaction_best_effort();
+        return Err(e);
+    }
     let (flow, writes) = rt.run_staged_block(ExecCtx::Transaction { writes: vec![] }, &stmts.body);
     match flow {
         Ok(flow) => {
+            // commit 前の budget 超過でも transaction を開いたままにしない。
+            // in-memory は tx_snapshot、emulator は transaction_id を保持し、
+            // どちらの backend も以降の transaction を "already in
+            // transaction" で失敗させるため、ここは abort が必要。
+            if let Err(e) = rt.check_wall_clock() {
+                rt.abort_transaction_best_effort();
+                return Err(e);
+            }
             if let Err(e) = rt.fs.commit_transaction(writes) {
                 rt.abort_transaction_best_effort();
                 return Err(backend_err(e));
             }
+            // commit 後も wall-clock を再検査しない。batch と同じく、
+            // 永続化済みの操作を timeout として返すと再試行が二重書き込みに
+            // つながる。commit 自体の deadline は backend timeout が担保する。
             Ok(flow)
         }
         Err(e) => {
@@ -1956,11 +2407,6 @@ fn expect_doc_path(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
     }
 }
 
-/// Firestore の document / collection ID は UTF-8 バイト数で 1,500 以下。
-/// Rust の `str::len()` は文字数ではなく UTF-8 のバイト数を返すため、
-/// 日本語などの ID でも Firestore と同じ単位で判定できる。
-const MAX_FIRESTORE_ID_BYTES: usize = 1_500;
-
 /// 単一 ID 引数(`col().doc()` / `col_group()`)を検証する。
 fn validate_document_id(id: &str) -> Result<(), Box<dyn Error>> {
     validate_standalone_id(id, "document id")
@@ -1980,43 +2426,6 @@ fn validate_standalone_id(id: &str, kind: &str) -> Result<(), Box<dyn Error>> {
         return Err(format!("invalid {kind}: {id} ({reason})").into());
     }
     Ok(())
-}
-
-/// Firestore の ID 固有の制約。パス上のセグメントと単一 ID 引数で共有する。
-///
-/// spec §6 の通り、document ID と collection ID で制約は同一。予約パターン
-/// `__.*__` の検査も document だけを対象にせず両方に適用する(片方だけだと
-/// `col("__meta__")` が通るが `doc("users/__x__")` は弾くというズレが
-/// in-memory / emulator の食い違いの原因になる)。
-fn validate_firestore_id(id: &str) -> Result<(), &'static str> {
-    if id.is_empty() {
-        return Err("must not be empty");
-    }
-    if id.contains('/') {
-        return Err("must not contain '/'");
-    }
-    if id.len() > MAX_FIRESTORE_ID_BYTES {
-        return Err("must be at most 1,500 UTF-8 bytes");
-    }
-    if id == "." || id == ".." {
-        return Err("must not be \".\" or \"..\"");
-    }
-    if is_reserved_firestore_id(id) {
-        return Err("must not match the reserved pattern __.*__");
-    }
-    Ok(())
-}
-
-/// Firestore の予約 ID 正規表現 `^__.*__$` 相当。
-///
-/// Datastore 由来の数値 ID(`__id123__` 形式)は既存ドキュメントの参照として
-/// 扱うため例外とする。クエリや参照フィールドで返されたドキュメントを
-/// `get` / `update` / `delete` に渡せなくなるのを避ける。
-fn is_reserved_firestore_id(id: &str) -> bool {
-    if id.len() >= 4 && id.starts_with("__") && id.ends_with("__") {
-        return !is_legacy_datastore_numeric_id(id);
-    }
-    false
 }
 
 /// ドキュメントパスは偶数個・コレクションパスは奇数個の非空セグメントで
@@ -2212,6 +2621,15 @@ fn int_binop(a: i64, b: i64, f: impl Fn(i64, i64) -> Option<i64>) -> Result<Valu
     f(a, b)
         .map(Value::Int)
         .ok_or_else(|| "integer overflow".into())
+}
+
+/// 予算を診断文に出すための表記。
+///
+/// ミリ秒固定だと 500µs のような sub-millisecond 予算が "max 0ms" と
+/// 誤表示され、単位も分からない。`Duration` の `Debug` 表現は設定した
+/// 単位に合わせて出るため、予算と診断文がずれない。
+fn format_duration(duration: Duration) -> String {
+    format!("{duration:?}")
 }
 
 fn backend_err(e: Box<dyn Error>) -> Box<dyn Error> {

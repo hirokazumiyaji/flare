@@ -10,26 +10,48 @@ use prost_types::{NullValue, Timestamp as ProtoTimestamp};
 use super::path::document_name;
 use crate::value::{DocRef, Timestamp, Value};
 
-pub(super) fn encode_array_items(items: &[Value]) -> Result<Vec<SdkValue>, Box<dyn Error>> {
-    items.iter().map(encode_field_value).collect()
+/// Codec recursion is bounded so a deeply nested value cannot overflow the
+/// native stack. The root field is depth 0, matching `max_value_depth`.
+fn too_deep(max_depth: usize) -> Box<dyn Error> {
+    format!("value nesting limit exceeded (max {max_depth})").into()
 }
 
-pub(super) fn encode_fields(
+pub(super) fn encode_array_items_bounded(
+    items: &[Value],
+    depth: usize,
+    max_depth: usize,
+) -> Result<Vec<SdkValue>, Box<dyn Error>> {
+    items
+        .iter()
+        .map(|item| encode_field_value_bounded(item, depth, max_depth))
+        .collect()
+}
+
+pub(super) fn encode_fields_bounded(
     map: &BTreeMap<String, Value>,
+    depth: usize,
+    max_depth: usize,
 ) -> Result<HashMap<String, SdkValue>, Box<dyn Error>> {
     let mut out = HashMap::new();
     for (k, v) in map {
-        out.insert(k.clone(), encode_field_value(v)?);
+        out.insert(k.clone(), encode_field_value_bounded(v, depth, max_depth)?);
     }
     Ok(out)
 }
 
-/// Encodes a value for a document write.
+/// Encodes a value for a document write, refusing to recurse past `max_depth`.
 ///
 /// `DocRef` is deliberately not accepted here. In this API references are
 /// query-filter values; the write codec remains restricted to the documented
 /// writable field values and reports an unsupported value for references.
-pub(super) fn encode_field_value(v: &Value) -> Result<SdkValue, Box<dyn Error>> {
+pub(super) fn encode_field_value_bounded(
+    v: &Value,
+    depth: usize,
+    max_depth: usize,
+) -> Result<SdkValue, Box<dyn Error>> {
+    if depth > max_depth {
+        return Err(too_deep(max_depth));
+    }
     Ok(SdkValue {
         value_type: Some(match v {
             Value::Str(s) => value::ValueType::StringValue(s.clone()),
@@ -42,10 +64,10 @@ pub(super) fn encode_field_value(v: &Value) -> Result<SdkValue, Box<dyn Error>> 
             }),
             Value::Bytes(bytes) => value::ValueType::BytesValue(bytes.clone()),
             Value::Array(items) => value::ValueType::ArrayValue(ArrayValue {
-                values: encode_array_items(items)?,
+                values: encode_array_items_bounded(items, depth + 1, max_depth)?,
             }),
             Value::Map(m) => value::ValueType::MapValue(MapValue {
-                fields: encode_fields(m)?,
+                fields: encode_fields_bounded(m, depth + 1, max_depth)?,
             }),
             _ => return Err(format!("unsupported value in emulator write: {v:?}").into()),
         }),
@@ -108,21 +130,35 @@ fn query_reference_name(project_id: &str, doc_ref: &DocRef) -> Result<String, Bo
 /// Decode a document using the resource root of the Firestore client that
 /// returned it. References outside that root stay `Opaque` instead of being
 /// mistaken for paths in the current database.
-pub(super) fn decode_document(
+pub(super) fn decode_document_bounded(
     doc: &Document,
     resource_root: &str,
+    max_depth: usize,
 ) -> Result<Value, Box<dyn Error>> {
     let mut out = BTreeMap::new();
     for (k, fv) in &doc.fields {
-        out.insert(k.clone(), decode_field_value(fv, resource_root)?);
+        out.insert(
+            k.clone(),
+            decode_field_value_bounded(fv, resource_root, 0, max_depth)?,
+        );
     }
     Ok(Value::Map(out))
 }
 
-pub(super) fn decode_field_value(
+/// Decode one stored value, refusing to recurse past `max_depth`.
+///
+/// A stored document can be nested far deeper than the runtime's own budget
+/// allows, so the decoder has to stop with an error instead of overflowing the
+/// native stack before any later validation could run.
+pub(super) fn decode_field_value_bounded(
     v: &SdkValue,
     resource_root: &str,
+    depth: usize,
+    max_depth: usize,
 ) -> Result<Value, Box<dyn Error>> {
+    if depth > max_depth {
+        return Err(too_deep(max_depth));
+    }
     match v
         .value_type
         .as_ref()
@@ -139,14 +175,22 @@ pub(super) fn decode_field_value(
         value::ValueType::ArrayValue(arr) => {
             let mut out = vec![];
             for x in &arr.values {
-                out.push(decode_field_value(x, resource_root)?);
+                out.push(decode_field_value_bounded(
+                    x,
+                    resource_root,
+                    depth + 1,
+                    max_depth,
+                )?);
             }
             Ok(Value::Array(out))
         }
         value::ValueType::MapValue(map) => {
             let mut out = BTreeMap::new();
             for (k, fv) in &map.fields {
-                out.insert(k.clone(), decode_field_value(fv, resource_root)?);
+                out.insert(
+                    k.clone(),
+                    decode_field_value_bounded(fv, resource_root, depth + 1, max_depth)?,
+                );
             }
             Ok(Value::Map(out))
         }
@@ -188,8 +232,65 @@ fn local_reference_path<'a>(name: &'a str, resource_root: &str) -> Option<&'a st
 mod tests {
     use super::super::path::relative_document_name;
     use super::*;
+    use crate::limits::DEFAULT_MAX_VALUE_DEPTH;
 
     const RESOURCE_ROOT: &str = "projects/p/databases/(default)/documents";
+
+    /// Convenience wrappers at the shipped default depth so the codec's
+    /// behaviour tests stay focused on shape rather than on the budget.
+    fn decode_document(doc: &Document, resource_root: &str) -> Result<Value, Box<dyn Error>> {
+        decode_document_bounded(doc, resource_root, DEFAULT_MAX_VALUE_DEPTH)
+    }
+
+    fn decode_field_value(v: &SdkValue, resource_root: &str) -> Result<Value, Box<dyn Error>> {
+        decode_field_value_bounded(v, resource_root, 0, DEFAULT_MAX_VALUE_DEPTH)
+    }
+
+    fn encode_field_value(v: &Value) -> Result<SdkValue, Box<dyn Error>> {
+        encode_field_value_bounded(v, 0, DEFAULT_MAX_VALUE_DEPTH)
+    }
+
+    /// Build a value nested `depth` levels: `0` at the root, then `depth - 1`
+    /// further array wrappers.
+    fn nested(depth: usize) -> Value {
+        let mut v = Value::Int(0);
+        for _ in 0..depth {
+            v = Value::Array(vec![v]);
+        }
+        v
+    }
+
+    #[test]
+    fn encode_rejects_values_deeper_than_the_budget() {
+        // The root is depth 0, so a 4-deep value is legal at max 4.
+        assert!(encode_field_value_bounded(&nested(4), 0, 4).is_ok());
+        let err = encode_field_value_bounded(&nested(5), 0, 4).unwrap_err();
+        assert!(
+            format!("{err}").contains("value nesting limit exceeded"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_documents_deeper_than_the_budget() {
+        // A 2000-deep stored document must be a controlled error, not a stack
+        // overflow. Only the bounded entry point is allowed to see it.
+        let mut sdk = SdkValue {
+            value_type: Some(value::ValueType::IntegerValue(0)),
+        };
+        for _ in 0..2_000 {
+            sdk = SdkValue {
+                value_type: Some(value::ValueType::ArrayValue(ArrayValue {
+                    values: vec![sdk],
+                })),
+            };
+        }
+        let err = decode_field_value_bounded(&sdk, RESOURCE_ROOT, 0, 64).unwrap_err();
+        assert!(
+            format!("{err}").contains("value nesting limit exceeded"),
+            "{err}"
+        );
+    }
 
     fn sdk(value_type: value::ValueType) -> SdkValue {
         SdkValue {

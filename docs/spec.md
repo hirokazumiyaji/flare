@@ -16,9 +16,10 @@
 - [10. CLI (`fl`)](#10-cli-fl)
 - [11. Auth API](#11-auth-api)
 - [12. バックエンド](#12-バックエンド)
-- [13. スコープ外(MVP)](#13-スコープ外mvp)
-- [14. 既知の制限・実装メモ](#14-既知の制限実装メモ)
-- [15. Cloud Storage API](#15-cloud-storage-api)
+- [13. 実行予算と信頼境界](#13-実行予算と信頼境界)
+- [14. スコープ外(MVP)](#14-スコープ外mvp)
+- [15. 既知の制限・実装メモ](#15-既知の制限実装メモ)
+- [16. Cloud Storage API](#16-cloud-storage-api)
 
 ## 1. 概要
 
@@ -78,13 +79,15 @@ Firestore 操作のための特殊な値:
 | CollectionRef | `col("users")` | コレクション参照 |
 | CollectionGroupRef | `col_group("members")` | コレクショングループ参照 |
 | QueryRef | `col(..).where(..)` 等 | 構築中のクエリ |
-| ServerTimestamp | `server_timestamp()` | 書き込み時にサーバ時刻へ解決されるセンチネル |
+| ServerTimestamp | `server_timestamp()` | commit の request time へ解決されるセンチネル。同じ write / batch / transaction commit 内の全センチネルは同じ時刻 |
 | ArrayUnion / ArrayRemove | `array_union([..])` / `array_remove([..])` | 配列フィールド変換センチネル |
 | DeleteField | `delete_field()` | フィールド削除センチネル(`update` / merge `set` のみ) |
 | Increment | `increment(n)` | 数値加算センチネル |
 | Opaque | (生成不可。emulator 読み取りのみ) | `double` / `geo_point` など、firelang が持たないフィールド型の表示専用値(`Double(1.5)` 等)。書き込みには使えない |
 | AuthSession | `auth_sign_up(...)` / `auth_sign_in(...)` | Auth のセッション。user record と ID / refresh token の所有者を保持する。`inspect` ではトークンが redact される(§11) |
 | RedactedToken | (生成不可。`session.id_token` アクセス) | トークンの redacted 投影値(`<redacted:id_token>`)。生のトークンは決してスクリプトに現れない(§11) |
+
+センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(in-memory / emulator 共通でエラー)。`set` / `update` は write を staging する前に data_map を再帰的に検証し、`Func` / クエリ / `Opaque` など Firestore に保存できない値も backend へ送らずエラーにする(`unsupported value in write`)。
 
 センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(in-memory / emulator 共通でエラー)。
 
@@ -287,7 +290,7 @@ while cond { ... }
 | `bytes(str)` / `bytes(int_array)` | Bytes | 文字列の UTF-8 バイト列、または 0..=255 の Int からなる配列を immutable なバイナリ列にする。引数は厳密に 1 個 |
 | `array_union(array)` | センチネル | 配列フィールドへの追加(重複は追加されない) |
 | `array_remove(array)` | センチネル | 配列フィールドからの除去 |
-| `server_timestamp()` | センチネル | 書き込み時にサーバ時刻に解決 |
+| `server_timestamp()` | センチネル | 書き込み時にサーバ時刻に解決。通常の 1 回の write、または 1 回の batch / transaction commit に含まれる全センチネルは同じ request time を使う |
 | `delete_field()` | センチネル | `update` / merge `set` でフィールドを削除する。存在しないフィールドへの指定は no-op |
 | `increment(n)` | センチネル | 数値フィールドに `n`(Int)を加算する。フィールドが存在しないか数値以外の場合は `n` を設定。正負のオーバーフロー時は `i64::MAX` / `i64::MIN` に飽和する(Firestore 仕様準拠) |
 | `batch { ... }` | ブロックの値 | 8 章参照 |
@@ -295,13 +298,15 @@ while cond { ... }
 
 `data_map` の値に使えるのは: Int / Str / Bool / Nil / Array / Map / Timestamp / Bytes、および直下フィールドのセンチネル 5 種。
 
-Firestore へ書き込む値は、in-memory / emulator 共通の再帰 validator で RPC 前に検証する。Firestore の制約は次の通り:
+Firestore へ書き込む値は、runtime が write を staging する前と、in-memory / emulator 共通の再帰 validator の write 境界の両方で検証する(同じ validator を共有するため誤差は出ない)。batch / transaction の staging は 1 write でも拒否されれば何も保存されない。検証で弾かれるのは保存できない値(Func / クエリ / `Opaque`、および emulator では `DocRef`)。Firestore の制約は次の通り:
 
 - `Array` の要素として別の `Array` を直接置けない(`[[1]]` は `Nested arrays are not allowed`)。ただし `Array -> Map -> Array` の間接的な配列入れ子は許可する(例: `{rows: [{values: [1, 2]}]}`)。
 - Map / ドキュメントのフィールド名は空にできず、Firestore の予約正規表現 `__.*__` に一致してはならない。空名・予約名のチェックは Map のすべてのネストレベルで適用する(それぞれ `The property.name is the empty string.` / `field name <name> is reserved`)。フィールド名は UTF-8 で 1,500 バイト以下。
 - update / merge `set` のフィールドパスでは、単純フィールド名の各セグメントにも同じ名前制約を適用する(`__name__` などの予約名は不可)。
 
 センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(エラー: `field transforms cannot be nested`)。`delete_field()` は `update` と merge `set` でのみ使え、置換の `set` ではエラー(`delete_field() cannot be used with set() without merge`)。
+
+`server_timestamp()` は commit の request time を使う。通常の `set` / `update` はそれぞれ 1 回の write request として扱い、`batch` / `transaction` はそれぞれ 1 回の commit request として扱う。**同じ request 内のすべての `ServerTimestamp` センチネルは同じ Timestamp になる**。別々の通常の write は別々の request なので、同じ Timestamp になるとは限らない。これは emulator の Firestore `REQUEST_TIME` transform と同じ意味であり、`now()`(呼び出しごとの現在時刻)とは異なる。
 
 ```ruby
 set(doc("users/1"), {name: "alice", age: 20})
@@ -532,8 +537,53 @@ Identity Toolkit のエラーコードは `:` 区切りの詳細が付くこと�
 - ただし emulator 側に firelang 外の型(`double` / `reference` / `geo_point`)で書かれたフィールドがある場合、emulator バックエンドは `Opaque` / `DocRef` に読み替えて返す(§3)。`bytes` は `Bytes` として lossless に往復する。in-memory には firelang 外の型の値は存在しない。
 - ローカル実行の security rules は `firebase.emulators.json` が参照する `firestore.emulator.rules`(read/write 許可)を使う。`firebase.json` が参照する `firestore.rules` は read/write 拒否で、リモート project への誤デプロイに備えてある([Firebase rules の分離とデプロイ防止策](firebase-security.md))。
 
+## 13. 実行予算と信頼境界
 
-## 13. スコープ外(MVP)
+`fl` は任意のスクリプトファイルを受け付ける。したがって誤ったスクリプト・無限再帰・無限ループ・巨大なネスト・巨大なクエリ結果が、スタック枯渇や無期限の停止に導かれてはならない。ランタイムは**有限の実行予算**を既定で持ち、超過時は panic ではなく、位置付きの通常のエラー(`error: <line>:<col>: ...`)で終了する。
+
+予算は 1 回の `run` / `eval_program` を単位にリセットされる(累積)。
+
+| 予算 | 既定値 | 対象・備考 |
+|------|--------|-----------|
+| 呼び出し深度 | 32 | ネストした呼び出し(ユーザー関数・組み込み)。再帰呼び出しの深さを制限する |
+| ステップ数 | 1,000,000 | 評価した文の数。`step limit exceeded` |
+| ループ反復数 | 100,000 | `while` / `each` / `map` の反復回数。実行全体で共有する。`loop iteration limit exceeded` |
+| 壁時計時間 | 5,000 ms | 字句解析・構文解析・評価の経過時間。`wall-clock limit exceeded` |
+| パーサ深度 | 128 | 括弧・マップ/配列リテラル・`else if` チェーン・`!`/`-` のネスト。`parser nesting limit exceeded` |
+| 補間深度 | 32 | ネストした `"#{...}"` |
+| 値ネスト深度 | 64 | 実行時 `Value`(Array / Map)のネスト。ルートは深さ 0 で、上限は**その深さを含意**する(深さ 64 の値は許され、子が 1 つでもあれば超過)。子が存在しないときは上限を超えたと見なさないので、上限 0 でもスカラー・空配列・空マップは通る。`value nesting limit exceeded`。emulator の `Value` ⇔ SDK コーデックも同じ上限で再帰を止める(保存されたネストが深い文書でも、runtime が検査する**前**にスタックを枯渇させないため) |
+| 値ノード数 | 100,000 | 実行時 `Value` の総ノード数。ルートも 1 ノードとして数えるので 0 ならスカラー結果も拒否する。走査は**子を追加する時点**で数えるため、バックエンドが返した巨大な配列を全部スタックに積む前に上限が働く。`value node limit exceeded` |
+| クエリ結果数 | 10,000 | 1 回のクエリで走査する一致候補件数。`query result limit exceeded` |
+| ソース長 | 1 MiB | UTF-8 バイト数 |
+| トークン数 | 100,000 | 補間内を含む字句数 |
+| バックエンド timeout | 5,000 ms | Firestore 1 回の呼び出し。組み込み emulator が強制する |
+
+- すべての予算エラーは `ErrorKind::Runtime`(字句解析・パース由来のものは `Lex` / `Parse`)であり、失敗したトップレベル文の開始位置を持つ。評価開始前に超過した壁時計予算だけは、プログラム先頭 `1:1` を位置とする。
+- 予算超過は `batch` を 1 件も書かずに中断し、`transaction` は abort する(通常実行時エラーと同じ原子性)。commit 後に発火した予算エラーで「成功したはずの永続書き込み」を失敗として返さない。
+- **呼び出し深度はネイティブスタックを保護する**。1 段のユーザー関数呼び出しは、引数とレシーバーの契約検証を含めて debug ビルドで約 50 KiB のスタックを消費する。2 MiB スタックのホスト(libtest のスレッド等)で実測すると 40 段でスタックが尽きるため、既定値 32 はその手前で止まる。大きなスタックを確保できるホストでは `max_call_depth` を上げてよいが、2 MiB 未満のスタックでは予算を無効化しないこと(深い再帰でスタックオーバーフローによるプロセス abort が発生しうる)。
+- 埋め込み側が `eval_program` に渡す AST はパーサを通らないため、同じ深さ予算を `eval_block` に入る前に検証する。位置はプログラム先頭 `1:1`、種類はパーサ由来と同じ `Parse` である。
+- クエリ結果数の上限は**走査する一致候補件数**に対するもの。バックエンドは候補が予算を超えた時点で中断し(超過を証明する 1 件は materialization しない)、その後に `order_by` / `offset` / `limit` を適用してスクリプトに渡すページを作る。従って `limit(3)` は 20 件の候補があっても予算内に収まれば成功し、返るのは 3 件である。
+
+### 埋め込み API
+
+予算は `RuntimeLimits` で設定できる。ライブラリ埋め込みと `fl` CLI の**双方**に有限の既定値が適用される。
+
+```rust
+let limits = RuntimeLimits::default().with_max_call_depth(32);
+let mut rt = Runtime::with_limits(backend, limits);
+let out = rt.run(source)?;
+let usage = rt.usage();   // steps / loop_iterations / max_call_depth / ...
+```
+
+予算ごとの予算値は `RuntimeLimits` の builder(`with_max_steps` / `with_max_loop_iterations` / `with_max_wall_clock` / `with_max_parser_depth` / `with_max_value_depth` / `with_max_query_results` など)で上書きできる。`Runtime::set_limits` で稼働中のランタイムを再設定できる。
+
+### 予算の無効化(信頼済みスクリプト)
+
+`Runtime::new_unlimited` / `RuntimeLimits::unlimited()` は予算をすべて無効にする**明示的なオプトイン**である。ユーザー入力・アップロードされたスクリプト・CLI には使わず、信頼済みスクリプトにのみ用いること。`fl --unlimited` は CLI 側の同等手段である。
+
+なお汎用の同期 `Firestore` トレイトは任意の実装を強制中断できないため、`backend_timeout` を強制するのは組み込み `FirestoreEmulator` である(`Runtime::backend_timeout_supported()` で確認できる)。応答しない独自バックエンドは、自身が timeout を実装すること。バックエンド呼び出しの timeout は発生原因を保つため `ErrorKind::Backend` で報告し、位置は他と同じく失敗した文の開始位置につく。
+
+## 14. スコープ外(MVP)
 
 以下は明示的に**非対応**。実装しない・README で匂わせない。
 
@@ -550,9 +600,9 @@ Identity Toolkit のエラーコードは `:` 区切りの詳細が付くこと�
 - リスナー(リアルタイム購読)・インデックス依存機能
 - ドキュメントに書かれたサブセットを超える mruby 互換
 
-## 14. 既知の制限・実装メモ
+## 15. 既知の制限・実装メモ
 
-## 15. Cloud Storage API
+## 16. Cloud Storage API
 
 Cloud Storage の MVP CRUD はグローバル関数として提供する。Firestore の `doc()` / `col()` とは別の object path を使う。
 

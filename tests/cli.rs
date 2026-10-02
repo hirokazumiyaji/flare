@@ -1,5 +1,11 @@
 //! Smoke tests for the `fl` binary.
 
+mod common;
+
+// Only the emulator round-trip test uses this helper, and that test is
+// compiled with the `emulator` feature.
+#[cfg(feature = "emulator")]
+use common::test_collection;
 use std::process::{Command, Stdio};
 
 const FL_EXE: &str = env!("CARGO_BIN_EXE_fl");
@@ -11,6 +17,38 @@ fn fl_help_exits_zero() {
         .status()
         .expect("spawn fl");
     assert!(status.success(), "fl --help should exit 0");
+}
+
+// The compiled `fl` only accepts `--backend emulator` with the feature
+// enabled, so a default or `--no-default-features` build must skip this test
+// even when `FIRESTORE_EMULATOR_HOST` happens to be exported.
+#[cfg(feature = "emulator")]
+#[test]
+fn fl_emulator_backend_set_get_round_trip() {
+    let Ok(host) = std::env::var("FIRESTORE_EMULATOR_HOST") else {
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
+        return;
+    };
+    let project_id =
+        std::env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".to_string());
+    let path = format!("{}/smoke", test_collection("cli_emulator"));
+    let source = format!("set(\"{path}\", {{value: \"ok\"}})\nget(\"{path}\")");
+    let out = Command::new(FL_EXE)
+        .args(["--backend", "emulator", "-e"])
+        .arg(source)
+        .env("FIRESTORE_EMULATOR_HOST", host)
+        .env("FIRESTORE_PROJECT_ID", project_id)
+        .output()
+        .expect("spawn fl with emulator backend");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "=> {\"value\" => \"ok\"}\n"
+    );
 }
 
 #[test]
@@ -412,6 +450,150 @@ fn fl_timeout_alias_reports_the_alias_and_help_uses_the_default_constant() {
         stderr.contains("per-RPC timeout (default: 30000ms)"),
         "{stderr:?}"
     );
+}
+
+#[test]
+fn fl_rejects_non_numeric_budget_values() {
+    let out = Command::new(FL_EXE)
+        .args(["--max-steps", "abc", "-e", "1"])
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--max-steps requires a non-negative integer"),
+        "{stderr:?}"
+    );
+}
+
+#[test]
+fn fl_rejects_budget_option_without_a_value() {
+    // No value at all: reported before any script-source validation.
+    let out = Command::new(FL_EXE)
+        .args(["--max-call-depth"])
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--max-call-depth requires a number"),
+        "{stderr:?}"
+    );
+
+    // A following option is reported as a bad value rather than silently
+    // consumed as the budget.
+    let out = Command::new(FL_EXE)
+        .args(["--max-call-depth", "-e", "1"])
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--max-call-depth requires a non-negative integer"),
+        "{stderr:?}"
+    );
+}
+
+#[test]
+fn fl_default_budgets_stop_infinite_recursion() {
+    // A runaway script must exit promptly with a positioned error instead of
+    // blowing the stack (issue #82).
+    let started = std::time::Instant::now();
+    let out = Command::new(FL_EXE)
+        .args(["-e", "fn f() { f() } f()"])
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "fl should not hang on runaway recursion"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("call depth limit exceeded"), "{stderr:?}");
+    // The position of the failing top-level statement (`f()`), not of the fn.
+    assert!(stderr.starts_with("error: 1:16: "), "{stderr:?}");
+}
+
+#[test]
+fn fl_default_budgets_stop_infinite_loops() {
+    let started = std::time::Instant::now();
+    let out = Command::new(FL_EXE)
+        .args(["-e", "while true { }"])
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "fl should not hang on an infinite loop"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("loop iteration limit exceeded"),
+        "{stderr:?}"
+    );
+}
+
+#[test]
+fn fl_budget_options_override_defaults() {
+    // A tiny budget that the default would never hit.
+    let out = Command::new(FL_EXE)
+        .args(["--max-steps", "1", "-e", "a = 1\nb = 2"])
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("step limit exceeded"), "{stderr:?}");
+
+    // Raising a limit above the default still works for legitimate scripts.
+    let out = Command::new(FL_EXE)
+        .args([
+            "--max-call-depth",
+            "64",
+            "-e",
+            "fn f(n) { if n <= 0 { 0 } else { f(n - 1) } } f(20)",
+        ])
+        .output()
+        .expect("spawn fl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "=> 0\n");
+}
+
+#[test]
+fn fl_unlimited_is_an_explicit_opt_in() {
+    // `--unlimited` on its own removes the guards; a later per-budget option
+    // re-enables just that one budget.
+    let out = Command::new(FL_EXE)
+        .args([
+            "--unlimited",
+            "-e",
+            "fn f(n) { if n <= 0 { 0 } else { f(n - 1) } } f(32)",
+        ])
+        .output()
+        .expect("spawn fl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "=> 0\n");
+
+    let out = Command::new(FL_EXE)
+        .args([
+            "--unlimited",
+            "--max-call-depth",
+            "16",
+            "-e",
+            "fn f(n) { if n <= 0 { 0 } else { f(n - 1) } } f(32)",
+        ])
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("call depth limit exceeded"), "{stderr:?}");
 }
 
 #[test]

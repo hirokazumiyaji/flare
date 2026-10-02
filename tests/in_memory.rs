@@ -1,11 +1,15 @@
 //! In-memory backend behavior tests (language + Firestore API).
 
+use std::time::Duration;
+
 #[macro_use]
 mod common;
 
 use firelang::run_script;
+use firelang::run_script_with_limits;
 use firelang::runtime::Runtime;
-use firelang::{InMemoryFirestore, Value};
+use firelang::value::Timestamp;
+use firelang::{InMemoryFirestore, RuntimeLimits, Value};
 
 /// 同じ `Runtime` で複数スクリプトを続けて評価する(状態保持のテスト用)。
 fn run_in(
@@ -13,6 +17,19 @@ fn run_in(
     source: &str,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     runtime.run(source)
+}
+
+fn assert_runtime_write_error(err: Box<dyn std::error::Error>) {
+    use firelang::{ErrorKind, FirelangError};
+
+    let ferr = err
+        .downcast_ref::<FirelangError>()
+        .expect("write validation should produce a FirelangError");
+    assert_eq!(ferr.kind, ErrorKind::Runtime, "{ferr}");
+    assert!(
+        ferr.message.contains("unsupported value in write"),
+        "{ferr}"
+    );
 }
 
 #[test]
@@ -546,6 +563,75 @@ fn transaction_rejects_get_after_write() {
     let err = run_script("transaction { set(\"users/txa\", {n: 1})\nget(\"users/txa\") }");
     assert!(err.is_err());
     assert!(format!("{}", err.unwrap_err()).contains("get is not allowed"));
+}
+
+#[test]
+fn runtime_query_result_budget_is_checked_by_the_bounded_backend_path() {
+    let limits = RuntimeLimits::default().with_max_query_results(1);
+    let err = run_script_with_limits(
+        "set(\"users/budget_a\", {n: 1})\nset(\"users/budget_b\", {n: 2})\ncol(\"users\").get()",
+        limits,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("query result limit exceeded (max 1)"),
+        "{err}"
+    );
+
+    let limits = RuntimeLimits::default().with_max_query_results(1);
+    let err = run_script_with_limits(
+        "set(\"users/budget_a\", {n: 1})\nset(\"users/budget_b\", {n: 2})\ncol(\"users\").count()",
+        limits,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("query result limit exceeded (max 1)"),
+        "{err}"
+    );
+
+    // The bound is inclusive: a query with exactly the configured number of
+    // candidates remains valid.
+    let limits = RuntimeLimits::default().with_max_query_results(2);
+    let out = run_script_with_limits(
+        "set(\"users/budget_a\", {n: 1})\nset(\"users/budget_b\", {n: 2})\ncol(\"users\").get()",
+        limits,
+    )
+    .unwrap();
+    assert!(matches!(out, Value::Array(rows) if rows.len() == 2));
+
+    let limits = RuntimeLimits::default().with_max_query_results(0);
+    let err = run_script_with_limits(
+        "set(\"users/budget_a\", {n: 1})\ncol(\"users\").get()",
+        limits,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("query result limit exceeded (max 0)"),
+        "{err}"
+    );
+
+    // The query result's enclosing array and row metadata are part of the
+    // runtime value too; checking only individual fields would miss this.
+    let limits = RuntimeLimits::default().with_max_value_nodes(3);
+    let err = run_script_with_limits(
+        "set(\"users/budget_value\", {n: 1})\ncol(\"users\").get()",
+        limits,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("value node limit exceeded (max 3)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn wall_clock_limit_is_checked_before_parsing_or_evaluation() {
+    let limits = RuntimeLimits::default().with_max_wall_clock(Duration::ZERO);
+    let err = run_script_with_limits("1 + 1", limits).unwrap_err();
+    assert!(
+        format!("{err}").contains("wall-clock limit exceeded"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -1962,6 +2048,45 @@ fn where_rejects_large_string_filter_values() {
 }
 
 #[test]
+fn query_field_paths_are_normalized_and_document_name_is_filterable() {
+    let out = run_script(
+        r#"set("users/qfp1", {"a-b": 1, "a.b": 2, profile: {age: 3}})
+set("users/qfp2", {"a-b": 9, "a.b": 8, profile: {age: 1}})
+[
+  col("users").where("a-b", "==", 1).get()[0]["__name__"],
+  col("users").where("`a.b`", "==", 2).get()[0]["__name__"],
+  col("users").where("profile.age", ">=", 3).get()[0]["__name__"],
+  col("users").where("__name__", "==", "users/qfp1").get().len(),
+  col("users").where("__name__", "==", doc("users/qfp2")).get().len(),
+  col("users").order_by("a-b", "asc").get()[0]["__name__"]
+]"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("users/qfp1".to_string()),
+            Value::Str("users/qfp1".to_string()),
+            Value::Str("users/qfp1".to_string()),
+            Value::Int(1),
+            Value::Int(1),
+            Value::Str("users/qfp1".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn document_name_filter_values_require_valid_paths() {
+    for source in [
+        r#"col("users").where("__name__", "in", ["users/a", "bad"]).get()"#,
+        r#"col("users").where("__name__", "not-in", ["users/a", "users/b/c"]).get()"#,
+    ] {
+        let err = run_script(source).unwrap_err();
+        assert!(err.to_string().contains("invalid document path"), "{err}");
+    }
+}
+
+#[test]
 fn where_validates_nested_filter_string_sizes() {
     // 1,499 bytes are valid; 1,500 bytes are rejected for equality,
     // membership, and array_contains filters, including nested Map / Array
@@ -2746,4 +2871,246 @@ fn overlapping_update_and_delete_paths_are_rejected() {
         format!("{err}").contains("overlapping field paths"),
         "{err}"
     );
+}
+
+#[test]
+fn server_timestamp_samples_one_clock_per_write_commit() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let clock_calls = Arc::clone(&calls);
+    let fs = InMemoryFirestore::with_clock(move || {
+        let n = clock_calls.fetch_add(1, Ordering::SeqCst) as i64;
+        Ok(Timestamp { seconds: 1000 + n })
+    });
+    let mut runtime = Runtime::new(fs);
+    let out = runtime
+        .run(
+            r#"
+set("users/clock_1", {a: server_timestamp(), b: server_timestamp()})
+set("users/clock_2", {c: server_timestamp()})
+[get("users/clock_1"), get("users/clock_2")]
+"#,
+        )
+        .unwrap();
+
+    let Value::Array(docs) = out else {
+        panic!("expected two documents, got {out:?}");
+    };
+    let Value::Map(first) = &docs[0] else {
+        panic!("expected map");
+    };
+    let Value::Map(second) = &docs[1] else {
+        panic!("expected map");
+    };
+    assert_eq!(
+        first.get("a"),
+        Some(&Value::Timestamp(Timestamp { seconds: 1000 }))
+    );
+    assert_eq!(
+        first.get("b"),
+        Some(&Value::Timestamp(Timestamp { seconds: 1000 }))
+    );
+    assert_eq!(
+        second.get("c"),
+        Some(&Value::Timestamp(Timestamp { seconds: 1001 }))
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn server_timestamp_samples_one_clock_per_batch_and_transaction_commit() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let clock_calls = Arc::clone(&calls);
+    let fs = InMemoryFirestore::with_clock(move || {
+        let n = clock_calls.fetch_add(1, Ordering::SeqCst) as i64;
+        Ok(Timestamp { seconds: 2000 + n })
+    });
+    let mut runtime = Runtime::new(fs);
+    let out = runtime
+        .run(
+            r#"
+batch {
+  set("users/batch_clock_1", {a: server_timestamp(), b: server_timestamp()})
+  set("users/batch_clock_2", {c: server_timestamp()})
+}
+transaction {
+  set("users/tx_clock_1", {a: server_timestamp(), b: server_timestamp()})
+  set("users/tx_clock_2", {c: server_timestamp()})
+}
+[
+  get("users/batch_clock_1")["a"],
+  get("users/batch_clock_1")["b"],
+  get("users/batch_clock_2")["c"],
+  get("users/tx_clock_1")["a"],
+  get("users/tx_clock_1")["b"],
+  get("users/tx_clock_2")["c"],
+]
+"#,
+        )
+        .unwrap();
+
+    let Value::Array(times) = out else {
+        panic!("expected timestamp list, got {out:?}");
+    };
+    assert_eq!(times[0], Value::Timestamp(Timestamp { seconds: 2000 }));
+    assert_eq!(times[1], Value::Timestamp(Timestamp { seconds: 2000 }));
+    assert_eq!(times[2], Value::Timestamp(Timestamp { seconds: 2000 }));
+    assert_eq!(times[3], Value::Timestamp(Timestamp { seconds: 2001 }));
+    assert_eq!(times[4], Value::Timestamp(Timestamp { seconds: 2001 }));
+    assert_eq!(times[5], Value::Timestamp(Timestamp { seconds: 2001 }));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn server_timestamp_uses_request_time_for_update_and_merge_set() {
+    let fs = InMemoryFirestore::with_fixed_timestamp(3000);
+    let mut runtime = Runtime::new(fs);
+    let out = runtime
+        .run(
+            r#"
+set("users/fixed_clock", {initial: 1})
+update("users/fixed_clock", {updated: server_timestamp(), changed: server_timestamp()})
+set("users/fixed_clock", {merged: server_timestamp()}, merge: true)
+get("users/fixed_clock")
+"#,
+        )
+        .unwrap();
+
+    let Value::Map(doc) = out else {
+        panic!("expected map, got {out:?}");
+    };
+    for key in ["updated", "changed", "merged"] {
+        assert_eq!(
+            doc.get(key),
+            Some(&Value::Timestamp(Timestamp { seconds: 3000 })),
+            "{key}: {doc:?}"
+        );
+    }
+}
+
+#[test]
+fn set_rejects_unsupported_values_recursively() {
+    // `doc()` は意図的にここに入らない。in-memory は参照を直接保持し、
+    // emulator の write codec だけが `unsupported value in emulator write`
+    // で拒否する(spec §7)。同じ値を両バックエンドで違う結論にしない。
+    let cases = [
+        "fn f() { 1 }\nset(\"users/write_set_func\", {value: f})",
+        "set(\"users/write_set_collection\", {value: col(\"users\")})",
+        "set(\"users/write_set_group\", {value: col_group(\"members\")})",
+        "set(\"users/write_set_query\", {value: col(\"users\").where(\"x\", \"==\", 1)})",
+        "set(\"users/write_set_nested\", {value: {nested: [col(\"users\")]}})",
+    ];
+    for source in cases {
+        let err = run_script(source).unwrap_err();
+        assert_runtime_write_error(err);
+    }
+}
+
+#[test]
+fn update_rejects_unsupported_values_before_staging() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    run_in(&mut runtime, "set(\"users/write_update\", {value: 1})").unwrap();
+
+    let err = run_in(
+        &mut runtime,
+        "fn f() { 1 }\nupdate(\"users/write_update\", {value: f})",
+    )
+    .unwrap_err();
+    assert_runtime_write_error(err);
+    assert_eq!(
+        run_in(&mut runtime, "get(\"users/write_update\")").unwrap(),
+        map! {"value" => Value::Int(1)}
+    );
+}
+
+#[test]
+fn batch_with_unsupported_value_persists_nothing() {
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    let err = run_in(
+        &mut runtime,
+        "batch { set(\"users/write_batch_good\", {ok: true})\nset(\"users/write_batch_bad\", {value: col(\"users\")}) }",
+    )
+    .unwrap_err();
+    assert_runtime_write_error(err);
+    assert_eq!(
+        run_in(&mut runtime, "get(\"users/write_batch_good\")").unwrap(),
+        Value::Nil
+    );
+    assert_eq!(
+        run_in(&mut runtime, "get(\"users/write_batch_bad\")").unwrap(),
+        Value::Nil
+    );
+}
+
+#[test]
+fn documented_values_and_direct_transforms_remain_writable() {
+    let out = run_script(
+        "set(\"users/write_allowed\", {int: 1, str: \"s\", bool: true, \"nil\": nil, array: [1, {nested: timestamp(2)}], map: {ok: false}, ts: timestamp(3), tags: array_union([\"a\"]), items: [\"x\"], remove_me: true, count: 10})\nupdate(\"users/write_allowed\", {tags: array_union([\"b\"]), items: array_remove([\"x\"]), remove_me: delete_field(), count: increment(2), updated_at: server_timestamp()})\nget(\"users/write_allowed\")",
+    )
+    .unwrap();
+    let Value::Map(fields) = out else {
+        panic!("expected document map");
+    };
+    assert_eq!(fields.get("int"), Some(&Value::Int(1)));
+    assert_eq!(fields.get("str"), Some(&Value::Str("s".to_string())));
+    assert_eq!(fields.get("bool"), Some(&Value::Bool(true)));
+    assert_eq!(fields.get("nil"), Some(&Value::Nil));
+    assert!(matches!(fields.get("ts"), Some(Value::Timestamp(_))));
+    assert_eq!(
+        fields.get("tags"),
+        Some(&Value::Array(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string())
+        ]))
+    );
+    assert_eq!(fields.get("items"), Some(&Value::Array(vec![])));
+    assert!(!fields.contains_key("remove_me"));
+    assert_eq!(fields.get("count"), Some(&Value::Int(12)));
+    assert!(matches!(
+        fields.get("updated_at"),
+        Some(Value::Timestamp(_))
+    ));
+}
+
+#[test]
+fn server_timestamp_does_not_sample_the_clock_without_a_sentinel() {
+    // The clock is sampled lazily, so writes without `server_timestamp()` and
+    // empty commits must not advance a caller's deterministic counter.  See
+    // `RequestClock`'s contract: at most once per commit, and only when a
+    // server timestamp is present.
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let clock_calls = Arc::clone(&calls);
+    let fs = InMemoryFirestore::with_clock(move || {
+        let n = clock_calls.fetch_add(1, Ordering::SeqCst) as i64;
+        Ok(Timestamp { seconds: 3000 + n })
+    });
+    let mut runtime = Runtime::new(fs);
+    let out = runtime
+        .run(
+            r#"
+batch { set("users/no_clock_1", {a: 1}) }
+transaction { set("users/no_clock_2", {b: 2}) }
+batch { }
+transaction { }
+set("users/with_clock", {c: server_timestamp()})
+get("users/with_clock")["c"]
+"#,
+        )
+        .unwrap();
+    assert_eq!(out, Value::Timestamp(Timestamp { seconds: 3000 }));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
