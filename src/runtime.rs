@@ -193,6 +193,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
 
     pub fn eval_program(&mut self, stmts: &[Stmt]) -> Result<Value, Box<dyn Error>> {
         self.with_execution(|rt| {
+            rt.validate_external_ast_depth(stmts)?;
             rt.check_wall_clock_at_source()
                 .and_then(|_| rt.eval_block(stmts).map(ExecFlow::into_value))
         })

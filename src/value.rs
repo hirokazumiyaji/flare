@@ -148,12 +148,40 @@ pub fn validate_value_depth(value: &Value, max_depth: usize) -> Result<(), Box<d
     validate_value_limits(value, Some(max_depth), None).map(|_| ())
 }
 
+/// Reject a value that nests deeper than `max_depth` allows.
+///
+/// The limit is inclusive: a value at exactly `max_depth` is valid, which is
+/// why the caller checks the depth of a child *when the child exists* rather
+/// than predicting it from the parent.
+fn check_value_depth_budget(depth: usize, max_depth: Option<usize>) -> Result<(), Box<dyn Error>> {
+    match max_depth {
+        Some(max) if depth > max => Err(format!("value nesting limit exceeded (max {max})").into()),
+        _ => Ok(()),
+    }
+}
+
+/// Count one node against the node budget.
+///
+/// Counting happens on the way *in*: the traversal pushes children onto its
+/// stack as it goes, so a backend-supplied value that is far wider than the
+/// budget must not be able to allocate traversal memory proportional to the
+/// whole value before the limit fires.
+fn check_value_node_budget(
+    nodes: &mut usize,
+    max_nodes: Option<usize>,
+) -> Result<(), Box<dyn Error>> {
+    *nodes = nodes.saturating_add(1);
+    match max_nodes {
+        Some(max) if *nodes > max => Err(format!("value node limit exceeded (max {max})").into()),
+        _ => Ok(()),
+    }
+}
+
 /// Validate both nesting and total node count of a runtime value in a single
 /// pass and return the observed maximum depth.
 ///
-/// The node budget is enforced *while enqueuing* children, so a wide
-/// backend-supplied value cannot allocate an unbounded `Vec` before the limit
-/// has a chance to fire.
+/// The root is depth 0 and counts as one node, so `max_depth = 0` accepts only
+/// a value that has no children (a leaf, an empty array, or an empty map).
 pub fn validate_value_limits(
     value: &Value,
     max_depth: Option<usize>,
@@ -162,36 +190,28 @@ pub fn validate_value_limits(
     let mut stack = vec![(value, 0usize)];
     let mut nodes = 0usize;
     let mut observed_depth = 0usize;
+    check_value_node_budget(&mut nodes, max_nodes)?;
 
     while let Some((value, depth)) = stack.pop() {
-        if let Some(max) = max_depth {
-            if depth > max {
-                return Err(format!("value nesting limit exceeded (max {max})").into());
-            }
-        }
-        nodes = nodes.saturating_add(1);
-        if let Some(max) = max_nodes {
-            if nodes > max {
-                return Err(format!("value node limit exceeded (max {max})").into());
-            }
-        }
+        check_value_depth_budget(depth, max_depth)?;
         observed_depth = observed_depth.max(depth);
-
         let child_depth = depth.saturating_add(1);
-        if let Some(max) = max_depth {
-            if child_depth > max {
-                return Err(format!("value nesting limit exceeded (max {max})").into());
-            }
-        }
 
         match value {
             Value::Array(items) | Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
                 for item in items {
+                    // Bound each real child as it is enqueued: an empty
+                    // container at the limit is valid, so the depth check must
+                    // not run for children that do not exist.
+                    check_value_depth_budget(child_depth, max_depth)?;
+                    check_value_node_budget(&mut nodes, max_nodes)?;
                     stack.push((item, child_depth));
                 }
             }
             Value::Map(map) => {
                 for item in map.values() {
+                    check_value_depth_budget(child_depth, max_depth)?;
+                    check_value_node_budget(&mut nodes, max_nodes)?;
                     stack.push((item, child_depth));
                 }
             }
