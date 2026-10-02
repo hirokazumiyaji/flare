@@ -38,6 +38,7 @@ pub(super) fn commit_writes(
                 database,
                 writes,
                 transaction,
+                request_options: None,
             }))
             .await
     });

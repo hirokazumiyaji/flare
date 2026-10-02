@@ -111,6 +111,7 @@ pub(super) fn connect(
                     name: probe_name,
                     mask: None,
                     consistency_selector: None,
+                    request_options: None,
                 }))
                 .await
         }
@@ -240,6 +241,11 @@ fn ensure_url_scheme(host: &str) -> String {
 /// rules 検証にはこの形式が必要になる(実測で 403 PERMISSION_DENIED を確認)。
 const NON_ADMIN_JWT: &str = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1bmF1dGhvcmljYXRlZCJ9.";
 
+/// 静的 emulator token の有効期限(2100-01-01T00:00:00Z の POSIX 秒)。
+/// emulator はこの token の有効期限を検証しないが、SDK は `Token` に期限を
+/// 必須とするため、十分先の日付を固定値で持つ。
+const EMULATOR_TOKEN_EXPIRY_SECONDS: i64 = 4_102_444_800;
+
 fn emulator_token_source(auth: EmulatorAuth) -> gcloud_sdk::TokenSourceType {
     // `owner` は admin 資格で rules をバイパスする。rules を検証したい
     // ときは admin でない token を送る必要がある。
@@ -252,7 +258,10 @@ fn emulator_token_source(auth: EmulatorAuth) -> gcloud_sdk::TokenSourceType {
             std::future::ready(Ok(gcloud_sdk::Token::new(
                 "Bearer".to_string(),
                 token.into(),
-                chrono::DateTime::<chrono::Utc>::from_timestamp(4_102_444_800, 0)
+                // 2100-01-01 の POSIX 秒。gcloud-sdk 0.32 は token の期限を
+                // `jiff::Timestamp` で持つ。`firestore::FirestoreInstant` は
+                // その型の別名なので、jiff を直接依存せずに同じ値を作れる。
+                firestore::FirestoreInstant::new(EMULATOR_TOKEN_EXPIRY_SECONDS, 0)
                     .expect("valid token expiry"),
             )))
         }),
