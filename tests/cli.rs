@@ -1,5 +1,8 @@
 //! Smoke tests for the `fl` binary.
 
+mod common;
+
+use common::test_collection;
 use std::process::{Command, Stdio};
 
 const FL_EXE: &str = env!("CARGO_BIN_EXE_fl");
@@ -11,6 +14,38 @@ fn fl_help_exits_zero() {
         .status()
         .expect("spawn fl");
     assert!(status.success(), "fl --help should exit 0");
+}
+
+// The compiled `fl` only accepts `--backend emulator` with the feature
+// enabled, so a default or `--no-default-features` build must skip this test
+// even when `FIRESTORE_EMULATOR_HOST` happens to be exported.
+#[cfg(feature = "emulator")]
+#[test]
+fn fl_emulator_backend_set_get_round_trip() {
+    let Ok(host) = std::env::var("FIRESTORE_EMULATOR_HOST") else {
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
+        return;
+    };
+    let project_id =
+        std::env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".to_string());
+    let path = format!("{}/smoke", test_collection("cli_emulator"));
+    let source = format!("set(\"{path}\", {{value: \"ok\"}})\nget(\"{path}\")");
+    let out = Command::new(FL_EXE)
+        .args(["--backend", "emulator", "-e"])
+        .arg(source)
+        .env("FIRESTORE_EMULATOR_HOST", host)
+        .env("FIRESTORE_PROJECT_ID", project_id)
+        .output()
+        .expect("spawn fl with emulator backend");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "=> {\"value\" => \"ok\"}\n"
+    );
 }
 
 #[test]

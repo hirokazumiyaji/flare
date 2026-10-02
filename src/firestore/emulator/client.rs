@@ -6,8 +6,11 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use firestore::{FirestoreDb, FirestoreDbOptions};
+use gcloud_sdk::google::firestore::v1::GetDocumentRequest;
+use gcloud_sdk::tonic::Request;
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
+use super::path;
 use crate::error::FirelangError;
 
 pub(super) struct EmulatorClient {
@@ -16,6 +19,16 @@ pub(super) struct EmulatorClient {
     pub(super) project_id: String,
     pub(super) operation_timeout: Duration,
 }
+
+/// Collection used only for the connect-time liveness probe.  It is never
+/// written to; the probe is a read of a document that does not exist.
+const PROBE_COLLECTION: &str = "_firelang_connection_probe";
+
+/// Fail-fast deadline for the connect step, independent of the caller's
+/// per-operation timeout.  A host that accepts a TCP connection but never
+/// completes the HTTP/2 handshake would otherwise block the caller for the
+/// whole operation timeout.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Firestore emulator に対して使う資格情報。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,12 +53,18 @@ pub(super) fn connect(
         .build()
         .expect("create tokio runtime for Firestore SDK");
     let options = sdk_options(host, project_id);
-    // The SDK has its own (30 second) connect timeout.  Keep the application
-    // timeout as the outer guard as well, so an embedding caller is not forced
-    // to wait for the SDK's transport default.
+    // The SDK has its own (30 second) connect timeout.  Keep the connect step
+    // bounded by the shorter of the caller-supplied operation timeout and the
+    // dedicated connect deadline so an embedding caller is not forced to wait
+    // for the SDK's transport default.
+    let connect_timeout = operation_timeout.min(CONNECT_TIMEOUT);
+    // One deadline for the whole connection sequence.  Client creation and the
+    // probe run back to back, so a separate full timeout for each would let a
+    // constructor configured for 5 seconds block for nearly 10.
+    let sequence_started = Instant::now();
     let db = run_operation(
         &runtime,
-        operation_timeout,
+        connect_timeout,
         "connect",
         FirestoreDb::with_options_token_source(
             options,
@@ -53,6 +72,62 @@ pub(super) fn connect(
             emulator_token_source(auth),
         ),
     )?;
+    let probe_timeout = remaining_budget(connect_timeout, sequence_started.elapsed());
+
+    // The SDK's channel can be created after the TCP socket is accepted even
+    // when the peer never completes the HTTP/2 handshake.  Probe one harmless
+    // read so `connect` has a real fail-fast deadline instead of returning a
+    // client that only fails on the user's first Firestore operation.
+    //
+    // The probe only proves that the peer speaks Firestore, so an answer that
+    // says "the request was refused" is still a reachable emulator: NOT_FOUND
+    // (the probe document does not exist), PERMISSION_DENIED (security rules
+    // deny every read, which is exactly how the deploy-config deny rules are
+    // verified) and UNAUTHENTICATED (the peer's credentials were rejected) all
+    // mean the request reached Firestore.  Any other status means something
+    // else is listening on this port.
+    // The probe path must be a legal Firestore document path: the emulator
+    // rejects reserved collection ids (`__name__`, `__reserved__`) with
+    // INVALID_ARGUMENT, which is a configuration error rather than a
+    // successful "no such document".
+    let probe_name = path::document_name(project_id, &format!("{}/probe", PROBE_COLLECTION));
+    let probe = {
+        let db = &db;
+        async move {
+            let mut service = db.client().get();
+            service
+                .get_document(Request::new(GetDocumentRequest {
+                    name: probe_name,
+                    mask: None,
+                    consistency_selector: None,
+                }))
+                .await
+        }
+    };
+    match runtime.block_on(async move { tokio::time::timeout(probe_timeout, probe).await }) {
+        // `Err(_)` is the deadline firing; the status itself is reported below.
+        Err(_) => {
+            return Err(FirelangError::backend(format!(
+                "Firestore emulator connection probe timed out after {}ms (connect budget {}ms)",
+                probe_timeout.as_millis(),
+                connect_timeout.as_millis()
+            ))
+            .into())
+        }
+        Ok(Ok(_)) => {}
+        // A denied read is expected for the EnforceRules/deny-rules setup, and
+        // the emulator also answers UNAUTHENTICATED when the owner token is
+        // refused (the rules-deployed project rejects the owner's requests
+        // with exactly that status).  All three statuses prove the peer
+        // understood a Firestore request, which is what the probe is for.
+        Ok(Err(status)) if is_reachable_probe_answer(status.code()) => {}
+        Ok(Err(status)) => {
+            return Err(FirelangError::backend(format!(
+                "Firestore emulator connection probe failed: {status}"
+            ))
+            .into())
+        }
+    }
     Ok(EmulatorClient {
         db,
         runtime,
@@ -84,6 +159,34 @@ where
         Ok(Err(error)) => Err(error.into()),
         Err(_) => Err(timeout_error(operation, started.elapsed(), timeout)),
     }
+}
+
+/// Budget left for the connect probe after client creation consumed part of it.
+///
+/// `connect` advertises one fail-fast deadline for the whole sequence, so the
+/// probe may only spend what the client did not.  Saturating subtraction keeps
+/// the result non-negative, which makes a stalled probe fail immediately
+/// instead of being handed a second full budget.
+fn remaining_budget(connect_timeout: Duration, elapsed: Duration) -> Duration {
+    connect_timeout.saturating_sub(elapsed)
+}
+
+/// Statuses that still prove the peer is a Firestore emulator.
+///
+/// `UNAUTHENTICATED` is deliberately **not** accepted: an authentication
+/// gateway in front of a non-Firestore gRPC service answers with it, and so
+/// does an emulator that rejected the credentials the caller asked for.
+/// Returning a client in that state would move the failure to the caller's
+/// first real operation instead of reporting it at construction time.
+///
+/// Anything else (UNAVAILABLE, UNIMPLEMENTED, INTERNAL, ...) means the port
+/// belongs to a different service or the emulator is broken, and `connect`
+/// must not hand back a client that only fails on the caller's first write.
+fn is_reachable_probe_answer(code: gcloud_sdk::tonic::Code) -> bool {
+    matches!(
+        code,
+        gcloud_sdk::tonic::Code::NotFound | gcloud_sdk::tonic::Code::PermissionDenied
+    )
 }
 
 fn timeout_error(operation: &str, elapsed: Duration, timeout: Duration) -> Box<dyn Error> {
@@ -158,20 +261,78 @@ mod tests {
 
     #[test]
     fn sdk_options_targets_emulator_host() {
-        let options = sdk_options("127.0.0.1:9", "p");
+        let options = sdk_options("emulator.test", "p");
         assert_eq!(options.google_project_id, "p");
         assert_eq!(
             options.firebase_api_url.as_deref(),
-            Some("http://127.0.0.1:9")
+            Some("http://emulator.test")
         );
     }
 
     #[test]
+    fn connection_to_a_blackhole_listener_times_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let host = listener.local_addr().expect("listener address").to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _listener = listener;
+            tx.send(connect(&host, "p", EmulatorAuth::Owner, Duration::from_secs(30)).is_err())
+                .expect("send result");
+        });
+        assert!(rx
+            .recv_timeout(CONNECT_TIMEOUT + Duration::from_secs(2))
+            .expect("connection should return after the deadline"));
+    }
+
+    #[test]
     fn sdk_options_keeps_explicit_scheme() {
-        let options = sdk_options("http://localhost:8080", "p");
+        let options = sdk_options("http://emulator.test/firestore", "p");
         assert_eq!(
             options.firebase_api_url.as_deref(),
-            Some("http://localhost:8080")
+            Some("http://emulator.test/firestore")
+        );
+    }
+
+    #[test]
+    fn probe_accepts_refusals_but_rejects_other_services() {
+        // These two still prove the peer is a Firestore emulator: the probe
+        // document is absent, or the rules deny every read. The deny-rules CI
+        // check depends on the second case.
+        for code in [
+            gcloud_sdk::tonic::Code::NotFound,
+            gcloud_sdk::tonic::Code::PermissionDenied,
+        ] {
+            assert!(is_reachable_probe_answer(code), "{code:?}");
+        }
+        // A port owned by a different service, or credentials the emulator
+        // refused, must still fail `connect` instead of handing back a client
+        // whose first real operation fails.
+        for code in [
+            gcloud_sdk::tonic::Code::Unauthenticated,
+            gcloud_sdk::tonic::Code::Unavailable,
+            gcloud_sdk::tonic::Code::Unimplemented,
+            gcloud_sdk::tonic::Code::Internal,
+            gcloud_sdk::tonic::Code::InvalidArgument,
+            gcloud_sdk::tonic::Code::DeadlineExceeded,
+        ] {
+            assert!(!is_reachable_probe_answer(code), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn probe_only_gets_the_budget_the_client_creation_left() {
+        // Client creation plus the probe share one deadline.
+        let budget = Duration::from_millis(500);
+        assert_eq!(remaining_budget(budget, Duration::from_millis(0)), budget);
+        assert_eq!(
+            remaining_budget(budget, Duration::from_millis(200)),
+            Duration::from_millis(300)
+        );
+        // Overrunning the budget must not wrap around into a second full
+        // budget for the probe.
+        assert_eq!(
+            remaining_budget(budget, Duration::from_millis(900)),
+            Duration::ZERO
         );
     }
 

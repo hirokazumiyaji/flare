@@ -188,10 +188,18 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
-      - name: Run integration tests with allow-all emulator rules
+      - name: Run integration tests with allow-all emulator rules, twice
+        # Two passes in the same emulator session: fixtures from the first run
+        # stay in the datastore, so a suite that only passes on a clean
+        # emulator (unscoped collections, or `!=` queries that match other
+        # tests' documents) fails here.
         run: |
           firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang \
-            'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --locked -- --nocapture'
+            'set -eu
+              env | grep -q "^FIRESTORE_EMULATOR_HOST="
+              for run in 1 2; do
+                FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --test cli --locked -- --nocapture
+              done'
 
       - name: Verify deploy config denies Firestore writes
         run: |
@@ -203,7 +211,7 @@ jobs:
           # テストは FIRELANG_FIRESTORE_RULES が "deny" でなければ黙って
           # 成功する。変数名をどちらかの側で変更すると、この検査が
           # assertion を一度も実行しないまま緑になってしまうため、
-          # テストと同じシェルで変数が実際に渡っていることを確認する.
+          # テストと同じシェルで変数が実際に渡っていることを確認する。
           firebase emulators:exec --config firebase.json --only firestore --project demo-firelang \
             'FIRESTORE_PROJECT_ID=demo-firelang FIRELANG_FIRESTORE_RULES=deny sh -c '"'"'
                test "$FIRELANG_FIRESTORE_RULES" = deny || {
@@ -222,3 +230,4 @@ jobs:
         run: |
           firebase emulators:exec --config firebase.emulators.json --only auth --project demo-firelang \
             'FIREBASE_PROJECT_ID=demo-firelang cargo test --features emulator --test auth_emulator --locked -- --nocapture'
+
