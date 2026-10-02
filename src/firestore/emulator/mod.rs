@@ -18,8 +18,8 @@ use gcloud_sdk::google::firestore::v1::{
 };
 use gcloud_sdk::tonic::{Code, Request};
 
-use super::{apply_query_shape, Firestore, QueryCandidates, WriteOp};
-use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Value};
+use super::{apply_query_shape, parse_query_field_path, Firestore, QueryCandidates, WriteOp};
+use crate::value::{DocRef, QueryFilter, QueryOp, QueryRef, QuerySource, Value};
 
 const COUNT_ALIAS: &str = "all";
 
@@ -370,6 +370,10 @@ impl Firestore for FirestoreEmulator {
 
     fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
+        // Parse every filter before constructing/sending the RPC.  This keeps
+        // malformed paths from reaching Firestore and gives both backends the
+        // same validation error.
+        super::prepare_query_filters(&query.filters)?;
         // Firestore の server filter は候補を減らすためだけに使ってよい。
         // 最終的な一致判定は必ず共通の local matcher で行う(特に異型の
         // 大小比較を Firestore の型順序に委ねない)。
@@ -387,7 +391,6 @@ impl Firestore for FirestoreEmulator {
             }
             QuerySource::CollectionGroup(id) => {
                 let sq = structured_query(&self.client.project_id, id, true, &server_filters)?;
-
                 run_query_candidates(self, None, sq, &query.filters)
             }
         }
@@ -424,7 +427,8 @@ impl Firestore for FirestoreEmulator {
             run_query_candidates(self, parent, sq, &query.filters)
         } else {
             let rows = run_query_candidates(self, parent, sq, &query.filters)?;
-            Ok(apply_query_shape(rows, query))
+            let order_by = super::parse_order_by(query)?;
+            Ok(apply_query_shape(rows, query, &order_by))
         }
     }
 
@@ -465,7 +469,8 @@ impl Firestore for FirestoreEmulator {
         }
         let rows =
             run_query_candidates_bounded(self, parent.as_deref(), sq, &query.filters, max_results)?;
-        Ok(apply_query_shape(rows, query))
+        let order_by = super::parse_order_by(query)?;
+        Ok(apply_query_shape(rows, query, &order_by))
     }
 
     /// Apply `RuntimeLimits::backend_timeout` to every subsequent RPC.
@@ -776,36 +781,6 @@ fn run_query_candidates(
     decode_query_documents(fs, docs, filters)
 }
 
-/// Decode collected documents and re-apply the complete predicate with the
-/// same matcher the in-memory backend uses, so server-specific null and
-/// structural-value behavior cannot leak through.
-fn decode_query_documents(
-    fs: &FirestoreEmulator,
-    docs: Vec<Document>,
-    filters: &[QueryFilter],
-) -> Result<QueryCandidates, Box<dyn Error>> {
-    let mut out = Vec::with_capacity(docs.len());
-    let resource_root = fs.client.db.get_documents_path();
-    for doc in docs {
-        let rel = path::relative_document_name_for(
-            &doc.name,
-            &fs.client.project_id,
-            path::DEFAULT_DATABASE_ID,
-        )?;
-        let Value::Map(fields) =
-            codec::decode_document_bounded(&doc, resource_root, fs.max_value_depth)?
-        else {
-            return Err("query result must be a map".into());
-        };
-        out.push((rel, fields));
-    }
-    // The server query is only a candidate-generation optimization.  Re-run
-    // every predicate with the same matcher used by the in-memory backend so
-    // server-specific null and structural-value behavior cannot leak through.
-    out.retain(|(rel, fields)| super::matches_filters(rel, fields, filters));
-    Ok(out)
-}
-
 /// Consume a server-streaming query, decoding and matching rows as they
 /// arrive and stopping as soon as more than `max_results` candidates match.
 ///
@@ -825,6 +800,10 @@ fn run_query_candidates_bounded(
 ) -> Result<QueryCandidates, Box<dyn Error>> {
     let db = &fs.client.db;
     let parent = path::parent_path(&fs.client.project_id, parent);
+    // The shared matcher needs the parsed field paths (quoted names, the
+    // `__name__` pseudo-field) and the normalized document-name filter values.
+    // Both are derived once per query, not per document.
+    let (field_paths, normalized_values) = super::prepare_query_filters(filters)?;
     let project_id = fs.client.project_id.clone();
     let resource_root = db.get_documents_path();
     let max_value_depth = fs.max_value_depth;
@@ -857,11 +836,17 @@ fn run_query_candidates_bounded(
                     path::DEFAULT_DATABASE_ID,
                 )?;
                 let Value::Map(fields) =
-                    codec::decode_document_bounded(&doc, &resource_root, max_value_depth)?
+                    codec::decode_document_bounded(&doc, resource_root, max_value_depth)?
                 else {
                     return Err(QueryStreamError::Local("query result must be a map".into()));
                 };
-                if !super::matches_filters(&rel, &fields, &filters) {
+                if !super::matches_filters(
+                    &rel,
+                    &fields,
+                    &filters,
+                    &field_paths,
+                    &normalized_values,
+                ) {
                     continue;
                 }
                 if rows.len() >= max_results {
@@ -950,6 +935,39 @@ fn run_query_candidate_documents(
             Ok::<_, gcloud_sdk::tonic::Status>(docs)
         },
     )
+}
+
+/// Decode collected documents and re-apply the complete predicate with the
+/// same matcher the in-memory backend uses, so server-specific null and
+/// structural-value behavior cannot leak through.  The server query is only a
+/// candidate-generation optimization.
+fn decode_query_documents(
+    fs: &FirestoreEmulator,
+    docs: Vec<Document>,
+    filters: &[QueryFilter],
+) -> Result<QueryCandidates, Box<dyn Error>> {
+    let (field_paths, normalized_values) = super::prepare_query_filters(filters)?;
+    let mut out = Vec::with_capacity(docs.len());
+    let resource_root = fs.client.db.get_documents_path();
+    for doc in docs {
+        let rel = path::relative_document_name_for(
+            &doc.name,
+            &fs.client.project_id,
+            path::DEFAULT_DATABASE_ID,
+        )?;
+        let Value::Map(fields) =
+            codec::decode_document_bounded(&doc, resource_root, fs.max_value_depth)?
+        else {
+            return Err("query result must be a map".into());
+        };
+        if super::matches_filters(&rel, &fields, filters, &field_paths, &normalized_values) {
+            out.push((rel, fields));
+        }
+    }
+    out.retain(|(rel, fields)| {
+        super::matches_filters(rel, fields, filters, &field_paths, &normalized_values)
+    });
+    Ok(out)
 }
 
 fn is_not_found(error: &(dyn Error + 'static)) -> bool {
@@ -1071,6 +1089,7 @@ fn build_where(
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
     let mut parts = vec![];
     for f in filters {
+        let field_path = parse_query_field_path(&f.field)?;
         let op = match f.op {
             QueryOp::Eq => structured_query::field_filter::Operator::Equal,
             QueryOp::Ne => structured_query::field_filter::Operator::NotEqual,
@@ -1083,14 +1102,19 @@ fn build_where(
             QueryOp::ArrayContains => structured_query::field_filter::Operator::ArrayContains,
             QueryOp::ArrayContainsAny => structured_query::field_filter::Operator::ArrayContainsAny,
         };
+        let value = if field_path.is_document_id() {
+            encode_document_id_query_value(project_id, &f.value)?
+        } else {
+            codec::encode_query_value(project_id, &f.value)?
+        };
         parts.push(structured_query::Filter {
             filter_type: Some(structured_query::filter::FilterType::FieldFilter(
                 structured_query::FieldFilter {
                     field: Some(structured_query::FieldReference {
-                        field_path: f.field.clone(),
+                        field_path: field_path.wire().to_string(),
                     }),
                     op: op.into(),
-                    value: Some(codec::encode_query_value(project_id, &f.value)?),
+                    value: Some(value),
                 },
             )),
         });
@@ -1109,16 +1133,49 @@ fn build_where(
     })
 }
 
+/// `__name__` is a document reference on the wire, while the public API uses
+/// a relative path string.  Convert both strings and DocRefs recursively so
+/// `==`, `in`, and nested membership values have the same meaning.
+fn encode_document_id_query_value(
+    project_id: &str,
+    value: &Value,
+) -> Result<gcloud_sdk::google::firestore::v1::Value, Box<dyn Error>> {
+    match value {
+        Value::Str(path) => {
+            codec::encode_query_value(project_id, &Value::DocRef(DocRef { path: path.clone() }))
+        }
+        Value::Array(items) => Ok(gcloud_sdk::google::firestore::v1::Value {
+            value_type: Some(
+                gcloud_sdk::google::firestore::v1::value::ValueType::ArrayValue(
+                    gcloud_sdk::google::firestore::v1::ArrayValue {
+                        values: items
+                            .iter()
+                            .map(|item| encode_document_id_query_value(project_id, item))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    },
+                ),
+            ),
+        }),
+        other => codec::encode_query_value(project_id, other),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn new_fails_fast_without_emulator() {
-        // 接続は構築時に確立する。届かない相手には即エラーになる。
-        // (9番ポートは discard のため emulator がいることはない)
+        // OS に一時的に確保させ、接続していない loopback port を取得する。
+        // discard port のように「通常誰も使わない」固定 port には依存しない。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        // 接続は構築時に確立する。届かない相手には connect deadline までに
+        // エラーになる。
         let res = FirestoreEmulator::new_with_timeout(
-            "127.0.0.1:9".to_string(),
+            host,
             "p".to_string(),
             Some(std::time::Duration::from_millis(50)),
         );

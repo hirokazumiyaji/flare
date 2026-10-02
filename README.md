@@ -47,7 +47,7 @@ GitHub Actions は full commit SHA で固定されています。
 cargo run --locked --bin fl -- path/to/script.fl
 ```
 
-Firestore エミュレータバックエンドは `emulator` feature を明示して有効にします(`FIRESTORE_EMULATOR_HOST` が必須。プロジェクト ID は省略時 `firelang-test`):
+Firestore エミュレータバックエンドは `emulator` feature を明示して有効にします(`FIRESTORE_EMULATOR_HOST` が必須。プロジェクト ID は省略時 `firelang-test`)。in-memory では `server_timestamp()` の request time を commit ごとに高々 1 回だけ取得するため、Rust から `InMemoryFirestore::with_clock(...)` で決定論的な clock を注入できます:
 
 ```bash
 export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080
@@ -62,11 +62,15 @@ Local emulator には allow-all rules を持つ `firebase.emulators.json` を明
 firebase emulators:start --config firebase.emulators.json --only firestore --project demo-firelang
 ```
 
-ワンショットで統合テストを実行する例:
+同じ emulator に対して library / CLI の integration test を 2 回実行する例(2 回目の pass では 1 回目に書いた fixture がそのまま残るため、test 間の干渉を検出できる):
 
 ```bash
 firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang \
-  'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --locked -- --nocapture'
+  'set -eu
+    env | grep -q "^FIRESTORE_EMULATOR_HOST="
+    for run in 1 2; do
+      FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --test cli --locked -- --nocapture
+    done'
 ```
 
 `firebase.json` は deploy 用であり、Firestore と Storage の read/write を拒否します。
@@ -201,6 +205,8 @@ cargo test --locked --features emulator --test storage_emulator -- --nocapture  
 cargo test --locked --features emulator --test auth_emulator -- --nocapture      # FIREBASE_AUTH_EMULATOR_HOST 未設定なら skip
 ```
 
+永続 emulator へ接続中は、同じコマンドの繰り返しや integration test binary を分けて実行しても contention しません。各 test は `_firelang_tests/<test-name>_<unique-run>/docs` の固有 hierarchy へ書き込みます。環境変数が設定済みで接続に失敗した場合は skip せず失敗します。
+
 `Firestore` / `InMemoryFirestore` / `run_script` は feature に依存せず利用できます。
 `FirestoreEmulator` と `fl --backend emulator` は `emulator` feature でのみ公開・有効です。
 ライブラリとして emulator backend を使う consumer は、依存宣言に
@@ -210,7 +216,7 @@ cargo test --locked --features emulator --test auth_emulator -- --nocapture     
 
 - **`test` ジョブ**: 固定された Rust toolchain と `Cargo.lock` で `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --all-targets --locked`, `cargo build --release --bin fl --locked` を実行し、tool version をログに出力
 - **`feature-builds` ジョブ**: default / `--no-default-features` / `--features emulator` のビルド境界を検証
-- **`integration-emulator` ジョブ**: Firebase CLI 15.31.0 の Firestore / Storage / Auth エミュレータを起動し、tool version をログに出力してから各統合テストを実行
+- **`integration-emulator` ジョブ**: Firebase CLI 15.31.0 の Firestore / Storage / Auth エミュレータを起動し、tool version をログに出力してから各統合テストを実行する。Firestore の emulator suite だけは同じ emulator 上で 2 回走らせ、test 間の干渉を検出する
 - CI は reusable workflow になっており、`v*` タグを押した CD も同じジョブ群（integration test を含む）を必ず実行します。CD の release ジョブはこの gate と tag version check に依存するため、branch CI を飛ばした tag でも公開できません。
 - **CD**: tag の `v` を除いた部分（例: `v0.1.0` → `0.1.0`）が `cargo metadata --no-deps` の `firelang` package version と一致する場合だけ、`fl` の Linux バイナリを `--features emulator` でビルドして release します。
 - release asset は raw binary ではなく `firelang-<version>-linux-x86_64.tar.gz` と SHA-256 `.sha256` sidecar です。tarball には実行権限付きの `fl`、`README.md`、`LICENSE`、`docs/spec.md`、ファイル単位の `SHA256SUMS` が含まれます。

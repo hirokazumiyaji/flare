@@ -79,7 +79,7 @@ Firestore 操作のための特殊な値:
 | CollectionRef | `col("users")` | コレクション参照 |
 | CollectionGroupRef | `col_group("members")` | コレクショングループ参照 |
 | QueryRef | `col(..).where(..)` 等 | 構築中のクエリ |
-| ServerTimestamp | `server_timestamp()` | 書き込み時にサーバ時刻へ解決されるセンチネル |
+| ServerTimestamp | `server_timestamp()` | commit の request time へ解決されるセンチネル。同じ write / batch / transaction commit 内の全センチネルは同じ時刻 |
 | ArrayUnion / ArrayRemove | `array_union([..])` / `array_remove([..])` | 配列フィールド変換センチネル |
 | DeleteField | `delete_field()` | フィールド削除センチネル(`update` / merge `set` のみ) |
 | Increment | `increment(n)` | 数値加算センチネル |
@@ -290,7 +290,7 @@ while cond { ... }
 | `bytes(str)` / `bytes(int_array)` | Bytes | 文字列の UTF-8 バイト列、または 0..=255 の Int からなる配列を immutable なバイナリ列にする。引数は厳密に 1 個 |
 | `array_union(array)` | センチネル | 配列フィールドへの追加(重複は追加されない) |
 | `array_remove(array)` | センチネル | 配列フィールドからの除去 |
-| `server_timestamp()` | センチネル | 書き込み時にサーバ時刻に解決 |
+| `server_timestamp()` | センチネル | 書き込み時にサーバ時刻に解決。通常の 1 回の write、または 1 回の batch / transaction commit に含まれる全センチネルは同じ request time を使う |
 | `delete_field()` | センチネル | `update` / merge `set` でフィールドを削除する。存在しないフィールドへの指定は no-op |
 | `increment(n)` | センチネル | 数値フィールドに `n`(Int)を加算する。フィールドが存在しないか数値以外の場合は `n` を設定。正負のオーバーフロー時は `i64::MAX` / `i64::MIN` に飽和する(Firestore 仕様準拠) |
 | `batch { ... }` | ブロックの値 | 8 章参照 |
@@ -305,6 +305,8 @@ Firestore へ書き込む値は、runtime が write を staging する前と、i
 - update / merge `set` のフィールドパスでは、単純フィールド名の各セグメントにも同じ名前制約を適用する(`__name__` などの予約名は不可)。
 
 センチネル 5 種(ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment)は `set` / `update` の data_map の**直下のフィールド値**としてのみ意味を持つ。ネストした Map / Array の中では使えない(エラー: `field transforms cannot be nested`)。`delete_field()` は `update` と merge `set` でのみ使え、置換の `set` ではエラー(`delete_field() cannot be used with set() without merge`)。
+
+`server_timestamp()` は commit の request time を使う。通常の `set` / `update` はそれぞれ 1 回の write request として扱い、`batch` / `transaction` はそれぞれ 1 回の commit request として扱う。**同じ request 内のすべての `ServerTimestamp` センチネルは同じ Timestamp になる**。別々の通常の write は別々の request なので、同じ Timestamp になるとは限らない。これは emulator の Firestore `REQUEST_TIME` transform と同じ意味であり、`now()`(呼び出しごとの現在時刻)とは異なる。
 
 ```ruby
 set(doc("users/1"), {name: "alice", age: 20})
@@ -535,7 +537,6 @@ Identity Toolkit のエラーコードは `:` 区切りの詳細が付くこと�
 - ただし emulator 側に firelang 外の型(`double` / `reference` / `geo_point`)で書かれたフィールドがある場合、emulator バックエンドは `Opaque` / `DocRef` に読み替えて返す(§3)。`bytes` は `Bytes` として lossless に往復する。in-memory には firelang 外の型の値は存在しない。
 - ローカル実行の security rules は `firebase.emulators.json` が参照する `firestore.emulator.rules`(read/write 許可)を使う。`firebase.json` が参照する `firestore.rules` は read/write 拒否で、リモート project への誤デプロイに備えてある([Firebase rules の分離とデプロイ防止策](firebase-security.md))。
 
-<<<<<<< HEAD
 ## 13. 実行予算と信頼境界
 
 `fl` は任意のスクリプトファイルを受け付ける。したがって誤ったスクリプト・無限再帰・無限ループ・巨大なネスト・巨大なクエリ結果が、スタック枯渇や無期限の停止に導かれてはならない。ランタイムは**有限の実行予算**を既定で持ち、超過時は panic ではなく、位置付きの通常のエラー(`error: <line>:<col>: ...`)で終了する。

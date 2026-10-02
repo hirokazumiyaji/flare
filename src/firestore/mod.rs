@@ -9,7 +9,7 @@ pub use emulator::{
     parse_timeout_ms, EmulatorAuth, EmulatorConfig, EmulatorConnectionError, FirestoreEmulator,
     FirestoreEmulatorOptions, DEFAULT_OPERATION_TIMEOUT, OPERATION_TIMEOUT_ENV,
 };
-pub use memory::InMemoryFirestore;
+pub use memory::{InMemoryFirestore, RequestClock};
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -174,6 +174,46 @@ pub(crate) fn validate_firestore_field_name(name: &str) -> Result<(), Box<dyn Er
     Ok(())
 }
 
+/// Firestore の ID 固有の制約。パス上のセグメントと単一 ID 引数で共有する。
+///
+/// spec §6 の通り、document ID と collection ID で制約は同一。予約パターン
+/// `__.*__` の検査も document だけを対象にせず両方に適用する(片方だけだと
+/// `col("__meta__")` が通るが `doc("users/__x__")` は弾くというズレが
+/// in-memory / emulator の食い違いの原因になる)。
+///
+/// `__name__` クエリフィルタの document path 検証もここを使うので、
+/// `get` / `doc` / write と name フィルタが同じパスを受け入れる。
+pub(crate) fn validate_firestore_id(id: &str) -> Result<(), &'static str> {
+    if id.is_empty() {
+        return Err("must not be empty");
+    }
+    if id.contains('/') {
+        return Err("must not contain '/'");
+    }
+    if id.len() > MAX_FIELD_NAME_BYTES {
+        return Err("must be at most 1,500 UTF-8 bytes");
+    }
+    if id == "." || id == ".." {
+        return Err("must not be \".\" or \"..\"");
+    }
+    if is_reserved_firestore_id(id) {
+        return Err("must not match the reserved pattern __.*__");
+    }
+    Ok(())
+}
+
+/// Firestore の予約 ID 正規表現 `^__.*__$` 相当。
+///
+/// Datastore 由来の数値 ID(`__id123__` 形式)は既存ドキュメントの参照として
+/// 扱うため例外とする。クエリや参照フィールドで返されたドキュメントを
+/// `get` / `update` / `delete` に渡せなくなるのを避ける。
+pub(crate) fn is_reserved_firestore_id(id: &str) -> bool {
+    if id.len() >= 4 && id.starts_with("__") && id.ends_with("__") {
+        return !is_legacy_datastore_numeric_id(id);
+    }
+    false
+}
+
 /// Datastore 由来の数値エンティティ ID(`__id` + 10進数字 + `__`)かどうか。
 /// 予約パターン `__.*__` の例外として、既存参照の読み書きに使う。
 pub(crate) fn is_legacy_datastore_numeric_id(id: &str) -> bool {
@@ -204,6 +244,230 @@ pub(crate) fn validate_write_data(data: &BTreeMap<String, Value>) -> Result<(), 
     Ok(())
 }
 
+/// `__name__` は保存されたフィールドではなく相対ドキュメントパスを指す
+/// 疑似フィールド。
+fn is_document_name_field(field: &str) -> bool {
+    field == "__name__"
+}
+
+/// A parsed query field path.
+///
+/// Query field paths are user-facing strings, while the emulator sends a
+/// Firestore `FieldReference.field_path` string.  Keeping the decoded segments
+/// and the canonical wire spelling together prevents the two backends from
+/// interpreting quoted names, nested names, and the document-name pseudo-field
+/// differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QueryFieldPath {
+    segments: Vec<String>,
+    wire: String,
+    document_id: bool,
+}
+
+impl QueryFieldPath {
+    /// Parse a query field path and produce its canonical Firestore spelling.
+    ///
+    /// A dot always separates path segments.  A segment can be written as a
+    /// simple name (`[A-Za-z_][A-Za-z0-9_]*`) or quoted with backticks.  A
+    /// non-simple, non-empty unquoted segment is retained as a literal field
+    /// name and is quoted in the wire representation.  This is intentional:
+    /// `a-b` was already a valid in-memory field lookup, so silently turning it
+    /// into a nested/invalid path would be a compatibility break.  Quoting is
+    /// required when a segment contains a dot (for example `` `a.b` ``).
+    pub(crate) fn parse(input: &str) -> Result<Self, Box<dyn Error>> {
+        if input.is_empty() {
+            return Err(invalid_query_field_path(input, "empty field path"));
+        }
+
+        let chars: Vec<char> = input.chars().collect();
+        let mut segments = Vec::new();
+        let mut quoted = Vec::new();
+        let mut index = 0;
+
+        while index < chars.len() {
+            let (segment, was_quoted, next) = if chars[index] == '`' {
+                parse_quoted_segment(input, &chars, index)?
+            } else {
+                let start = index;
+                while index < chars.len() && chars[index] != '.' {
+                    if chars[index] == '`' {
+                        return Err(invalid_query_field_path(
+                            input,
+                            "backtick must delimit a complete segment",
+                        ));
+                    }
+                    index += 1;
+                }
+                (chars[start..index].iter().collect::<String>(), false, index)
+            };
+            index = next;
+            if segment.is_empty() {
+                return Err(invalid_query_field_path(input, "empty field segment"));
+            }
+            segments.push(segment);
+            quoted.push(was_quoted);
+
+            if index == chars.len() {
+                break;
+            }
+            if chars[index] != '.' {
+                return Err(invalid_query_field_path(
+                    input,
+                    "quoted segment must be followed by '.' or end of path",
+                ));
+            }
+            index += 1;
+            if index == chars.len() {
+                return Err(invalid_query_field_path(input, "empty field segment"));
+            }
+        }
+
+        let document_id = segments.len() == 1 && segments[0] == "__name__" && !quoted[0];
+        if segments.iter().any(|segment| segment == "__name__") && !document_id {
+            return Err(invalid_query_field_path(
+                input,
+                "__name__ is a document-name pseudo-field and cannot be nested",
+            ));
+        }
+        if !document_id && quoted[0] && segments[0] == "__name__" {
+            return Err(invalid_query_field_path(
+                input,
+                "__name__ is a reserved document-name pseudo-field",
+            ));
+        }
+
+        let wire = segments
+            .iter()
+            .map(|segment| quote_wire_segment(segment))
+            .collect::<Vec<_>>()
+            .join(".");
+        Ok(Self {
+            segments,
+            wire,
+            document_id,
+        })
+    }
+
+    pub(crate) fn wire(&self) -> &str {
+        &self.wire
+    }
+
+    pub(crate) fn is_document_id(&self) -> bool {
+        self.document_id
+    }
+
+    /// Look up the path in a decoded document. `__name__` is handled by the
+    /// caller because its value comes from the candidate path, not the map.
+    pub(crate) fn lookup<'a>(&self, doc: &'a BTreeMap<String, Value>) -> Option<&'a Value> {
+        let mut current = doc;
+        for (index, segment) in self.segments.iter().enumerate() {
+            let value = current.get(segment)?;
+            if index + 1 == self.segments.len() {
+                return Some(value);
+            }
+            let Value::Map(next) = value else {
+                return None;
+            };
+            current = next;
+        }
+        None
+    }
+}
+
+/// Return the canonical spelling used by the Firestore RPC layer.
+pub(crate) fn normalize_query_field_path(path: &str) -> Result<String, Box<dyn Error>> {
+    Ok(parse_query_field_path(path)?.wire().to_string())
+}
+
+/// Parse a query field path while retaining its decoded segments.
+pub(crate) fn parse_query_field_path(path: &str) -> Result<QueryFieldPath, Box<dyn Error>> {
+    QueryFieldPath::parse(path)
+}
+
+/// Normalize a value used for a `__name__` filter to the relative path shape
+/// used by the in-memory candidate matcher.  A DocRef is accepted as a
+/// convenience and is equivalent to its relative path string.
+pub(crate) fn normalize_document_id_filter_value(value: &Value) -> Value {
+    match value {
+        Value::DocRef(reference) => Value::Str(reference.path.clone()),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(normalize_document_id_filter_value)
+                .collect(),
+        ),
+        Value::Map(map) => Value::Map(
+            map.iter()
+                .map(|(key, value)| (key.clone(), normalize_document_id_filter_value(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn parse_quoted_segment(
+    input: &str,
+    chars: &[char],
+    mut index: usize,
+) -> Result<(String, bool, usize), Box<dyn Error>> {
+    // `index` points at the opening backtick.
+    index += 1;
+    let mut segment = String::new();
+    let mut closed = false;
+    while index < chars.len() {
+        match chars[index] {
+            '`' => {
+                index += 1;
+                closed = true;
+                break;
+            }
+            '\\' if index + 1 < chars.len() => {
+                // Firestore quotes use a backslash to escape a backtick.  We
+                // also accept an escaped backslash so the decoder is lossless.
+                segment.push(chars[index + 1]);
+                index += 2;
+            }
+            other => {
+                segment.push(other);
+                index += 1;
+            }
+        }
+    }
+    if !closed {
+        return Err(invalid_query_field_path(
+            input,
+            "unterminated quoted field segment",
+        ));
+    }
+    Ok((segment, true, index))
+}
+
+fn quote_wire_segment(segment: &str) -> String {
+    if is_simple_query_segment(segment) {
+        return segment.to_string();
+    }
+    let mut quoted = String::with_capacity(segment.len() + 2);
+    quoted.push('`');
+    for ch in segment.chars() {
+        if ch == '`' || ch == '\\' {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('`');
+    quoted
+}
+
+fn is_simple_query_segment(segment: &str) -> bool {
+    let mut chars = segment.chars();
+    matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn invalid_query_field_path(path: &str, reason: &str) -> Box<dyn Error> {
+    format!("invalid field path: {path} ({reason})").into()
+}
+
 /// クエリフィルタ値の共有検証。in-memory / emulator のクエリ実行前に
 /// 両バックエンドが呼び、同じエラーを同じメッセージで返す。
 /// - 文字列フィルタ値は 1,500 UTF-8 バイト未満(Firestore 準拠。Map / Array
@@ -211,7 +475,14 @@ pub(crate) fn validate_write_data(data: &BTreeMap<String, Value>) -> Result<(), 
 /// - `in` / `not-in` / `array_contains_any` の値は Array で要素は最大 10 個
 pub(crate) fn validate_query_filters(filters: &[QueryFilter]) -> Result<(), Box<dyn Error>> {
     for f in filters {
-        check_query_value_size(&f.field, &f.value)?;
+        if is_document_name_field(&f.field) {
+            // `__name__` は wire 上では document reference なので indexed
+            // string の 1,500 バイト制限を当てない。代わりに参照の規則で
+            // 検証する(reference は document path として長さが制約される)。
+            validate_document_id_filter_value(&f.field, &f.value)?;
+        } else {
+            check_query_value_size(&f.field, &f.value)?;
+        }
         match f.op {
             QueryOp::In | QueryOp::NotIn | QueryOp::ArrayContainsAny => {
                 let op_name = match f.op {
@@ -228,6 +499,53 @@ pub(crate) fn validate_query_filters(filters: &[QueryFilter]) -> Result<(), Box<
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// `__name__` フィルタ値が document reference として妥当か検証する。
+///
+/// `__name__` は wire 上では reference なので、値は文字列 path か `doc()`
+/// で作った DocRef しか受け付けない。整数や `nil` を渡すと in-memory は
+/// 「一致なし」で終わる一方、emulator は Firestore が document-key フィルタを
+/// 丸ごと拒否するため、両バックエンドがずれる。よって実行前に弾く。
+fn validate_document_id_filter_value(field: &str, value: &Value) -> Result<(), Box<dyn Error>> {
+    match value {
+        Value::Str(path) => validate_document_filter_path(field, path),
+        Value::DocRef(reference) => validate_document_filter_path(field, &reference.path),
+        // `in` / `not-in` / `array_contains_any` の配列は中身まで同じ規則を
+        // 適用する(要素が 1 つでも reference でなければ拒否)。
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| validate_document_id_filter_value(field, item)),
+        other => Err(format!(
+            "__name__ filter requires a document path string or doc(), got {}",
+            other.inspect()
+        )
+        .into()),
+    }
+}
+
+/// document path の形と、各 document ID のサイズを検証する。
+///
+/// `__name__` のフィルタ値は indexed string ではないので 1,500 バイトの
+/// 文字列上限を当てない(パス全体が 1,499 バイトを超えていても、各 ID が
+/// Firestore の制限内なら有効な reference になる)。代わりに Firestore の
+/// document / collection ID と同じ 1,500 UTF-8 バイト制限を ID 単位で課す。
+fn validate_document_filter_path(field: &str, path: &str) -> Result<(), Box<dyn Error>> {
+    let segments: Vec<&str> = path.split('/').collect();
+    // `doc()` / `get()` / write と同じ document path 規則を使う。collection
+    // セグメントも検査する(片側だけ検査すると `doc()` では通らない path が
+    // name フィルタだけ通ってしまう)ので、index で分ける処理はしない。
+    if segments.is_empty() || !segments.len().is_multiple_of(2) {
+        return Err(format!("invalid document path in {field} filter: {path}").into());
+    }
+    for segment in &segments {
+        validate_firestore_id(segment).map_err(|reason| {
+            format!(
+                "invalid document path in {field} filter: {path} (segment {segment:?}: {reason})"
+            )
+        })?;
     }
     Ok(())
 }
@@ -260,60 +578,99 @@ fn check_query_value_size(field: &str, value: &Value) -> Result<(), Box<dyn Erro
 ///
 /// 比較演算子は `Value::cmp_for_where` が規定する同型比較だけを受け付ける。
 /// `order_by` の全順序 (`Value::cmp_for_order`) とは別の契約である。
+/// parse 済みの field path と、`__name__` フィルタ値の正規化結果。
+pub(crate) type PreparedFilters = (Vec<QueryFieldPath>, Vec<Option<Value>>);
+
+/// `__name__` を含むクエリの前処理。field path を 1 回だけ parse し、
+/// `__name__` のフィルタ値を相対パス表現に正規化する。
+///
+/// parse に失敗した field path は両バックエンドが同じエラーで弾く(呼び出し
+/// 側が parse の失敗を返す)。クエリごとに 1 度だけ呼べばよい。
+pub(crate) fn prepare_query_filters(
+    filters: &[QueryFilter],
+) -> Result<PreparedFilters, Box<dyn Error>> {
+    let field_paths = filters
+        .iter()
+        .map(|filter| parse_query_field_path(&filter.field))
+        .collect::<Result<Vec<_>, _>>()?;
+    let normalized_values = filters
+        .iter()
+        .zip(&field_paths)
+        .map(|(filter, field_path)| {
+            field_path
+                .is_document_id()
+                .then(|| normalize_document_id_filter_value(&filter.value))
+        })
+        .collect();
+    Ok((field_paths, normalized_values))
+}
+
+/// 共有 matcher。`prepared` は [`prepare_query_filters`] の戻り値。
 pub(crate) fn matches_filters(
     path: &str,
     doc: &BTreeMap<String, Value>,
     filters: &[QueryFilter],
+    field_paths: &[QueryFieldPath],
+    normalized_values: &[Option<Value>],
 ) -> bool {
-    filters.iter().all(|filter| {
-        // `__name__` は保存された field ではなく相対ドキュメントパス。
-        if filter.field == "__name__" {
-            return matches_document_name_filter(path, filter);
-        }
-        let actual = query_field_value(doc, &filter.field);
-        match filter.op {
-            QueryOp::Eq => actual == Some(&filter.value),
-            QueryOp::Ne => actual.is_some_and(|value| value != &filter.value),
-            QueryOp::Gt => compare_where_values(actual, &filter.value, Ordering::is_gt),
-            QueryOp::Ge => compare_where_values(actual, &filter.value, Ordering::is_ge),
-            QueryOp::Lt => compare_where_values(actual, &filter.value, Ordering::is_lt),
-            QueryOp::Le => compare_where_values(actual, &filter.value, Ordering::is_le),
-            QueryOp::In => match (&filter.value, actual) {
-                (Value::Array(list), Some(value)) => list.contains(value),
-                _ => false,
-            },
-            QueryOp::NotIn => match (&filter.value, actual) {
-                (Value::Array(list), Some(value))
-                    if !list.iter().any(|item| matches!(item, Value::Nil)) =>
-                {
-                    !list.contains(value)
-                }
-                _ => false,
-            },
-            QueryOp::ArrayContains => match actual {
-                Some(Value::Array(items)) => items.contains(&filter.value),
-                _ => false,
-            },
-            QueryOp::ArrayContainsAny => match (&filter.value, actual) {
-                (Value::Array(candidates), Some(Value::Array(items))) => {
-                    items.iter().any(|item| candidates.contains(item))
-                }
-                _ => false,
-            },
-        }
-    })
+    filters.iter().zip(field_paths).zip(normalized_values).all(
+        |((filter, field_path), normalized_value)| {
+            // `__name__` は保存された field ではなく相対ドキュメントパス。
+            if field_path.is_document_id() {
+                return matches_document_name_filter(path, filter, normalized_value);
+            }
+            let actual = field_path.lookup(doc);
+            match filter.op {
+                QueryOp::Eq => actual == Some(&filter.value),
+                QueryOp::Ne => actual.is_some_and(|value| value != &filter.value),
+                QueryOp::Gt => compare_where_values(actual, &filter.value, Ordering::is_gt),
+                QueryOp::Ge => compare_where_values(actual, &filter.value, Ordering::is_ge),
+                QueryOp::Lt => compare_where_values(actual, &filter.value, Ordering::is_lt),
+                QueryOp::Le => compare_where_values(actual, &filter.value, Ordering::is_le),
+                QueryOp::In => match (&filter.value, actual) {
+                    (Value::Array(list), Some(value)) => list.contains(value),
+                    _ => false,
+                },
+                QueryOp::NotIn => match (&filter.value, actual) {
+                    (Value::Array(list), Some(value))
+                        if !list.iter().any(|item| matches!(item, Value::Nil)) =>
+                    {
+                        !list.contains(value)
+                    }
+                    _ => false,
+                },
+                QueryOp::ArrayContains => match actual {
+                    Some(Value::Array(items)) => items.contains(&filter.value),
+                    _ => false,
+                },
+                QueryOp::ArrayContainsAny => match (&filter.value, actual) {
+                    (Value::Array(candidates), Some(Value::Array(items))) => {
+                        items.iter().any(|item| candidates.contains(item))
+                    }
+                    _ => false,
+                },
+            }
+        },
+    )
 }
 
-fn matches_document_name_filter(path: &str, filter: &QueryFilter) -> bool {
+fn matches_document_name_filter(
+    path: &str,
+    filter: &QueryFilter,
+    normalized_value: &Option<Value>,
+) -> bool {
+    // `__name__` のフィルタ値は `doc()` で渡された DocRef と文字列 path の
+    // どちらでも同じ意味になるよう、正規化済みの値だけを使う。
+    let value = normalized_value.as_ref().unwrap_or(&filter.value);
     let is_path = |value: &Value| matches!(value, Value::Str(actual) if actual == path);
     match filter.op {
-        QueryOp::Eq => is_path(&filter.value),
-        QueryOp::Ne => !is_path(&filter.value),
-        QueryOp::In => match &filter.value {
+        QueryOp::Eq => is_path(value),
+        QueryOp::Ne => !is_path(value),
+        QueryOp::In => match value {
             Value::Array(values) => values.iter().any(is_path),
             _ => false,
         },
-        QueryOp::NotIn => match &filter.value {
+        QueryOp::NotIn => match value {
             Value::Array(values) if !values.iter().any(|value| matches!(value, Value::Nil)) => {
                 !values.iter().any(is_path)
             }
@@ -332,25 +689,6 @@ fn compare_where_values(
     actual
         .and_then(|value| value.cmp_for_where(filter))
         .is_some_and(predicate)
-}
-
-pub(crate) fn query_field_value<'a>(
-    doc: &'a BTreeMap<String, Value>,
-    field: &str,
-) -> Option<&'a Value> {
-    let mut current = doc;
-    let mut segments = field.split('.').peekable();
-    while let Some(segment) = segments.next() {
-        let value = current.get(segment)?;
-        if segments.peek().is_none() {
-            return Some(value);
-        }
-        current = match value {
-            Value::Map(inner) => inner,
-            _ => return None,
-        };
-    }
-    None
 }
 
 pub(crate) fn paths_overlap(a: &str, b: &str) -> bool {
@@ -600,12 +938,16 @@ pub(crate) fn query_result_limit_error(max_results: usize) -> Box<dyn Error> {
 
 /// クエリの決定的な順序とページングを候補へ適用する。
 /// バックエンドが page 全体を処理できない場合の安全なフォールバックでも使う。
-pub(crate) fn apply_query_shape(mut rows: QueryCandidates, query: &QueryRef) -> QueryCandidates {
-    if query.order_by.is_empty() {
+pub(crate) fn apply_query_shape(
+    mut rows: QueryCandidates,
+    query: &QueryRef,
+    order_by: &[(QueryFieldPath, Direction)],
+) -> QueryCandidates {
+    if order_by.is_empty() {
         rows.sort_by(|a, b| a.0.cmp(&b.0));
     } else {
-        rows.retain(|(path, doc)| candidate_has_order_fields(path, doc, query));
-        rows.sort_by(|a, b| compare_query_candidates(&a.0, &a.1, &b.0, &b.1, query));
+        rows.retain(|(_, doc)| candidate_has_order_fields(doc, order_by));
+        rows.sort_by(|a, b| compare_query_candidates(&a.0, &a.1, &b.0, &b.1, order_by));
     }
     let skip = query.offset.unwrap_or(0);
     let mut rows = rows.into_iter().skip(skip).collect::<Vec<_>>();
@@ -618,29 +960,43 @@ pub(crate) fn apply_query_shape(mut rows: QueryCandidates, query: &QueryRef) -> 
 pub(crate) fn page_borrowed_candidates<'a>(
     candidates: impl Iterator<Item = (&'a String, &'a BTreeMap<String, Value>)>,
     query: &QueryRef,
+    order_by: &[(QueryFieldPath, Direction)],
 ) -> Vec<(&'a String, &'a BTreeMap<String, Value>)> {
     let mut rows: Vec<_> = candidates.collect();
-    if query.order_by.is_empty() {
+    if order_by.is_empty() {
         rows.sort_by(|a, b| a.0.cmp(b.0));
     } else {
-        rows.retain(|(path, doc)| candidate_has_order_fields(path, doc, query));
-        rows.sort_by(|a, b| compare_query_candidates(a.0, a.1, b.0, b.1, query));
+        rows.retain(|(_, doc)| candidate_has_order_fields(doc, order_by));
+        rows.sort_by(|a, b| compare_query_candidates(a.0, a.1, b.0, b.1, order_by));
     }
     let skip = query.offset.unwrap_or(0);
     let limit = query.limit.unwrap_or(usize::MAX);
     rows.into_iter().skip(skip).take(limit).collect()
 }
 
-/// 注文対象を持つ候補だけを順序付け・ページング対象へ残す。
-pub(crate) fn candidate_has_order_fields(
-    _path: &str,
-    doc: &BTreeMap<String, Value>,
+/// `order_by` の field path を 1 回だけ parse する。
+///
+/// 正規化済みの spelling(`` `a-b` `` など)をそのまま document に探すと
+/// 見つからない。in-memory の参照解決と emulator の wire 表現を同じ
+/// field path 定義で扱うために、parse 済みの path を使う。
+pub(crate) fn parse_order_by(
     query: &QueryRef,
-) -> bool {
+) -> Result<Vec<(QueryFieldPath, Direction)>, Box<dyn Error>> {
     query
         .order_by
         .iter()
-        .all(|(field, _)| field == "__name__" || query_field_value(doc, field).is_some())
+        .map(|(field, direction)| Ok((parse_query_field_path(field)?, *direction)))
+        .collect()
+}
+
+/// 注文対象を持つ候補だけを順序付け・ページング対象へ残す。
+pub(crate) fn candidate_has_order_fields(
+    doc: &BTreeMap<String, Value>,
+    order_by: &[(QueryFieldPath, Direction)],
+) -> bool {
+    order_by
+        .iter()
+        .all(|(field, _)| field.is_document_id() || field.lookup(doc).is_some())
 }
 
 /// 共通比較器で 2 候補を比較する。
@@ -650,16 +1006,13 @@ pub(crate) fn compare_query_candidates(
     a_doc: &BTreeMap<String, Value>,
     b_path: &str,
     b_doc: &BTreeMap<String, Value>,
-    query: &QueryRef,
+    order_by: &[(QueryFieldPath, Direction)],
 ) -> Ordering {
-    for (field, direction) in &query.order_by {
-        let mut ordering = if field == "__name__" {
+    for (field, direction) in order_by {
+        let mut ordering = if field.is_document_id() {
             a_path.cmp(b_path)
         } else {
-            let (Some(a), Some(b)) = (
-                query_field_value(a_doc, field),
-                query_field_value(b_doc, field),
-            ) else {
+            let (Some(a), Some(b)) = (field.lookup(a_doc), field.lookup(b_doc)) else {
                 debug_assert!(
                     false,
                     "candidates missing order fields are filtered before sorting"
@@ -681,6 +1034,7 @@ pub(crate) fn compare_query_candidates(
 pub trait Firestore {
     fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
     /// Apply writes atomically: either all writes persist or none do.
+    /// All `ServerTimestamp` sentinels in this call use one request time.
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>>;
     /// Returns filter-matching candidates as (relative path, document fields).
     /// Ordering, offset, and limit are NOT applied here. This method remains the
@@ -695,7 +1049,8 @@ pub trait Firestore {
     /// document payloads for rows outside the page. The default is a safe client
     /// fallback over [`Firestore::run_query`].
     fn run_query_page(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
-        Ok(apply_query_shape(self.run_query(query)?, query))
+        let order_by = parse_order_by(query)?;
+        Ok(apply_query_shape(self.run_query(query)?, query, &order_by))
     }
 
     /// Counts all documents matching the filters, ignoring order, offset, and
@@ -755,9 +1110,10 @@ pub trait Firestore {
 
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>>;
     fn transaction_get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
-    /// Commit writes using the current transaction. A failed preparation or
-    /// commit must leave the transaction available to `abort_transaction`;
-    /// successful commit closes it.
+    /// Commit transaction writes atomically. A failed preparation or commit
+    /// must leave the transaction available to `abort_transaction`; a
+    /// successful commit closes it. All `ServerTimestamp` sentinels in this
+    /// call use the one request time of this commit.
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>>;
     /// Rollback an open transaction. Idempotent: succeeds when no
     /// transaction is open. A failed rollback must leave the transaction
@@ -770,6 +1126,137 @@ pub trait Firestore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_field_path_normalizes_simple_quoted_and_nested_segments() {
+        assert_eq!(
+            normalize_query_field_path("profile.age").unwrap(),
+            "profile.age"
+        );
+        assert_eq!(
+            normalize_query_field_path("`profile.name`").unwrap(),
+            "`profile.name`"
+        );
+        assert_eq!(normalize_query_field_path("a-b").unwrap(), "`a-b`");
+        assert_eq!(normalize_query_field_path("`a\\`b`").unwrap(), "`a\\`b`");
+    }
+
+    #[test]
+    fn query_field_path_rejects_empty_and_malformed_segments() {
+        for path in ["", ".a", "a.", "a..b", "`a", "a`b", "`a`b"] {
+            let err = normalize_query_field_path(path).unwrap_err();
+            assert!(
+                format!("{err}").contains("invalid field path"),
+                "{path}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn document_name_filters_reject_non_reference_values() {
+        // in-memory は「一致なし」で終わるが、emulator は Firestore が
+        // document-key フィルタを拒否する。実行前に同じエラーで止める。
+        let bad = Value::Int(1);
+        for filter in [
+            QueryFilter {
+                field: "__name__".to_string(),
+                op: QueryOp::Eq,
+                value: bad.clone(),
+            },
+            QueryFilter {
+                field: "__name__".to_string(),
+                op: QueryOp::In,
+                value: Value::Array(vec![Value::Str("users/a".to_string()), bad.clone()]),
+            },
+            QueryFilter {
+                field: "__name__".to_string(),
+                op: QueryOp::Ne,
+                value: Value::Nil,
+            },
+        ] {
+            let err = validate_query_filters(std::slice::from_ref(&filter)).unwrap_err();
+            assert!(
+                format!("{err}").contains("requires a document path string or doc()"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn document_name_filter_paths_use_document_id_size_rules() {
+        // パス全体が 1,500 バイトを超えていても、各 ID が範囲内なら有効な
+        // reference なので、indexed string の上限では拒否しない。
+        // 39 collection + 1 document で document path の偶数セグメント要件を満たす。
+        let deep = (0..39)
+            .map(|index| format!("c{index}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let long_id = "x".repeat(MAX_FIELD_NAME_BYTES);
+        let valid = format!("{deep}/{long_id}");
+        assert!(
+            valid.len() >= 1500,
+            "fixture should exceed the string bound"
+        );
+        let filter = QueryFilter {
+            field: "__name__".to_string(),
+            op: QueryOp::Eq,
+            value: Value::Str(valid),
+        };
+        validate_query_filters(std::slice::from_ref(&filter)).unwrap();
+
+        // 1 ID だけ上限を超える reference は拒否する。拒否理由は `doc()` /
+        // `get()` / write と同じ共有规则的文言になる。
+        let filter = QueryFilter {
+            field: "__name__".to_string(),
+            op: QueryOp::Eq,
+            value: Value::Str(format!("{deep}/{}", "y".repeat(MAX_FIELD_NAME_BYTES + 1))),
+        };
+        let err = validate_query_filters(std::slice::from_ref(&filter)).unwrap_err();
+        assert!(
+            format!("{err}").contains("must be at most 1,500 UTF-8 bytes"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn document_name_filter_paths_follow_the_shared_path_rules() {
+        let accept = |path: &str| {
+            let filter = QueryFilter {
+                field: "__name__".to_string(),
+                op: QueryOp::Eq,
+                value: Value::Str(path.to_string()),
+            };
+            validate_query_filters(std::slice::from_ref(&filter))
+        };
+        // Datastore 由来の数値 ID は `set` / `get` / `doc()` が受け付ける
+        // 既存参照なので、name フィルタも同じく通す。
+        accept("users/__id123__").unwrap();
+        // collection セグメントも同じ規則で検査する(片側だけ検査すると
+        // `doc()` では通らない path が name フィルタだけ通ってしまう)。
+        for reserved in [
+            "__meta__/1",
+            "users/1/__name__",
+            "users/1/__id1__",
+            "users/1/.",
+            "users/1/..",
+            "users//1",
+            "users",
+        ] {
+            assert!(
+                accept(reserved).is_err(),
+                "expected {reserved:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn document_name_is_a_distinct_query_path() {
+        let path = parse_query_field_path("__name__").unwrap();
+        assert!(path.is_document_id());
+        assert_eq!(path.wire(), "__name__");
+        assert!(parse_query_field_path("profile.__name__").is_err());
+        assert!(parse_query_field_path("`__name__`").is_err());
+    }
     use crate::value::QuerySource;
 
     struct FallbackFirestore;

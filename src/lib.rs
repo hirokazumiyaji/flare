@@ -22,7 +22,7 @@ pub use firestore::{
     parse_timeout_ms, EmulatorAuth, EmulatorConfig, EmulatorConnectionError, FirestoreEmulator,
     FirestoreEmulatorOptions, DEFAULT_OPERATION_TIMEOUT, OPERATION_TIMEOUT_ENV,
 };
-pub use firestore::{Firestore, InMemoryFirestore};
+pub use firestore::{Firestore, InMemoryFirestore, RequestClock};
 pub use limits::{
     ParserLimits, RuntimeLimits, RuntimeUsage, DEFAULT_BACKEND_TIMEOUT_MS, DEFAULT_MAX_CALL_DEPTH,
     DEFAULT_MAX_LOOP_ITERATIONS, DEFAULT_MAX_PARSER_DEPTH, DEFAULT_MAX_QUERY_RESULTS,
