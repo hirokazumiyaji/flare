@@ -5,13 +5,16 @@ use std::time::Duration;
 /// The limits are intentionally finite.  Embedders that run trusted scripts
 /// can opt into [`RuntimeLimits::unlimited`] explicitly.
 ///
-/// `DEFAULT_MAX_CALL_DEPTH` is deliberately well below the depth a debug build
-/// can actually reach.  Recursion consumes the *native* Rust stack, and one
-/// user-function frame costs roughly 24 KiB in a debug build, so a 128-frame
-/// default overflows on any host with a 2 MiB stack (a libtest thread, for
-/// example).  64 leaves headroom on small stacks; hosts with even less stack
-/// should lower it further.
-pub const DEFAULT_MAX_CALL_DEPTH: usize = 64;
+/// Default nesting depth for calls.
+///
+/// The runtime validates a call's contract before evaluating its arguments and
+/// receiver, so one user-function call costs roughly 50 KiB of native stack in
+/// a debug build. Measured on a 2 MiB thread, 40 nested calls overflow before
+/// the budget can fire; 32 stops first with margin to spare. That keeps the
+/// default safe for hosts with a small stack (libtest threads, wasm, embedded
+/// threads). Embedders with a larger stack can raise it via
+/// `RuntimeLimits::with_max_call_depth`.
+pub const DEFAULT_MAX_CALL_DEPTH: usize = 32;
 pub const DEFAULT_MAX_STEPS: u64 = 1_000_000;
 pub const DEFAULT_MAX_LOOP_ITERATIONS: u64 = 100_000;
 pub const DEFAULT_MAX_WALL_CLOCK_MS: u64 = 5_000;

@@ -198,22 +198,24 @@ fn query_limit_still_wins_when_under_the_materialization_budget() {
         .run(&format!("{setup}\ncol(\"users\").limit(3).get().len()"))
         .unwrap();
     assert_eq!(out, Value::Int(3));
-    assert_eq!(rt.usage().query_results, 20);
+    // `usage` counts the rows the script received, not the candidates scanned.
+    assert_eq!(rt.usage().query_results, 3);
 }
 
 #[test]
 fn unlimited_budgets_are_an_explicit_opt_in() {
     // `unlimited()` removes every guard.  Recursion still consumes the native
     // Rust stack, so the depth here stays well inside a 2 MiB test-thread
-    // stack; raising the limit is exactly the risk the opt-in accepts.
+    // stack (see `default_call_depth_is_safe_on_a_small_stack`); raising the
+    // limit past that is exactly the risk the opt-in accepts.
     let mut rt = runtime_with(RuntimeLimits::unlimited());
     let out = rt
-        .run("fn f(n) { if n <= 0 { 0 } else { f(n - 1) } }\nf(40)")
+        .run("fn f(n) { if n <= 0 { 0 } else { f(n - 1) } }\nf(12)")
         .unwrap();
     assert_eq!(out, Value::Int(0));
     assert!(rt.limits().max_call_depth.is_none());
     assert!(rt.limits().max_wall_clock.is_none());
-    assert_eq!(rt.usage().max_call_depth, 41);
+    assert_eq!(rt.usage().max_call_depth, 13);
 }
 
 #[test]

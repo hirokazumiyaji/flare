@@ -1,11 +1,12 @@
+use std::collections::HashSet;
 use std::error::Error;
 
-use crate::ast::{BinOp, Block, Expr, Stmt, StrPiece, UnOp};
+use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
 use crate::error::{FirelangError, Span};
 use crate::lexer::{SpannedToken, StrPart, Token};
 use crate::limits::ParserLimits;
 
-type ParsedArgs = (Vec<Expr>, Vec<(String, Expr)>);
+type ParsedArgs = Vec<CallArg>;
 
 /// 二項演算子の優先順位表(弱い順)。`parse_or` / `parse_and` より強く、
 /// 単項より弱い 3 段。和・積の各段は左結合。
@@ -31,7 +32,7 @@ pub struct Parser {
     /// `{ ... }` と区別するため)。
     suppress_block_calls: usize,
     /// マップ / 配列リテラル・引数リスト・グループ化・添字・仮引数リストの
-    /// 内側で 1 以上。内側では改行をトークンとして透過的に無視する。
+    /// 内側で 1 以上。式中の改行を透過的に無視する。
     depth: usize,
     /// Recursive syntax depth guard.  Unlike `depth`, this also covers
     /// unary expressions, `else if` chains, and embedded newlines.
@@ -127,7 +128,10 @@ impl Parser {
         let mut params = vec![];
         if self.at(&Token::LParen) {
             self.bump();
-            let parsed = self.parse_comma_separated(Token::RParen, |p| p.expect_ident());
+            let mut seen = HashSet::new();
+            let parsed = self.parse_comma_separated(Token::RParen, |p| {
+                p.parse_unique_param(&mut seen, "function")
+            });
             params = parsed?;
             self.expect(Token::RParen)?;
         }
@@ -186,6 +190,7 @@ impl Parser {
     }
     fn parse_or(&mut self) -> Result<Expr, Box<dyn Error>> {
         let mut left = self.parse_and()?;
+        self.skip_newlines_inside_delimiter();
         while self.at(&Token::OrOr) {
             self.bump();
             let right = self.parse_and()?;
@@ -194,11 +199,13 @@ impl Parser {
                 op: BinOp::Or,
                 right: Box::new(right),
             };
+            self.skip_newlines_inside_delimiter();
         }
         Ok(left)
     }
     fn parse_and(&mut self) -> Result<Expr, Box<dyn Error>> {
         let mut left = self.parse_comparison()?;
+        self.skip_newlines_inside_delimiter();
         while self.at(&Token::AndAnd) {
             self.bump();
             let right = self.parse_comparison()?;
@@ -207,6 +214,7 @@ impl Parser {
                 op: BinOp::And,
                 right: Box::new(right),
             };
+            self.skip_newlines_inside_delimiter();
         }
         Ok(left)
     }
@@ -221,6 +229,7 @@ impl Parser {
         } else {
             self.parse_unary()?
         };
+        self.skip_newlines_inside_delimiter();
         while let Some(op) = BINARY_LEVELS[level]
             .iter()
             .find(|(t, _)| self.at(t))
@@ -236,14 +245,13 @@ impl Parser {
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
-            }
+            };
+            self.skip_newlines_inside_delimiter();
         }
         Ok(left)
     }
     fn parse_unary(&mut self) -> Result<Expr, Box<dyn Error>> {
-        if self.depth > 0 {
-            self.skip_newlines();
-        }
+        self.skip_newlines_inside_delimiter();
         if self.at(&Token::Bang) {
             self.bump();
             let expr = self.with_nesting(|parser| parser.parse_unary())?;
@@ -265,15 +273,16 @@ impl Parser {
     fn parse_call(&mut self) -> Result<Expr, Box<dyn Error>> {
         let mut expr = self.parse_primary()?;
         loop {
+            self.skip_newlines_inside_delimiter();
             if self.at(&Token::Dot) {
                 self.bump();
+                self.skip_newlines_inside_delimiter();
                 let name = self.expect_ident()?;
-                let (args, kwargs) = self.parse_args()?;
+                let args = self.parse_args()?;
                 expr = Expr::Call {
                     receiver: Some(Box::new(expr)),
                     name,
                     args,
-                    kwargs,
                     block: self.parse_optional_brace_block()?,
                 };
             } else if self.at(&Token::LBracket) {
@@ -282,10 +291,10 @@ impl Parser {
                 self.depth += 1;
                 self.skip_newlines();
                 let index = self.parse_expr();
+                self.skip_newlines();
                 self.depth -= 1;
                 self.leave_nesting();
                 let index = index?;
-                self.skip_newlines();
                 self.expect(Token::RBracket)?;
                 expr = Expr::Index {
                     base: Box::new(expr),
@@ -328,12 +337,11 @@ impl Parser {
                     || (self.is_arg_start() && self.suppress_block_calls == 0)
                     || (self.at(&Token::LBrace) && self.suppress_block_calls == 0)
                 {
-                    let (args, kwargs) = self.parse_args()?;
+                    let args = self.parse_args()?;
                     Ok(Expr::Call {
                         receiver: None,
                         name,
                         args,
-                        kwargs,
                         block: self.parse_optional_brace_block()?,
                     })
                 } else {
@@ -346,10 +354,10 @@ impl Parser {
                 self.depth += 1;
                 self.skip_newlines();
                 let out = self.parse_expr();
+                self.skip_newlines();
                 self.depth -= 1;
                 self.leave_nesting();
                 let out = out?;
-                self.skip_newlines();
                 self.expect(Token::RParen)?;
                 Ok(out)
             }
@@ -446,60 +454,42 @@ impl Parser {
     fn parse_array_items(&mut self) -> Result<Vec<Expr>, Box<dyn Error>> {
         self.parse_comma_separated(Token::RBracket, |p| p.parse_expr())
     }
-    fn parse_arg_into(
-        &mut self,
-        args: &mut Vec<Expr>,
-        kwargs: &mut Vec<(String, Expr)>,
-    ) -> Result<(), Box<dyn Error>> {
-        if let Some(kw) = self.parse_kwarg()? {
-            kwargs.push(kw);
+    fn parse_arg(&mut self) -> Result<CallArg, Box<dyn Error>> {
+        if let Some((name, value)) = self.parse_kwarg()? {
+            Ok(CallArg::Keyword { name, value })
         } else {
-            args.push(self.parse_expr()?);
+            Ok(CallArg::Positional(self.parse_expr()?))
         }
-        Ok(())
     }
 
+    // Keep positional and keyword arguments in one sequence.  The runtime
+    // later separates them for parameter binding, but evaluation must retain
+    // this source order.
     fn parse_args(&mut self) -> Result<ParsedArgs, Box<dyn Error>> {
-        let mut args = vec![];
-        let mut kwargs = vec![];
         if self.at(&Token::LParen) {
             self.bump();
             self.enter_nesting()?;
             self.depth += 1;
-            let parsed = self.parse_paren_args(&mut args, &mut kwargs);
+            let parsed = self.parse_comma_separated(Token::RParen, |p| p.parse_arg());
             self.depth -= 1;
             self.leave_nesting();
-            parsed?;
+            let args = parsed?;
             self.expect(Token::RParen)?;
-            return Ok((args, kwargs));
+            return Ok(args);
         }
         if self.is_arg_start() {
+            let mut args = vec![];
             loop {
-                self.parse_arg_into(&mut args, &mut kwargs)?;
+                args.push(self.parse_arg()?);
                 if self.at(&Token::Comma) {
                     self.bump();
                 } else {
                     break;
                 }
             }
+            return Ok(args);
         }
-        Ok((args, kwargs))
-    }
-
-    fn parse_paren_args(
-        &mut self,
-        args: &mut Vec<Expr>,
-        kwargs: &mut Vec<(String, Expr)>,
-    ) -> Result<(), Box<dyn Error>> {
-        self.parse_comma_separated(Token::RParen, |p| {
-            if let Some(kw) = p.parse_kwarg()? {
-                kwargs.push(kw);
-            } else {
-                args.push(p.parse_expr()?);
-            }
-            Ok(())
-        })?;
-        Ok(())
+        Ok(vec![])
     }
     fn expr_from_string_parts(&self, parts: Vec<StrPart>) -> Result<Expr, Box<dyn Error>> {
         if let [StrPart::Lit(s)] = parts.as_slice() {
@@ -575,14 +565,19 @@ impl Parser {
         // `max_tokens` に遠く及ばない深い `if 1 { if 1 { ... } }` が
         // ガードに届く前にスタックを枯渇させる。
         self.enter_nesting()?;
-        let result = self.parse_brace_block_with_params_active();
+        // A brace block is a statement sequence, even when it appears inside
+        // an array/map/argument delimiter. Save the expression depth so an
+        // outer delimiter cannot make a newline in this block join operators
+        // or postfix expressions from adjacent statements.
+        let saved_depth = self.depth;
+        self.depth = 0;
+        let result = self.parse_brace_block_contents();
+        self.depth = saved_depth;
         self.leave_nesting();
         result
     }
 
-    fn parse_brace_block_with_params_active(
-        &mut self,
-    ) -> Result<(Block, Option<Span>), Box<dyn Error>> {
+    fn parse_brace_block_contents(&mut self) -> Result<(Block, Option<Span>), Box<dyn Error>> {
         self.expect(Token::LBrace)?;
         // `{\n|x| ... }` のようにパラメータリストの直前に改行が置けるようにする。
         self.skip_newlines();
@@ -620,8 +615,9 @@ impl Parser {
             self.bump();
             return Ok(params);
         }
+        let mut seen = HashSet::new();
         loop {
-            params.push(self.expect_ident()?);
+            params.push(self.parse_unique_param(&mut seen, "block")?);
             self.skip_newlines();
             if self.at(&Token::Comma) {
                 self.bump();
@@ -635,6 +631,20 @@ impl Parser {
         }
         self.expect(Token::Pipe)?;
         Ok(params)
+    }
+    fn parse_unique_param(
+        &mut self,
+        seen: &mut HashSet<String>,
+        kind: &str,
+    ) -> Result<String, Box<dyn Error>> {
+        let span = self.peek_span();
+        let name = self.expect_ident()?;
+        if !seen.insert(name.clone()) {
+            return Err(
+                FirelangError::parse(format!("duplicate {kind} parameter: {name}"), span).into(),
+            );
+        }
+        Ok(name)
     }
     fn is_arg_start(&self) -> bool {
         matches!(
@@ -654,6 +664,13 @@ impl Parser {
     fn skip_separators(&mut self) {
         while self.at(&Token::Newline) || self.at(&Token::Semicolon) {
             self.bump();
+        }
+    }
+    /// delimiter の内側だけで式中の改行を透過的に無視する。delimiter の外側では
+    /// 改行を文の区切りとして残す。
+    fn skip_newlines_inside_delimiter(&mut self) {
+        if self.depth > 0 {
+            self.skip_newlines();
         }
     }
     /// delimiter(リテラル・引数リスト・仮引数リスト等)の内側の改行だけを
@@ -704,6 +721,17 @@ impl Parser {
         let result = f(self);
         self.leave_nesting();
         result
+    }
+
+    /// Validate an externally constructed AST against the parser-depth budget.
+    ///
+    /// The public `eval_program` entry points accept a `&[Stmt]` the parser did
+    /// not produce, so the guard the parser applies to its own output has to be
+    /// reachable without a `Parser`. Returns the same message the in-parser
+    /// walk produces.
+    pub fn validate_stmt_depth(stmts: &[Stmt], max: usize) -> Result<(), Box<dyn Error>> {
+        let parser = Self::new_with_limits(Vec::new(), ParserLimits::default().with_max_depth(max));
+        parser.validate_program_limits(stmts)
     }
 
     fn validate_program_limits(&self, stmts: &[Stmt]) -> Result<(), Box<dyn Error>> {
@@ -804,7 +832,6 @@ impl Parser {
                 Expr::Call {
                     receiver,
                     args,
-                    kwargs,
                     block,
                     ..
                 } => {
@@ -812,10 +839,13 @@ impl Parser {
                         stack.push((receiver, child_depth));
                     }
                     for arg in args {
-                        stack.push((arg, child_depth));
-                    }
-                    for (_, arg) in kwargs {
-                        stack.push((arg, child_depth));
+                        // Positional and keyword arguments share one ordered
+                        // sequence; the value expression lives in either arm.
+                        let value = match arg {
+                            CallArg::Positional(expr) => expr,
+                            CallArg::Keyword { value, .. } => value,
+                        };
+                        stack.push((value, child_depth));
                     }
                     if let Some(block) = block {
                         for stmt in &block.body {
