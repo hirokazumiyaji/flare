@@ -20,8 +20,9 @@ pub enum Expr {
     Call {
         receiver: Option<Box<Expr>>,
         name: String,
-        args: Vec<Expr>,
-        kwargs: Vec<(String, Expr)>,
+        /// Positional and keyword arguments stay in source order. Binding
+        /// them to parameters is a separate step performed by the runtime.
+        args: Vec<CallArg>,
         block: Option<Block>,
     },
     Map(Vec<(String, Expr)>),
@@ -30,6 +31,17 @@ pub enum Expr {
         base: Box<Expr>,
         index: Box<Expr>,
     },
+}
+
+/// An argument to a call, retaining its position in the source.
+///
+/// Keeping positional and keyword arguments in one sequence is important:
+/// evaluation must follow source order even though parameter binding gives
+/// positional arguments precedence.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallArg {
+    Positional(Expr),
+    Keyword { name: String, value: Expr },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

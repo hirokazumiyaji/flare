@@ -95,11 +95,11 @@ Phase 3:
 
 ## Definition Of Done
 
-- `cargo test` passes locally.
+- `cargo test --locked` passes locally.
 - Emulator-backed integration tests pass with documented environment variables.
 - Repeated query executions return the same results in the same order.
 - A failing `batch` or `transaction` leaves Firestore unchanged.
 - `fl --backend emulator <script>` succeeds against the documented local emulator setup.
 - CLI usage output documents backend selection and required emulator environment variables.
-- `cargo build --release --bin fl` produces the documented binary.
+- `cargo build --locked --release --bin fl` produces the documented binary.
 - README setup instructions are sufficient to run one emulator-backed script from a clean checkout.
