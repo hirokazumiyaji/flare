@@ -1976,6 +1976,45 @@ fn where_rejects_large_string_filter_values() {
 }
 
 #[test]
+fn query_field_paths_are_normalized_and_document_name_is_filterable() {
+    let out = run_script(
+        r#"set("users/qfp1", {"a-b": 1, "a.b": 2, profile: {age: 3}})
+set("users/qfp2", {"a-b": 9, "a.b": 8, profile: {age: 1}})
+[
+  col("users").where("a-b", "==", 1).get()[0]["__name__"],
+  col("users").where("`a.b`", "==", 2).get()[0]["__name__"],
+  col("users").where("profile.age", ">=", 3).get()[0]["__name__"],
+  col("users").where("__name__", "==", "users/qfp1").get().len(),
+  col("users").where("__name__", "==", doc("users/qfp2")).get().len(),
+  col("users").order_by("a-b", "asc").get()[0]["__name__"]
+]"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("users/qfp1".to_string()),
+            Value::Str("users/qfp1".to_string()),
+            Value::Str("users/qfp1".to_string()),
+            Value::Int(1),
+            Value::Int(1),
+            Value::Str("users/qfp1".to_string()),
+        ])
+    );
+}
+
+#[test]
+fn document_name_filter_values_require_valid_paths() {
+    for source in [
+        r#"col("users").where("__name__", "in", ["users/a", "bad"]).get()"#,
+        r#"col("users").where("__name__", "not-in", ["users/a", "users/b/c"]).get()"#,
+    ] {
+        let err = run_script(source).unwrap_err();
+        assert!(err.to_string().contains("invalid document path"), "{err}");
+    }
+}
+
+#[test]
 fn where_validates_nested_filter_string_sizes() {
     // 1,499 bytes are valid; 1,500 bytes are rejected for equality,
     // membership, and array_contains filters, including nested Map / Array

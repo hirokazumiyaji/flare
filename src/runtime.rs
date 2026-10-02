@@ -4,7 +4,9 @@ use std::error::Error;
 use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
 use crate::auth::{Auth, AuthError, InMemoryAuth};
 use crate::error::{FirelangError, Span};
-use crate::firestore::{is_legacy_datastore_numeric_id, validate_write_data, Firestore, WriteOp};
+use crate::firestore::{
+    normalize_query_field_path, validate_firestore_id, validate_write_data, Firestore, WriteOp,
+};
 use crate::storage::{validate_content_type, validate_storage_path, InMemoryStorage, Storage};
 use crate::value::{
     CollectionGroupRef, CollectionRef, Direction, DocRef, QueryFilter, QueryOp, QueryRef,
@@ -696,9 +698,13 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
     ) -> Result<Value, Box<dyn Error>> {
         match name {
             "where" => {
+                // Field path は正規化してから保存する。in-memory の lookup と
+                // emulator の wire 表現が同じ spelling を共有する。
+                let field = normalize_query_field_path(expect_string(args.first())?)?;
+                let op = QueryOp::parse(expect_string(args.get(1))?)?;
                 query.filters.push(QueryFilter {
-                    field: expect_string(args.first())?.to_string(),
-                    op: QueryOp::parse(expect_string(args.get(1))?)?,
+                    field,
+                    op,
                     value: args.get(2).cloned().ok_or("where requires value")?,
                 });
                 Ok(Value::QueryRef(query))
@@ -716,7 +722,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
                 Ok(Value::QueryRef(query))
             }
             "order_by" => {
-                let field = expect_string(args.first())?.to_string();
+                let field = normalize_query_field_path(expect_string(args.first())?)?;
                 let dir = Direction::parse(expect_string(args.get(1))?)?;
                 query.order_by.push((field, dir));
                 Ok(Value::QueryRef(query))
@@ -1958,11 +1964,6 @@ fn expect_doc_path(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
     }
 }
 
-/// Firestore の document / collection ID は UTF-8 バイト数で 1,500 以下。
-/// Rust の `str::len()` は文字数ではなく UTF-8 のバイト数を返すため、
-/// 日本語などの ID でも Firestore と同じ単位で判定できる。
-const MAX_FIRESTORE_ID_BYTES: usize = 1_500;
-
 /// 単一 ID 引数(`col().doc()` / `col_group()`)を検証する。
 fn validate_document_id(id: &str) -> Result<(), Box<dyn Error>> {
     validate_standalone_id(id, "document id")
@@ -1982,43 +1983,6 @@ fn validate_standalone_id(id: &str, kind: &str) -> Result<(), Box<dyn Error>> {
         return Err(format!("invalid {kind}: {id} ({reason})").into());
     }
     Ok(())
-}
-
-/// Firestore の ID 固有の制約。パス上のセグメントと単一 ID 引数で共有する。
-///
-/// spec §6 の通り、document ID と collection ID で制約は同一。予約パターン
-/// `__.*__` の検査も document だけを対象にせず両方に適用する(片方だけだと
-/// `col("__meta__")` が通るが `doc("users/__x__")` は弾くというズレが
-/// in-memory / emulator の食い違いの原因になる)。
-fn validate_firestore_id(id: &str) -> Result<(), &'static str> {
-    if id.is_empty() {
-        return Err("must not be empty");
-    }
-    if id.contains('/') {
-        return Err("must not contain '/'");
-    }
-    if id.len() > MAX_FIRESTORE_ID_BYTES {
-        return Err("must be at most 1,500 UTF-8 bytes");
-    }
-    if id == "." || id == ".." {
-        return Err("must not be \".\" or \"..\"");
-    }
-    if is_reserved_firestore_id(id) {
-        return Err("must not match the reserved pattern __.*__");
-    }
-    Ok(())
-}
-
-/// Firestore の予約 ID 正規表現 `^__.*__$` 相当。
-///
-/// Datastore 由来の数値 ID(`__id123__` 形式)は既存ドキュメントの参照として
-/// 扱うため例外とする。クエリや参照フィールドで返されたドキュメントを
-/// `get` / `update` / `delete` に渡せなくなるのを避ける。
-fn is_reserved_firestore_id(id: &str) -> bool {
-    if id.len() >= 4 && id.starts_with("__") && id.ends_with("__") {
-        return !is_legacy_datastore_numeric_id(id);
-    }
-    false
 }
 
 /// ドキュメントパスは偶数個・コレクションパスは奇数個の非空セグメントで

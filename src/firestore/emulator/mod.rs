@@ -17,8 +17,8 @@ use gcloud_sdk::google::firestore::v1::{
 };
 use gcloud_sdk::tonic::{Code, Request};
 
-use super::{apply_query_shape, Firestore, QueryCandidates, WriteOp};
-use crate::value::{QueryFilter, QueryOp, QueryRef, QuerySource, Value};
+use super::{apply_query_shape, parse_query_field_path, Firestore, QueryCandidates, WriteOp};
+use crate::value::{DocRef, QueryFilter, QueryOp, QueryRef, QuerySource, Value};
 
 const COUNT_ALIAS: &str = "all";
 
@@ -339,6 +339,10 @@ impl Firestore for FirestoreEmulator {
 
     fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
+        // Parse every filter before constructing/sending the RPC.  This keeps
+        // malformed paths from reaching Firestore and gives both backends the
+        // same validation error.
+        super::prepare_query_filters(&query.filters)?;
         // Firestore の server filter は候補を減らすためだけに使ってよい。
         // 最終的な一致判定は必ず共通の local matcher で行う(特に異型の
         // 大小比較を Firestore の型順序に委ねない)。
@@ -356,7 +360,6 @@ impl Firestore for FirestoreEmulator {
             }
             QuerySource::CollectionGroup(id) => {
                 let sq = structured_query(&self.client.project_id, id, true, &server_filters)?;
-
                 run_query_candidates(self, None, sq, &query.filters)
             }
         }
@@ -393,7 +396,8 @@ impl Firestore for FirestoreEmulator {
             run_query_candidates(self, parent, sq, &query.filters)
         } else {
             let rows = run_query_candidates(self, parent, sq, &query.filters)?;
-            Ok(apply_query_shape(rows, query))
+            let order_by = super::parse_order_by(query)?;
+            Ok(apply_query_shape(rows, query, &order_by))
         }
     }
 
@@ -679,6 +683,10 @@ fn run_query_candidates(
 ) -> Result<QueryCandidates, Box<dyn Error>> {
     let db = &fs.client.db;
     let parent = path::parent_path(&fs.client.project_id, parent);
+    // The shared matcher needs the parsed field paths (quoted names, the
+    // `__name__` pseudo-field) and the normalized document-name filter values.
+    // Both are derived once per query, not per document.
+    let (field_paths, normalized_values) = super::prepare_query_filters(filters)?;
     let filters = filters.to_vec();
     let docs = client::run_operation(
         &fs.client.runtime,
@@ -717,14 +725,16 @@ fn run_query_candidates(
         let Value::Map(fields) = codec::decode_document(&doc, resource_root)? else {
             return Err("query result must be a map".into());
         };
-        if super::matches_filters(&rel, &fields, &filters) {
+        if super::matches_filters(&rel, &fields, &filters, &field_paths, &normalized_values) {
             out.push((rel, fields));
         }
     }
     // The server query is only a candidate-generation optimization.  Re-run
     // every predicate with the same matcher used by the in-memory backend so
     // server-specific null and structural-value behavior cannot leak through.
-    out.retain(|(rel, fields)| super::matches_filters(rel, fields, &filters));
+    out.retain(|(rel, fields)| {
+        super::matches_filters(rel, fields, &filters, &field_paths, &normalized_values)
+    });
     Ok(out)
 }
 
@@ -847,6 +857,7 @@ fn build_where(
 ) -> Result<Option<structured_query::Filter>, Box<dyn Error>> {
     let mut parts = vec![];
     for f in filters {
+        let field_path = parse_query_field_path(&f.field)?;
         let op = match f.op {
             QueryOp::Eq => structured_query::field_filter::Operator::Equal,
             QueryOp::Ne => structured_query::field_filter::Operator::NotEqual,
@@ -859,14 +870,19 @@ fn build_where(
             QueryOp::ArrayContains => structured_query::field_filter::Operator::ArrayContains,
             QueryOp::ArrayContainsAny => structured_query::field_filter::Operator::ArrayContainsAny,
         };
+        let value = if field_path.is_document_id() {
+            encode_document_id_query_value(project_id, &f.value)?
+        } else {
+            codec::encode_query_value(project_id, &f.value)?
+        };
         parts.push(structured_query::Filter {
             filter_type: Some(structured_query::filter::FilterType::FieldFilter(
                 structured_query::FieldFilter {
                     field: Some(structured_query::FieldReference {
-                        field_path: f.field.clone(),
+                        field_path: field_path.wire().to_string(),
                     }),
                     op: op.into(),
-                    value: Some(codec::encode_query_value(project_id, &f.value)?),
+                    value: Some(value),
                 },
             )),
         });
@@ -883,6 +899,33 @@ fn build_where(
             )),
         }),
     })
+}
+
+/// `__name__` is a document reference on the wire, while the public API uses
+/// a relative path string.  Convert both strings and DocRefs recursively so
+/// `==`, `in`, and nested membership values have the same meaning.
+fn encode_document_id_query_value(
+    project_id: &str,
+    value: &Value,
+) -> Result<gcloud_sdk::google::firestore::v1::Value, Box<dyn Error>> {
+    match value {
+        Value::Str(path) => {
+            codec::encode_query_value(project_id, &Value::DocRef(DocRef { path: path.clone() }))
+        }
+        Value::Array(items) => Ok(gcloud_sdk::google::firestore::v1::Value {
+            value_type: Some(
+                gcloud_sdk::google::firestore::v1::value::ValueType::ArrayValue(
+                    gcloud_sdk::google::firestore::v1::ArrayValue {
+                        values: items
+                            .iter()
+                            .map(|item| encode_document_id_query_value(project_id, item))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    },
+                ),
+            ),
+        }),
+        other => codec::encode_query_value(project_id, other),
+    }
 }
 
 #[cfg(test)]

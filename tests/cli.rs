@@ -2,6 +2,9 @@
 
 mod common;
 
+// Only the emulator round-trip test uses this helper, and that test is
+// compiled with the `emulator` feature.
+#[cfg(feature = "emulator")]
 use common::test_collection;
 use std::process::{Command, Stdio};
 

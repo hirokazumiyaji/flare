@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::sync::Arc;
 
-use super::{validate_write_op, Firestore, WriteOp};
+use super::{prepare_query_filters, validate_write_op, Firestore, WriteOp};
 use crate::value::{QueryRef, QuerySource, Timestamp, Value};
 
 /// in-memory backend が `server_timestamp()` の request time を取得する時計。
@@ -93,19 +93,26 @@ impl Firestore for InMemoryFirestore {
 
     fn run_query(&self, query: &QueryRef) -> Result<super::QueryCandidates, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
+        let (field_paths, normalized_values) = prepare_query_filters(&query.filters)?;
         Ok(self
             .candidates(&query.source)
-            .filter(|(path, doc)| super::matches_filters(path, doc, &query.filters))
+            .filter(|(path, doc)| {
+                super::matches_filters(path, doc, &query.filters, &field_paths, &normalized_values)
+            })
             .map(|(path, doc)| (path.clone(), doc.clone()))
             .collect())
     }
 
     fn run_query_page(&self, query: &QueryRef) -> Result<super::QueryCandidates, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
+        let (field_paths, normalized_values) = prepare_query_filters(&query.filters)?;
+        let order_by = super::parse_order_by(query)?;
         let rows = super::page_borrowed_candidates(
-            self.candidates(&query.source)
-                .filter(|(path, doc)| super::matches_filters(path, doc, &query.filters)),
+            self.candidates(&query.source).filter(|(path, doc)| {
+                super::matches_filters(path, doc, &query.filters, &field_paths, &normalized_values)
+            }),
             query,
+            &order_by,
         );
         Ok(rows
             .into_iter()
@@ -115,9 +122,12 @@ impl Firestore for InMemoryFirestore {
 
     fn count_query(&self, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
+        let (field_paths, normalized_values) = prepare_query_filters(&query.filters)?;
         Ok(self
             .candidates(&query.source)
-            .filter(|(path, doc)| super::matches_filters(path, doc, &query.filters))
+            .filter(|(path, doc)| {
+                super::matches_filters(path, doc, &query.filters, &field_paths, &normalized_values)
+            })
             .count() as i64)
     }
 
