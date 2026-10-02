@@ -8,7 +8,14 @@ use crate::value::{QueryRef, QuerySource, Timestamp, Value};
 /// in-memory backend が `server_timestamp()` の request time を取得する時計。
 ///
 /// 実運用では [`Timestamp::now`] を使い、テストでは commit ごとに異なる固定値を
-/// 返すクロージャーを注入できる。コミット処理はこのクロージャーを一度だけ呼ぶ。
+/// 返すクロージャーを注入できる。
+///
+/// コミット処理はこのクロージャーを**高々 1 回**呼ぶ。request time は
+/// `server_timestamp()` を含む sentinel を解決するときだけ必要になるため、
+/// timestamp を含まない write や空の transaction commit では **0 回**である。
+/// 呼び出し側が「1 commit = 1 回」のように回数で状態を返す closure を
+/// 書かないこと: 同一 commit 内の複数 sentinel は 1 つの request time を
+/// 共有し、commit ごとに値が同じでも次の commit でまた呼ばれる。
 pub type RequestClock = Arc<dyn Fn() -> Result<Timestamp, Box<dyn Error>> + Send + Sync + 'static>;
 
 struct RequestTime<'a> {
@@ -41,8 +48,12 @@ impl Default for InMemoryFirestore {
 
 impl InMemoryFirestore {
     /// `server_timestamp()` を使う request time を注入して in-memory
-    /// Firestore を作る。クロージャーは 1 回の write / batch / transaction
-    /// commit につき一度だけ呼ばれる。
+    /// Firestore を作る。
+    ///
+    /// `clock` は 1 回の write / batch / transaction commit につき**高々 1 回**、
+    /// そしてその commit が `server_timestamp()` を含むときだけ呼ばれる。
+    /// timestamp を含まない write や空の commit では呼ばれないので、呼び出し
+    /// 回数を前提にした状態を進めないこと(値は commit ごとに 1 つ共有される)。
     pub fn with_clock<F>(clock: F) -> Self
     where
         F: Fn() -> Result<Timestamp, Box<dyn Error>> + Send + Sync + 'static,

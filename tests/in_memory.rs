@@ -2969,3 +2969,37 @@ fn documented_values_and_direct_transforms_remain_writable() {
         Some(Value::Timestamp(_))
     ));
 }
+
+#[test]
+fn server_timestamp_does_not_sample_the_clock_without_a_sentinel() {
+    // The clock is sampled lazily, so writes without `server_timestamp()` and
+    // empty commits must not advance a caller's deterministic counter.  See
+    // `RequestClock`'s contract: at most once per commit, and only when a
+    // server timestamp is present.
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let clock_calls = Arc::clone(&calls);
+    let fs = InMemoryFirestore::with_clock(move || {
+        let n = clock_calls.fetch_add(1, Ordering::SeqCst) as i64;
+        Ok(Timestamp { seconds: 3000 + n })
+    });
+    let mut runtime = Runtime::new(fs);
+    let out = runtime
+        .run(
+            r#"
+batch { set("users/no_clock_1", {a: 1}) }
+transaction { set("users/no_clock_2", {b: 2}) }
+batch { }
+transaction { }
+set("users/with_clock", {c: server_timestamp()})
+get("users/with_clock")["c"]
+"#,
+        )
+        .unwrap();
+    assert_eq!(out, Value::Timestamp(Timestamp { seconds: 3000 }));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
