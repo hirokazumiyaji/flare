@@ -16,9 +16,10 @@
 - [10. CLI (`fl`)](#10-cli-fl)
 - [11. Auth API](#11-auth-api)
 - [12. バックエンド](#12-バックエンド)
-- [13. スコープ外(MVP)](#13-スコープ外mvp)
-- [14. 既知の制限・実装メモ](#14-既知の制限実装メモ)
-- [15. Cloud Storage API](#15-cloud-storage-api)
+- [13. 実行予算と信頼境界](#13-実行予算と信頼境界)
+- [14. スコープ外(MVP)](#14-スコープ外mvp)
+- [15. 既知の制限・実装メモ](#15-既知の制限実装メモ)
+- [16. Cloud Storage API](#16-cloud-storage-api)
 
 ## 1. 概要
 
@@ -536,8 +537,53 @@ Identity Toolkit のエラーコードは `:` 区切りの詳細が付くこと�
 - ただし emulator 側に firelang 外の型(`double` / `reference` / `geo_point`)で書かれたフィールドがある場合、emulator バックエンドは `Opaque` / `DocRef` に読み替えて返す(§3)。`bytes` は `Bytes` として lossless に往復する。in-memory には firelang 外の型の値は存在しない。
 - ローカル実行の security rules は `firebase.emulators.json` が参照する `firestore.emulator.rules`(read/write 許可)を使う。`firebase.json` が参照する `firestore.rules` は read/write 拒否で、リモート project への誤デプロイに備えてある([Firebase rules の分離とデプロイ防止策](firebase-security.md))。
 
+## 13. 実行予算と信頼境界
 
-## 13. スコープ外(MVP)
+`fl` は任意のスクリプトファイルを受け付ける。したがって誤ったスクリプト・無限再帰・無限ループ・巨大なネスト・巨大なクエリ結果が、スタック枯渇や無期限の停止に導かれてはならない。ランタイムは**有限の実行予算**を既定で持ち、超過時は panic ではなく、位置付きの通常のエラー(`error: <line>:<col>: ...`)で終了する。
+
+予算は 1 回の `run` / `eval_program` を単位にリセットされる(累積)。
+
+| 予算 | 既定値 | 対象・備考 |
+|------|--------|-----------|
+| 呼び出し深度 | 32 | ネストした呼び出し(ユーザー関数・組み込み)。再帰呼び出しの深さを制限する |
+| ステップ数 | 1,000,000 | 評価した文の数。`step limit exceeded` |
+| ループ反復数 | 100,000 | `while` / `each` / `map` の反復回数。実行全体で共有する。`loop iteration limit exceeded` |
+| 壁時計時間 | 5,000 ms | 字句解析・構文解析・評価の経過時間。`wall-clock limit exceeded` |
+| パーサ深度 | 128 | 括弧・マップ/配列リテラル・`else if` チェーン・`!`/`-` のネスト。`parser nesting limit exceeded` |
+| 補間深度 | 32 | ネストした `"#{...}"` |
+| 値ネスト深度 | 64 | 実行時 `Value`(Array / Map)のネスト。ルートは深さ 0 で、上限は**その深さを含意**する(深さ 64 の値は許され、子が 1 つでもあれば超過)。子が存在しないときは上限を超えたと見なさないので、上限 0 でもスカラー・空配列・空マップは通る。`value nesting limit exceeded`。emulator の `Value` ⇔ SDK コーデックも同じ上限で再帰を止める(保存されたネストが深い文書でも、runtime が検査する**前**にスタックを枯渇させないため) |
+| 値ノード数 | 100,000 | 実行時 `Value` の総ノード数。ルートも 1 ノードとして数えるので 0 ならスカラー結果も拒否する。走査は**子を追加する時点**で数えるため、バックエンドが返した巨大な配列を全部スタックに積む前に上限が働く。`value node limit exceeded` |
+| クエリ結果数 | 10,000 | 1 回のクエリで走査する一致候補件数。`query result limit exceeded` |
+| ソース長 | 1 MiB | UTF-8 バイト数 |
+| トークン数 | 100,000 | 補間内を含む字句数 |
+| バックエンド timeout | 5,000 ms | Firestore 1 回の呼び出し。組み込み emulator が強制する |
+
+- すべての予算エラーは `ErrorKind::Runtime`(字句解析・パース由来のものは `Lex` / `Parse`)であり、失敗したトップレベル文の開始位置を持つ。評価開始前に超過した壁時計予算だけは、プログラム先頭 `1:1` を位置とする。
+- 予算超過は `batch` を 1 件も書かずに中断し、`transaction` は abort する(通常実行時エラーと同じ原子性)。commit 後に発火した予算エラーで「成功したはずの永続書き込み」を失敗として返さない。
+- **呼び出し深度はネイティブスタックを保護する**。1 段のユーザー関数呼び出しは、引数とレシーバーの契約検証を含めて debug ビルドで約 50 KiB のスタックを消費する。2 MiB スタックのホスト(libtest のスレッド等)で実測すると 40 段でスタックが尽きるため、既定値 32 はその手前で止まる。大きなスタックを確保できるホストでは `max_call_depth` を上げてよいが、2 MiB 未満のスタックでは予算を無効化しないこと(深い再帰でスタックオーバーフローによるプロセス abort が発生しうる)。
+- 埋め込み側が `eval_program` に渡す AST はパーサを通らないため、同じ深さ予算を `eval_block` に入る前に検証する。位置はプログラム先頭 `1:1`、種類はパーサ由来と同じ `Parse` である。
+- クエリ結果数の上限は**走査する一致候補件数**に対するもの。バックエンドは候補が予算を超えた時点で中断し(超過を証明する 1 件は materialization しない)、その後に `order_by` / `offset` / `limit` を適用してスクリプトに渡すページを作る。従って `limit(3)` は 20 件の候補があっても予算内に収まれば成功し、返るのは 3 件である。
+
+### 埋め込み API
+
+予算は `RuntimeLimits` で設定できる。ライブラリ埋め込みと `fl` CLI の**双方**に有限の既定値が適用される。
+
+```rust
+let limits = RuntimeLimits::default().with_max_call_depth(32);
+let mut rt = Runtime::with_limits(backend, limits);
+let out = rt.run(source)?;
+let usage = rt.usage();   // steps / loop_iterations / max_call_depth / ...
+```
+
+予算ごとの予算値は `RuntimeLimits` の builder(`with_max_steps` / `with_max_loop_iterations` / `with_max_wall_clock` / `with_max_parser_depth` / `with_max_value_depth` / `with_max_query_results` など)で上書きできる。`Runtime::set_limits` で稼働中のランタイムを再設定できる。
+
+### 予算の無効化(信頼済みスクリプト)
+
+`Runtime::new_unlimited` / `RuntimeLimits::unlimited()` は予算をすべて無効にする**明示的なオプトイン**である。ユーザー入力・アップロードされたスクリプト・CLI には使わず、信頼済みスクリプトにのみ用いること。`fl --unlimited` は CLI 側の同等手段である。
+
+なお汎用の同期 `Firestore` トレイトは任意の実装を強制中断できないため、`backend_timeout` を強制するのは組み込み `FirestoreEmulator` である(`Runtime::backend_timeout_supported()` で確認できる)。応答しない独自バックエンドは、自身が timeout を実装すること。バックエンド呼び出しの timeout は発生原因を保つため `ErrorKind::Backend` で報告し、位置は他と同じく失敗した文の開始位置につく。
+
+## 14. スコープ外(MVP)
 
 以下は明示的に**非対応**。実装しない・README で匂わせない。
 
@@ -554,9 +600,9 @@ Identity Toolkit のエラーコードは `:` 区切りの詳細が付くこと�
 - リスナー(リアルタイム購読)・インデックス依存機能
 - ドキュメントに書かれたサブセットを超える mruby 互換
 
-## 14. 既知の制限・実装メモ
+## 15. 既知の制限・実装メモ
 
-## 15. Cloud Storage API
+## 16. Cloud Storage API
 
 Cloud Storage の MVP CRUD はグローバル関数として提供する。Firestore の `doc()` / `col()` とは別の object path を使う。
 

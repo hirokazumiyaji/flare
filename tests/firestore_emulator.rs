@@ -9,8 +9,9 @@ mod common;
 
 use common::{test_collection, test_namespace, unique};
 use firelang::run_script_with_firestore;
+use firelang::run_script_with_firestore_and_limits;
 use firelang::runtime::Runtime;
-use firelang::{EmulatorAuth, FirestoreEmulator, Value};
+use firelang::{EmulatorAuth, FirestoreEmulator, RuntimeLimits, Value};
 use firestore::{FirestoreCreateSupport, FirestoreDb, FirestoreDbOptions};
 use gcloud_sdk::google::firestore::v1::{value, ArrayValue, Document, MapValue, Value as SdkValue};
 use std::collections::HashMap;
@@ -305,6 +306,26 @@ fn emulator_rejects_invalid_query_field_paths_before_rpc() {
             "{field}: {err}"
         );
     }
+}
+
+#[test]
+fn emulator_query_result_budget_uses_the_bounded_stream_path() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let run = unique("budget");
+    let script = format!(
+        r#"set("users/{run}/rows/a", {{kind: "match"}})
+set("users/{run}/rows/b", {{kind: "match"}})
+col("users/{run}/rows").where("kind", "==", "match").get()"#
+    );
+    let limits = RuntimeLimits::default().with_max_query_results(1);
+    let err = run_script_with_firestore_and_limits(&script, fs, limits).unwrap_err();
+    assert!(
+        format!("{err}").contains("query result limit exceeded (max 1)"),
+        "{err}"
+    );
 }
 
 #[test]

@@ -14,6 +14,7 @@ pub use memory::{InMemoryFirestore, RequestClock};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::fmt;
 
 use crate::value::{Direction, QueryFilter, QueryOp, QueryRef, Value};
 
@@ -909,6 +910,32 @@ pub enum WriteOp {
 /// する filter 自体は backend の共有 matcher が相対パスに対して評価する。
 pub type QueryCandidates = Vec<(String, BTreeMap<String, Value>)>;
 
+/// Marker error used when a backend would materialize more query candidates
+/// than the runtime's query budget permits.
+///
+/// A distinct type (rather than a formatted `String`) lets the runtime tell a
+/// budget failure apart from a genuine backend failure, so it can record the
+/// budget that was hit and still report the failure as a *runtime* error with a
+/// source position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueryResultLimitExceeded {
+    pub(crate) max_results: usize,
+}
+
+impl fmt::Display for QueryResultLimitExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "query result limit exceeded (max {})", self.max_results)
+    }
+}
+
+impl Error for QueryResultLimitExceeded {}
+
+/// Error used when a backend would materialize more query candidates than
+/// the runtime's query budget permits.
+pub(crate) fn query_result_limit_error(max_results: usize) -> Box<dyn Error> {
+    Box::new(QueryResultLimitExceeded { max_results })
+}
+
 /// クエリの決定的な順序とページングを候補へ適用する。
 /// バックエンドが page 全体を処理できない場合の安全なフォールバックでも使う。
 pub(crate) fn apply_query_shape(
@@ -1031,6 +1058,54 @@ pub trait Firestore {
     /// default is a safe fallback over [`Firestore::run_query`].
     fn count_query(&self, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
         Ok(self.run_query(query)?.len() as i64)
+    }
+
+    /// Run a query while refusing to return more than `max_results` matching
+    /// candidates.
+    ///
+    /// The default is a compatibility fallback: it delegates to `run_query`
+    /// and then rejects an oversized result, so existing third-party
+    /// implementations of [`Firestore`] keep compiling. That bounds the value
+    /// handed to the runtime, but *not* peak memory during collection. A
+    /// backend that must bound memory has to override this and stop before the
+    /// first extra candidate is materialized.
+    fn run_query_bounded(
+        &self,
+        query: &QueryRef,
+        max_results: usize,
+    ) -> Result<QueryCandidates, Box<dyn Error>> {
+        let rows = self.run_query(query)?;
+        if rows.len() > max_results {
+            return Err(query_result_limit_error(max_results));
+        }
+        Ok(rows)
+    }
+
+    /// Configure a per-call timeout for backends that support one.
+    ///
+    /// The default is intentionally a no-op so existing third-party
+    /// implementations remain source-compatible. Such an implementation
+    /// cannot be forcibly interrupted by a synchronous trait call; it should
+    /// override this hook when it has a cancellable I/O path. The built-in
+    /// emulator overrides it and applies the deadline to every RPC.
+    fn set_timeout(&mut self, _timeout: Option<std::time::Duration>) {}
+
+    /// Configure the maximum `Value` nesting depth this backend may recurse
+    /// through while encoding or decoding.
+    ///
+    /// Backends that convert values recursively (the built-in emulator codec)
+    /// must bound that recursion, otherwise a deeply nested document overflows
+    /// the native stack before the runtime can inspect the result. The default
+    /// is a no-op for source compatibility.
+    fn set_max_value_depth(&mut self, _max_depth: usize) {}
+
+    /// Whether this backend actually enforces the configured timeout.
+    ///
+    /// This is a capability query, not another limit. It lets embedders
+    /// distinguish the built-in adapter from a legacy synchronous backend
+    /// that must retain the compatibility no-op above.
+    fn supports_backend_timeout(&self) -> bool {
+        false
     }
 
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>>;

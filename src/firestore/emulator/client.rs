@@ -17,7 +17,10 @@ pub(super) struct EmulatorClient {
     pub(super) db: FirestoreDb,
     pub(super) runtime: Runtime,
     pub(super) project_id: String,
-    pub(super) operation_timeout: Duration,
+    /// `None` means that the runtime explicitly disabled the per-operation
+    /// deadline. The constructor chooses the initial value and `Runtime` may
+    /// replace it when it applies `RuntimeLimits::backend_timeout`.
+    pub(super) operation_timeout: Option<Duration>,
 }
 
 /// Collection used only for the connect-time liveness probe.  It is never
@@ -46,7 +49,7 @@ pub(super) fn connect(
     host: &str,
     project_id: &str,
     auth: EmulatorAuth,
-    operation_timeout: Duration,
+    operation_timeout: Option<Duration>,
 ) -> Result<EmulatorClient, Box<dyn Error>> {
     let runtime = RuntimeBuilder::new_current_thread()
         .enable_all()
@@ -57,14 +60,21 @@ pub(super) fn connect(
     // bounded by the shorter of the caller-supplied operation timeout and the
     // dedicated connect deadline so an embedding caller is not forced to wait
     // for the SDK's transport default.
-    let connect_timeout = operation_timeout.min(CONNECT_TIMEOUT);
+    //
+    // A caller that disabled the *operation* deadline (`RuntimeLimits`
+    // unlimited) still gets the connect deadline: disabling per-operation
+    // budgets must not turn a dead host into an unbounded constructor call.
+    let connect_timeout = match operation_timeout {
+        Some(limit) => limit.min(CONNECT_TIMEOUT),
+        None => CONNECT_TIMEOUT,
+    };
     // One deadline for the whole connection sequence.  Client creation and the
     // probe run back to back, so a separate full timeout for each would let a
     // constructor configured for 5 seconds block for nearly 10.
     let sequence_started = Instant::now();
     let db = run_operation(
         &runtime,
-        connect_timeout,
+        Some(connect_timeout),
         "connect",
         FirestoreDb::with_options_token_source(
             options,
@@ -81,11 +91,12 @@ pub(super) fn connect(
     //
     // The probe only proves that the peer speaks Firestore, so an answer that
     // says "the request was refused" is still a reachable emulator: NOT_FOUND
-    // (the probe document does not exist), PERMISSION_DENIED (security rules
-    // deny every read, which is exactly how the deploy-config deny rules are
-    // verified) and UNAUTHENTICATED (the peer's credentials were rejected) all
-    // mean the request reached Firestore.  Any other status means something
-    // else is listening on this port.
+    // (the probe document does not exist) and PERMISSION_DENIED (security
+    // rules deny every read, which is exactly how the deploy-config deny rules
+    // are verified) both mean the request reached Firestore.  Any other status
+    // means something else is listening on this port, or that the credentials
+    // the caller asked for were rejected, and either way `connect` must fail
+    // instead of handing back a client that only fails on the first write.
     // The probe path must be a legal Firestore document path: the emulator
     // rejects reserved collection ids (`__name__`, `__reserved__`) with
     // INVALID_ARGUMENT, which is a configuration error rather than a
@@ -144,7 +155,7 @@ pub(super) fn connect(
 /// client and reused for the next operation.
 pub(super) fn run_operation<T, E, F>(
     runtime: &Runtime,
-    timeout: Duration,
+    timeout: Option<Duration>,
     operation: &str,
     future: F,
 ) -> Result<T, Box<dyn Error>>
@@ -153,6 +164,13 @@ where
     E: Error + 'static,
     F: Future<Output = Result<T, E>>,
 {
+    // A disabled deadline runs the operation to completion: nothing is dropped
+    // on expiry, so a caller that opts out of the budget accepts that an
+    // unresponsive backend blocks instead of being cancelled.
+    let Some(timeout) = timeout else {
+        return runtime.block_on(future).map_err(Into::into);
+    };
+
     let started = Instant::now();
     match runtime.block_on(async move { tokio::time::timeout(timeout, future).await }) {
         Ok(Ok(value)) => Ok(value),
@@ -190,14 +208,13 @@ fn is_reachable_probe_answer(code: gcloud_sdk::tonic::Code) -> bool {
 }
 
 fn timeout_error(operation: &str, elapsed: Duration, timeout: Duration) -> Box<dyn Error> {
-    // Keep both values in the message: the observed elapsed time is useful
-    // when diagnosing a slow machine, while the limit explains why the RPC
-    // was cancelled.  `as_millis` is deliberately used instead of Debug's
-    // duration representation so CLI/API errors are stable and easy to grep.
+    // `as_millis()` は切り捨てなので、500µs のような sub-millisecond の予算が
+    // "timeout 0ms" と誤表示され、運用者が設定値を判断できなくなる。
+    // `Duration` の `Debug` は設定単位に合わせて出るため、runtime 側の
+    // `format_duration` と同じ表記に揃える。
     FirelangError::backend(format!(
-        "Firestore emulator operation '{operation}' timed out: elapsed {}ms exceeded timeout {}ms",
-        elapsed.as_millis(),
-        timeout.as_millis(),
+        "Firestore emulator operation '{operation}' timed out: \
+         elapsed {elapsed:?} exceeded timeout {timeout:?}"
     ))
     .into()
 }
@@ -276,8 +293,16 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _listener = listener;
-            tx.send(connect(&host, "p", EmulatorAuth::Owner, Duration::from_secs(30)).is_err())
-                .expect("send result");
+            tx.send(
+                connect(
+                    &host,
+                    "p",
+                    EmulatorAuth::Owner,
+                    Some(Duration::from_secs(30)),
+                )
+                .is_err(),
+            )
+            .expect("send result");
         });
         assert!(rx
             .recv_timeout(CONNECT_TIMEOUT + Duration::from_secs(2))
@@ -343,12 +368,11 @@ mod tests {
             .build()
             .expect("test runtime");
         let dropped = Arc::new(AtomicBool::new(false));
-        let result = run_operation(&runtime, Duration::from_millis(5), "query", async {
+        let error = run_operation(&runtime, Some(Duration::from_millis(5)), "query", async {
             let _guard = DropSignal(Arc::clone(&dropped));
             future::pending::<Result<(), gcloud_sdk::tonic::Status>>().await
-        });
-
-        let error = result.expect_err("pending operation should time out");
+        })
+        .expect_err("pending operation should time out");
         let firelang_error = error
             .downcast_ref::<FirelangError>()
             .expect("timeout should be a typed backend error");
@@ -358,6 +382,15 @@ mod tests {
         assert!(message.contains("timed out"), "{message}");
         assert!(message.contains("elapsed"), "{message}");
         assert!(message.contains("5ms"), "{message}");
+        // A sub-millisecond budget must not render as "0ms".
+        let error = run_operation(
+            &runtime,
+            Some(Duration::from_micros(500)),
+            "query",
+            future::pending::<Result<(), gcloud_sdk::tonic::Status>>(),
+        )
+        .expect_err("pending operation should time out");
+        assert!(error.to_string().contains("500µs"), "{error}");
         assert!(dropped.load(Ordering::SeqCst), "future was not cancelled");
 
         // A timeout must not poison the runtime.  This is deliberately a
@@ -366,6 +399,19 @@ mod tests {
             tokio::task::yield_now().await;
             7
         });
+        assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn operation_timeout_none_keeps_ready_operations_working() {
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let value = run_operation(&runtime, None, "get", async {
+            Ok::<_, gcloud_sdk::tonic::Status>(7)
+        })
+        .expect("ready operation");
         assert_eq!(value, 7);
     }
 }

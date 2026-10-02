@@ -131,6 +131,41 @@ impl Firestore for InMemoryFirestore {
             .count() as i64)
     }
 
+    /// The budget bounds the **matching candidates** the backend walks, not the
+    /// page the script receives: `limit` / `offset` shape the page afterwards,
+    /// so a `limit(3)` query over 20 matches still succeeds while the scan
+    /// stays bounded.  Counting first and cloning afterwards also keeps the
+    /// extra match that proves the budget was exceeded from ever being
+    /// materialized.
+    fn run_query_bounded(
+        &self,
+        query: &QueryRef,
+        max_results: usize,
+    ) -> Result<super::QueryCandidates, Box<dyn Error>> {
+        super::validate_query_filters(&query.filters)?;
+        let (field_paths, normalized_values) = prepare_query_filters(&query.filters)?;
+        let order_by = super::parse_order_by(query)?;
+        let mut matched = 0usize;
+        for _ in self.candidates(&query.source).filter(|(path, doc)| {
+            super::matches_filters(path, doc, &query.filters, &field_paths, &normalized_values)
+        }) {
+            matched += 1;
+            if matched > max_results {
+                return Err(super::query_result_limit_error(max_results));
+            }
+        }
+        Ok(super::page_borrowed_candidates(
+            self.candidates(&query.source).filter(|(path, doc)| {
+                super::matches_filters(path, doc, &query.filters, &field_paths, &normalized_values)
+            }),
+            query,
+            &order_by,
+        )
+        .into_iter()
+        .map(|(path, doc)| (path.clone(), doc.clone()))
+        .collect())
+    }
+
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
         if self.tx_snapshot.is_some() {
             return Err("already in transaction".into());

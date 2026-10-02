@@ -1,12 +1,15 @@
 //! In-memory backend behavior tests (language + Firestore API).
 
+use std::time::Duration;
+
 #[macro_use]
 mod common;
 
 use firelang::run_script;
+use firelang::run_script_with_limits;
 use firelang::runtime::Runtime;
 use firelang::value::Timestamp;
-use firelang::{InMemoryFirestore, Value};
+use firelang::{InMemoryFirestore, RuntimeLimits, Value};
 
 /// 同じ `Runtime` で複数スクリプトを続けて評価する(状態保持のテスト用)。
 fn run_in(
@@ -560,6 +563,75 @@ fn transaction_rejects_get_after_write() {
     let err = run_script("transaction { set(\"users/txa\", {n: 1})\nget(\"users/txa\") }");
     assert!(err.is_err());
     assert!(format!("{}", err.unwrap_err()).contains("get is not allowed"));
+}
+
+#[test]
+fn runtime_query_result_budget_is_checked_by_the_bounded_backend_path() {
+    let limits = RuntimeLimits::default().with_max_query_results(1);
+    let err = run_script_with_limits(
+        "set(\"users/budget_a\", {n: 1})\nset(\"users/budget_b\", {n: 2})\ncol(\"users\").get()",
+        limits,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("query result limit exceeded (max 1)"),
+        "{err}"
+    );
+
+    let limits = RuntimeLimits::default().with_max_query_results(1);
+    let err = run_script_with_limits(
+        "set(\"users/budget_a\", {n: 1})\nset(\"users/budget_b\", {n: 2})\ncol(\"users\").count()",
+        limits,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("query result limit exceeded (max 1)"),
+        "{err}"
+    );
+
+    // The bound is inclusive: a query with exactly the configured number of
+    // candidates remains valid.
+    let limits = RuntimeLimits::default().with_max_query_results(2);
+    let out = run_script_with_limits(
+        "set(\"users/budget_a\", {n: 1})\nset(\"users/budget_b\", {n: 2})\ncol(\"users\").get()",
+        limits,
+    )
+    .unwrap();
+    assert!(matches!(out, Value::Array(rows) if rows.len() == 2));
+
+    let limits = RuntimeLimits::default().with_max_query_results(0);
+    let err = run_script_with_limits(
+        "set(\"users/budget_a\", {n: 1})\ncol(\"users\").get()",
+        limits,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("query result limit exceeded (max 0)"),
+        "{err}"
+    );
+
+    // The query result's enclosing array and row metadata are part of the
+    // runtime value too; checking only individual fields would miss this.
+    let limits = RuntimeLimits::default().with_max_value_nodes(3);
+    let err = run_script_with_limits(
+        "set(\"users/budget_value\", {n: 1})\ncol(\"users\").get()",
+        limits,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("value node limit exceeded (max 3)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn wall_clock_limit_is_checked_before_parsing_or_evaluation() {
+    let limits = RuntimeLimits::default().with_max_wall_clock(Duration::ZERO);
+    let err = run_script_with_limits("1 + 1", limits).unwrap_err();
+    assert!(
+        format!("{err}").contains("wall-clock limit exceeded"),
+        "{err}"
+    );
 }
 
 #[test]
