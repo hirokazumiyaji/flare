@@ -21,7 +21,7 @@ emulator = [
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 firestore = { version = "0.57", optional = true }
-gcloud-sdk = { version = "0.30", optional = true }
+gcloud-sdk = { version = "0.32", optional = true }
 prost-types = { version = "0.14", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json"], optional = true }
 serde_json = "1"

@@ -312,6 +312,7 @@ impl Firestore for FirestoreEmulator {
                         name,
                         mask: None,
                         consistency_selector: None,
+                        request_options: None,
                     }))
                     .await
             },
@@ -443,6 +444,7 @@ impl Firestore for FirestoreEmulator {
                     .begin_transaction(Request::new(BeginTransactionRequest {
                         database,
                         options: None,
+                        request_options: None,
                     }))
                     .await?;
                 Ok::<_, gcloud_sdk::tonic::Status>(resp.into_inner().transaction)
@@ -472,6 +474,7 @@ impl Firestore for FirestoreEmulator {
                         consistency_selector: Some(
                             batch_get_documents_request::ConsistencySelector::Transaction(tid),
                         ),
+                        request_options: None,
                     }))
                     .await?;
                 let mut stream = response.into_inner();
@@ -537,6 +540,7 @@ impl Firestore for FirestoreEmulator {
                     .rollback(Request::new(RollbackRequest {
                         database,
                         transaction: tid,
+                        request_options: None,
                     }))
                     .await?;
                 Ok::<_, gcloud_sdk::tonic::Status>(())
@@ -637,6 +641,7 @@ fn run_count_aggregation(
                     run_aggregation_query_request::QueryType::StructuredAggregationQuery(query),
                 ),
                 consistency_selector: None,
+                request_options: None,
             }))
             .await
         {
@@ -693,6 +698,7 @@ fn run_query_candidates(
                     explain_options: None,
                     query_type: Some(run_query_request::QueryType::StructuredQuery(query)),
                     consistency_selector: None,
+                    request_options: None,
                 }))
                 .await?;
             let mut stream = response.into_inner();
@@ -801,6 +807,7 @@ fn run_count_fallback(fs: &FirestoreEmulator, query: &QueryRef) -> Result<i64, B
                 explain_options: None,
                 query_type: Some(run_query_request::QueryType::StructuredQuery(sq)),
                 consistency_selector: None,
+                request_options: None,
             }))
             .await?;
         let mut stream = response.into_inner();

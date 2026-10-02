@@ -11,8 +11,11 @@ use std::collections::HashMap;
 
 use firelang::run_script_with_firestore;
 use firelang::{EmulatorAuth, FirestoreEmulator, Value};
-use firestore::{FirestoreCreateSupport, FirestoreDb, FirestoreDbOptions};
-use gcloud_sdk::google::firestore::v1::{value, ArrayValue, Document, MapValue, Value as SdkValue};
+use firestore::{FirestoreDb, FirestoreDbOptions};
+use gcloud_sdk::google::firestore::v1::{
+    value, write, ArrayValue, CommitRequest, Document, MapValue, Value as SdkValue, Write,
+};
+use gcloud_sdk::tonic::Request;
 
 fn emulator() -> Option<FirestoreEmulator> {
     match FirestoreEmulator::try_from_env() {
@@ -83,28 +86,48 @@ fn seed_reference_documents(
                     std::future::ready(Ok(gcloud_sdk::Token::new(
                         "Bearer".to_string(),
                         "owner".into(),
-                        chrono::DateTime::<chrono::Utc>::from_timestamp(4_102_444_800, 0)
+                        firestore::FirestoreInstant::new(4_102_444_800, 0)
                             .expect("valid token expiry"),
                     )))
                 }),
             )),
         ))
         .expect("connect test Firestore client");
-    for (id, fields) in documents {
-        runtime
-            .block_on(db.create_doc(
-                collection_id,
-                Some(id.to_string()),
-                Document {
-                    name: String::new(),
-                    fields,
-                    create_time: None,
-                    update_time: None,
-                },
-                None,
-            ))
-            .expect("seed reference document");
-    }
+    // These documents hold values firelang cannot write (double, geo_point,
+    // external reference), so they are seeded with a raw Firestore `commit`
+    // instead of `set()`. The `firestore` crate's low-level helpers became
+    // private in 0.57; the gRPC surface they wrapped is still public, and a
+    // commit is the smallest request that writes an arbitrary `Document`.
+    let database = db.get_database_path().to_string();
+    let writes: Vec<Write> = documents
+        .into_iter()
+        .map(|(id, fields)| {
+            let document = Document {
+                name: format!("{database}/documents/{collection_id}/{id}"),
+                fields,
+                create_time: None,
+                update_time: None,
+            };
+            Write {
+                // An `update` write without a field mask overwrites every
+                // field, which is what seeding needs. gcloud-sdk 0.32 types
+                // `update_transforms` as a flat list of `FieldTransform`, so
+                // there is no `DocumentTransform` to fill in.
+                update_mask: None,
+                update_transforms: vec![],
+                current_document: None,
+                operation: Some(write::Operation::Update(document)),
+            }
+        })
+        .collect();
+    runtime
+        .block_on(db.client().get().commit(Request::new(CommitRequest {
+            database: database.clone(),
+            writes,
+            transaction: vec![],
+            request_options: None,
+        })))
+        .expect("seed reference documents");
 }
 
 #[test]
