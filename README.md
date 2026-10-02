@@ -47,7 +47,7 @@ GitHub Actions は full commit SHA で固定されています。
 cargo run --locked --bin fl -- path/to/script.fl
 ```
 
-Firestore エミュレータバックエンドは `emulator` feature を明示して有効にします(`FIRESTORE_EMULATOR_HOST` が必須。プロジェクト ID は省略時 `firelang-test`):
+Firestore エミュレータバックエンドは `emulator` feature を明示して有効にします(`FIRESTORE_EMULATOR_HOST` が必須。プロジェクト ID は省略時 `firelang-test`)。in-memory では `server_timestamp()` の request time を commit ごとに高々 1 回だけ取得するため、Rust から `InMemoryFirestore::with_clock(...)` で決定論的な clock を注入できます:
 
 ```bash
 export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080

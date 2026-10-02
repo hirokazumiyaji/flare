@@ -9,7 +9,7 @@ pub use emulator::{
     parse_timeout_ms, EmulatorAuth, EmulatorConfig, EmulatorConnectionError, FirestoreEmulator,
     FirestoreEmulatorOptions, DEFAULT_OPERATION_TIMEOUT, OPERATION_TIMEOUT_ENV,
 };
-pub use memory::InMemoryFirestore;
+pub use memory::{InMemoryFirestore, RequestClock};
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -654,6 +654,7 @@ pub(crate) fn compare_query_candidates(
 pub trait Firestore {
     fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
     /// Apply writes atomically: either all writes persist or none do.
+    /// All `ServerTimestamp` sentinels in this call use one request time.
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>>;
     /// Returns filter-matching candidates as (relative path, document fields).
     /// Ordering, offset, and limit are NOT applied here. This method remains the
@@ -680,9 +681,10 @@ pub trait Firestore {
 
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>>;
     fn transaction_get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
-    /// Commit writes using the current transaction. A failed preparation or
-    /// commit must leave the transaction available to `abort_transaction`;
-    /// successful commit closes it.
+    /// Commit transaction writes atomically. A failed preparation or commit
+    /// must leave the transaction available to `abort_transaction`; a
+    /// successful commit closes it. All `ServerTimestamp` sentinels in this
+    /// call use the one request time of this commit.
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>>;
     /// Rollback an open transaction. Idempotent: succeeds when no
     /// transaction is open. A failed rollback must leave the transaction

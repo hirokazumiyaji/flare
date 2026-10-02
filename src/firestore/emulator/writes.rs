@@ -222,6 +222,8 @@ fn encode_field_transform(
 ) -> Result<document_transform::FieldTransform, Box<dyn Error>> {
     let transform_type = match v {
         Value::ServerTimestamp => {
+            // Keep this as a server transform: Firestore assigns one request
+            // time to every ServerTimestamp in the enclosing CommitRequest.
             document_transform::field_transform::TransformType::SetToServerValue(
                 document_transform::field_transform::ServerValue::RequestTime.into(),
             )

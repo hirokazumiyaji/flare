@@ -405,6 +405,45 @@ fn emulator_server_timestamp_resolves() {
 }
 
 #[test]
+fn emulator_server_timestamp_is_shared_within_batch_and_transaction_commits() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    // ドキュメント path はセグメント数が偶数でなければならないため、run ごとの
+    // subcollection(`users/{run}/docs/...`)へ fixture を置く。
+    let collection = format!("users/{}/docs", unique("stcommit"));
+    let script = format!(
+        r#"
+batch {{
+  set("{collection}/batch_1", {{a: server_timestamp(), b: server_timestamp()}})
+  set("{collection}/batch_2", {{c: server_timestamp()}})
+}}
+transaction {{
+  set("{collection}/tx_1", {{a: server_timestamp(), b: server_timestamp()}})
+  set("{collection}/tx_2", {{c: server_timestamp()}})
+}}
+[
+  get("{collection}/batch_1")["a"],
+  get("{collection}/batch_1")["b"],
+  get("{collection}/batch_2")["c"],
+  get("{collection}/tx_1")["a"],
+  get("{collection}/tx_1")["b"],
+  get("{collection}/tx_2")["c"],
+]
+"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    let Value::Array(times) = out else {
+        panic!("expected timestamp list, got {out:?}");
+    };
+    assert_eq!(times.len(), 6);
+    assert!(matches!(times[0], Value::Timestamp(_)));
+    assert!(times[0..3].iter().all(|value| value == &times[0]));
+    assert!(times[3..].iter().all(|value| value == &times[3]));
+}
+
+#[test]
 fn emulator_batch_atomic_commit() {
     let Some(fs) = emulator() else {
         eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
