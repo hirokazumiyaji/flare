@@ -2598,22 +2598,8 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
             (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a <= b),
             _ => return Err("unsupported <= operands".into()),
         },
-        // `eval_expr` 側で短絡評価するため、ここに来るのは両辺評価済みの場合のみ。
-        // Ruby と同じくオペランドそのものを返す。
-        BinOp::And => {
-            if !l.truthy() {
-                l
-            } else {
-                r
-            }
-        }
-        BinOp::Or => {
-            if l.truthy() {
-                l
-            } else {
-                r
-            }
-        }
+        // `eval_expr` が `And` / `Or` を短絡評価して返すため、ここには到達しない。
+        BinOp::And | BinOp::Or => unreachable!("And/Or are short-circuited in eval_expr"),
     })
 }
 
