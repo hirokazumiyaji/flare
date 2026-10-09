@@ -1,49 +1,40 @@
-# Firebase Services と組み込み module の設計案
+# Design Proposal: Firebase Services and Built-in Modules
 
-対象: [Issue #78](https://github.com/hirokazumiyaji/firelang/issues/78)
+Applies to [Issue #78](https://github.com/hirokazumiyaji/flare/issues/78).
 
-この文書は実装前の設計案である。
-現行の正式仕様は [docs/spec.md](../spec.md) であり、この設計案によって現行の挙動を変更するものではない。
-コード調査の基点は `b38bc96`。
+This document is a pre-implementation design proposal. The current authoritative specification is [docs/spec.md](../spec.md); this proposal does not change current behavior. The code review baseline is `b38bc96`.
 
-Firestore、Auth、Storage を一つのスクリプトから使い、サービスごとにバックエンドを差し替えられる構成を設計する。
-言語 API は `Firestore.*`、`Auth.*`、`Storage.*` の組み込み module に分ける。
-初期の実装範囲は組み込み module とする。
-ユーザー定義の `module` 構文、`include`、`extend`、定数の一般的な仕組みは後続の言語機能とする。
+The design lets one script use Firestore, Auth, and Storage while allowing each service to use a separate backend. The language API is organized under the built-in modules `Firestore.*`, `Auth.*`, and `Storage.*`. The initial scope covers built-in modules only. User-defined `module` syntax, `include`, `extend`, and general constant support are future language features.
 
-## 1. 現在の実装と Issue の残作業
+## 1. Existing implementation and remaining issue work
 
-Issue の記述から実装が進んでおり、Auth / Storage の trait とバックエンドを新設する作業は不要である。
+Implementation has advanced beyond the original issue description. New Auth and Storage traits and backends are not needed.
 
-| 対象 | 現在の実装 | 今回必要な変更 |
+| Area | Current implementation | Required change |
 | --- | --- | --- |
-| バックエンド | `Firestore`、`Auth`、`Storage` と各 in-memory / emulator 実装が存在する | 既存 trait と実装を再利用する |
-| Runtime | `Runtime<F, S>` が Firestore、Storage、`Box<dyn Auth>` を別々に保持する | 所有権を `Services` にまとめ、実行器から generic parameter を除く |
-| 埋め込み API | サービスの組み合わせ別の関数とコンストラクタが存在する | 新しい標準入口を `run_script_with_services` に統一する |
-| 言語 API | Firestore 操作と `auth_*` / `storage_*` がグローバル関数である | 組み込み module から同じ実装を呼び出す |
-| サービス未設定 | コンストラクタが未指定サービスを in-memory で補う | 新 API では未設定を明示できるようにする |
-| timeout | Firestore は Runtime の設定、Auth は HTTP client の固定 15 秒、Storage は接続 5 秒と read/write 30 秒 | 設定値と保証範囲をサービスごとに明示する |
-| project | CLI / バックエンドが個別に環境変数を読む | 新しい構成経路では project 設定を一度解決して渡す |
+| Backends | `Firestore`, `Auth`, and `Storage` traits and in-memory/emulator implementations exist | Reuse the existing traits and implementations |
+| Runtime | `Runtime<F, S>` owns Firestore, Storage, and `Box<dyn Auth>` separately | Group ownership in `Services` and remove generic parameters from the evaluator |
+| Embedding API | Functions and constructors exist for combinations of services | Standardize the new entry point as `run_script_with_services` |
+| Language API | Firestore operations and `auth_*` / `storage_*` are global functions | Route built-in module calls to the same implementations |
+| Unconfigured services | Constructors fill omitted services with in-memory backends | Let the new API represent an unconfigured service explicitly |
+| Timeouts | Firestore uses Runtime settings; Auth has a fixed 15-second HTTP client timeout; Storage uses 5 seconds to connect and 30 seconds for reads/writes | Specify settings and guarantees per service |
+| Project settings | CLI and backends read environment variables independently | Resolve project settings once in the new construction path and pass them through |
 
-`src/runtime.rs` の組み込み関数にも `F` / `S` が付いている。
-サービスのフィールドをまとめるだけでは、Issue の「サービス追加で各組み込み関数の generic parameter を増やさない」という条件を十分に解決できない。
-そのため、公開 Runtime と内部の実行器を分ける。
+Built-ins in `src/runtime.rs` also carry `F` / `S` generic parameters. Grouping service fields alone would not satisfy the issue's requirement to avoid adding a generic parameter to every built-in when a service is added. Keep the public Runtime separate from the internal evaluator.
 
-## 2. 構成方式の比較
+## 2. Compare construction approaches
 
-| 方式 | 利点 | 負担・制約 | 判断 |
+| Approach | Benefits | Costs / constraints | Decision |
 | --- | --- | --- | --- |
-| 既存の公開 Runtime の型を保ち、内部実行器で `dyn Trait` を借用する | `Runtime<F, S>` の型注釈と借用 Storage を維持できる。組み込み関数は generic 不要になる | 所有する構成と借用する実行器の二つが必要 | 採用する |
-| Runtime と Services をすべて `Box<dyn Trait>` にする | 所有する型も非 generic にできる | `Runtime<InMemoryFirestore>` がコンパイルできなくなる。既存の借用 API に lifetime の再設計が必要 | 公開 API を破壊する版で再検討する |
-| `Runtime<F, A, S, ...>` と generic parameter を追加する | バックエンドを具体型のまま保持できる | 組み込み関数やコンストラクタがサービス数に応じて増える | 採用しない |
+| Keep the existing public Runtime type and borrow trait objects in an internal evaluator | Preserves `Runtime<F, S>` annotations and borrowed Storage; built-ins need no generics | Requires separate owned configuration and borrowed evaluator views | Adopt |
+| Make Runtime and Services use `Box<dyn Trait>` throughout | Makes owned types non-generic | Breaks `Runtime<InMemoryFirestore>` and requires redesigning lifetimes in the borrowed API | Reconsider in a breaking release |
+| Add generic parameters such as `Runtime<F, A, S, ...>` | Keeps concrete backend types | Built-ins and constructors grow with the number of services | Reject |
 
-既存公開 API のために残す generic parameter は現在の `F` / `S` だけとする。
-Auth と今後追加するサービスは Services の boxed trait object とし、Runtime の型引数を増やさない。
-これは Firebase 向けのサービス境界であり、複数 cloud provider を統一する抽象化には拡張しない。
+Retain only the existing `F` / `S` parameters for public API compatibility. Store Auth and future services as boxed trait objects in Services so Runtime's type parameters do not grow. This is a Firebase service boundary, not an abstraction intended to unify multiple cloud providers.
 
-## 3. 所有権と実行器
+## 3. Ownership and evaluator
 
-以下は型の構成案であり、実装コードではない。
+The following is a type layout proposal, not implementation code:
 
 ```rust
 pub struct Services<F: Firestore, S: Storage = InMemoryStorage> {
@@ -71,43 +62,33 @@ struct Evaluator<'a> {
 }
 ```
 
-`RuntimeState` が scopes、batch / transaction 状態、pending rollback、実行予算、usage、call depth、実行中フラグを保持する。
-`Runtime::run` / `eval_program*` は Services と state を同時に借用し、その呼び出し中だけ Evaluator を作る。
-Evaluator が AST を評価し、バックエンドは借用した trait object を通して呼ぶ。
-実行をまたいで残す状態を Evaluator のローカルフィールドへ移さない。
-特に rollback の再試行状態と Auth のセッションを実行終了時に消さない。
+`RuntimeState` owns scopes, batch/transaction state, pending rollback state, execution budgets, usage, call depth, and the running flag. `Runtime::run` / `eval_program*` borrow Services and state together and create an Evaluator for the duration of that call. The Evaluator evaluates the AST and calls backends through borrowed trait objects. State that must survive between runs must not be moved into evaluator-local fields. In particular, preserve rollback retry state and Auth sessions after execution ends.
 
-Auth のセッションの所有者は現在と同じ Auth バックエンドである。
-Services や RuntimeState に別の current user / token を複製しない。
-同じ Runtime の複数回の `run` では、そのバックエンドのセッションを維持する。
-新しい Runtime の生成と `sign_out` がセッションの境界になる。
+The Auth backend remains the owner of its session. Do not duplicate a current user or token in Services or RuntimeState. Repeated `run` calls on one Runtime keep the backend's session. Creating a new Runtime or calling `sign_out` defines the session boundary.
 
-組み込み関数と ScopeGuard は Evaluator を受け取り、`F` / `S` を要求しない。
-公開 Runtime のコンストラクタと実行入口には、Services の構築・借用・委譲だけを残す。
-既存入口と新入口で別々の評価ロジックを持たない。
+Built-ins and ScopeGuard receive the Evaluator and do not require `F` / `S`. Public Runtime constructors and entry points should only construct Services, borrow it, and delegate. Existing and new entry points must not have separate evaluation logic.
 
 ```mermaid
 flowchart TD
-    Old[既存の埋め込み API] --> Runtime
+    Old[Existing embedding API] --> Runtime
     New[run_script_with_services] --> Runtime
-    CLI[CLI のサービス選択] --> Services
+    CLI[CLI service selection] --> Services
     Runtime --> Services
     Runtime --> State[RuntimeState]
     Services --> Access[ServiceAccess]
     State --> Eval[Evaluator]
     Access --> Eval
-    Eval --> Dispatch[共通の呼び出し定義]
+    Eval --> Dispatch[Shared call definitions]
     Dispatch --> FM[Firestore module]
     Dispatch --> AM[Auth module]
     Dispatch --> SM[Storage module]
 ```
 
-## 4. Services の公開 API と未設定サービス
+## 4. Public Services API and unconfigured services
 
-### 4.1 構築 API
+### 4.1 Construction API
 
-新しい標準 API は以下の形とする。
-`with_*` はバックエンドを所有し、同じサービスを再指定した場合は新しいバックエンドに置き換える。
+The new standard API should have the following shape. `with_*` takes ownership of a backend and replaces it when the same service is specified again.
 
 ```rust
 Services::in_memory() -> Services<InMemoryFirestore, InMemoryStorage>
@@ -135,10 +116,7 @@ run_script_with_services_and_limits<F: Firestore, S: Storage>(
 ) -> Result<Value, Box<dyn Error>>
 ```
 
-`Services::in_memory()` は三サービスを in-memory にする。
-`Services::empty(project)` は三サービスを未設定にする。
-新 API には「サービスを省略すると emulator を探し、失敗すると in-memory に切り替える」という経路を設けない。
-CLI の現行 `storage auto` の挙動は CLI 内で扱う。
+`Services::in_memory()` configures all three services in memory. `Services::empty(project)` leaves all three unconfigured. The new API must not implicitly search for an emulator and fall back to in-memory when none is available. Keep the CLI's current `storage auto` behavior inside the CLI.
 
 ```rust
 let services = Services::in_memory()
@@ -152,46 +130,25 @@ let services = Services::empty(project)
 let result = run_script_with_services("Auth.current_user()", services)?;
 ```
 
-既存の Storage の借用用途も維持する。
-`Services::in_memory().with_storage(&mut storage)` が使え、`Storage` に `'static` を追加しない。
-Auth の `'static` 制約は現行 API と同じとする。
-trait 全体に新しい `Send` / `Sync` 制約を追加しない。
+Preserve borrowed Storage use: `Services::in_memory().with_storage(&mut storage)` must work, and do not add `'static` to `Storage`. Keep Auth's current `'static` constraint. Do not add `Send` / `Sync` constraints to the traits.
 
-### 4.2 未設定サービスの表現
+### 4.2 Representing unconfigured services
 
-未設定を表す `UnavailableFirestore` / `UnavailableAuth` / `UnavailableStorage` を用意する。
-これらはサービスを実装する型であり、呼び出された操作をエラーにする。
-別バックエンドに処理を切り替える機能は持たない。
-Auth を未設定にしても `Runtime::auth()` / `auth_mut()` の既存シグネチャを保てる。
+Add `UnavailableFirestore`, `UnavailableAuth`, and `UnavailableStorage`. Each implements its service trait and returns an error when called; none redirects to another backend. An unconfigured Auth must still support the existing `Runtime::auth()` / `auth_mut()` signatures.
 
-三つのサービス trait に `is_available(&self) -> bool` を追加する。
-既定実装は `true` を返し、Unavailable 型だけ `false` を返す。
-既存の custom backend に新しい必須メソッドを要求しない。
-Availability の別フラグを Services に重複保持しない。
+Add `is_available(&self) -> bool` to each service trait. The default returns `true`; only Unavailable types return `false`. Do not require existing custom backends to implement a new method, and do not duplicate availability flags in Services.
 
-言語のサービス操作では引数評価前に availability を検査する。
-Auth 未設定の `Auth.current_user()` は `nil` ではなく capability error になる。
-設定済み Auth で未ログインの場合は、現在と同じく `nil` になる。
-この二つの状態を区別する。
+Check availability before evaluating arguments to a language service operation. `Auth.current_user()` with Auth unconfigured is a capability error, not `nil`. Configured Auth with no signed-in user continues to return `nil`; these states must remain distinct.
 
-`CapabilityError` は独立した公開エラー型とする。
-`service: ServiceId` と `span: Option<Span>` を持ち、`Box<dyn Error>` から downcast できる。
-`ServiceId` は `Firestore` / `Auth` / `Storage` の enum とする。
-表示は `1:1: service unavailable: Auth` の形にする。
-実行フェーズは Runtime エラーとして扱い、既存の `ErrorKind` enum と `FirelangError` の公開フィールドは変更しない。
-位置の付与とエラーのラップ処理では CapabilityError の型を保持する。
+Expose a separate `CapabilityError` with `service: ServiceId` and `span: Option<Span>`, downcastable from `Box<dyn Error>`. `ServiceId` is an enum with `Firestore`, `Auth`, and `Storage`. Format errors like `1:1: service unavailable: Auth`. At runtime, treat it as a Runtime error without changing the existing `ErrorKind` enum or public fields of `FlareError`. Preserve its type when attaching a location or wrapping an error.
 
-Auth trait の直接利用は既存の `AuthError` が戻り値であるため、UnavailableAuth は `AuthError::Configuration` を返す。
-言語 API では availability の事前検査によって共通の CapabilityError を返す。
-既存の AuthError の enum variant を増やして外部の exhaustive match を壊さない。
+Direct calls to the Auth trait return the existing `AuthError`, so `UnavailableAuth` returns `AuthError::Configuration`. The language API performs the availability check first and returns the common `CapabilityError`. Do not add an `AuthError` variant that would break exhaustive matches in downstream code.
 
-Firestore の参照・クエリ・センチネルの構築は通信を行わず、未設定でも許可する。
-`Firestore.get/set/update/delete/batch/transaction` とクエリの `get/count` では Firestore を必須とする。
-Auth / Storage の各サービス操作では対応するサービスを必須とする。
+Firestore reference, query, and sentinel construction do not perform I/O and remain available when Firestore is unconfigured. Require Firestore for `Firestore.get/set/update/delete/batch/transaction` and query `get/count`. Each Auth and Storage operation requires its corresponding service.
 
-## 5. 組み込み module の言語仕様
+## 5. Built-in module language API
 
-### 5.1 公開する操作
+### 5.1 Public operations
 
 ```ruby
 session = Auth.sign_in("alice@example.com", "password")
@@ -206,380 +163,306 @@ puts rows
 Auth.sign_out()
 ```
 
-この例のログインは Auth のセッションを作る。
-Firestore / Storage のリクエスト資格情報に token を自動転送する意味は持たない。
+Signing in creates an Auth session. It does not automatically forward a token as credentials for Firestore or Storage requests.
 
-| module | 公開メソッド | 対応する現行 API |
+| Module | Public methods | Existing API |
 | --- | --- | --- |
-| Firestore | `doc`, `col`, `col_group` | 同名のグローバル関数 |
-| Firestore | `get`, `set`, `update`, `delete` | 同名のグローバル関数 |
-| Firestore | `batch`, `transaction` | 同名のブロック付き関数 |
-| Firestore | `server_timestamp`, `array_union`, `array_remove`, `delete_field`, `increment` | 同名のセンチネル生成関数 |
-| Auth | `sign_up`, `sign_in`, `current_user`, `sign_out` | `auth_` prefix のグローバル関数 |
-| Storage | `upload`, `download`, `metadata`, `delete` | `storage_` prefix のグローバル関数 |
+| Firestore | `doc`, `col`, `col_group` | Same-named global functions |
+| Firestore | `get`, `set`, `update`, `delete` | Same-named global functions |
+| Firestore | `batch`, `transaction` | Same-named functions with blocks |
+| Firestore | `server_timestamp`, `array_union`, `array_remove`, `delete_field`, `increment` | Same-named sentinel constructors |
+| Auth | `sign_up`, `sign_in`, `current_user`, `sign_out` | Global functions prefixed with `auth_` |
+| Storage | `upload`, `download`, `metadata`, `delete` | Global functions prefixed with `storage_` |
 
-`puts`、`array`、`len`、`bytes`、`timestamp`、`now` は言語全体の値操作なのでグローバルに置く。
-`Firestore.timestamp` や `Storage.bytes` は追加しない。
-Firestore のクエリチェーンと AuthSession のフィールドアクセスは現在の形を保つ。
-`Firestore.set(..., merge: true)` と `Storage.upload(..., content_type: ...)` は既存と同じ keyword argument を受け付ける。
-`Firestore.batch { ... }` / `Firestore.transaction { ... }` は既存と同じ block / return の意味を持つ。
+Keep `puts`, `array`, `len`, `bytes`, `timestamp`, and `now` global because they operate on general language values. Do not add `Firestore.timestamp` or `Storage.bytes`. Preserve the current Firestore query chain and AuthSession field access. `Firestore.set(..., merge: true)` and `Storage.upload(..., content_type: ...)` accept the same keyword arguments as today. `Firestore.batch { ... }` and `Firestore.transaction { ... }` retain their current block and return semantics.
 
-mruby は module の定義と module function の登録をそれぞれ提供している。
-今回採用するのは module に所属する操作を呼び出す形であり、mruby の mixin や private instance method まで再現しない。
-根拠: [mruby 公式 C API Reference](https://github.com/mruby/mruby/blob/master/doc/guides/capi.md#defining-methods)。
+mruby provides module definitions and module-function registration separately. This design uses calls to operations owned by a module; it does not reproduce mruby mixins or private instance methods. See the [official mruby C API reference](https://github.com/mruby/mruby/blob/master/doc/guides/capi.md#defining-methods).
 
-### 5.2 構文と module 値
+### 5.2 Syntax and module values
 
-`Firestore.set(...)` は現行 AST の `Expr::Call { receiver: Some(...), ... }` で表現できる。
-大文字始まりの名前も現行 lexer の identifier として読める。
-lexer / parser / AST の構文を増やさず、Runtime に組み込み module の名前解決を追加する。
+`Firestore.set(...)` can use the current `Expr::Call { receiver: Some(...), ... }` AST representation. The current lexer already accepts identifiers beginning with an uppercase letter. Add built-in module name resolution in Runtime without changing lexer, parser, or AST syntax.
 
-`Value::Module(BuiltinModule)` を追加する。
-`BuiltinModule` は `Firestore` / `Auth` / `Storage` の固定 enum である。
-module 値にバックエンド、token、project config を入れず、呼び出し時に実行中 Runtime の Services を参照する。
-未設定サービスでも module の名前は存在するため、未設定を undefined variable として報告しない。
+Add `Value::Module(BuiltinModule)`, where `BuiltinModule` is a fixed enum containing `Firestore`, `Auth`, and `Storage`. Module values contain no backend, token, or project configuration; calls access the Services of the running Runtime. The module name exists even when its service is unconfigured, so that case must not be reported as an undefined variable.
 
-以下の規則に固定する。
+Use these rules:
 
-- 通常の変数・関数の名前解決を先に行い、見つからなければ三つの組み込み module 名を解決する。
-- 既存の `Auth = ...` などのローカル変数を新しい予約語として禁止しない。そのスコープではローカルの値が優先される。
-- `a = Auth; a.current_user()` のように別名で参照できる。
-- module 値は immutable であり、メソッドの追加・変更・再定義の API は提供しない。
-- `inspect` / `to_s` は `Firestore` / `Auth` / `Storage` の名前を返す。同じ module ID の値は等しい。
-- module 値は truthy であり、深さの検証では leaf として扱う。
-- Firestore の保存値、filter operand、transform operand として module 値を受け付けない。Map / Array 内にある場合も通信前に拒否する。
-- Storage の内容には既存どおり Bytes のみを受け付ける。
+- Resolve regular variables and functions first. If neither matches, resolve the three built-in module names.
+- Do not reserve names such as `Auth = ...`; a local value takes precedence in its scope.
+- Support aliases such as `a = Auth; a.current_user()`.
+- Module values are immutable. Provide no API to add, modify, or redefine methods.
+- `inspect` / `to_s` return the names `Firestore`, `Auth`, or `Storage`. Values with the same module ID compare equal.
+- Module values are truthy and are leaves for depth validation.
+- Reject module values as Firestore stored values, filter operands, or transform operands, including when nested in a Map or Array. Reject them before network I/O.
+- Storage content continues to accept only Bytes.
 
-この名前解決は今回の組み込み namespace の仕様であり、Ruby の一般的な定数探索を導入するものではない。
+This name-resolution rule is specific to these built-in namespaces; it does not introduce general Ruby-style constant lookup.
 
-### 5.3 共通の呼び出し定義
+### 5.3 Shared call definitions
 
-メソッド名を別のグローバル関数名に書き換えて再評価する方式は採用しない。
-module 呼び出しと既存グローバル関数を、同じ BuiltinSpec の handler に解決する。
+Do not rewrite module method names into global function names and re-evaluate the call. Resolve module calls and existing global functions to the same `BuiltinSpec` handler.
 
-BuiltinSpec には以下を保持する。
+A `BuiltinSpec` records:
 
-- 所属 module、公開メソッド名、既存のグローバル名。
-- 引数個数、keyword、位置引数と keyword の重複、block の CallContract。
-- 必要なサービス。参照構築や値操作の場合はなし。
-- generic parameter を持たない handler。
+- Owning module, public method name, and existing global name.
+- Arity, keywords, duplicate positional/keyword rules, and block `CallContract`.
+- Required service, if any. Reference construction and value operations require none.
+- A handler with no generic parameters.
 
-現在の `BUILTIN_NAMES`、handler table、`builtin_contract` の重複をこの定義にまとめる。
-所属サービスの操作定義は各サービスの Rust ファイルに置き、共通側は名前解決と呼び出しを担う。
-任意のプラグインを登録する汎用 registry は作らない。
+Consolidate the current `BUILTIN_NAMES`, handler table, and `builtin_contract` duplication into this definition. Keep each service's operation definitions in its Rust module; shared code handles resolution and dispatch. Do not build a general registry for arbitrary plugins.
 
-呼び出し順序は次のとおりとする。
+Call evaluation order:
 
-1. 重複 keyword と、receiver の評価なしに確定できる不正を検出する。
-2. receiver があれば一度だけ評価する。ここで Return が発生した場合は伝播する。
-3. receiver の種類に応じて BuiltinSpec / 既存メソッド / ユーザー関数を解決する。
-4. 引数個数、keyword、block、サービスの availability と実行コンテキストを検査する。
-5. 引数をソース順に評価する。位置引数と keyword を別々の順序で評価しない。
-6. 評価済みの値を handler に渡す。
+1. Detect duplicate keywords and errors that can be determined without evaluating the receiver.
+2. If present, evaluate the receiver exactly once. Propagate `Return` if it occurs.
+3. Resolve a `BuiltinSpec`, existing method, or user function based on receiver type.
+4. Check arity, keywords, block, service availability, and execution context.
+5. Evaluate arguments in source order; do not evaluate positional and keyword arguments in separate passes.
+6. Pass evaluated values to the handler.
 
-現行実装は receiver 付き呼び出しの keyword と `each/map` 以外の block を早い段階で一律拒否する。
-この処理を module の CallContract に対応させる必要がある。
-構文が通るだけでは `Firestore.set(..., merge: true)` と `Firestore.batch { ... }` は動かない。
-通常の Array / Query / Map メソッドについては、keyword / block の可否と、不正な呼び出しで引数を評価しない保証を保つ。
-receiver の種類によって keyword / block の可否が異なるため、重複 keyword などを除き、receiver を評価してからその可否を検査する。
-これにより、不正な keyword / block を持つ通常メソッドでも receiver 自身が先に評価される場合がある。
-現在はそれらを receiver の評価前に拒否しているので、この評価順とエラーの優先順位は明示的な言語仕様の変更として扱う。
-例として `receiver().len(nope: true)` は、receiver に書かれた副作用が起きた後で keyword error になるが、`nope` の値の式は実行しない。
-receiver 自身の副作用を取り消せるとは約束しない。
-receiver が Module を返す任意の式でも、同じ規則で keyword / block を扱えるようにし、構文の形ごとの特別扱いを増やさない。
+The current implementation rejects keywords on receiver calls and blocks other than `each` / `map` early and uniformly. Update this behavior to honor the module's `CallContract`; syntax support alone is insufficient for `Firestore.set(..., merge: true)` and `Firestore.batch { ... }` to work.
 
-不正な `Storage.upload` や未設定の Auth 呼び出しが、引数に書かれた Firestore 書き込みを実行しないことを検査する。
-未知の module メソッドは `unknown module method: Auth.foo` の形で報告する。
+Preserve keyword/block rules for ordinary Array, Query, and Map methods, including the guarantee that arguments are not evaluated for invalid calls. Since support varies by receiver type, evaluate the receiver before checking keyword/block validity, except for duplicate keywords and other receiver-independent errors. This means a regular method call with invalid keywords or a block may evaluate its receiver first. The current implementation rejects these calls before receiver evaluation, so changing this order and error precedence is an explicit language-spec change. For example, `receiver().len(nope: true)` evaluates receiver side effects, then returns a keyword error; it does not evaluate the expression for `nope`. Receiver side effects are not rolled back.
 
-### 5.4 互換性と batch / transaction
+Apply the same keyword/block rules to any expression that returns a Module; do not add syntax-shape-specific handling. Test that invalid `Storage.upload` calls and calls to unconfigured Auth do not execute Firestore writes embedded in their arguments. Report unknown module methods as `unknown module method: Auth.foo`.
 
-既存グローバル関数は、同じ handler / CallContract に解決する別の公開名として維持する。
-引数の変換、失敗時の再試行、旧 Runtime に戻す分岐は設けない。
-新しいサンプルと説明では module API を標準とし、既存グローバル関数の削除や deprecation は今回行わない。
+### 5.4 Compatibility and batch / transaction
 
-Firestore の batch / transaction は Firestore の操作だけを atomic にする。
-Storage は現在と同じく内部から呼び出せない。
-Auth は現行実装では内部から呼び出せるため、今回はその可否を変更せず、Auth の変更が rollback の対象に含まれないことを仕様に明記する。
-Auth 操作の禁止やサービスをまたぐ transaction は別の挙動変更として扱う。
-module API と既存 API の間でこの可否を変えない。
+Keep existing global functions as alternate public names routed to the same handler and `CallContract`. Do not add argument conversions, retry-on-failure behavior, or a fallback to the old Runtime. Use the module API in new examples and documentation, but do not remove or deprecate existing global functions in this change.
 
-## 6. project 設定、資格情報、identity
+Firestore batch / transaction makes only Firestore operations atomic. As today, Storage cannot be called inside them. The current implementation allows Auth calls inside; do not change this behavior here. Document that Auth changes are not part of rollback. Disallowing Auth operations or adding cross-service transactions would be a separate behavior change. Module and existing APIs must behave identically here.
 
-`ProjectConfig` は `project_id: Option<String>` と `storage_bucket: Option<String>` を持つ、秘密を含まない設定値とする。
-環境変数の読み取りを設定型のデフォルト生成に含めない。
-既存コンストラクタは project を未指定の config とし、既に生成されたバックエンドの project を書き換えない。
-これにより、既存の `Runtime::new(FirestoreEmulator::new(...))` が違う project に接続し直す問題を避ける。
-新 API で明示する config は、バックエンドを構築する際にも同じ値を渡す。
-`with_project` に既存バックエンドを再構成する副作用は持たせない。
-custom backend の内部 project はホストの責任とし、汎用 trait に project 検証を強制しない。
+## 6. Project configuration, credentials, and identity
 
-Auth の明示構築には `AuthEmulatorOptions { api_key: String, operation_timeout: Option<Duration> }` を追加する。
-既定値は現在の emulator 用 API key `fake-api-key` と 5,000 ms とする。
-`AuthEmulator::new_with_options(host, project_id, options) -> Result<Self, AuthError>` は環境変数を読まない。
-既存の `new` / `from_env` は環境から options を解決してこの constructor に委譲し、シグネチャを保つ。
-CLI は明示構築を使い、構築後の再読み取りをなくす。
-Storage も既存の明示 constructor と bucket / token 指定を使い、CLI から `from_env` を呼ばない。
+`ProjectConfig` contains non-secret `project_id: Option<String>` and `storage_bucket: Option<String>` values. Do not read environment variables while creating its defaults. Existing constructors use an unspecified project config and must not rewrite the project of an already-constructed backend. This avoids reconnecting `Runtime::new(FirestoreEmulator::new(...))` to a different project. The new API passes its explicit config when constructing backends. `with_project` must not reconfigure existing backends. Custom backends own their internal project settings; do not require the generic traits to validate them.
 
-CLI では `FIREBASE_PROJECT_ID` / `GCLOUD_PROJECT` / `FIRESTORE_PROJECT_ID` を一度だけ読む。
-複数が設定され、値が異なる場合は configuration error とする。
-同じ値の重複は許可し、どれもなければ現行の `firelang-test` を使う。
-これは現行のサービス別の優先順位を整理する変更なので、CLI の仕様変更として明記する。
-Storage bucket は明示値を優先し、未設定なら現行 emulator 契約の `{project_id}.appspot.com` を使う。
-この既定値を本番 bucket の命名規則として説明しない。
+Add `AuthEmulatorOptions { api_key: String, operation_timeout: Option<Duration> }` for explicit Auth construction. Defaults are the current emulator API key, `fake-api-key`, and 5,000 ms. `AuthEmulator::new_with_options(host, project_id, options) -> Result<Self, AuthError>` must not read environment variables. Existing `new` / `from_env` preserve their signatures, resolve options from the environment, and delegate to this constructor. The CLI uses explicit construction and does not reread settings afterward. Storage also uses its existing explicit constructor and bucket/token settings; the CLI does not call `from_env`.
 
-Firebase は emulator 間の連携のため同じ project ID を使うことを推奨している。
-ここから、CLI の三サービスに同じ解決済み project を渡す設計を採用する。
-根拠: [Firebase Emulator Suite の設定](https://firebase.google.com/docs/emulator-suite/install_and_configure)。
+The CLI reads `FIREBASE_PROJECT_ID`, `GCLOUD_PROJECT`, and `FIRESTORE_PROJECT_ID` once. If multiple variables are set to different values, return a configuration error. Repeated identical values are allowed; if none is set, keep the current `flare-test` default. This consolidates the current service-specific precedence and must be documented as a CLI behavior change. An explicit Storage bucket takes precedence; otherwise use the current emulator default `{project_id}.appspot.com`. Do not present this as a production bucket naming rule.
 
-credentials / token はサービスのインスタンスが所有する。
-ProjectConfig と module 値に格納せず、global mutable state に保存しない。
-AuthSession / AuthToken の表示時の redaction と、保存できない値の検証を維持する。
-パスワードや token を含むリクエスト・レスポンス本文をエラーメッセージに加えない。
+Firebase recommends using the same project ID across emulators for interoperability. Pass the same resolved project to all three CLI services. See [Configure the Emulator Suite](https://firebase.google.com/docs/emulator-suite/install_and_configure).
 
-今回は Auth の token を Firestore / Storage へ自動転送しない。
-既存の Firestore admin mode と Storage の明示 token を維持する。
-Auth にログインできることと、その identity で security rules が評価されることは、異なる機能として扱う。
-後続タスクでは明示的な user identity mode、リクエスト直前の token の取得、期限切れ、sign-out、project の一致、owner token の扱いを設計する。
-emulator の ID token は署名されておらず、本番 token として扱えない。
-根拠: [Authentication Emulator との接続](https://firebase.google.com/docs/emulator-suite/connect_auth)。
+Credentials and tokens are owned by their service instances. Do not store them in ProjectConfig, module values, or global mutable state. Preserve redaction for AuthSession / AuthToken and validation that prevents these values from being stored. Never include passwords or tokens, or request/response bodies containing them, in error messages.
 
-in-memory backend は language contract の fake として使う。
-security rules の評価器は実装せず、認可の許可・拒否は emulator integration test で検査する。
+This design does not automatically forward Auth tokens to Firestore or Storage. Preserve the current Firestore admin mode and explicit Storage token behavior. Signing in to Auth and evaluating security rules under that identity are separate features. Future work must design an explicit user-identity mode, token acquisition immediately before a request, expiration, sign-out, project matching, and owner-token handling. Emulator ID tokens are unsigned and must not be treated as production tokens. See [Connect to the Authentication Emulator](https://firebase.google.com/docs/emulator-suite/connect_auth).
 
-## 7. 同期実行と timeout の契約
+Use in-memory backends as fakes for language contracts. Do not implement a security-rules evaluator; test authorization allow/deny behavior with emulator integration tests.
 
-Runtime と三サービスの trait は同期のままとする。
-今回 async Runtime や自動的な background worker を追加しない。
+## 7. Synchronous execution and timeout contract
 
-### 7.1 設定とエラー
+Runtime and the three service traits remain synchronous. Do not add an async Runtime or automatic background worker in this change.
 
-`RuntimeLimits.backend_timeout` の現行既定値 5,000 ms を三サービスへ伝える。
-Firestore の既存 hook に合わせ、Auth / Storage に既定実装付きの `set_timeout` / `supports_backend_timeout` を追加する。
-既定 hook は設定を保持しない no-op、supports は `false` とし、既存 custom backend の実装を維持する。
-`Box<T>` / `&mut T` の既存 forwarding impl は新 hook も転送する。
+### 7.1 Settings and errors
 
-`Runtime::backend_timeout_supported()` は現在と同じく Firestore の情報を返す。
-新しく `service_backend_timeout_supported(service: ServiceId) -> bool` を用意し、Auth / Storage も個別に確認できるようにする。
-サービス追加時に引数や戻り値の組み合わせを増やさない。
+Propagate the current `RuntimeLimits.backend_timeout` default of 5,000 ms to all three services. Following Firestore's existing hooks, add defaulted `set_timeout` / `supports_backend_timeout` hooks to Auth and Storage. The default setter is a no-op and support is `false`, preserving existing custom backends. Forward the new hooks through existing `Box<T>` / `&mut T` implementations.
 
-組み込みネットワークバックエンドは、一つの操作に絶対 deadline を設定する。
-read を繰り返すたびに timeout を最初から数え直す方式では、少量ずつ応答するサーバーを制限できない。
-Auth は send と response body の読み取りを一つの timeout で囲む。
-Storage は connect / write / read の各段階で残り時間を設定し、アドレスの再試行も同じ deadline を使う。
-Auth の固定 15 秒と Storage の固定 30 秒は、この設定値に置き換える。
+`Runtime::backend_timeout_supported()` continues to report Firestore support. Add `service_backend_timeout_supported(service: ServiceId) -> bool` to query Auth and Storage too. Do not add service-combination-specific parameters or return types when adding a service.
 
-同期の custom backend と OS の同期 DNS 解決は、Runtime から強制中断できない。
-Storage の現在の TCP transport が同期 DNS 解決を含む間は、完全な操作 timeout の support を `false` と報告する。
-socket I/O に deadline を適用できることと、DNS まで含む全操作を制限できることを混同しない。
-完全な保証が必要な Storage transport の置き換えは、保証を `true` に変更する時点で実装・検査する。
-この設計で三サービスに timeout の設定を統一しても、すべての独自実装を強制中断できるとは約束しない。
+Built-in network backends use one absolute deadline per operation. Restarting the timeout after each read does not constrain a server that sends data slowly in small pieces. Auth applies one timeout to sending and reading the response body. Storage applies the remaining time to connect, write, and read stages; address retries share the same deadline. Replace Auth's fixed 15-second and Storage's fixed 30-second timeouts with this setting.
 
-`max_wall_clock` は評価中のチェック地点で検査する現行の実行予算とする。
-backend timeout と別の設定として扱い、今回「残り wall clock に合わせて外部操作を強制停止する」意味には拡張しない。
-操作が終わった後で wall clock を超えた場合、成功済みの外部書き込みを取り消せるとは説明しない。
+Runtime cannot forcibly interrupt synchronous custom backends or the operating system's synchronous DNS lookup. While Storage's TCP transport uses synchronous DNS, report full-operation timeout support as `false`. Do not confuse deadlines on socket I/O with a deadline covering the entire operation including DNS. Implement and verify a replacement Storage transport before reporting full support as `true`. A shared timeout setting does not guarantee that every custom backend can be interrupted.
 
-ネットワーク timeout は既存と同じ Backend error とし、Auth は既存の `AuthErrorKind::Network` を保持する。
-token、password、HTTP body を表示しない。
-connection setup の timeout は Runtime の生成前にクライアントへ渡し、実行中の予算とは分けて仕様化する。
-`Runtime::set_limits` は次の操作から新しい設定を適用する。
-transaction の rollback は元のエラーを維持し、失敗時の pending rollback 状態を維持する。
+`max_wall_clock` remains the existing execution budget checked at evaluator checkpoints. Keep it separate from backend timeout; do not extend it to forcibly stop external operations based on remaining wall-clock time. Do not imply that a successful external write can be undone if wall-clock time expires after the operation completes.
 
-### 7.2 Tokio 上での利用
+Network timeouts remain Backend errors, and Auth keeps `AuthErrorKind::Network`. Do not expose tokens, passwords, or HTTP bodies. Pass connection-setup timeouts to clients before Runtime construction and specify them separately from execution budgets. `Runtime::set_limits` applies new settings starting with the next operation. Transaction rollback preserves the original error and pending rollback state after a failed rollback.
 
-Firestore / Auth の emulator client は内部の Tokio Runtime で `block_on` する。
-Tokio の task 内で同期ネットワーク API をそのまま呼ぶ利用方法はサポートしない。
-組み込み client は nested runtime の状態を検査して Backend / Auth Network error を返し、Tokio の panic を利用者に渡さない。
-in-memory の実行まで一律に禁止しない。
+### 7.2 Use from Tokio
 
-async の呼び出し元は blocking task または専用の同期スレッド内でクライアントと Runtime を構築して実行する。
-既存の `Box<dyn Auth>` が Send を要求しないため、Runtime を構築してから `spawn_blocking` に移動できるとは約束しない。
-async 呼び出しを支えるためだけに既存 trait へ Send を追加しない。
+Firestore / Auth emulator clients call `block_on` using an internal Tokio Runtime. Calling their synchronous network APIs directly inside a Tokio task is unsupported. Built-in clients detect a nested runtime and return a Backend / Auth Network error instead of exposing a Tokio panic. Do not prohibit in-memory execution in this case.
 
-## 8. ファイルごとの責務
+Async callers should construct and run the client and Runtime in a blocking task or a dedicated synchronous thread. Since the existing `Box<dyn Auth>` does not require `Send`, do not promise that a Runtime can be moved to `spawn_blocking` after construction. Do not add `Send` to existing traits solely to support async callers.
 
-| ファイル | 責務 |
+## 8. File responsibilities
+
+| File | Responsibility |
 | --- | --- |
-| `src/services.rs`（新規） | Services、ProjectConfig、ServiceId、ServiceAccess、未設定サービスの構成 |
-| `src/runtime.rs` | 公開 Runtime、既存コンストラクタ、実行入口の委譲 |
-| `src/runtime/state.rs`（新規） | 評価をまたいで保持する状態 |
-| `src/runtime/evaluator.rs`（新規） | AST 評価、スコープ、制御フロー、call contract、budget 検査 |
-| `src/runtime/builtins/mod.rs`（新規） | BuiltinSpec、module / global の解決、共通の呼び出し |
-| `src/runtime/builtins/core.rs`（新規） | puts / array / bytes / timestamp などの値操作 |
-| `src/runtime/builtins/firestore.rs`（新規） | Firestore handler、query 呼び出し、batch / transaction |
-| `src/runtime/builtins/auth.rs`（新規） | Auth handler と session の投影 |
-| `src/runtime/builtins/storage.rs`（新規） | Storage handler と Bytes / metadata の変換 |
-| `src/value.rs` | BuiltinModule / Value::Module と表示・比較 |
-| `src/error.rs` | CapabilityError と位置の保持 |
-| `src/auth/*`、`src/storage/*` | availability / timeout hook と既存実装 |
-| `src/lib.rs` | Services API の export と既存関数の委譲 |
-| `src/main.rs` | 設定の一回の解決、サービス選択、Services の構築 |
+| `src/services.rs` (new) | Services, ProjectConfig, ServiceId, ServiceAccess, and unconfigured services |
+| `src/runtime.rs` | Public Runtime, existing constructors, delegation from entry points |
+| `src/runtime/state.rs` (new) | State that persists across evaluations |
+| `src/runtime/evaluator.rs` (new) | AST evaluation, scopes, control flow, call contracts, budget checks |
+| `src/runtime/builtins/mod.rs` (new) | BuiltinSpec, module/global resolution, shared dispatch |
+| `src/runtime/builtins/core.rs` (new) | Value operations such as puts, array, bytes, and timestamp |
+| `src/runtime/builtins/firestore.rs` (new) | Firestore handlers, query calls, batch / transaction |
+| `src/runtime/builtins/auth.rs` (new) | Auth handlers and session projection |
+| `src/runtime/builtins/storage.rs` (new) | Storage handlers and Bytes / metadata conversion |
+| `src/value.rs` | BuiltinModule / Value::Module, display, and comparison |
+| `src/error.rs` | CapabilityError and source locations |
+| `src/auth/*`, `src/storage/*` | Availability / timeout hooks and existing implementations |
+| `src/lib.rs` | Export Services API and delegate existing functions |
+| `src/main.rs` | Resolve configuration once, select services, construct Services |
 
-Unavailable 型の trait 実装は各サービスの `unavailable.rs` に置き、Services がそれらを組み合わせる。
-backend の CRUD や codec を今回の Runtime 再編のために移動しない。
-Cargo feature の分割も今回行わない。
-StorageEmulator が feature なしでも公開されている現行実装と、正式仕様の feature の説明の食い違いは、現行挙動に合わせてドキュメントを訂正する。
-サービス別 feature の導入は別タスクとする。
+Put each Unavailable trait implementation in that service's `unavailable.rs`, then compose them in Services. Do not move backend CRUD or codecs as part of this Runtime refactor. Do not split Cargo features here. Correct the documentation to match current behavior where StorageEmulator is available without a feature but the specification says otherwise. Service-specific features are a separate task.
 
-## 9. 実装単位と依存関係
+## 9. Implementation units and dependencies
 
-作業単位は独立してレビューできる変更の大きさにする。
-各単位で実際の挙動を変える場合は `docs/spec.md` を同時に更新する。
-以下の検査項目とコマンドは将来の実装時に実行するものであり、この設計作業ではテストを実行していない。
+Each work unit should be independently reviewable. Update `docs/spec.md` in the same change whenever a unit changes behavior. The checks below are for future implementation; no tests were run as part of writing this design.
 
-### Task 1: Services の導入と既存入口の集約
+### Task 1: Add Services and consolidate existing entry points
 
-対象: `src/services.rs`、`src/runtime.rs`、`src/lib.rs`、`tests/services.rs`（新規）。
+**Scope:** `src/services.rs`, `src/runtime.rs`, `src/lib.rs`, and new `tests/services.rs`.
 
-- Services と ProjectConfig を導入し、Runtime の三つのバックエンドフィールドを Services にまとめる。
-- `in_memory` / `with_firestore` / `with_auth` / `with_storage` / `with_project` を実装する。
-- `from_services*` / `run_script_with_services*` を追加する。
-- 既存コンストラクタと `run_script_with_*` は Services 構築に委譲する。シグネチャと in-memory 補完の挙動を保つ。
-- 三サービスを recording fake に別々に差し替え、同じスクリプトの呼び出しが指定した各バックエンドへ届くことを検査する。
-- `Runtime<InMemoryFirestore>` の型注釈と借用 Storage の呼び出しを compile できることを検査する。
+- Add Services and ProjectConfig; group Runtime's three backend fields in Services.
+- Implement `in_memory`, `with_firestore`, `with_auth`, `with_storage`, and `with_project`.
+- Add `from_services*` and `run_script_with_services*`.
+- Delegate existing constructors and `run_script_with_*` functions through Services while preserving signatures and in-memory defaults.
+- Use separate recording fakes to verify that calls in the same script reach the selected backend.
+- Verify `Runtime<InMemoryFirestore>` annotations and borrowed Storage calls still compile.
 
-完了条件: 言語 API を変えず、新入口で三サービスを組み合わせられる。
-検査: `cargo test --locked --test services --test auth --test storage --test in_memory`。
+**Done when:** The language API is unchanged and the new entry point can combine all three services.
 
-### Task 2: 内部実行器から generic parameter を除去
+**Checks:** `cargo test --locked --test services --test auth --test storage --test in_memory`.
 
-依存: Task 1。
-対象: `src/runtime.rs`、`src/runtime/state.rs`、`src/runtime/evaluator.rs`、`src/runtime/builtins/*`、既存 Runtime の単体テスト。
+### Task 2: Remove generics from the internal evaluator
 
-- RuntimeState と借用 ServiceAccess / Evaluator を導入する。
-- 評価メソッド、ScopeGuard、組み込み関数を移し、generic parameter を除去する。
-- query の shaped / bounded な取得、codec の depth 設定、transaction lifecycle の既存経路をそのまま保持する。
-- `run` を繰り返したときの scopes / Auth session / usage reset を検査する。
-- `return`、引数 binding error、panic unwind からの復帰、失敗した rollback の再試行を既存テストで検査する。
+**Depends on:** Task 1.
 
-完了条件: 組み込み関数と評価メソッドの型に `F` / `S` がなく、既存の budget / transaction 契約を維持する。
-検査: `cargo test --locked`。
+**Scope:** `src/runtime.rs`, new `src/runtime/state.rs`, `src/runtime/evaluator.rs`, `src/runtime/builtins/*`, and existing Runtime unit tests.
 
-### Task 3: 明示的な未設定サービスと capability error
+- Add RuntimeState, borrowed ServiceAccess, and Evaluator.
+- Move evaluation methods, ScopeGuard, and built-ins; remove their generic parameters.
+- Preserve existing shaped/bounded query retrieval, codec depth settings, and transaction lifecycle.
+- Test scopes, Auth sessions, and usage reset across repeated `run` calls.
+- Cover `return`, argument binding errors, recovery after panic unwinding, and retries of failed rollback using existing tests.
 
-依存: Task 2。
-対象: `src/services.rs`、各サービスの trait / `unavailable.rs`、`src/error.rs`、評価器、`tests/services.rs`。
+**Done when:** Built-ins and evaluator methods have no `F` / `S` parameters, and current budget/transaction contracts remain intact.
 
-- `is_available`、Unavailable 型、`Services::empty(project)`、CapabilityError を導入する。既存の `Box<T>` / `&mut T` forwarding impl に availability の転送も追加する。
-- 共通呼び出しに必要なサービスの情報を持たせ、引数評価前に検査する。
-- Auth-only / Storage-only / Firestore-only の Services を検査する。
-- 未設定 Auth の current_user は CapabilityError、設定済み未ログインは Nil となることを検査する。
-- 未設定サービスの呼び出しに副作用のある引数を渡し、副作用が起きないことを検査する。
-- module 導入前のグローバル関数と query get/count にも同じ検査を適用する。
-- CapabilityError の downcast と source span を検査する。
+**Checks:** `cargo test --locked`.
 
-完了条件: 未設定が in-memory で暗黙に補われず、未ログイン・未存在・ネットワーク失敗と区別できる。
-検査: `cargo test --locked --test services --test in_memory`。
+### Task 3: Add explicit unconfigured services and capability errors
 
-### Task 4: 組み込み module 値と共通の呼び出し定義
+**Depends on:** Task 2.
 
-依存: Task 3。
-対象: `src/value.rs`、評価器、`src/runtime/builtins/*`、Firestore の共通値検証、`tests/modules.rs`（新規）。
+**Scope:** `src/services.rs`, service traits and `unavailable.rs` modules, `src/error.rs`, evaluator, and `tests/services.rs`.
 
-- BuiltinModule / Value::Module を導入し、通常の変数探索の後に三つの名前を解決する。
-- BuiltinSpec に handler / CallContract / 所属 / 公開名 / 必要サービスをまとめる。
-- module と既存グローバル関数から同じ handler に到達させる。
-- receiver 付き呼び出しの keyword / block 検査を module に対応させる。
-- 三 module の全メソッドと既存 API の戻り値・副作用・エラー分類を比較する。
-- merge / content_type の位置引数と keyword の重複、未知 keyword、不正 block、未知メソッドを検査する。
-- receiver が一度だけ評価され、引数がソース順に評価されることを検査する。
-- 不正な通常メソッドの keyword / block は、receiver の評価後・引数の評価前に拒否される新しい順序を正式仕様とテストに反映する。
-- alias、関数内の参照、通常変数による shadow、inspect、nested Module の保存拒否を検査する。
-- module 経由でも transaction の return / rollback と Storage の内部呼び出し拒否が同じであることを検査する。
+- Add `is_available`, Unavailable types, `Services::empty(project)`, and CapabilityError. Forward availability through existing `Box<T>` / `&mut T` implementations.
+- Record each call's required service and check availability before evaluating arguments.
+- Test Auth-only, Storage-only, and Firestore-only Services.
+- Verify that unconfigured Auth `current_user` returns CapabilityError while configured Auth without a user returns Nil.
+- Pass side-effecting arguments to unconfigured services and verify no side effect occurs.
+- Apply the same checks to global functions and query `get/count` before adding modules.
+- Verify CapabilityError downcasting and source spans.
 
-完了条件: 新しい構文を追加せず、三 module と既存グローバル関数が同じ契約で動く。
-検査: `cargo test --locked --test modules --test services --test auth --test storage --test in_memory`。
+**Done when:** Unconfigured services are not silently replaced by in-memory backends and can be distinguished from signed-out, missing, and network-error states.
 
-### Task 5: CLI の Services 構築と共通 project 設定
+**Checks:** `cargo test --locked --test services --test in_memory`.
 
-依存: Task 1。統合の最終確認は Task 4 の後に行う。
-対象: `src/main.rs`、バックエンドの明示設定による構築経路、`tests/cli.rs`、`tests/firebase_config.rs`。
+### Task 4: Add built-in module values and shared call definitions
 
-- CLI で project 設定を一度解決し、選択した三バックエンドへ渡す。
-- AuthEmulator の `new_with_options` / AuthEmulatorOptions を追加し、API key を constructor 内で環境から読み直さず、解決済み options として渡す。既存 constructor はその経路に委譲する。
-- 現行のサービス選択を維持し、選択結果から一つの Services を作る。
-- Firestore / Storage の組み合わせごとにスクリプトを実行する match の重複を除去する。
-- 必要な `Firestore for Box<T>` forwarding impl を追加し、query page/count/bounded、transaction、timeout、depth の hook も転送する。
-- project 環境変数の単独指定、同値の重複、衝突、未設定と bucket override を検査する。
-- emulator を明示指定した場合の host 不足と feature 不足、Storage auto の現在の挙動を検査する。
+**Depends on:** Task 3.
 
-完了条件: CLI が新入口を一回だけ呼び、三サービスの project 設定が一致する。
-検査: `cargo test --locked --test cli --test firebase_config`。
+**Scope:** `src/value.rs`, evaluator, `src/runtime/builtins/*`, shared Firestore value validation, and new `tests/modules.rs`.
 
-### Task 6: timeout の設定伝播と同期 client の制約
+- Add BuiltinModule / Value::Module; resolve the three names after ordinary variable lookup.
+- Consolidate handlers, CallContracts, ownership, public names, and required services in BuiltinSpec.
+- Route modules and existing global functions to the same handlers.
+- Support keyword/block validation for receiver calls.
+- Compare return values, side effects, and error categories across all module methods and existing APIs.
+- Test duplicate positional/keyword forms for merge/content_type, unknown keywords, invalid blocks, and unknown methods.
+- Verify receiver evaluation exactly once and arguments in source order.
+- Specify and test the new order for invalid keywords/blocks on regular methods: reject after receiver evaluation but before argument evaluation.
+- Test aliases, use inside functions, shadowing with ordinary variables, inspect, and rejection of nested Modules in stored values.
+- Confirm module calls preserve transaction return/rollback behavior and reject Storage calls inside transactions.
 
-依存: Task 2。
-対象: 各サービスの trait、AuthEmulator、StorageEmulator / transport、Firestore emulator client、`tests/budgets.rs`、バックエンドの単体テスト。
+**Done when:** All three modules and existing globals share the same contract without new syntax.
 
-- Auth / Storage の timeout hook とサービス別の support 確認 API を追加する。
-- Runtime の生成と `set_limits` の両方で三サービスへ設定を伝える。
-- Auth の HTTP 操作全体と Storage の socket 操作の deadline を実装する。
-- 設定を無効にした場合と、Runtime の生成前の接続予算を区別する。
-- fake backend で三サービスへの設定値と `Box<T>` / `&mut T` の転送を検査する。
-- ローカルの遅延サーバーで response body の停滞と少量ずつの応答を検査する。外部ネットワークに依存しない。
-- Storage の同期 DNS 制約がある間は support=false、Auth / Firestore の保証できる経路は support=true と検査する。
-- Tokio task からの Firestore / Auth 操作が panic せず説明付きのエラーになることと、in-memory は動くことを検査する。
-- timeout 後も token が表示されず、transaction の cleanup と Runtime の再利用が維持されることを検査する。
+**Checks:** `cargo test --locked --test modules --test services --test auth --test storage --test in_memory`.
 
-完了条件: 三サービスへ同じ設定が届き、強制できない範囲を API と文書で確認できる。
-検査: `cargo test --locked --test budgets` と `cargo test --locked --features emulator`。
+### Task 5: Build CLI Services and share project configuration
 
-### Task 7: emulator と in-memory の共通 language contract
+**Depends on:** Task 1; final integration check follows Task 4.
 
-依存: Task 4、5、6。
-対象: `tests/common/*`、`tests/modules.rs`、既存三サービスの emulator test、`tests/services.rs`。
+**Scope:** `src/main.rs`, explicit backend construction paths, `tests/cli.rs`, and `tests/firebase_config.rs`.
 
-- サービスごとの共通 script / assertion を用意し、in-memory と emulator に適用する。
-- token の文字列や emulator の uid の具体値は一致条件に含めず、戻り値の shape と表示・操作契約を比較する。
-- 三サービスを使う一つの script を両構成で実行する。
-- emulator と in-memory を混ぜた構成でも、指定したバックエンドへ到達することを検査する。
-- emulator test は対象サービスの起動設定がある場合に実行し、実行したサービスを skip で成功扱いにしない。
-- 既存の deny rules の検査を維持する。Auth token と rules の統合をこの共通 contract の成立条件に加えない。
+- Resolve project settings once in the CLI and pass them to the selected backends.
+- Add `AuthEmulator::new_with_options` / AuthEmulatorOptions. Pass the resolved API key instead of rereading the environment in the constructor; delegate existing constructors to this path.
+- Preserve current service selection and build one Services value from it.
+- Remove duplicated matches that execute scripts for Firestore/Storage combinations.
+- Add required `Firestore for Box<T>` forwarding, including query page/count/bounded, transaction, timeout, and depth hooks.
+- Test individually set project variables, identical duplicates, conflicts, unset defaults, and bucket overrides.
+- Test missing host/feature when an emulator is explicitly selected and preserve current Storage auto behavior.
 
-完了条件: 三サービスの language contract が各実装で一致し、emulator のない環境で新 API / module API を検査できる。
-検査: `cargo test --locked` と、ローカルの三 emulator を起動した `cargo test --locked --features emulator`。
+**Done when:** The CLI calls the new entry point once and all three services receive consistent project settings.
 
-### Task 8: 正式仕様とサンプルの統合
+**Checks:** `cargo test --locked --test cli --test firebase_config`.
 
-依存: Task 7。各 Task の挙動変更はそれぞれの時点で正式仕様に反映する。
-対象: `docs/spec.md`、`README.md`、`docs/firebase-security.md`、`examples/scripts/*`、`tests/example_scripts.rs`。
+### Task 6: Propagate timeouts and specify synchronous-client limits
 
-- module API、Services API、未設定サービス、timeout support、同期実行の制約を正式仕様にまとめる。
-- 三サービスを組み合わせる module API のサンプルを追加する。
-- 既存 API の互換性を確認するサンプルを残す。
-- Auth が rules の identity に自動接続されないことと、Auth が Firestore transaction の rollback 対象でないことを明記する。
-- security 文書に残っている「Auth emulator を起動しない」「Storage が Runtime API に含まれない」という古い記述を訂正する。
-- StorageEmulator の現行 feature の公開条件を実装に合わせて訂正する。
-- ライブラリ利用例をコンパイルでき、掲載 script が example test で実行できることを検査する。
+**Depends on:** Task 2.
 
-完了条件: 言語仕様、Rust API、CLI、サンプルが実際の契約と一致する。
-検査: `cargo test --locked --doc` と `cargo test --locked --test example_scripts`。
+**Scope:** Service traits, AuthEmulator, StorageEmulator / transport, Firestore emulator client, `tests/budgets.rs`, and backend unit tests.
 
-推奨実装順序は Task 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 とする。
-Task 5 と 6 はそれぞれの依存 Task が終われば先に着手できるが、全体の契約の統合は Task 7 で行う。
+- Add timeout hooks and per-service support queries for Auth / Storage.
+- Propagate settings to all three services both during Runtime construction and `set_limits`.
+- Implement deadlines across the full Auth HTTP operation and Storage socket operations.
+- Distinguish disabled settings from connection timeouts that occur before Runtime construction.
+- Use fake backends to verify settings and forwarding through `Box<T>` / `&mut T`.
+- Use a local delayed server to test stalled response bodies and slow, incremental responses; do not depend on external networks.
+- While synchronous DNS remains in Storage, verify support is false; verify true only for Auth / Firestore paths with full guarantees.
+- Verify Firestore / Auth calls from Tokio tasks return explanatory errors without panicking, and in-memory execution still works.
+- Verify tokens remain hidden after timeout and transaction cleanup / Runtime reuse still work.
 
-## 10. 受け入れ条件の対応
+**Done when:** All services receive the same setting and APIs/docs expose what can and cannot be interrupted.
 
-| Issue / 設計の条件 | 実装単位 | 確認する事実 |
+**Checks:** `cargo test --locked --test budgets` and `cargo test --locked --features emulator`.
+
+### Task 7: Share language contracts across emulator and in-memory backends
+
+**Depends on:** Tasks 4, 5, and 6.
+
+**Scope:** `tests/common/*`, `tests/modules.rs`, existing emulator tests for all three services, and `tests/services.rs`.
+
+- Create shared scripts/assertions for each service and run them against in-memory and emulator backends.
+- Compare return shapes, display, and operation contracts without requiring token strings or exact emulator UIDs to match.
+- Run one script that uses all three services under both configurations.
+- Verify mixed emulator/in-memory setups reach the selected backend.
+- Run emulator tests when the relevant service is configured; do not report a configured service as successful by skipping it.
+- Preserve deny-rules coverage. Auth-token integration with security rules is not a prerequisite for this shared contract.
+
+**Done when:** All three service contracts match across implementations, and the new API/module API can be tested without emulators.
+
+**Checks:** `cargo test --locked`, plus `cargo test --locked --features emulator` with all three local emulators running.
+
+### Task 8: Integrate the authoritative specification and examples
+
+**Depends on:** Task 7. Update the specification alongside each behavior change in the earlier tasks.
+
+**Scope:** `docs/spec.md`, `README.md`, `docs/firebase-security.md`, `examples/scripts/*`, and `tests/example_scripts.rs`.
+
+- Document module and Services APIs, unconfigured services, timeout support, and synchronous execution constraints.
+- Add an example that uses the module API with all three services.
+- Keep an example that checks compatibility with existing APIs.
+- State that Auth does not automatically become the identity used by security rules and is not covered by Firestore transaction rollback.
+- Correct stale security-document statements that the Auth emulator does not start or Storage is absent from the Runtime API.
+- Correct StorageEmulator feature availability to match the implementation.
+- Verify library examples compile and scripts run in the example test.
+
+**Done when:** The language spec, Rust API, CLI, and examples match the actual contract.
+
+**Checks:** `cargo test --locked --doc` and `cargo test --locked --test example_scripts`.
+
+Recommended order: Task 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8. Tasks 5 and 6 may start once their dependencies are done, but integrate the overall contract in Task 7.
+
+## 10. Acceptance criteria mapping
+
+| Issue / design requirement | Work unit | Evidence |
 | --- | --- | --- |
-| Firestore のみを生成する既存コードが動く | Task 1、2 | 既存シグネチャ、型注釈、実行結果が維持される |
-| Auth と Storage を別々に差し替えられる | Task 1、7 | recording fake と混在構成が選択した backend に到達する |
-| emulator なしで同じ script を実行できる | Task 4、7 | Services::in_memory と module API が通常のテストで動く |
-| サービス追加で組み込み関数の型引数が増えない | Task 2 | Evaluator / handler が非 generic である |
-| 未設定サービスを明示できる | Task 3、4 | CapabilityError の service / span と副作用の抑制が確認できる |
-| サービス別の module API を提供する | Task 4 | 全公開メソッドが既存 API と共通の handler に解決される |
-| token を通常の表示や保存に漏らさない | Task 4、6、7 | AuthSession、Module、timeout error の表示と保存拒否を確認する |
-| timeout と async の制約が明確である | Task 6、8 | 設定伝播、support、nested Tokio の失敗方法が一致する |
+| Existing code that constructs only Firestore continues to work | Tasks 1, 2 | Existing signatures, type annotations, and results are preserved |
+| Auth and Storage can be replaced independently | Tasks 1, 7 | Recording fakes and mixed configurations reach the selected backend |
+| The same script runs without emulators | Tasks 4, 7 | Services::in_memory and module API work in regular tests |
+| Adding a service does not add generic parameters to built-ins | Task 2 | Evaluator / handlers are non-generic |
+| Unconfigured services are explicit | Tasks 3, 4 | CapabilityError service/span and suppressed side effects are verified |
+| Service-specific module APIs are provided | Task 4 | Every public method resolves to a handler shared with the existing API |
+| Tokens do not leak through display or storage | Tasks 4, 6, 7 | AuthSession, Module, timeout errors, and storage rejection are verified |
+| Timeout and async constraints are clear | Tasks 6, 8 | Propagation, support, and nested Tokio failure behavior are consistent |
 
-## 11. 後続タスク
+## 11. Follow-up work
 
-以下は Services / 組み込み module の導入後に独立して設計する。
+Design these independently after Services and built-in modules are introduced:
 
-- Auth identity と Firestore / Storage security rules の接続。
-- ユーザー定義 module と名前空間内の関数・定数の探索。
-- Firestore / Auth / Storage ごとの Cargo feature 分割。
-- 同期 DNS 解決も含めて操作全体の deadline を強制できる Storage transport。
-- 本番 Firebase、token refresh、OAuth / anonymous sign-in。
-- async Runtime。必要な Send / Sync、所有権、キャンセルの意味を別途定義する。
+- Connect Auth identity to Firestore / Storage security rules.
+- User-defined modules and lookup of functions/constants in namespaces.
+- Separate Cargo features for Firestore, Auth, and Storage.
+- A Storage transport that can enforce an operation deadline including synchronous DNS resolution.
+- Production Firebase, token refresh, OAuth, and anonymous sign-in.
+- An async Runtime, with separate definitions for required Send / Sync bounds, ownership, and cancellation behavior.
 
-サービスを一つ追加するときは、trait / backend、Services の所有フィールドと ServiceAccess の借用フィールド、必要なら module の操作定義を追加する。
-公開 Runtime の型引数、既存の組み込み handler のシグネチャ、組み合わせ別の実行入口は増やさない。
+When adding a service, add its trait/backend, its owned field in Services and borrowed field in ServiceAccess, and module operations if needed. Do not add public Runtime type parameters, change existing built-in handler signatures, or add entry points for each service combination.

@@ -17,7 +17,7 @@ mod unix {
                 .expect("system clock should be after the Unix epoch")
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "firelang-release-test-{}-{unique}",
+                "flare-release-test-{}-{unique}",
                 std::process::id()
             ));
             fs::create_dir_all(&path).expect("create test directory");
@@ -139,7 +139,7 @@ mod unix {
         assert_success(&output);
 
         let version = env!("CARGO_PKG_VERSION");
-        let package_name = format!("firelang-{version}-linux-x86_64");
+        let package_name = format!("flare-{version}-linux-x86_64");
         let archive = output_dir.join(format!("{package_name}.tar.gz"));
         let archive_checksum = output_dir.join(format!("{package_name}.tar.gz.sha256"));
         assert!(archive.is_file(), "release archive was not created");

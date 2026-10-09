@@ -1,15 +1,15 @@
 //! Runtime budget tests (issue #82).
 //!
-//! Every hostile script here must produce a controlled `FirelangError` with a
+//! Every hostile script here must produce a controlled `FlareError` with a
 //! `Runtime` kind and a source position -- never a panic, a stack overflow, or
 //! a hang.
 
 use std::time::Duration;
 
-use firelang::firestore::{Firestore, QueryCandidates, WriteOp};
-use firelang::runtime::Runtime;
-use firelang::value::QueryRef;
-use firelang::{ErrorKind, FirelangError, InMemoryFirestore, RuntimeLimits, Value};
+use flare::firestore::{Firestore, QueryCandidates, WriteOp};
+use flare::runtime::Runtime;
+use flare::value::QueryRef;
+use flare::{ErrorKind, FlareError, InMemoryFirestore, RuntimeLimits, Value};
 
 fn runtime_with(limits: RuntimeLimits) -> Runtime<InMemoryFirestore> {
     Runtime::with_limits(InMemoryFirestore::default(), limits)
@@ -26,8 +26,8 @@ fn assert_budget_error_kind(err: Box<dyn std::error::Error>, kind: ErrorKind, ne
     let text = format!("{err}");
     assert!(text.contains(needle), "expected {needle:?} in {text:?}");
     let ferr = err
-        .downcast_ref::<FirelangError>()
-        .unwrap_or_else(|| panic!("budget failure should be a FirelangError: {text:?}"));
+        .downcast_ref::<FlareError>()
+        .unwrap_or_else(|| panic!("budget failure should be a FlareError: {text:?}"));
     assert_eq!(ferr.kind, kind, "{text:?}");
     assert!(
         ferr.span.is_some(),
@@ -157,14 +157,14 @@ fn deep_parser_nesting_is_a_controlled_error() {
         text.contains("parser nesting limit exceeded") || text.contains("token limit exceeded"),
         "{text:?}"
     );
-    let ferr = err.downcast_ref::<FirelangError>().expect("typed error");
+    let ferr = err.downcast_ref::<FlareError>().expect("typed error");
     assert_eq!(ferr.kind, ErrorKind::Parse, "{text:?}");
 }
 
 #[test]
 fn deep_unary_nesting_does_not_overflow_the_stack() {
     let src = format!("{}1", "!".repeat(5_000));
-    let err = firelang::run_script(&src).unwrap_err();
+    let err = flare::run_script(&src).unwrap_err();
     let text = format!("{err}");
     assert!(text.contains("parser nesting limit exceeded"), "{text:?}");
 }
@@ -177,7 +177,7 @@ fn deep_else_if_chain_does_not_overflow_the_stack() {
         src.push_str("if x == 0 { 0 } else ");
     }
     src.push_str("{ 1 }");
-    let err = firelang::run_script(&src).unwrap_err();
+    let err = flare::run_script(&src).unwrap_err();
     let text = format!("{err}");
     assert!(text.contains("parser nesting limit exceeded"), "{text:?}");
 }
@@ -278,14 +278,14 @@ fn budget_failure_aborts_a_transaction() {
 #[test]
 fn embedding_entry_points_accept_limits() {
     let limits = RuntimeLimits::default().with_max_call_depth(3);
-    let err = firelang::run_script_with_limits("fn f() { f() }\nf()", limits).unwrap_err();
+    let err = flare::run_script_with_limits("fn f() { f() }\nf()", limits).unwrap_err();
     assert!(
         format!("{err}").contains("call depth limit exceeded"),
         "{err}"
     );
 
     let limits = RuntimeLimits::default().with_max_steps(1);
-    let err = firelang::run_script_with_firestore_and_limits(
+    let err = flare::run_script_with_firestore_and_limits(
         "a = 1\nb = 2",
         InMemoryFirestore::default(),
         limits,
@@ -296,7 +296,7 @@ fn embedding_entry_points_accept_limits() {
 
 #[test]
 fn value_depth_limit_is_inclusive_of_the_deepest_existing_level() {
-    use firelang::validate_value_limits;
+    use flare::validate_value_limits;
     let leaf = Value::Int(1);
     let one_deep = Value::Array(vec![leaf.clone()]);
     let two_deep = Value::Array(vec![one_deep.clone()]);
@@ -319,7 +319,7 @@ fn value_depth_limit_is_inclusive_of_the_deepest_existing_level() {
 
 #[test]
 fn value_node_limit_is_enforced_while_enqueuing_children() {
-    use firelang::validate_value_limits;
+    use flare::validate_value_limits;
     // A backend-supplied value far wider than the budget must be rejected
     // without the traversal first enqueueing every child.
     let wide = Value::Array((0..10_000).map(Value::Int).collect());
@@ -351,7 +351,7 @@ fn scalar_results_count_against_the_value_node_limit() {
 
 #[test]
 fn external_asts_are_depth_checked_before_evaluation() {
-    use firelang::ast::{Expr, Stmt, UnOp};
+    use flare::ast::{Expr, Stmt, UnOp};
 
     // An embedder can hand the public API an AST it built itself, so the
     // parser-depth budget has to hold for ASTs that never went through the

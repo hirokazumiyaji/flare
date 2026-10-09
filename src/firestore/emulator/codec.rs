@@ -77,7 +77,7 @@ pub(super) fn encode_field_value_bounded(
 /// Encodes a value used in a structured query filter.
 ///
 /// Firestore's `ReferenceValue` is a fully qualified resource name, while a
-/// `DocRef` in firelang contains only a document-relative path. Query
+/// `DocRef` in flare contains only a document-relative path. Query
 /// construction supplies the project and uses the backend's default database
 /// to turn that path into a reference. Unlike [`encode_field_value`], this
 /// encoder walks arrays and maps recursively so references nested in either
@@ -194,7 +194,7 @@ pub(super) fn decode_field_value_bounded(
             }
             Ok(Value::Map(out))
         }
-        // firelang が持たない型は読めることだけを目標にする。double・
+        // flare が持たない型は読めることだけを目標にする。double・
         // geo_point は表示専用の Opaque にし、bytes は第一級値として
         // 扱い、reference は現在の resource root と完全一致する場合だけ
         // 相対パスの DocRef にする。別 project/database の reference は

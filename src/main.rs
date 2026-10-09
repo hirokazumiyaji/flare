@@ -7,10 +7,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[cfg(feature = "emulator")]
-use firelang::{
+use flare::{
     parse_timeout_ms as parse_library_timeout_ms, AuthEmulator, EmulatorConfig, FirestoreEmulator,
 };
-use firelang::{
+use flare::{
     run_script_with_all_backends_and_limits, Auth, InMemoryAuth, InMemoryFirestore,
     InMemoryStorage, RuntimeLimits, StorageEmulator,
 };
@@ -374,7 +374,7 @@ fn storage_project_id() -> String {
     env::var("FIREBASE_PROJECT_ID")
         .or_else(|_| env::var("GCLOUD_PROJECT"))
         .or_else(|_| env::var("FIRESTORE_PROJECT_ID"))
-        .unwrap_or_else(|_| "firelang-test".to_string())
+        .unwrap_or_else(|_| "flare-test".to_string())
 }
 
 fn select_storage(
@@ -470,7 +470,7 @@ fn print_usage() {
     #[cfg(feature = "emulator")]
     eprintln!(
         "    --emulator-timeout-ms <ms>  per-RPC timeout (default: {}ms)",
-        firelang::DEFAULT_OPERATION_TIMEOUT.as_millis()
+        flare::DEFAULT_OPERATION_TIMEOUT.as_millis()
     );
     #[cfg(feature = "emulator")]
     eprintln!("    --timeout-ms <ms>          alias for --emulator-timeout-ms");
@@ -480,31 +480,31 @@ fn print_usage() {
     eprintln!("  Budgets (all optional; finite defaults protect untrusted input):");
     eprintln!(
         "    --max-call-depth <n>        nested call depth (default {})",
-        firelang::DEFAULT_MAX_CALL_DEPTH
+        flare::DEFAULT_MAX_CALL_DEPTH
     );
     eprintln!(
         "    --max-steps <n>             evaluated statements (default {})",
-        firelang::DEFAULT_MAX_STEPS
+        flare::DEFAULT_MAX_STEPS
     );
     eprintln!(
         "    --max-loop-iterations <n>   while/each/map iterations (default {})",
-        firelang::DEFAULT_MAX_LOOP_ITERATIONS
+        flare::DEFAULT_MAX_LOOP_ITERATIONS
     );
     eprintln!(
         "    --max-wall-clock-ms <n>     wall-clock budget in ms (default {})",
-        firelang::DEFAULT_MAX_WALL_CLOCK_MS
+        flare::DEFAULT_MAX_WALL_CLOCK_MS
     );
     eprintln!(
         "    --max-parser-depth <n>      parser/AST nesting (default {})",
-        firelang::DEFAULT_MAX_PARSER_DEPTH
+        flare::DEFAULT_MAX_PARSER_DEPTH
     );
     eprintln!(
         "    --max-value-depth <n>       runtime Value nesting (default {})",
-        firelang::DEFAULT_MAX_VALUE_DEPTH
+        flare::DEFAULT_MAX_VALUE_DEPTH
     );
     eprintln!(
         "    --max-query-results <n>     query candidates materialized (default {})",
-        firelang::DEFAULT_MAX_QUERY_RESULTS
+        flare::DEFAULT_MAX_QUERY_RESULTS
     );
     eprintln!("    --unlimited                 disable every budget (trusted scripts only;");
     eprintln!("                                recursion can then overflow the native stack)");
@@ -528,9 +528,9 @@ fn print_usage() {
 /// Each backend keeps its documented precedence so existing Firestore setups
 /// are unaffected:
 /// - Firestore (`prefer_firebase = false`): `FIRESTORE_PROJECT_ID`,
-///   then `FIREBASE_PROJECT_ID`, then `firelang-test`.
+///   then `FIREBASE_PROJECT_ID`, then `flare-test`.
 /// - Auth (`prefer_firebase = true`): `FIREBASE_PROJECT_ID`,
-///   then `FIRESTORE_PROJECT_ID`, then `firelang-test`.
+///   then `FIRESTORE_PROJECT_ID`, then `flare-test`.
 ///
 /// Reading both names lets one Firebase CLI project (`--project X`) drive the
 /// Firestore and Auth emulators together without exporting a second variable.
@@ -550,7 +550,7 @@ fn resolve_project_id(prefer_firebase: bool, lookup: impl Fn(&str) -> Option<Str
     };
     lookup(first)
         .or_else(|| lookup(second))
-        .unwrap_or_else(|| "firelang-test".to_string())
+        .unwrap_or_else(|| "flare-test".to_string())
 }
 
 fn read_stdin() -> Result<String, Box<dyn Error>> {
@@ -601,7 +601,7 @@ mod tests {
     #[test]
     fn default_project_id_is_used_when_unset() {
         let empty = lookup(&[]);
-        assert_eq!(resolve_project_id(false, &empty), "firelang-test");
-        assert_eq!(resolve_project_id(true, &empty), "firelang-test");
+        assert_eq!(resolve_project_id(false, &empty), "flare-test");
+        assert_eq!(resolve_project_id(true, &empty), "flare-test");
     }
 }

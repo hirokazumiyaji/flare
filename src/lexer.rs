@@ -1,6 +1,6 @@
 use std::error::Error;
 
-use crate::error::{FirelangError, Span};
+use crate::error::{FlareError, Span};
 use crate::limits::ParserLimits;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,7 +73,7 @@ impl<'a> Lexer<'a> {
     fn new(input: &'a str, limits: ParserLimits) -> Result<Self, Box<dyn Error>> {
         if let Some(max) = limits.max_source_bytes {
             if input.len() > max {
-                return Err(FirelangError::lex(
+                return Err(FlareError::lex(
                     format!("source exceeds maximum size of {max} bytes"),
                     1,
                     1,
@@ -134,7 +134,7 @@ impl<'a> Lexer<'a> {
             if let Some(max) = self.limits.max_tokens {
                 if self.tokens_emitted > max {
                     let span = token.span;
-                    return Err(FirelangError::lex(
+                    return Err(FlareError::lex(
                         format!("token limit exceeded (max {max})"),
                         span.line,
                         span.col,
@@ -193,7 +193,7 @@ impl<'a> Lexer<'a> {
                     match s.parse::<i64>() {
                         Ok(v) => return Ok(Some(self.spanned(Token::Int(v), span))),
                         Err(_) => {
-                            return Err(FirelangError::lex(
+                            return Err(FlareError::lex(
                                 format!("integer literal out of range: {s}"),
                                 span.line,
                                 span.col,
@@ -217,7 +217,7 @@ impl<'a> Lexer<'a> {
                     match single_char_token(c) {
                         Some(t) => return Ok(Some(self.spanned(t, span))),
                         None => {
-                            return Err(FirelangError::lex(
+                            return Err(FlareError::lex(
                                 format!("unexpected char: {c}"),
                                 span.line,
                                 span.col,
@@ -244,7 +244,7 @@ impl<'a> Lexer<'a> {
                         return Ok(Some(self.spanned(Token::AndAnd, span)));
                     }
                     return Err(
-                        FirelangError::lex("unexpected char: &", span.line, span.col).into(),
+                        FlareError::lex("unexpected char: &", span.line, span.col).into(),
                     );
                 }
                 '|' => {
@@ -292,7 +292,7 @@ impl<'a> Lexer<'a> {
                 }
                 _ => {
                     let span = self.span();
-                    return Err(FirelangError::lex(
+                    return Err(FlareError::lex(
                         format!("unexpected char: {c}"),
                         span.line,
                         span.col,
@@ -309,13 +309,13 @@ impl<'a> Lexer<'a> {
         let mut lit = String::new();
         loop {
             let ch = self.bump().ok_or_else(|| {
-                FirelangError::lex("unterminated string literal", self.line, self.col)
+                FlareError::lex("unterminated string literal", self.line, self.col)
             })?;
             match ch {
                 '"' => break,
                 '\\' => {
                     let esc = self.bump().ok_or_else(|| {
-                        FirelangError::lex("unterminated string literal", self.line, self.col)
+                        FlareError::lex("unterminated string literal", self.line, self.col)
                     })?;
                     lit.push(match esc {
                         'n' => '\n',
@@ -349,7 +349,7 @@ impl<'a> Lexer<'a> {
     fn lex_interp_tokens(&mut self) -> Result<Vec<SpannedToken>, Box<dyn Error>> {
         if let Some(max) = self.limits.max_interpolation_depth {
             if self.interpolation_depth >= max {
-                return Err(FirelangError::lex(
+                return Err(FlareError::lex(
                     format!("interpolation nesting limit exceeded (max {max})"),
                     self.line,
                     self.col,
@@ -368,7 +368,7 @@ impl<'a> Lexer<'a> {
         let mut depth = 0usize;
         loop {
             let Some(st) = self.next_token()? else {
-                return Err(FirelangError::lex(
+                return Err(FlareError::lex(
                     "unterminated string interpolation",
                     self.line,
                     self.col,

@@ -16,7 +16,7 @@ pub use runtime::Runtime;
 #[cfg(feature = "emulator")]
 pub use auth::AuthEmulator;
 pub use auth::{Auth, AuthError, AuthErrorKind, AuthSession, AuthToken, AuthUser, InMemoryAuth};
-pub use error::{ErrorKind, FirelangError, Span};
+pub use error::{ErrorKind, FlareError, Span};
 #[cfg(feature = "emulator")]
 pub use firestore::{
     parse_timeout_ms, EmulatorAuth, EmulatorConfig, EmulatorConnectionError, FirestoreEmulator,

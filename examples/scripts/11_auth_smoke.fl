@@ -1,10 +1,10 @@
 # Auth Emulator vertical slice: sign-up -> current user -> sign-out.
 # Run with the local Auth emulator:
-#   FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 FIREBASE_PROJECT_ID=demo-firelang \
+#   FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099 FIREBASE_PROJECT_ID=demo-flare \
 #     fl --auth-backend emulator examples/scripts/11_auth_smoke.fl
 #
 # Without an emulator this still runs against the in-memory Auth backend.
-email = "firelang-example@example.com"
+email = "flare-example@example.com"
 password = "password123"
 
 session = auth_sign_up(email, password)

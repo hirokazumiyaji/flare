@@ -194,11 +194,11 @@ jobs:
         # emulator (unscoped collections, or `!=` queries that match other
         # tests' documents) fails here.
         run: |
-          firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang \
+          firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-flare \
             'set -eu
               env | grep -q "^FIRESTORE_EMULATOR_HOST="
               for run in 1 2; do
-                FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --test cli --locked -- --nocapture
+                FIRESTORE_PROJECT_ID=demo-flare cargo test --features emulator --test firestore_emulator --test cli --locked -- --nocapture
               done'
 
       - name: Verify deploy config denies Firestore writes
@@ -208,14 +208,14 @@ jobs:
           # 名前が変わっていないことを先に確認する。
           cargo test --features emulator --test firestore_emulator --locked -- --list \
             | grep -Fqx 'production_config_denies_firestore_writes: test'
-          # テストは FIRELANG_FIRESTORE_RULES が "deny" でなければ黙って
+          # テストは FLARE_FIRESTORE_RULES が "deny" でなければ黙って
           # 成功する。変数名をどちらかの側で変更すると、この検査が
           # assertion を一度も実行しないまま緑になってしまうため、
           # テストと同じシェルで変数が実際に渡っていることを確認する。
-          firebase emulators:exec --config firebase.json --only firestore --project demo-firelang \
-            'FIRESTORE_PROJECT_ID=demo-firelang FIRELANG_FIRESTORE_RULES=deny sh -c '"'"'
-               test "$FIRELANG_FIRESTORE_RULES" = deny || {
-                 echo "FIRELANG_FIRESTORE_RULES did not reach the test process" >&2
+          firebase emulators:exec --config firebase.json --only firestore --project demo-flare \
+            'FIRESTORE_PROJECT_ID=demo-flare FLARE_FIRESTORE_RULES=deny sh -c '"'"'
+               test "$FLARE_FIRESTORE_RULES" = deny || {
+                 echo "FLARE_FIRESTORE_RULES did not reach the test process" >&2
                  exit 1
                }
                cargo test --features emulator --test firestore_emulator --locked production_config_denies_firestore_writes -- --exact --nocapture
@@ -223,11 +223,11 @@ jobs:
 
       - name: Run integration tests with Firestore and Storage emulators
         run: |
-          firebase emulators:exec --config firebase.emulators.json --only firestore,storage --project demo-firelang \
-            'FIRESTORE_PROJECT_ID=demo-firelang FIREBASE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --test storage_emulator --locked -- --nocapture'
+          firebase emulators:exec --config firebase.emulators.json --only firestore,storage --project demo-flare \
+            'FIRESTORE_PROJECT_ID=demo-flare FIREBASE_PROJECT_ID=demo-flare cargo test --features emulator --test firestore_emulator --test storage_emulator --locked -- --nocapture'
 
       - name: Run integration tests with Auth emulator
         run: |
-          firebase emulators:exec --config firebase.emulators.json --only auth --project demo-firelang \
-            'FIREBASE_PROJECT_ID=demo-firelang cargo test --features emulator --test auth_emulator --locked -- --nocapture'
+          firebase emulators:exec --config firebase.emulators.json --only auth --project demo-flare \
+            'FIREBASE_PROJECT_ID=demo-flare cargo test --features emulator --test auth_emulator --locked -- --nocapture'
 

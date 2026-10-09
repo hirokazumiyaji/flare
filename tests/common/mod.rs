@@ -21,7 +21,7 @@ pub(crate) fn unique(prefix: &str) -> String {
 /// test 固有の ancestor document。配下の collection を別の test と共有しない。
 #[allow(dead_code)]
 pub(crate) fn test_namespace(test_name: &str) -> String {
-    format!("_firelang_tests/{test_name}_{}", unique("run"))
+    format!("_flare_tests/{test_name}_{}", unique("run"))
 }
 
 /// test 固有の subcollection。通常の emulator integration test fixture はここへ書く。

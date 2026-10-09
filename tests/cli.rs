@@ -30,7 +30,7 @@ fn fl_emulator_backend_set_get_round_trip() {
         return;
     };
     let project_id =
-        std::env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".to_string());
+        std::env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "flare-test".to_string());
     let path = format!("{}/smoke", test_collection("cli_emulator"));
     let source = format!("set(\"{path}\", {{value: \"ok\"}})\nget(\"{path}\")");
     let out = Command::new(FL_EXE)

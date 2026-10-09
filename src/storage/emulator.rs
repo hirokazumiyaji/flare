@@ -255,7 +255,7 @@ impl StorageEmulator<HttpStorageTransport> {
         let project_id = std::env::var("FIREBASE_PROJECT_ID")
             .or_else(|_| std::env::var("GCLOUD_PROJECT"))
             .or_else(|_| std::env::var("FIRESTORE_PROJECT_ID"))
-            .unwrap_or_else(|_| "firelang-test".to_string());
+            .unwrap_or_else(|_| "flare-test".to_string());
         let mut client = Self::new(host, project_id)?;
         if let Ok(bucket) = std::env::var("FIREBASE_STORAGE_BUCKET") {
             client = client.with_bucket(bucket)?;

@@ -31,7 +31,7 @@ for required in README.md LICENSE docs/spec.md; do
 done
 
 mkdir -p "$output_dir"
-package_name="firelang-${version}-linux-x86_64"
+package_name="flare-${version}-linux-x86_64"
 staging_dir="$output_dir/$package_name"
 archive="$output_dir/${package_name}.tar.gz"
 checksum_file="$archive.sha256"

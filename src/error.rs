@@ -43,13 +43,13 @@ impl fmt::Display for ErrorKind {
     }
 }
 
-/// Typed firelang error with optional source span.
+/// Typed flare error with optional source span.
 ///
 /// Display is `line:col: message` when a span is present, otherwise `message`.
 /// This keeps existing `contains("...")` assertions working while adding
 /// positions for CLI output (`error: <display>`).
 #[derive(Debug, Clone, PartialEq)]
-pub struct FirelangError {
+pub struct FlareError {
     pub kind: ErrorKind,
     pub message: String,
     pub span: Option<Span>,
@@ -60,7 +60,7 @@ pub struct FirelangError {
     pub auth_kind: Option<AuthErrorKind>,
 }
 
-impl FirelangError {
+impl FlareError {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -100,7 +100,7 @@ impl FirelangError {
     }
 }
 
-impl fmt::Display for FirelangError {
+impl fmt::Display for FlareError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.span {
             Some(span) => write!(f, "{span}: {}", self.message),
@@ -109,4 +109,4 @@ impl fmt::Display for FirelangError {
     }
 }
 
-impl Error for FirelangError {}
+impl Error for FlareError {}

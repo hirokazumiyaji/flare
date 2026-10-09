@@ -1,6 +1,6 @@
-# firelang
+# flare
 
-Firestore と Cloud Storage を操作するための **mruby 風スクリプト言語ランタイム**(Rust 実装)です。
+A Rust implementation of an **mruby-inspired scripting language runtime** for working with Firestore and Cloud Storage.
 
 ```ruby
 set("users/1", {name: "alice", age: 20})
@@ -12,145 +12,139 @@ storage_upload("avatars/alice.bin", payload, content_type: "application/octet-st
 content = storage_download("avatars/alice.bin")
 ```
 
-ローカル Firebase Auth Emulator に対する MVP の認証 API も提供します(`auth_sign_up` / `auth_sign_in` / `auth_current_user` / `auth_sign_out`)。
+The runtime also provides an MVP authentication API for the local Firebase Auth Emulator: `auth_sign_up`, `auth_sign_in`, `auth_current_user`, and `auth_sign_out`.
 
-数値は整数のみ、変数は再代入不可、`batch` / `transaction` は原子的に適用 — といった言語・API の正式な契約はすべて **[言語仕様 / API リファレンス](docs/spec.md)** にまとまっています(このリポジトリの唯一の正式仕様です)。
+The complete language and API contract—including integer-only numbers, immutable variables, and atomic `batch` / `transaction` operations—is documented in the **[Language Specification / API Reference](docs/spec.md)**, the repository's sole authoritative specification.
 
-## ドキュメント
+## Documentation
 
-- [言語仕様 / API リファレンス](docs/spec.md) — 言語・Firestore / Storage API・batch/transaction セマンティクス・Auth API の正式仕様
-- [examples/scripts/](examples/scripts/) — 動くサンプルスクリプト集
-- [Firebase rules の分離とデプロイ防止策](docs/firebase-security.md)
-- [リリースチェックリスト](docs/release-checklist.md)
-- [過去の MVP 計画資料(アーカイブ)](docs/archive/mvp/)
+- [Language Specification / API Reference](docs/spec.md): language, Firestore and Storage APIs, batch/transaction semantics, and Auth API
+- [examples/scripts/](examples/scripts/): runnable example scripts
+- [Firebase rules separation and deployment safeguards](docs/firebase-security.md)
+- [Release checklist](docs/release-checklist.md)
+- [Archived MVP planning documents](docs/archive/mvp/)
 
-## 再現可能なビルド
+## Reproducible builds
 
-Rust は [`rust-toolchain.toml`](rust-toolchain.toml) で **1.98.1** に固定されています。
-依存関係を更新しない限り、Cargo の依存解決を変更するコマンドには `--locked` を付けてください。CI と CD は同じ toolchain と `Cargo.lock` を使い、runner image も `ubuntu-24.04` に固定しています。
+Rust is pinned to **1.98.1** in [`rust-toolchain.toml`](rust-toolchain.toml).
+Unless you are updating dependencies, pass `--locked` to Cargo commands that resolve dependencies. CI and CD use the same toolchain and `Cargo.lock`, and pin the runner image to `ubuntu-24.04`.
 
-Firestore エミュレータの CI は Node **24.11.0**、Temurin Java **21.0.8**、Firebase CLI **15.31.0** を使い、ジョブログに各バージョンを表示します。
-ローカルでも同じ Firebase CLI を使う場合は、明示的にインストールして `firebase --version` で確認してください。
+Firestore emulator CI uses Node **24.11.0**, Temurin Java **21.0.8**, and Firebase CLI **15.31.0**. The job logs each version. To use the same Firebase CLI locally, install it explicitly and check it with `firebase --version`:
 
 ```bash
 npm install --global firebase-tools@15.31.0
-firebase --version  # 15.31.0 と表示されること
+firebase --version  # should print 15.31.0
 ```
 
-GitHub Actions は full commit SHA で固定されています。
-更新は [Dependabot](.github/dependabot.yml) が Rust 依存関係と Action 更新を別々の pull request で提案します。
+GitHub Actions are pinned to full commit SHAs. [Dependabot](.github/dependabot.yml) proposes Rust dependency updates and Action updates in separate pull requests.
 
-## 使い方
+## Usage
 
 ```bash
-# 既定ビルド(in-memory のみ。emulator SDK はリンクされない)
+# Default build: in-memory only; the emulator SDK is not linked
 cargo run --locked --bin fl -- path/to/script.fl
 ```
 
-Firestore エミュレータバックエンドは `emulator` feature を明示して有効にします(`FIRESTORE_EMULATOR_HOST` が必須。プロジェクト ID は省略時 `firelang-test`)。in-memory では `server_timestamp()` の request time を commit ごとに高々 1 回だけ取得するため、Rust から `InMemoryFirestore::with_clock(...)` で決定論的な clock を注入できます:
+Enable the Firestore emulator backend explicitly with the `emulator` feature. `FIRESTORE_EMULATOR_HOST` is required; the default project ID is `flare-test`. The in-memory backend obtains the request time for `server_timestamp()` at most once per commit. Rust callers can inject a deterministic clock with `InMemoryFirestore::with_clock(...)`:
 
 ```bash
 export FIRESTORE_EMULATOR_HOST=127.0.0.1:8080
-export FIRESTORE_PROJECT_ID=firelang-test
+export FIRESTORE_PROJECT_ID=flare-test
 cargo run --locked --features emulator --bin fl -- --backend emulator path/to/script.fl
 ```
 
-エミュレータは Firebase CLI で起動します。
-Local emulator には allow-all rules を持つ `firebase.emulators.json` を明示し、project ID には `demo-firelang` を指定します。
+Start the emulator with the Firebase CLI. Use the explicitly local-only `firebase.emulators.json` config, which allows all rules, and the `demo-flare` project ID:
 
 ```bash
-firebase emulators:start --config firebase.emulators.json --only firestore --project demo-firelang
+firebase emulators:start --config firebase.emulators.json --only firestore --project demo-flare
 ```
 
-同じ emulator に対して library / CLI の integration test を 2 回実行する例(2 回目の pass では 1 回目に書いた fixture がそのまま残るため、test 間の干渉を検出できる):
+To run the library and CLI integration tests twice against the same emulator, use the following. Fixtures from the first pass remain in place during the second pass, which helps detect interference between tests:
 
 ```bash
-firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang \
+firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-flare \
   'set -eu
     env | grep -q "^FIRESTORE_EMULATOR_HOST="
     for run in 1 2; do
-      FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --test cli --locked -- --nocapture
+      FIRESTORE_PROJECT_ID=demo-flare cargo test --features emulator --test firestore_emulator --test cli --locked -- --nocapture
     done'
 ```
 
-`firebase.json` は deploy 用であり、Firestore と Storage の read/write を拒否します。
-`firebase deploy --config firebase.emulators.json` は実行しないでください。
-詳細は [Firebase rules の分離とデプロイ防止策](docs/firebase-security.md) を参照してください。
+`firebase.json` is for deployment and denies Firestore and Storage reads and writes. Do not run `firebase deploy --config firebase.emulators.json`. See [Firebase rules separation and deployment safeguards](docs/firebase-security.md) for details.
 
-`fl --backend emulator` は feature なしで実行すると、SDK を読み込まずに
-`emulator` feature の有効化方法を案内して終了します。in-memory 専用の
-consumer は `cargo build --no-default-features` でも同じ in-memory API を利用できます。
+When run without the feature, `fl --backend emulator` exits without loading the SDK and explains how to enable the `emulator` feature. Consumers that only need in-memory support can use the same API with `cargo build --no-default-features`.
 
-エミュレータは Firebase CLI で起動します(別ターミナルで `firebase emulators:start --only firestore` など)。リポジトリ直下の `firebase.json` を使ってワンショットで試す例:
+You can also start the emulator in another terminal (for example, with `firebase emulators:start --only firestore`) and run a one-shot test using the repository's `firebase.json`:
 
 ```bash
-firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang \
-  'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --locked -- --nocapture'
+firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-flare \
+  'FIRESTORE_PROJECT_ID=demo-flare cargo test --features emulator --test firestore_emulator --locked -- --nocapture'
 ```
 
-本番 Firestore および本番 Cloud Storage(認証付き)は非対応です。詳細は [仕様のバックエンド](docs/spec.md#12-バックエンド) と [Cloud Storage API](docs/spec.md#16-cloud-storage-api) を参照してください。
+Production Firestore and authenticated production Cloud Storage are not supported. See [Backends](docs/spec.md#12-backends) and [Cloud Storage API](docs/spec.md#16-cloud-storage-api) in the specification.
 
 ## Cloud Storage
 
-Storage の MVP CRUD は `storage_upload` / `storage_download` / `storage_metadata` / `storage_delete` のグローバル関数です。`bytes([0, 255])` は UTF-8 文字列ではなくバイト列で、ダウンロード時も text 化されません。Storage object path は Firestore の document path と異なり、セグメント数の偶奇を要求しません。
+The MVP Storage CRUD API consists of the global functions `storage_upload`, `storage_download`, `storage_metadata`, and `storage_delete`. `bytes([0, 255])` is a byte sequence, not a UTF-8 string, and downloads are not converted to text. Unlike Firestore document paths, Storage object paths do not require an even or odd number of segments.
 
-`firebase.json` にはローカル用の `storage.rules` と port 9199 の emulator を設定しています。Storage だけを検証する quickstart:
+`firebase.json` configures local `storage.rules` and the emulator on port 9199. To test Storage by itself:
 
 ```bash
-export FIREBASE_PROJECT_ID=demo-firelang
-firebase emulators:exec --config firebase.emulators.json --only storage --project demo-firelang \
+export FIREBASE_PROJECT_ID=demo-flare
+firebase emulators:exec --config firebase.emulators.json --only storage --project demo-flare \
   'cargo test --features emulator --test storage_emulator --locked -- --nocapture'
 ```
 
-Firestore と Storage を同時に使う場合は `--only firestore,storage` を指定します。`fl` は `--storage-backend emulator` で `FIREBASE_STORAGE_EMULATOR_HOST` を明示的に要求でき、未指定の `auto` では host があれば Storage emulator、なければ in-memory を使います。`FIREBASE_PROJECT_ID`（未設定時は `GCLOUD_PROJECT` / `FIRESTORE_PROJECT_ID` / `firelang-test`）からバケットを導出します。必要なら `FIREBASE_STORAGE_BUCKET` と、local rules テスト用の明示的な `FIREBASE_STORAGE_AUTH_TOKEN` も設定できます。本番 token の自動取得は MVP の対象外です。
-Auth エミュレータに接続する場合(`FIREBASE_AUTH_EMULATOR_HOST` が必須):
+To use Firestore and Storage together, pass `--only firestore,storage`. `fl --storage-backend emulator` requires `FIREBASE_STORAGE_EMULATOR_HOST`. With the default `auto` setting, `fl` uses the Storage emulator when a host is set and otherwise uses in-memory storage. The bucket name is derived from `FIREBASE_PROJECT_ID`, or from `GCLOUD_PROJECT`, `FIRESTORE_PROJECT_ID`, and finally `flare-test`. You can override it with `FIREBASE_STORAGE_BUCKET`. For local rules tests, you may also set `FIREBASE_STORAGE_AUTH_TOKEN` explicitly. Automatic production token acquisition is outside the MVP scope.
+
+To connect to the Auth emulator, set `FIREBASE_AUTH_EMULATOR_HOST`:
 
 ```bash
 export FIREBASE_AUTH_EMULATOR_HOST=127.0.0.1:9099
-export FIREBASE_PROJECT_ID=firelang-test
+export FIREBASE_PROJECT_ID=flare-test
 cargo run --locked --features emulator --bin fl -- --auth-backend emulator path/to/script.fl
 ```
 
-`--backend` と `--auth-backend` は独立で、両方を `emulator` にすると両方のエミュレータへ同時に接続します。**トークンは `inspect` / `puts` / `fl` の出力には現れません**(`AuthSession(user={...}, id_token=<redacted>, refresh_token=<redacted>, expires_at=...)`)。
+`--backend` and `--auth-backend` are independent. Setting both to `emulator` connects to both emulators. **Tokens are never shown in `inspect`, `puts`, or `fl` output** (`AuthSession(user={...}, id_token=<redacted>, refresh_token=<redacted>, expires_at=...)`).
 
-エミュレータは Firebase CLI で起動します(別ターミナルで `firebase emulators:start` など)。リポジトリ直下の `firebase.json` を使ってワンショットで試す例:
+Start the emulator with the Firebase CLI in another terminal (for example, with `firebase emulators:start`). To run the tests once using the repository's `firebase.json`:
 
 ```bash
-firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang \
-  'FIRESTORE_PROJECT_ID=demo-firelang cargo test --features emulator --test firestore_emulator --locked -- --nocapture'
+firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-flare \
+  'FIRESTORE_PROJECT_ID=demo-flare cargo test --features emulator --test firestore_emulator --locked -- --nocapture'
 
-firebase emulators:exec --config firebase.emulators.json --only auth --project demo-firelang \
-  'FIREBASE_PROJECT_ID=demo-firelang cargo test --features emulator --test auth_emulator --locked -- --nocapture'
+firebase emulators:exec --config firebase.emulators.json --only auth --project demo-flare \
+  'FIREBASE_PROJECT_ID=demo-flare cargo test --features emulator --test auth_emulator --locked -- --nocapture'
 ```
 
-本番 Firestore / 本番 Firebase Authentication への接続は非対応です。詳細は [仕様のバックエンド](docs/spec.md#12-バックエンド) を参照してください。
+Connections to production Firestore and production Firebase Authentication are not supported. See [Backends](docs/spec.md#12-backends) in the specification.
 
-## 信頼境界と実行予算
+## Trust boundaries and execution budgets
 
-`fl` は任意のファイルをスクリプトとして受け取ります。無限再帰・無限ループ・巨大なネスト・巨大なクエリ結果がスタック枯渇や無期限の停止につながらないよう、**ランタイムは既定で有限の実行予算**を持ち、超過すると `error: <line>:<col>: ...` の通常のエラーで終了します(panic / OS kill にはなりません)。
+`fl` accepts arbitrary files as scripts. To prevent infinite recursion, infinite loops, deep nesting, and huge query results from exhausting the stack or running indefinitely, the runtime has **finite execution budgets by default**. Exceeding a budget returns a regular error such as `error: <line>:<col>: ...`; it does not panic or get killed by the OS.
 
-既定値は「ライブラリ埋め込み」と `fl` CLI の両方に適用されます。
+The defaults apply both to library embedding and the `fl` CLI.
 
-| 予算 | 既定値 | 対象 |
-|------|--------|------|
-| 呼び出し深度 | 32 | ネストした呼び出し(ユーザー関数・組み込み) |
-| ステップ数 | 1,000,000 | 評価した文の数 |
-| ループ反復数 | 100,000 | `while` / `each` / `map` の反復回数(実行全体で共有) |
-| 壁時計時間 | 5,000 ms | 字句解析・構文解析・評価の経過時間 |
-| パーサ深度 | 128 | 括弧・リテラル・`else if` チェーン等のネスト |
-| 補間深度 | 32 | ネストした `"#{...}"` |
-| 値ネスト深度 | 64 | 実行時 `Value` のネスト(ルートは深さ 0、上限は含意) |
-| 値ノード数 | 100,000 | 実行時 `Value` の総ノード数(ルートも 1 ノード) |
-| クエリ結果数 | 10,000 | 1 回のクエリで走査する一致候補件数(`limit` / `offset` はその後で適用) |
-| ソース長 | 1 MiB | UTF-8 バイト数 |
-| トークン数 | 100,000 | 補間内を含む字句数 |
-| バックエンド timeout | 5,000 ms | Firestore 1 回の呼び出し(組み込み emulator が強制) |
+| Budget | Default | Applies to |
+|--------|---------|------------|
+| Call depth | 32 | Nested calls (user functions and built-ins) |
+| Steps | 1,000,000 | Number of evaluated statements |
+| Loop iterations | 100,000 | `while`, `each`, and `map` iterations, shared across the whole run |
+| Wall-clock time | 5,000 ms | Time spent lexing, parsing, and evaluating |
+| Parser depth | 128 | Nesting of parentheses, literals, `else if` chains, and similar constructs |
+| Interpolation depth | 32 | Nested `"#{...}"` expressions |
+| Value nesting depth | 64 | Nesting of runtime `Value`s (root depth is 0; the limit is inclusive) |
+| Value nodes | 100,000 | Total runtime `Value` nodes (the root counts as one node) |
+| Query results | 10,000 | Matching candidates scanned by one query (`limit` / `offset` apply afterward) |
+| Source length | 1 MiB | Number of UTF-8 bytes |
+| Tokens | 100,000 | Number of tokens, including those inside interpolation |
+| Backend timeout | 5,000 ms | One Firestore call (enforced by the built-in emulator backend) |
 
-予算は embedding API から設定できます。
+Set budgets through the embedding API:
 
 ```rust
 use std::time::Duration;
-use firelang::{InMemoryFirestore, Runtime, RuntimeLimits};
+use flare::{InMemoryFirestore, Runtime, RuntimeLimits};
 
 let limits = RuntimeLimits::default()
     .with_max_call_depth(32)
@@ -159,80 +153,76 @@ let limits = RuntimeLimits::default()
 let mut rt = Runtime::with_limits(InMemoryFirestore::default(), limits);
 let out = rt.run("col(\"users\").limit(10).get()")?;
 
-// 消費量はテストから観測できます。
+// Usage metrics can be inspected in tests.
 let usage = rt.usage();
 println!("steps={} loops={} max_depth={}", usage.steps, usage.loop_iterations, usage.max_call_depth);
 ```
 
-`Runtime::new_unlimited` / `RuntimeLimits::unlimited()` は**信頼済みスクリプト向けの明示的なオプトイン**です。ユーザー入力・アップロードファイル・CLI には使わず、既定値のままにしてください。
+`Runtime::new_unlimited` / `RuntimeLimits::unlimited()` are **explicit opt-ins for trusted scripts**. Do not use them for user input, uploaded files, or the CLI; keep the defaults in those cases.
 
-> **スタックに関する注意**: 呼び出し深度の予算は Rust のネイティブスタックを保護します。1 段のユーザー関数呼び出しは debug ビルドで約 50 KiB のスタックを消費するため、2 MiB のスタック(テストスレッドなど)では 40 段でスタックが尽きます。既定値 32 はそこで止まるので、小さいスタックのホストでも安全なままです。もっと深い再帰を許したい場合は `with_max_call_depth` で上げてください(スタックを 2 MiB より確保できるホストに限ってください)。逆に予算を無効化すると、深い再帰でスタックオーバーフロー(プロセスの abort)になる可能性が戻ります。
+> **Stack safety:** The call-depth budget protects Rust's native stack. A single user-function call uses about 50 KiB of stack in a debug build, so a 2 MiB stack (such as a test thread) is exhausted at around 40 levels. The default of 32 stops before that point, making it safe for hosts with small stacks. To allow deeper recursion, raise the limit with `with_max_call_depth` only on hosts with more than 2 MiB of stack. Disabling the budget can make deep recursion overflow the stack and abort the process.
 
-ネットワーク等のバックエンド実装が応答しない場合、汎用の同期 `Firestore` トレイトでは強制中断できないため、組み込み `FirestoreEmulator` のみ timeout を強制します。
+The generic synchronous `Firestore` trait cannot forcibly interrupt an unresponsive backend, such as one waiting on a network. Therefore, only the built-in `FirestoreEmulator` enforces timeouts.
 
-CLI では各予算を個別に上書きできます(`fl --help` に一覧):
+The CLI lets you override each budget individually; see `fl --help` for the full list:
 
 ```bash
 fl --max-call-depth 32 --max-steps 100000 script.fl
 fl --max-query-results 100 -e 'col("users").get()'
 ```
 
-## テスト
+## Tests
 
 ```bash
-cargo test --locked --all-targets            # ユニット + 統合テスト
-cargo test --locked --test budgets           # 実行予算(issue #82)のテスト
-cargo test --locked --test example_scripts   # サンプルスクリプト一括実行
-cargo test --locked --test cli               # CLI スモークテスト
-cargo test --locked --test release           # release tag/package の検証
-cargo test --locked --test auth              # Auth の in-memory contract テスト
-cargo test --locked --test firebase_config   # Firebase deploy guard
+cargo test --locked --all-targets            # unit and integration tests
+cargo test --locked --test budgets           # execution budget tests (issue #82)
+cargo test --locked --test example_scripts   # run all example scripts
+cargo test --locked --test cli               # CLI smoke tests
+cargo test --locked --test release           # release tag/package validation
+cargo test --locked --test auth              # in-memory Auth contract tests
+cargo test --locked --test firebase_config   # Firebase deployment guard
 
-# 既定 feature なし: in-memory のみ
+# Default features: in-memory only
 cargo check --locked --no-default-features --all-targets
 cargo test --locked --no-default-features --all-targets
 
-# emulator SDK を有効にしたビルド
+# Build with the emulator SDK enabled
 cargo check --locked --features emulator --all-targets
 cargo test --locked --features emulator --all-targets
 ```
 
-エミュレータ統合テスト(`firestore_emulator` / `storage_emulator` / `auth_emulator`)は対応する emulator host 変数が未設定なら早期 return でスキップされます。`emulator` feature を有効にして、実際に叩くには上記の `firebase emulators:exec` を使うか、エミュレータ起動後に環境変数を設定して:
+The emulator integration tests (`firestore_emulator`, `storage_emulator`, and `auth_emulator`) return early and skip when their corresponding emulator host variable is not set. To run them, enable the `emulator` feature and use `firebase emulators:exec` as above, or set the environment variables after starting the emulators:
 
 ```bash
 cargo test --locked --features emulator --test firestore_emulator -- --nocapture
-cargo test --locked --features emulator --test storage_emulator -- --nocapture   # FIREBASE_STORAGE_EMULATOR_HOST 未設定なら skip
-cargo test --locked --features emulator --test auth_emulator -- --nocapture      # FIREBASE_AUTH_EMULATOR_HOST 未設定なら skip
+cargo test --locked --features emulator --test storage_emulator -- --nocapture   # skipped if FIREBASE_STORAGE_EMULATOR_HOST is unset
+cargo test --locked --features emulator --test auth_emulator -- --nocapture      # skipped if FIREBASE_AUTH_EMULATOR_HOST is unset
 ```
 
-永続 emulator へ接続中は、同じコマンドの繰り返しや integration test binary を分けて実行しても contention しません。各 test は `_firelang_tests/<test-name>_<unique-run>/docs` の固有 hierarchy へ書き込みます。環境変数が設定済みで接続に失敗した場合は skip せず失敗します。
+When connected to a persistent emulator, rerunning a command or splitting integration test binaries does not cause contention. Each test writes to its own `_flare_tests/<test-name>_<unique-run>/docs` hierarchy. If an environment variable is set but the connection fails, the test fails instead of skipping.
 
-`Firestore` / `InMemoryFirestore` / `run_script` は feature に依存せず利用できます。
-`FirestoreEmulator` と `fl --backend emulator` は `emulator` feature でのみ公開・有効です。
-ライブラリとして emulator backend を使う consumer は、依存宣言に
-`features = ["emulator"]` を指定します。
+`Firestore`, `InMemoryFirestore`, and `run_script` are available without features. `FirestoreEmulator` and `fl --backend emulator` are available only with the `emulator` feature. Consumers that use the emulator backend as a library must specify `features = ["emulator"]` in their dependency declaration.
 
 ## CI / CD (GitHub Actions)
 
-- **`test` ジョブ**: 固定された Rust toolchain と `Cargo.lock` で `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --all-targets --locked`, `cargo build --release --bin fl --locked` を実行し、tool version をログに出力
-- **`feature-builds` ジョブ**: default / `--no-default-features` / `--features emulator` のビルド境界を検証
-- **`integration-emulator` ジョブ**: Firebase CLI 15.31.0 の Firestore / Storage / Auth エミュレータを起動し、tool version をログに出力してから各統合テストを実行する。Firestore の emulator suite だけは同じ emulator 上で 2 回走らせ、test 間の干渉を検出する
-- CI は reusable workflow になっており、`v*` タグを押した CD も同じジョブ群（integration test を含む）を必ず実行します。CD の release ジョブはこの gate と tag version check に依存するため、branch CI を飛ばした tag でも公開できません。
-- **CD**: tag の `v` を除いた部分（例: `v0.1.0` → `0.1.0`）が `cargo metadata --no-deps` の `firelang` package version と一致する場合だけ、`fl` の Linux バイナリを `--features emulator` でビルドして release します。
-- release asset は raw binary ではなく `firelang-<version>-linux-x86_64.tar.gz` と SHA-256 `.sha256` sidecar です。tarball には実行権限付きの `fl`、`README.md`、`LICENSE`、`docs/spec.md`、ファイル単位の `SHA256SUMS` が含まれます。
+- **`test` job:** runs `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --all-targets --locked`, and `cargo build --release --bin fl --locked` with the pinned Rust toolchain and `Cargo.lock`; logs tool versions.
+- **`feature-builds` job:** checks the default, `--no-default-features`, and `--features emulator` build boundaries.
+- **`integration-emulator` job:** starts the Firestore, Storage, and Auth emulators with Firebase CLI 15.31.0, logs tool versions, and runs each integration suite. It runs the Firestore emulator suite twice against the same emulator to detect test interference.
+- CI uses a reusable workflow. CD for a `v*` tag runs the same jobs, including integration tests. The release job depends on this gate and the tag version check, so a tag cannot be published if branch CI was skipped.
+- **CD:** builds and releases the Linux `fl` binary with `--features emulator` only when the tag without its `v` prefix (for example, `v0.1.0` → `0.1.0`) matches the `flare` package version from `cargo metadata --no-deps`.
+- Release assets are `flare-<version>-linux-x86_64.tar.gz` archives with SHA-256 `.sha256` sidecars, not raw binaries. Each archive contains the executable `fl`, `README.md`, `LICENSE`, `docs/spec.md`, and a per-file `SHA256SUMS` manifest.
 
-ダウンロード後は、archive とその sidecar を同じディレクトリに置いて次のように検証できます。
+After downloading, place the archive and its sidecar in the same directory and verify them as follows:
 
 ```bash
-sha256sum -c firelang-0.1.0-linux-x86_64.tar.gz.sha256
-tar -xzf firelang-0.1.0-linux-x86_64.tar.gz
-(cd firelang-0.1.0-linux-x86_64 && sha256sum -c SHA256SUMS)
+sha256sum -c flare-0.1.0-linux-x86_64.tar.gz.sha256
+tar -xzf flare-0.1.0-linux-x86_64.tar.gz
+(cd flare-0.1.0-linux-x86_64 && sha256sum -c SHA256SUMS)
 ```
 
-- 同じ release には `tool-versions.txt` も添付されます。Rust/Cargo のバージョン、`Cargo.lock` の SHA-256、runner image、CI が使う Firebase CLI version が記録されています。
-- CI の deploy 用 `firebase.json` が write を拒否することも `integration-emulator` ジョブで確認します。
+- Each release also includes `tool-versions.txt`, which records the Rust/Cargo versions, `Cargo.lock` SHA-256, runner image, and Firebase CLI version used by CI.
+- The `integration-emulator` job also verifies that the deployment `firebase.json` denies writes.
 
-
-## ライセンス
+## License
 
 [MIT](LICENSE)

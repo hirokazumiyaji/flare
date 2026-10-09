@@ -18,7 +18,7 @@ Current query support only works in-memory, only for part of the API, and produc
 - Emulator-backed collection group queries.
 - Deterministic query ordering by document path lexicographic order before `limit`.
 - Runtime support for a smoother query builder surface.
-- A documented ordering rule based on the firelang relative document path string, not bare document ids.
+- A documented ordering rule based on the flare relative document path string, not bare document ids.
 
 ## Behavior To Support
 
@@ -54,4 +54,4 @@ Current query support only works in-memory, only for part of the API, and produc
 
 ## Notes
 
-Use one ordering rule everywhere. For MVP that rule is lexicographic order on the firelang relative document path string, for example `users/a < users/b` and `teams/t1/members/a < teams/t2/members/a`.
+Use one ordering rule everywhere. For MVP that rule is lexicographic order on the flare relative document path string, for example `users/a < users/b` and `teams/t1/members/a < teams/t2/members/a`.

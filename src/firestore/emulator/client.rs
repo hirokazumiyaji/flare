@@ -11,7 +11,7 @@ use gcloud_sdk::tonic::Request;
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 use super::path;
-use crate::error::FirelangError;
+use crate::error::FlareError;
 
 pub(super) struct EmulatorClient {
     pub(super) db: FirestoreDb,
@@ -25,7 +25,7 @@ pub(super) struct EmulatorClient {
 
 /// Collection used only for the connect-time liveness probe.  It is never
 /// written to; the probe is a read of a document that does not exist.
-const PROBE_COLLECTION: &str = "_firelang_connection_probe";
+const PROBE_COLLECTION: &str = "_flare_connection_probe";
 
 /// Fail-fast deadline for the connect step, independent of the caller's
 /// per-operation timeout.  A host that accepts a TCP connection but never
@@ -119,7 +119,7 @@ pub(super) fn connect(
     match runtime.block_on(async move { tokio::time::timeout(probe_timeout, probe).await }) {
         // `Err(_)` is the deadline firing; the status itself is reported below.
         Err(_) => {
-            return Err(FirelangError::backend(format!(
+            return Err(FlareError::backend(format!(
                 "Firestore emulator connection probe timed out after {}ms (connect budget {}ms)",
                 probe_timeout.as_millis(),
                 connect_timeout.as_millis()
@@ -134,7 +134,7 @@ pub(super) fn connect(
         // understood a Firestore request, which is what the probe is for.
         Ok(Err(status)) if is_reachable_probe_answer(status.code()) => {}
         Ok(Err(status)) => {
-            return Err(FirelangError::backend(format!(
+            return Err(FlareError::backend(format!(
                 "Firestore emulator connection probe failed: {status}"
             ))
             .into())
@@ -213,7 +213,7 @@ fn timeout_error(operation: &str, elapsed: Duration, timeout: Duration) -> Box<d
     // "timeout 0ms" と誤表示され、運用者が設定値を判断できなくなる。
     // `Duration` の `Debug` は設定単位に合わせて出るため、runtime 側の
     // `format_duration` と同じ表記に揃える。
-    FirelangError::backend(format!(
+    FlareError::backend(format!(
         "Firestore emulator operation '{operation}' timed out: \
          elapsed {elapsed:?} exceeded timeout {timeout:?}"
     ))
@@ -382,11 +382,11 @@ mod tests {
             future::pending::<Result<(), gcloud_sdk::tonic::Status>>().await
         })
         .expect_err("pending operation should time out");
-        let firelang_error = error
-            .downcast_ref::<FirelangError>()
+        let flare_error = error
+            .downcast_ref::<FlareError>()
             .expect("timeout should be a typed backend error");
-        assert_eq!(firelang_error.kind, ErrorKind::Backend);
-        let message = firelang_error.to_string();
+        assert_eq!(flare_error.kind, ErrorKind::Backend);
+        let message = flare_error.to_string();
         assert!(message.contains("query"), "{message}");
         assert!(message.contains("timed out"), "{message}");
         assert!(message.contains("elapsed"), "{message}");

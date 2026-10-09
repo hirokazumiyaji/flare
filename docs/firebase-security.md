@@ -1,74 +1,57 @@
-# Firebase rules の分離とデプロイ防止策
+# Firebase rules separation and deployment safeguards
 
-firelang は認証付きの本番 Firestore と Cloud Storage に対応していません。
-そのため、リポジトリの通常の Firebase デプロイ先では、すべての read と write を拒否します。
-許可ポリシーを実装するまでは、誤ってデプロイしてもデータを公開できない状態を維持します。
+flare does not support authenticated production Firestore or Cloud Storage. The repository's normal Firebase deployment target therefore denies all reads and writes. Until an allow policy is implemented, an accidental deployment must not expose data.
 
-## 設定の分離
+## Separate configurations
 
-`firebase deploy` と `firebase emulators:*` は、通常 `--config` を省略すると `firebase.json` を読みます。
-rules の参照先も、この設定で決まります。
-このため、deploy 用と emulator 用の config と rules を別のファイルに分けます。
+When `--config` is omitted, `firebase deploy` and `firebase emulators:*` normally read `firebase.json`. This file also determines which rules are used. Keep deployment and emulator configurations and rules in separate files:
 
-| 対象 | リモート project 用の設定 | ローカル emulator 用の設定 |
+| Target | Configuration for remote projects | Configuration for local emulators |
 | --- | --- | --- |
-| Firestore | `firebase.json` → `firestore.rules`（read/write 拒否） | `firebase.emulators.json` → `firestore.emulator.rules`（read/write 許可） |
-| Cloud Storage | `firebase.json` → `storage.rules`（read/write 拒否） | `firebase.emulators.json` → `storage.emulator.rules`（read/write 許可） |
+| Firestore | `firebase.json` → `firestore.rules` (deny reads and writes) | `firebase.emulators.json` → `firestore.emulator.rules` (allow reads and writes) |
+| Cloud Storage | `firebase.json` → `storage.rules` (deny reads and writes) | `firebase.emulators.json` → `storage.emulator.rules` (allow reads and writes) |
 
-`firebase deploy` を `--config` なしで実行すると、`firebase.json` が選択されます。
-したがって、明示的に production-like project を指定しても、rules は read/write 拒否の状態でデプロイされます。
+Running `firebase deploy` without `--config` selects `firebase.json`. Its rules deny reads and writes even when a production-like project is explicitly selected.
 
-read/write を許可する emulator rules は `firebase.emulators.json` からだけ読み込みます。
-`firebase deploy --config firebase.emulators.json` は実行しないでください。
-このコマンドは許可 rules をリモート project へ送るため、テストや CI の deployment にも使いません。
+The emulator rules that allow reads and writes are loaded only through `firebase.emulators.json`. Do not run `firebase deploy --config firebase.emulators.json`. That command would upload the permissive rules to a remote project, so it must not be used for tests or CI deployment.
 
-## ローカルエミュレータの project
+## Local emulator project
 
-ローカルエミュレータでは `demo-firelang` を明示します。
-`demo-` で始まる project ID を使い、実運用の project ID をローカル設定へ追加しません。
+Always specify `demo-flare` for local emulators. Use project IDs beginning with `demo-`; do not add production project IDs to the local configuration.
 
 ```bash
 firebase emulators:start \
   --config firebase.emulators.json \
   --only firestore \
-  --project demo-firelang
+  --project demo-flare
 ```
 
-Firestore の統合テストも同じ設定を使います。
+Firestore integration tests use the same configuration:
 
 ```bash
 firebase emulators:exec \
   --config firebase.emulators.json \
   --only firestore \
-  --project demo-firelang \
-  'FIRESTORE_PROJECT_ID=demo-firelang cargo test --test firestore_emulator -- --nocapture'
+  --project demo-flare \
+  'FIRESTORE_PROJECT_ID=demo-flare cargo test --test firestore_emulator -- --nocapture'
 ```
 
-リポジトリには `.firebaserc` を用意していません。
-clone した直後は既定 project が未選択です。
-このドキュメントのコマンドは project ID を明示します。
+The repository does not include a `.firebaserc`. No default project is selected after cloning, so the commands in this document specify the project ID explicitly.
 
-## Authentication と Storage の扱い
+## Authentication and Storage
 
-現在の emulator config は Authentication を起動しません。
-ランタイムも本番の認証情報を扱わないため、本番用 rules は要求ごとに拒否するだけにしています。
+The current emulator configuration does not start Authentication. The runtime also does not handle production credentials, so the production rules deny every request.
 
-Authentication のサポートを追加するときは、読み書き要件ごとの security policy を実装します。
-policy の追加では、匿名リクエストと権限のない認証済みリクエストを拒否し、所有者と管理者のリクエストだけを許可してください。
-Firestore と Storage の両方で、許可する操作と拒否する操作を `demo-firelang` の emulator に対する integration test に含めます。
+When adding Authentication support, implement a security policy for each read and write requirement. The policy must deny anonymous requests and authenticated requests without permission, and allow only owner and administrator requests. Add integration tests for allowed and denied operations against the `demo-flare` Firestore and Storage emulators.
 
-Cloud Storage は現在のランタイム API には含まれません。
-`storage.emulator.rules` は将来のローカル integration test 用であり、`demo-firelang` 以外への deploy には使いません。
-一方、`firebase.json` は `storage.rules` を参照するため、Storage を誤って deploy しても read/write は拒否されます。
+Cloud Storage is not currently part of the runtime API. `storage.emulator.rules` is reserved for future local integration tests and must not be deployed to any project other than `demo-flare`. `firebase.json` refers to `storage.rules`, so an accidental Storage deployment still denies reads and writes.
 
-## Deployment guard のテスト
+## Deployment guard tests
 
-次のテストは、設定と rules の分離、および production 側の全拒否ポリシーを検査します。
+The following test checks the separation between configurations and rules, as well as the production-side deny-all policies:
 
 ```bash
 cargo test --test firebase_config
 ```
 
-CI では `firebase.json` 自身を使って Firestore emulator を起動し、write が `PERMISSION_DENIED` になることを検査します。
-emulator の `Bearer owner` は admin 資格で rules をバイパスするため、この検査は admin でない資格(`EmulatorAuth::EnforceRules`)で行います。
-静的テストも production 側の rules が read/write 拒否のままであることを検査するため、通常の `firebase deploy` によって production-like project が公開されることはありません。
+CI starts the Firestore emulator using `firebase.json` itself and verifies that writes return `PERMISSION_DENIED`. The emulator's `Bearer owner` bypasses rules with admin credentials, so this check uses non-admin credentials (`EmulatorAuth::EnforceRules`). Static tests also verify that the production rules continue to deny reads and writes. A normal `firebase deploy` therefore cannot expose a production-like project.

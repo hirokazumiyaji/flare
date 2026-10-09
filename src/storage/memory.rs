@@ -32,7 +32,7 @@ impl Storage for InMemoryStorage {
         let generation = self.next_generation.max(1).to_string();
         let metadata = StorageMetadata {
             name: path.to_string(),
-            bucket: "firelang-memory".to_string(),
+            bucket: "flare-memory".to_string(),
             content_type: content_type.to_string(),
             size,
             generation,
