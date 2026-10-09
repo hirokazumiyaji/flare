@@ -5,11 +5,11 @@ use std::time::Duration;
 #[macro_use]
 mod common;
 
-use firelang::run_script;
-use firelang::run_script_with_limits;
-use firelang::runtime::Runtime;
-use firelang::value::Timestamp;
-use firelang::{InMemoryFirestore, RuntimeLimits, Value};
+use flare::run_script;
+use flare::run_script_with_limits;
+use flare::runtime::Runtime;
+use flare::value::Timestamp;
+use flare::{InMemoryFirestore, RuntimeLimits, Value};
 
 /// 同じ `Runtime` で複数スクリプトを続けて評価する(状態保持のテスト用)。
 fn run_in(
@@ -20,11 +20,11 @@ fn run_in(
 }
 
 fn assert_runtime_write_error(err: Box<dyn std::error::Error>) {
-    use firelang::{ErrorKind, FirelangError};
+    use flare::{ErrorKind, FlareError};
 
     let ferr = err
-        .downcast_ref::<FirelangError>()
-        .expect("write validation should produce a FirelangError");
+        .downcast_ref::<FlareError>()
+        .expect("write validation should produce a FlareError");
     assert_eq!(ferr.kind, ErrorKind::Runtime, "{ferr}");
     assert!(
         ferr.message.contains("unsupported value in write"),
@@ -46,7 +46,7 @@ fn division_by_zero_returns_error() {
 
 #[test]
 fn unterminated_string_literal_errors() {
-    let err = firelang::lexer::lex("\"foo").unwrap_err();
+    let err = flare::lexer::lex("\"foo").unwrap_err();
     assert!(format!("{err}").contains("unterminated"));
 }
 
@@ -814,7 +814,7 @@ fn interpolation_in_map_key_is_rejected() {
 
 #[test]
 fn unterminated_interpolation_fails_at_lex_time() {
-    let err = firelang::lexer::lex("\"#{1 + 2\"").unwrap_err();
+    let err = flare::lexer::lex("\"#{1 + 2\"").unwrap_err();
     assert!(format!("{err}").contains("unterminated"), "{err}");
 }
 
@@ -1076,14 +1076,14 @@ fn block_param_must_match_yielded_argument_count() {
 
 #[test]
 fn duplicate_block_params_are_rejected_at_parse() {
-    use firelang::{ErrorKind, FirelangError};
+    use flare::{ErrorKind, FlareError};
 
     let err = run_script("[1].map { |item, item| item }").unwrap_err();
     // Pin the phase, not just the wording: validate_unique_params produces the
     // same text, so a runtime check added later would otherwise pass this.
     let ferr = err
-        .downcast_ref::<FirelangError>()
-        .expect("duplicate block parameter should be a FirelangError");
+        .downcast_ref::<FlareError>()
+        .expect("duplicate block parameter should be a FlareError");
     assert_eq!(ferr.kind, ErrorKind::Parse, "{ferr}");
     assert!(
         format!("{err}").contains("duplicate block parameter: item"),
@@ -1779,7 +1779,7 @@ fn legacy_datastore_numeric_ids_are_accepted() {
         out,
         Value::Array(vec![
             Value::Int(1),
-            Value::DocRef(firelang::value::DocRef {
+            Value::DocRef(flare::value::DocRef {
                 path: "users/__id123__".to_string()
             }),
         ])
@@ -2234,13 +2234,13 @@ fn else_if_chain_evaluates_first_matching_branch() {
 
 #[test]
 fn errors_carry_kind_and_line_col() {
-    use firelang::{ErrorKind, FirelangError, Span};
+    use flare::{ErrorKind, FlareError, Span};
 
     // lex エラー: 行・桁付き。
-    let err = firelang::lexer::lex("a = 1\nb = 2 &").unwrap_err();
+    let err = flare::lexer::lex("a = 1\nb = 2 &").unwrap_err();
     let ferr = err
-        .downcast_ref::<FirelangError>()
-        .expect("lex error should be FirelangError");
+        .downcast_ref::<FlareError>()
+        .expect("lex error should be FlareError");
     assert_eq!(ferr.kind, ErrorKind::Lex);
     assert_eq!(ferr.span, Some(Span::new(2, 7)));
     assert!(format!("{ferr}").contains("unexpected char"), "{ferr}");
@@ -2248,8 +2248,8 @@ fn errors_carry_kind_and_line_col() {
     // parse エラー: 行・桁付き。
     let err = run_script("a = 1\nb = }").unwrap_err();
     let ferr = err
-        .downcast_ref::<FirelangError>()
-        .expect("parse error should be FirelangError");
+        .downcast_ref::<FlareError>()
+        .expect("parse error should be FlareError");
     assert_eq!(ferr.kind, ErrorKind::Parse);
     assert_eq!(ferr.span, Some(Span::new(2, 5)));
     assert!(format!("{ferr}").starts_with("2:5: "), "{ferr}");
@@ -2257,8 +2257,8 @@ fn errors_carry_kind_and_line_col() {
     // runtime エラー: 失敗したトップレベル文の開始位置。
     let err = run_script("a = 1\nb = 2\nc = undefined_var").unwrap_err();
     let ferr = err
-        .downcast_ref::<FirelangError>()
-        .expect("runtime error should be FirelangError");
+        .downcast_ref::<FlareError>()
+        .expect("runtime error should be FlareError");
     assert_eq!(ferr.kind, ErrorKind::Runtime);
     assert_eq!(ferr.span, Some(Span::new(3, 1)));
     assert!(format!("{ferr}").contains("undefined variable"), "{ferr}");
@@ -2266,36 +2266,36 @@ fn errors_carry_kind_and_line_col() {
     // backend エラー(in-memory の document not found)は Backend 種別。
     let err = run_script("update(\"users/nope\", {x: 1})").unwrap_err();
     let ferr = err
-        .downcast_ref::<FirelangError>()
-        .expect("backend error should be FirelangError");
+        .downcast_ref::<FlareError>()
+        .expect("backend error should be FlareError");
     assert_eq!(ferr.kind, ErrorKind::Backend);
     assert_eq!(ferr.span, Some(Span::new(1, 1)));
 
     // 文字列補間内のエラー位置: 式の先頭からの相対位置が正しく反映される
     let err = run_script("\"#{@}\"").unwrap_err();
     let ferr = err
-        .downcast_ref::<FirelangError>()
-        .expect("lex error in interpolation should be FirelangError");
+        .downcast_ref::<FlareError>()
+        .expect("lex error in interpolation should be FlareError");
     assert_eq!(ferr.span, Some(Span::new(1, 4)));
 
     let err = run_script("\"#{1 + }\"").unwrap_err();
     let ferr = err
-        .downcast_ref::<FirelangError>()
-        .expect("parse error in interpolation should be FirelangError");
+        .downcast_ref::<FlareError>()
+        .expect("parse error in interpolation should be FlareError");
     assert_eq!(ferr.span, Some(Span::new(1, 8)));
 
     // マップキーでの文字列補間禁止エラーの位置: 拒否されたキートークン自体の位置を指す
     let err = run_script("{\"#{x}\": 1}").unwrap_err();
     let ferr = err
-        .downcast_ref::<FirelangError>()
-        .expect("parse error in map key should be FirelangError");
+        .downcast_ref::<FlareError>()
+        .expect("parse error in map key should be FlareError");
     assert_eq!(ferr.span, Some(Span::new(1, 2)));
 
     // 補間内の単一式制約違反: 仕様(docs/spec.md §10)通り位置が付かない (None)
     let err = run_script("\"#{1; 2}\"").unwrap_err();
     let ferr = err
-        .downcast_ref::<FirelangError>()
-        .expect("parse error in interpolation should be FirelangError");
+        .downcast_ref::<FlareError>()
+        .expect("parse error in interpolation should be FlareError");
     assert_eq!(ferr.span, None);
     assert_eq!(
         format!("{ferr}"),
@@ -2303,8 +2303,8 @@ fn errors_carry_kind_and_line_col() {
     );
     let err = run_script("if true { |x| x }").unwrap_err();
     let ferr = err
-        .downcast_ref::<FirelangError>()
-        .expect("block parameter error should be FirelangError");
+        .downcast_ref::<FlareError>()
+        .expect("block parameter error should be FlareError");
     assert_eq!(ferr.span, Some(Span::new(1, 11)));
 }
 

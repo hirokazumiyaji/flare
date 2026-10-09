@@ -23,9 +23,9 @@ import json
 import sys
 
 metadata = json.load(sys.stdin)
-packages = [package for package in metadata["packages"] if package["name"] == "firelang"]
+packages = [package for package in metadata["packages"] if package["name"] == "flare"]
 if len(packages) != 1:
-    raise SystemExit(f"expected one firelang package, found {len(packages)}")
+    raise SystemExit(f"expected one flare package, found {len(packages)}")
 print(packages[0]["version"])
 '
 )"

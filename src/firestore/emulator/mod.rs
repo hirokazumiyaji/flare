@@ -27,7 +27,7 @@ pub use client::EmulatorAuth;
 
 /// Default application-level deadline for one emulator RPC.
 ///
-/// The deadline is deliberately owned by the firelang adapter rather than the
+/// The deadline is deliberately owned by the flare adapter rather than the
 /// SDK transport.  A timed-out future is dropped, while the current-thread
 /// runtime and SDK client remain available for the next operation.
 pub const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -185,7 +185,7 @@ impl FirestoreEmulator {
 
         let project_id = match env::var("FIRESTORE_PROJECT_ID") {
             Ok(project_id) => project_id,
-            Err(VarError::NotPresent) => "firelang-test".to_string(),
+            Err(VarError::NotPresent) => "flare-test".to_string(),
             Err(VarError::NotUnicode(_)) => {
                 return Err("FIRESTORE_PROJECT_ID must be valid UTF-8".into());
             }
@@ -872,7 +872,7 @@ fn run_query_candidates_bounded(
 
 /// Either a transport error or a decode/match error raised while consuming a
 /// query stream.  Decoding inside the stream loop needs both, and gRPC's
-/// `Status` cannot carry a firelang-side message faithfully.
+/// `Status` cannot carry a flare-side message faithfully.
 #[derive(Debug)]
 enum QueryStreamError {
     Rpc(gcloud_sdk::tonic::Status),

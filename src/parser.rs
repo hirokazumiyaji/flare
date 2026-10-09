@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::error::Error;
 
 use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
-use crate::error::{FirelangError, Span};
+use crate::error::{FlareError, Span};
 use crate::lexer::{SpannedToken, StrPart, Token};
 use crate::limits::ParserLimits;
 
@@ -391,7 +391,7 @@ impl Parser {
                     match parts.as_slice() {
                         [StrPart::Lit(s)] => s.clone(),
                         _ => {
-                            return Err(FirelangError::parse(
+                            return Err(FlareError::parse(
                                 "interpolation is not allowed in map keys",
                                 span,
                             )
@@ -523,7 +523,7 @@ impl Parser {
         let expr = parser.parse_expr()?;
         parser.skip_separators();
         if !parser.at(&Token::Eof) {
-            return Err(FirelangError::parse(
+            return Err(FlareError::parse(
                 "interpolation must contain a single expression",
                 None,
             )
@@ -554,7 +554,7 @@ impl Parser {
         let (block, params_span) = self.parse_brace_block_with_params()?;
         if !block.params.is_empty() {
             return Err(
-                FirelangError::parse("block parameters are not allowed here", params_span).into(),
+                FlareError::parse("block parameters are not allowed here", params_span).into(),
             );
         }
         Ok(block.body)
@@ -641,7 +641,7 @@ impl Parser {
         let name = self.expect_ident()?;
         if !seen.insert(name.clone()) {
             return Err(
-                FirelangError::parse(format!("duplicate {kind} parameter: {name}"), span).into(),
+                FlareError::parse(format!("duplicate {kind} parameter: {name}"), span).into(),
             );
         }
         Ok(name)
@@ -922,7 +922,7 @@ impl Parser {
         self.spans.get(self.pos).and_then(|s| *s)
     }
     fn parse_err(&self, message: impl Into<String>) -> Box<dyn Error> {
-        FirelangError::parse(message, self.peek_span()).into()
+        FlareError::parse(message, self.peek_span()).into()
     }
     fn peek_n(&self, n: usize) -> Option<&Token> {
         self.tokens.get(self.pos + n)

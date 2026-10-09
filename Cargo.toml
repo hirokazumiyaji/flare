@@ -1,12 +1,12 @@
 [package]
-name = "firelang"
+name = "flare"
 version = "0.1.0"
 edition = "2021"
 autobins = false
 
 [features]
 # Keep the default build focused on the in-memory backend.  The emulator
-# client is deliberately opt-in so embedding firelang does not pull the
+# client is deliberately opt-in so embedding flare does not pull the
 # Firestore SDK, gRPC, and TLS dependency layers. Future Auth / Storage
 # clients should follow the same service-specific feature pattern.
 default = []

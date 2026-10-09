@@ -8,10 +8,10 @@
 mod common;
 
 use common::{test_collection, test_namespace, unique};
-use firelang::run_script_with_firestore;
-use firelang::run_script_with_firestore_and_limits;
-use firelang::runtime::Runtime;
-use firelang::{EmulatorAuth, FirestoreEmulator, RuntimeLimits, Value};
+use flare::run_script_with_firestore;
+use flare::run_script_with_firestore_and_limits;
+use flare::runtime::Runtime;
+use flare::{EmulatorAuth, FirestoreEmulator, RuntimeLimits, Value};
 use firestore::{FirestoreDb, FirestoreDbOptions};
 use gcloud_sdk::google::firestore::v1::{
     value, write, ArrayValue, CommitRequest, Document, MapValue, Value as SdkValue, Write,
@@ -30,11 +30,11 @@ fn emulator() -> Option<FirestoreEmulator> {
 }
 
 fn assert_runtime_write_error(err: Box<dyn std::error::Error>) {
-    use firelang::{ErrorKind, FirelangError};
+    use flare::{ErrorKind, FlareError};
 
     let ferr = err
-        .downcast_ref::<FirelangError>()
-        .expect("write validation should produce a FirelangError");
+        .downcast_ref::<FlareError>()
+        .expect("write validation should produce a FlareError");
     assert_eq!(ferr.kind, ErrorKind::Runtime, "{ferr}");
     assert!(
         ferr.message.contains("unsupported value in write"),
@@ -101,7 +101,7 @@ fn seed_reference_documents(
             )),
         ))
         .expect("connect test Firestore client");
-    // These documents hold values firelang cannot write (double, geo_point,
+    // These documents hold values flare cannot write (double, geo_point,
     // external reference), so they are seeded with a raw Firestore `commit`
     // instead of `set()`. The `firestore` crate's low-level helpers became
     // private in 0.57; the gRPC surface they wrapped is still public, and a
@@ -140,7 +140,7 @@ fn seed_reference_documents(
 
 #[test]
 fn production_config_denies_firestore_writes() {
-    if std::env::var("FIRELANG_FIRESTORE_RULES").as_deref() != Ok("deny") {
+    if std::env::var("FLARE_FIRESTORE_RULES").as_deref() != Ok("deny") {
         return;
     }
 
@@ -1033,7 +1033,7 @@ set("users/{run}/rows/other", {{kind: "skip", payload: "{payload}"}})
 #[test]
 fn emulator_membership_null_and_empty_array_queries_match_in_memory() {
     // This is the parity matrix for the filters that must not be delegated
-    // wholesale to Firestore.  In particular, null is a value in firelang and
+    // wholesale to Firestore.  In particular, null is a value in flare and
     // an array may contain null elements.
     let Some(fs) = emulator() else {
         eprintln!("skip: no emulator");
@@ -1089,7 +1089,7 @@ fn emulator_query_encodes_doc_refs_and_ignores_external_references() {
         eprintln!("skip: no emulator");
         return;
     };
-    let project = std::env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "firelang-test".into());
+    let project = std::env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "flare-test".into());
     let collection = format!("ref_queries_{}", unique("run"));
     let local = reference_value(&project, "(default)", "users/owner");
     let other_project = reference_value("other-project", "(default)", "users/owner");
@@ -1141,9 +1141,9 @@ fn emulator_query_encodes_doc_refs_and_ignores_external_references() {
 }
 
 fn run_on_shared_runtime(
-    rt: &mut firelang::runtime::Runtime<FirestoreEmulator>,
+    rt: &mut flare::runtime::Runtime<FirestoreEmulator>,
     source: &str,
-) -> Result<firelang::Value, Box<dyn std::error::Error>> {
+) -> Result<flare::Value, Box<dyn std::error::Error>> {
     rt.run(source)
 }
 
@@ -1156,7 +1156,7 @@ fn emulator_failed_transaction_aborts_and_restarts() {
         eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
         return;
     };
-    let mut rt = firelang::runtime::Runtime::new(fs);
+    let mut rt = flare::runtime::Runtime::new(fs);
     let path = format!("{}/transaction", test_collection("failed_transaction"));
     let failing = run_on_shared_runtime(
         &mut rt,

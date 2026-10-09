@@ -5,7 +5,7 @@
 //! cover the same REST contract with a fake transport when Firebase CLI is
 //! unavailable.
 
-use firelang::{run_script_with_storage, StorageEmulator, Value};
+use flare::{run_script_with_storage, StorageEmulator, Value};
 
 fn emulator() -> Option<StorageEmulator> {
     match StorageEmulator::try_from_env() {
@@ -32,7 +32,7 @@ fn storage_emulator_crud_and_lossless_binary_round_trip() {
         eprintln!("skip: FIREBASE_STORAGE_EMULATOR_HOST is not set");
         return;
     };
-    let path = format!("firelang-tests/{}", unique("crud"));
+    let path = format!("flare-tests/{}", unique("crud"));
     let script = format!(
         r#"
 payload = bytes([0, 255, 128, 10, 0])
@@ -60,7 +60,7 @@ fn storage_emulator_delete_then_not_found() {
         eprintln!("skip: FIREBASE_STORAGE_EMULATOR_HOST is not set");
         return;
     };
-    let path = format!("firelang-tests/{}", unique("delete"));
+    let path = format!("flare-tests/{}", unique("delete"));
     let script = format!(
         r#"
 storage_upload("{path}", bytes([1, 2, 3]), content_type: "application/octet-stream")

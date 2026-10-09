@@ -1,2 +1,2 @@
-name = "firelang"
+name = "flare"
 "hello #{name} #{1 + 2}"

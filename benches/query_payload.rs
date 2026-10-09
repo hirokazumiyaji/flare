@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::time::Instant;
 
-use firelang::firestore::{Firestore, InMemoryFirestore, WriteOp};
-use firelang::value::{QueryRef, QuerySource, Value};
+use flare::firestore::{Firestore, InMemoryFirestore, WriteOp};
+use flare::value::{QueryRef, QuerySource, Value};
 
 const DOCUMENT_COUNT: usize = 1_000;
 const PAYLOAD_BYTES: usize = 4 * 1024;

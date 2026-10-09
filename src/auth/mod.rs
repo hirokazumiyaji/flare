@@ -18,7 +18,7 @@ use std::fmt;
 
 use crate::value::Value;
 
-pub const DEFAULT_PROJECT_ID: &str = "firelang-test";
+pub const DEFAULT_PROJECT_ID: &str = "flare-test";
 pub const DEFAULT_ID_TOKEN_TTL_SECONDS: i64 = 60 * 60;
 
 /// Broad, stable categories for authentication failures.

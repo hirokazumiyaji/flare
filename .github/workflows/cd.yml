@@ -117,7 +117,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
-          archive="dist/firelang-${version}-linux-x86_64.tar.gz"
+          archive="dist/flare-${version}-linux-x86_64.tar.gz"
           checksum="${archive}.sha256"
           test -f "$archive"
           test -f "$checksum"
@@ -125,7 +125,7 @@ jobs:
           verify_dir="$(mktemp -d)"
           trap 'rm -rf "$verify_dir"' EXIT
           tar -xzf "$archive" -C "$verify_dir"
-          package_dir="$verify_dir/firelang-${version}-linux-x86_64"
+          package_dir="$verify_dir/flare-${version}-linux-x86_64"
           test -x "$package_dir/fl"
           test -f "$package_dir/README.md"
           test -f "$package_dir/LICENSE"
@@ -135,7 +135,7 @@ jobs:
       - name: Upload release package to workflow artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: firelang-${{ github.ref_name }}
+          name: flare-${{ github.ref_name }}
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256

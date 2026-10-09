@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
 use crate::auth::{Auth, AuthError, InMemoryAuth};
-use crate::error::{FirelangError, Span};
+use crate::error::{FlareError, Span};
 use crate::firestore::{
     normalize_query_field_path, validate_firestore_id, validate_write_data, Firestore,
     QueryCandidates, QueryResultLimitExceeded, WriteOp,
@@ -289,7 +289,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
     /// リセットし、step / value / wall-clock の budget が実質無効になる。
     fn start_execution(&mut self) -> Result<(), Box<dyn Error>> {
         if self.execution_active {
-            return Err(FirelangError::runtime(
+            return Err(FlareError::runtime(
                 "run() / eval_program() is already executing on this Runtime",
             )
             .into());
@@ -330,7 +330,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         };
         let elapsed = started_at.elapsed();
         if elapsed >= limit {
-            return Err(FirelangError::runtime(format!(
+            return Err(FlareError::runtime(format!(
                 "wall-clock limit exceeded (max {})",
                 format_duration(limit)
             ))
@@ -344,7 +344,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         if let Some(max) = self.limits.max_steps {
             if self.usage.steps >= max {
                 return Err(
-                    FirelangError::runtime(format!("step limit exceeded (max {max})")).into(),
+                    FlareError::runtime(format!("step limit exceeded (max {max})")).into(),
                 );
             }
         }
@@ -356,7 +356,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         self.check_wall_clock()?;
         if let Some(max) = self.limits.max_loop_iterations {
             if self.usage.loop_iterations >= max {
-                return Err(FirelangError::runtime(format!(
+                return Err(FlareError::runtime(format!(
                     "loop iteration limit exceeded (max {max})"
                 ))
                 .into());
@@ -370,7 +370,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         self.check_wall_clock()?;
         if let Some(max) = self.limits.max_call_depth {
             if self.call_depth >= max {
-                return Err(FirelangError::runtime(format!(
+                return Err(FlareError::runtime(format!(
                     "call depth limit exceeded (max {max})"
                 ))
                 .into());
@@ -1093,7 +1093,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
                 if let Some(limit) = e.downcast_ref::<QueryResultLimitExceeded>() {
                     self.usage.max_query_results =
                         self.usage.max_query_results.max(limit.max_results);
-                    return Err(FirelangError::runtime(limit.to_string()).into());
+                    return Err(FlareError::runtime(limit.to_string()).into());
                 }
                 return Err(backend_err(e));
             }
@@ -1104,7 +1104,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         if let Some(max) = max_results {
             if count > max {
                 self.usage.max_query_results = self.usage.max_query_results.max(max);
-                return Err(FirelangError::runtime(format!(
+                return Err(FlareError::runtime(format!(
                     "query result limit exceeded (max {max})"
                 ))
                 .into());
@@ -1139,7 +1139,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
                 if let Some(limit) = e.downcast_ref::<QueryResultLimitExceeded>() {
                     self.usage.max_query_results =
                         self.usage.max_query_results.max(limit.max_results);
-                    return Err(FirelangError::runtime(limit.to_string()).into());
+                    return Err(FlareError::runtime(limit.to_string()).into());
                 }
                 return Err(backend_err(e));
             }
@@ -1150,7 +1150,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         if let Some(max) = max_results {
             if count > max {
                 self.usage.max_query_results = self.usage.max_query_results.max(max);
-                return Err(FirelangError::runtime(format!(
+                return Err(FlareError::runtime(format!(
                     "query result limit exceeded (max {max})"
                 ))
                 .into());
@@ -2324,7 +2324,7 @@ fn reject_auth_call_args(
 }
 
 fn auth_backend_err(error: AuthError) -> Box<dyn Error> {
-    FirelangError::auth(error.kind(), error.to_string()).into()
+    FlareError::auth(error.kind(), error.to_string()).into()
 }
 
 fn auth_session_field(session: &crate::auth::AuthSession, name: &str) -> Value {
@@ -2619,42 +2619,42 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn backend_err(e: Box<dyn Error>) -> Box<dyn Error> {
-    if e.downcast_ref::<FirelangError>().is_some() {
+    if e.downcast_ref::<FlareError>().is_some() {
         e
     } else {
-        FirelangError::backend(e.to_string()).into()
+        FlareError::backend(e.to_string()).into()
     }
 }
 
 /// eval 失敗時にトップレベル文の位置を付与する。既に span を持つ
-/// FirelangError (lex/parse/backendで付与済み)はそのまま通し、
-/// span なしの FirelangError と String 系エラーは Runtime として包む。
+/// FlareError (lex/parse/backendで付与済み)はそのまま通し、
+/// span なしの FlareError と String 系エラーは Runtime として包む。
 fn attach_span(e: Box<dyn Error>, span: Option<Span>) -> Box<dyn Error> {
     let Some(span) = span else {
         return wrap_as_runtime(e);
     };
-    match e.downcast::<FirelangError>() {
+    match e.downcast::<FlareError>() {
         Ok(mut ferr) => {
             if ferr.span.is_none() {
                 ferr.span = Some(span);
             }
-            // `Box<FirelangError>` -> `Box<dyn Error>` は coerce する。
-            // `.into()` は `Box<FirelangError>` 自体を `Error` として
+            // `Box<FlareError>` -> `Box<dyn Error>` は coerce する。
+            // `.into()` は `Box<FlareError>` 自体を `Error` として
             // 二重に Box 化してしまい downcast が効かなくなるため使わない。
             ferr as Box<dyn Error>
         }
         Err(e) => {
             // String 等の非 typed エラーは Runtime として包む。
-            FirelangError::runtime(e.to_string()).with_span(span).into()
+            FlareError::runtime(e.to_string()).with_span(span).into()
         }
     }
 }
 
 fn wrap_as_runtime(e: Box<dyn Error>) -> Box<dyn Error> {
-    if e.downcast_ref::<FirelangError>().is_some() {
+    if e.downcast_ref::<FlareError>().is_some() {
         e
     } else {
-        FirelangError::runtime(e.to_string()).into()
+        FlareError::runtime(e.to_string()).into()
     }
 }
 

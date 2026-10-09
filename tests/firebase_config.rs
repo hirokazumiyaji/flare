@@ -120,10 +120,10 @@ fn ci_uses_the_explicit_configs_and_demo_project() {
     let ci = read_repo_file(".github/workflows/ci.yml");
 
     assert!(ci.contains(
-        "firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-firelang"
+        "firebase emulators:exec --config firebase.emulators.json --only firestore --project demo-flare"
     ));
     assert!(ci.contains(
-        "firebase emulators:exec --config firebase.json --only firestore --project demo-firelang"
+        "firebase emulators:exec --config firebase.json --only firestore --project demo-flare"
     ));
 }
 

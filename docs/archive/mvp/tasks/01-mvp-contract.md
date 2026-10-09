@@ -44,7 +44,7 @@ Task 01 updates only the contract block in the README. Broader README cleanup st
 - Queries inside `transaction` are out of scope for MVP.
 - `transaction` is single-attempt. No automatic retry logic is required for MVP.
 - Runtime errors and backend errors inside `batch` or `transaction` must both result in zero persisted writes.
-- Query ordering is deterministic by the firelang relative document path string in lexicographic order, not by bare document id. For example, `users/a` sorts before `users/b`, and `teams/t1/members/a` sorts before `teams/t2/members/a`.
+- Query ordering is deterministic by the flare relative document path string in lexicographic order, not by bare document id. For example, `users/a` sorts before `users/b`, and `teams/t1/members/a` sorts before `teams/t2/members/a`.
 
 ## Work Items
 

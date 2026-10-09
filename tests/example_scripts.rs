@@ -1,5 +1,5 @@
-use firelang::run_script;
-use firelang::Value;
+use flare::run_script;
+use flare::Value;
 
 #[test]
 fn runs_example_scripts_successfully() {
@@ -8,7 +8,7 @@ fn runs_example_scripts_successfully() {
         ("examples/scripts/02_keywords_and_blocks.fl", Value::Int(30)),
         (
             "examples/scripts/03_interpolation.fl",
-            Value::Str("hello firelang 3".to_string()),
+            Value::Str("hello flare 3".to_string()),
         ),
         (
             "examples/scripts/04_timestamp.fl",

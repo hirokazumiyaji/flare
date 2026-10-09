@@ -22,7 +22,7 @@ pub enum Value {
     ArrayRemove(Vec<Value>),
     DeleteField,
     Increment(i64),
-    /// emulator が読んだ firelang 外の型(double / geo_point)の表示専用値。
+    /// emulator が読んだ flare 外の型(double / geo_point)の表示専用値。
     /// スクリプトからは生成できず、書き戻しもできない。
     Opaque(String),
     /// A local Firebase Auth session.  This is intentionally a distinct value

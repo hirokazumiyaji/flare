@@ -1,10 +1,10 @@
-# Firelang MVP Task List
+# Flare MVP Task List
 
-> **ARCHIVED (2026-06-12):** 全タスク完了済みの歴史的な計画資料です。記述は当時のもので、現在の実装と乖離している箇所があります(例: emulator は REST ではなく gRPC SDK を使用)。現在の正式仕様は [docs/spec.md](../../spec.md) を参照してください。
+> **ARCHIVED (2026-06-12):** This is a historical planning document; all tasks are complete. Some details reflect the state at the time and may differ from the current implementation (for example, the emulator uses the gRPC SDK rather than REST). See [docs/spec.md](../../spec.md) for the current authoritative specification.
 
 ## Goal
 
-Deliver a usable MVP of `firelang` as a Firestore scripting tool, not just a language runtime.
+Deliver a usable MVP of `flare` as a Firestore scripting tool, not just a language runtime.
 
 This file is the planning index for MVP work. The authoritative MVP contract will be added to the README by Task 01.
 

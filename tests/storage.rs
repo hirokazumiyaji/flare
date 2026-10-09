@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 
-use firelang::{
+use flare::{
     run_script, run_script_with_storage, InMemoryStorage, Storage, StorageEmulator, StorageRequest,
     StorageResponse, StorageTransport, Value,
 };
@@ -122,7 +122,7 @@ fn fake_transport_can_drive_the_emulator_contract() {
     };
     let storage = StorageEmulator::with_transport("p", transport).unwrap();
     let mut runtime =
-        firelang::runtime::Runtime::with_storage(firelang::InMemoryFirestore::default(), storage);
+        flare::runtime::Runtime::with_storage(flare::InMemoryFirestore::default(), storage);
     let out = runtime
         .run("storage_upload(\"x\", bytes([1, 2]))\nstorage_download(\"x\")")
         .unwrap();

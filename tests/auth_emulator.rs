@@ -8,9 +8,9 @@
 //! The assertions deliberately mirror `tests/auth.rs`: both backends must
 //! agree on the visible script contract.
 
-use firelang::runtime::Runtime;
-use firelang::{
-    run_script_with_auth, AuthEmulator, AuthErrorKind, FirelangError, InMemoryFirestore,
+use flare::runtime::Runtime;
+use flare::{
+    run_script_with_auth, AuthEmulator, AuthErrorKind, FlareError, InMemoryFirestore,
 };
 
 fn emulator() -> Option<AuthEmulator> {
@@ -37,7 +37,7 @@ fn emulator_sign_up_sign_in_and_sign_out() {
     let session_value = runtime
         .run(&format!("auth_sign_up(\"{email}\", \"password\")"))
         .expect("sign-up should succeed against the Auth emulator");
-    let firelang::Value::AuthSession(session) = &session_value else {
+    let flare::Value::AuthSession(session) = &session_value else {
         panic!("expected AuthSession, got {session_value:?}");
     };
     assert_eq!(session.user.email, email);
@@ -64,12 +64,12 @@ fn emulator_sign_up_sign_in_and_sign_out() {
     // current_user reflects the session, and sign-out clears it.
     assert_eq!(
         runtime.run("auth_current_user()[\"email\"]").unwrap(),
-        firelang::Value::Str(email.clone())
+        flare::Value::Str(email.clone())
     );
     runtime.run("auth_sign_out()").unwrap();
     assert_eq!(
         runtime.run("auth_current_user()").unwrap(),
-        firelang::Value::Nil
+        flare::Value::Nil
     );
 
     // Sign back in with the account created above.
@@ -78,7 +78,7 @@ fn emulator_sign_up_sign_in_and_sign_out() {
         .expect("sign-in should succeed after sign-up");
     assert_eq!(
         runtime.run("auth_current_user()[\"email\"]").unwrap(),
-        firelang::Value::Str(email)
+        flare::Value::Str(email)
     );
 }
 
@@ -91,9 +91,9 @@ fn emulator_maps_user_not_found() {
     let email = unique_email("missing");
     let err = run_script_with_auth(&format!("auth_sign_in(\"{email}\", \"password\")"), auth)
         .unwrap_err();
-    let ferr = err.downcast_ref::<FirelangError>().unwrap();
+    let ferr = err.downcast_ref::<FlareError>().unwrap();
     assert_eq!(ferr.auth_kind, Some(AuthErrorKind::UserNotFound), "{err}");
-    assert_eq!(ferr.span, Some(firelang::Span::new(1, 1)), "{err}");
+    assert_eq!(ferr.span, Some(flare::Span::new(1, 1)), "{err}");
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn emulator_maps_invalid_credentials_and_duplicate_sign_up() {
         .run(&format!("auth_sign_in(\"{email}\", \"wrong-password\")"))
         .unwrap_err();
     assert_eq!(
-        err.downcast_ref::<FirelangError>().unwrap().auth_kind,
+        err.downcast_ref::<FlareError>().unwrap().auth_kind,
         Some(AuthErrorKind::InvalidCredentials),
         "{err}"
     );
@@ -122,7 +122,7 @@ fn emulator_maps_invalid_credentials_and_duplicate_sign_up() {
         .run(&format!("auth_sign_up(\"{email}\", \"password\")"))
         .unwrap_err();
     assert_eq!(
-        err.downcast_ref::<FirelangError>().unwrap().auth_kind,
+        err.downcast_ref::<FlareError>().unwrap().auth_kind,
         Some(AuthErrorKind::UserAlreadyExists),
         "{err}"
     );
@@ -148,7 +148,7 @@ fn emulator_validation_matches_in_memory_validation() {
     ] {
         let err = runtime.run(script).unwrap_err();
         assert_eq!(
-            err.downcast_ref::<FirelangError>().unwrap().auth_kind,
+            err.downcast_ref::<FlareError>().unwrap().auth_kind,
             Some(kind),
             "{script}: {err}"
         );
@@ -168,5 +168,5 @@ fn emulator_firestore_script_is_unaffected_by_auth() {
         auth,
     )
     .unwrap();
-    assert_eq!(out, firelang::Value::Str("alice".to_string()));
+    assert_eq!(out, flare::Value::Str("alice".to_string()));
 }
