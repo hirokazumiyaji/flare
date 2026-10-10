@@ -10,6 +10,22 @@ use super::{
 };
 
 const DEFAULT_API_KEY: &str = "fake-api-key";
+pub const DEFAULT_AUTH_OPERATION_TIMEOUT: Duration = Duration::from_millis(5_000);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthEmulatorOptions {
+    pub api_key: String,
+    pub operation_timeout: Option<Duration>,
+}
+
+impl Default for AuthEmulatorOptions {
+    fn default() -> Self {
+        Self {
+            api_key: DEFAULT_API_KEY.to_string(),
+            operation_timeout: Some(DEFAULT_AUTH_OPERATION_TIMEOUT),
+        }
+    }
+}
 
 /// Firebase Authentication Emulator adapter.
 ///
@@ -24,6 +40,7 @@ pub struct AuthEmulator {
     client: reqwest::Client,
     runtime: TokioRuntime,
     session: Option<AuthSession>,
+    operation_timeout: Option<Duration>,
 }
 
 impl AuthEmulator {
@@ -51,9 +68,30 @@ impl AuthEmulator {
 
     /// Construct an Auth Emulator client for an explicit host and project.
     pub fn new(host: impl Into<String>, project_id: impl Into<String>) -> Result<Self, AuthError> {
+        let api_key = env::var("FIREBASE_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string());
+        Self::new_with_options(
+            host,
+            project_id,
+            AuthEmulatorOptions {
+                api_key,
+                ..AuthEmulatorOptions::default()
+            },
+        )
+    }
+
+    pub fn new_with_options(
+        host: impl Into<String>,
+        project_id: impl Into<String>,
+        options: AuthEmulatorOptions,
+    ) -> Result<Self, AuthError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(AuthError::Configuration(
+                "Auth emulator construction cannot run inside an active Tokio runtime".into(),
+            ));
+        }
         let base_url = normalize_base_url(&host.into())?;
         let project_id = validate_project_id(&project_id.into())?;
-        let api_key = env::var("FIREBASE_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string());
+        let api_key = options.api_key;
         if api_key.trim().is_empty() {
             return Err(AuthError::Configuration(
                 "FIREBASE_API_KEY must not be empty when set".into(),
@@ -66,12 +104,9 @@ impl AuthEmulator {
             .map_err(|error| {
                 AuthError::Configuration(format!("could not create Auth client runtime: {error}"))
             })?;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .map_err(|error| {
-                AuthError::Configuration(format!("could not create Auth HTTP client: {error}"))
-            })?;
+        let client = reqwest::Client::builder().build().map_err(|error| {
+            AuthError::Configuration(format!("could not create Auth HTTP client: {error}"))
+        })?;
 
         Ok(Self {
             base_url,
@@ -80,6 +115,7 @@ impl AuthEmulator {
             client,
             runtime,
             session: None,
+            operation_timeout: options.operation_timeout,
         })
     }
 
@@ -96,6 +132,11 @@ impl AuthEmulator {
     }
 
     fn post(&self, operation: &str, body: JsonValue) -> Result<JsonValue, AuthError> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(AuthError::Network(
+                "Auth emulator calls cannot run inside an active Tokio runtime".into(),
+            ));
+        }
         // The public Identity Toolkit endpoints authenticate with the API key
         // query parameter.  No OAuth2 `Authorization` header is sent on purpose:
         // the emulator treats such a request as an Admin SDK call, and the
@@ -109,18 +150,26 @@ impl AuthEmulator {
             self.base_url, self.api_key
         );
         let (status, text) = self.runtime.block_on(async {
-            let response = self
-                .client
-                .post(url)
-                .header("X-Firebase-Project-ID", &self.project_id)
-                .header("X-Goog-Api-Key", &self.api_key)
-                .json(&body)
-                .send()
-                .await
-                .map_err(network_error)?;
-            let status = response.status();
-            let text = response.text().await.map_err(network_error)?;
-            Ok::<_, AuthError>((status, text))
+            let request = async {
+                let response = self
+                    .client
+                    .post(url)
+                    .header("X-Firebase-Project-ID", &self.project_id)
+                    .header("X-Goog-Api-Key", &self.api_key)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(network_error)?;
+                let status = response.status();
+                let text = response.text().await.map_err(network_error)?;
+                Ok::<_, AuthError>((status, text))
+            };
+            match self.operation_timeout {
+                Some(timeout) => tokio::time::timeout(timeout, request)
+                    .await
+                    .map_err(|_| AuthError::Network("Auth operation timed out".into()))?,
+                None => request.await,
+            }
         })?;
         if !status.is_success() {
             return Err(map_http_error(status.as_u16(), &text));
@@ -153,6 +202,14 @@ impl AuthEmulator {
 }
 
 impl Auth for AuthEmulator {
+    fn set_timeout(&mut self, timeout: Option<Duration>) {
+        self.operation_timeout = timeout;
+    }
+
+    fn supports_backend_timeout(&self) -> bool {
+        true
+    }
+
     fn sign_up(&mut self, email: &str, password: &str) -> Result<AuthSession, AuthError> {
         self.authenticate("accounts:signUp", email, password)
     }
@@ -281,7 +338,7 @@ fn map_http_error(status: u16, body: &str) -> AuthError {
         "USER_DISABLED" => AuthError::InvalidCredentials,
         "INVALID_EMAIL" | "MISSING_EMAIL" => AuthError::InvalidEmail,
         "WEAK_PASSWORD" | "MISSING_PASSWORD" | "PASSWORD_LOGIN_DISABLED" => AuthError::WeakPassword,
-        _ => AuthError::InvalidResponse(format!("Auth emulator HTTP {status}: {message}")),
+        _ => AuthError::InvalidResponse(format!("Auth emulator returned HTTP {status}")),
     }
 }
 
@@ -387,6 +444,16 @@ mod tests {
     }
 
     #[test]
+    fn explicit_options_have_emulator_defaults() {
+        let options = AuthEmulatorOptions::default();
+        assert_eq!(options.api_key, "fake-api-key");
+        assert_eq!(
+            options.operation_timeout,
+            Some(Duration::from_millis(5_000))
+        );
+    }
+
+    #[test]
     fn rejects_empty_configuration() {
         assert!(matches!(
             AuthEmulator::new("", DEFAULT_PROJECT_ID),
@@ -444,5 +511,71 @@ mod tests {
         let text = err.to_string();
         assert!(!text.contains("://"), "{text}");
         assert!(!text.contains("key="), "{text}");
+        let err = map_http_error(
+            503,
+            r#"{"error":{"message":"secret-token-should-not-escape"}}"#,
+        );
+        assert!(!err.to_string().contains("secret-token-should-not-escape"));
+    }
+
+    #[test]
+    fn operation_timeout_covers_incremental_response_body() {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skip: sandbox does not permit local TCP listeners");
+                return;
+            }
+            Err(error) => panic!("could not bind local test server: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\na",
+            )
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = std::io::Write::write_all(&mut stream, b"b");
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = std::io::Write::write_all(&mut stream, b"b");
+        });
+        let auth = AuthEmulator::new_with_options(
+            address.to_string(),
+            "project",
+            AuthEmulatorOptions {
+                operation_timeout: Some(Duration::from_millis(30)),
+                ..AuthEmulatorOptions::default()
+            },
+        )
+        .unwrap();
+        let error = auth.post("accounts:signUp", json!({})).unwrap_err();
+        assert!(matches!(error, AuthError::Network(ref message) if message.contains("timed out")));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn nested_tokio_calls_return_errors_without_panicking() {
+        let auth = AuthEmulator::new("127.0.0.1:9099", "project").unwrap();
+        let outer = RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = outer.block_on(async { auth.post("accounts:signUp", json!({})).unwrap_err() });
+        assert!(matches!(error, AuthError::Network(_)));
+        let construction = outer.block_on(async {
+            match AuthEmulator::new_with_options(
+                "127.0.0.1:9099",
+                "project",
+                AuthEmulatorOptions::default(),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("construction inside Tokio should fail"),
+            }
+        });
+        assert!(matches!(construction, AuthError::Configuration(_)));
     }
 }

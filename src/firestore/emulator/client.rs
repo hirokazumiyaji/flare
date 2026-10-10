@@ -51,6 +51,12 @@ pub(super) fn connect(
     auth: EmulatorAuth,
     operation_timeout: Option<Duration>,
 ) -> Result<EmulatorClient, Box<dyn Error>> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(std::io::Error::other(
+            "Firestore emulator construction cannot run inside an active Tokio runtime",
+        )
+        .into());
+    }
     let runtime = RuntimeBuilder::new_current_thread()
         .enable_all()
         .build()
@@ -165,6 +171,12 @@ where
     E: Error + 'static,
     F: Future<Output = Result<T, E>>,
 {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(std::io::Error::other(
+            "Firestore emulator calls cannot run inside an active Tokio runtime",
+        )
+        .into());
+    }
     // A disabled deadline runs the operation to completion: nothing is dropped
     // on expiry, so a caller that opts out of the budget accepts that an
     // unresponsive backend blocks instead of being cancelled.
@@ -293,6 +305,21 @@ mod tests {
             options.firebase_api_url.as_deref(),
             Some("http://emulator.test")
         );
+    }
+
+    #[test]
+    fn nested_tokio_construction_returns_error_without_panicking() {
+        let outer = RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = outer.block_on(async {
+            match connect("127.0.0.1:1", "project", EmulatorAuth::Owner, None) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("construction inside Tokio should fail"),
+            }
+        });
+        assert!(error.contains("active Tokio runtime"), "{error}");
     }
 
     #[test]

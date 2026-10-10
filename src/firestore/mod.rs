@@ -3,6 +3,7 @@
 #[cfg(feature = "emulator")]
 mod emulator;
 mod memory;
+mod unavailable;
 
 #[cfg(feature = "emulator")]
 pub use emulator::{
@@ -10,6 +11,7 @@ pub use emulator::{
     FirestoreEmulatorOptions, DEFAULT_OPERATION_TIMEOUT, OPERATION_TIMEOUT_ENV,
 };
 pub use memory::{InMemoryFirestore, RequestClock};
+pub use unavailable::UnavailableFirestore;
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -1032,6 +1034,10 @@ pub(crate) fn compare_query_candidates(
 }
 
 pub trait Firestore {
+    fn is_available(&self) -> bool {
+        true
+    }
+
     fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
     /// Apply writes atomically: either all writes persist or none do.
     /// All `ServerTimestamp` sentinels in this call use one request time.
@@ -1121,6 +1127,55 @@ pub trait Firestore {
     /// returned so callers can decide; `Runtime` ignores them to preserve
     /// the original block or commit error.
     fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>>;
+}
+
+impl<T: Firestore + ?Sized> Firestore for Box<T> {
+    fn is_available(&self) -> bool {
+        (**self).is_available()
+    }
+    fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+        (**self).get(path)
+    }
+    fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        (**self).apply(writes)
+    }
+    fn run_query(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
+        (**self).run_query(query)
+    }
+    fn run_query_page(&self, query: &QueryRef) -> Result<QueryCandidates, Box<dyn Error>> {
+        (**self).run_query_page(query)
+    }
+    fn count_query(&self, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
+        (**self).count_query(query)
+    }
+    fn run_query_bounded(
+        &self,
+        query: &QueryRef,
+        max_results: usize,
+    ) -> Result<QueryCandidates, Box<dyn Error>> {
+        (**self).run_query_bounded(query, max_results)
+    }
+    fn set_timeout(&mut self, timeout: Option<std::time::Duration>) {
+        (**self).set_timeout(timeout)
+    }
+    fn set_max_value_depth(&mut self, max_depth: usize) {
+        (**self).set_max_value_depth(max_depth)
+    }
+    fn supports_backend_timeout(&self) -> bool {
+        (**self).supports_backend_timeout()
+    }
+    fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+        (**self).begin_transaction()
+    }
+    fn transaction_get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+        (**self).transaction_get(path)
+    }
+    fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+        (**self).commit_transaction(writes)
+    }
+    fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+        (**self).abort_transaction()
+    }
 }
 
 #[cfg(test)]

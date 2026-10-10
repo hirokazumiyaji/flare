@@ -48,6 +48,14 @@ fn runs_example_scripts_successfully() {
                 Value::Int(4),
             ]),
         ),
+        (
+            "examples/scripts/12_all_services.fl",
+            Value::Array(vec![
+                Value::Bool(true),
+                Value::Str("all-services@example.com".to_string()),
+                Value::Bytes(b"flare".to_vec()),
+            ]),
+        ),
     ];
 
     for (path, expected) in cases {

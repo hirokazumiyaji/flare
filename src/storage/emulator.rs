@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Upper bound for establishing the emulator TCP connection. An unreachable
 /// or blackholed host must fail fast instead of stalling startup for the
@@ -78,6 +78,7 @@ impl StorageResponse {
 /// socket, while the production constructor uses [`HttpStorageTransport`].
 pub trait StorageTransport {
     fn send(&self, request: &StorageRequest) -> Result<StorageResponse, Box<dyn Error>>;
+    fn set_timeout(&mut self, _timeout: Option<Duration>) {}
 }
 
 /// Minimal HTTP transport for `FIREBASE_STORAGE_EMULATOR_HOST` (which is an
@@ -85,6 +86,7 @@ pub trait StorageTransport {
 pub struct HttpStorageTransport {
     address: String,
     host_header: String,
+    timeout: Option<Duration>,
 }
 
 impl HttpStorageTransport {
@@ -115,6 +117,7 @@ impl HttpStorageTransport {
         Ok(Self {
             address: without_path.to_string(),
             host_header: without_path.to_string(),
+            timeout: Some(Duration::from_secs(30)),
         })
     }
 
@@ -134,12 +137,28 @@ impl HttpStorageTransport {
     }
 
     fn connect(&self) -> Result<TcpStream, std::io::Error> {
+        self.connect_with_deadline(Some(Instant::now() + CONNECT_TIMEOUT))
+    }
+
+    fn connect_with_deadline(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Result<TcpStream, std::io::Error> {
         let mut last_err = std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("storage emulator host did not resolve: {}", self.address),
         );
         for addr in self.address.to_socket_addrs()? {
-            match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            let timeout = deadline
+                .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or(CONNECT_TIMEOUT);
+            if timeout.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "operation deadline elapsed",
+                ));
+            }
+            match TcpStream::connect_timeout(&addr, timeout.min(CONNECT_TIMEOUT)) {
                 Ok(stream) => return Ok(stream),
                 Err(e) => last_err = e,
             }
@@ -148,23 +167,15 @@ impl HttpStorageTransport {
     }
 
     fn send_http(&self, request: &StorageRequest) -> Result<StorageResponse, StorageError> {
-        let mut stream = self.connect().map_err(|e| {
+        let deadline = self
+            .timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout));
+        let mut stream = self.connect_with_deadline(deadline).map_err(|e| {
             StorageError::backend(format!(
                 "storage emulator connection failed for {}: {e}",
                 self.address
             ))
         })?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .map_err(|e| {
-                StorageError::backend(format!("storage emulator timeout setup failed: {e}"))
-            })?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(30)))
-            .map_err(|e| {
-                StorageError::backend(format!("storage emulator timeout setup failed: {e}"))
-            })?;
-
         let mut wire = format!(
             "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
             request.method, request.target, self.host_header
@@ -188,16 +199,19 @@ impl HttpStorageTransport {
             wire.push_str("\r\n");
         }
         wire.push_str("\r\n");
-        stream
-            .write_all(wire.as_bytes())
-            .and_then(|_| stream.write_all(&request.body))
-            .map_err(|e| StorageError::backend(format!("storage emulator request failed: {e}")))?;
+        write_with_deadline(&mut stream, wire.as_bytes(), deadline)?;
+        write_with_deadline(&mut stream, &request.body, deadline)?;
 
         let mut raw = Vec::new();
         let mut buffer = [0_u8; 8192];
         loop {
+            set_remaining_timeout(&stream, deadline, true)?;
             let read = stream.read(&mut buffer).map_err(|e| {
-                StorageError::backend(format!("storage emulator response read failed: {e}"))
+                if is_timeout_error(&e) {
+                    StorageError::backend("storage emulator operation timed out")
+                } else {
+                    StorageError::backend(format!("storage emulator response read failed: {e}"))
+                }
             })?;
             if read == 0 {
                 break;
@@ -216,9 +230,60 @@ impl HttpStorageTransport {
     }
 }
 
+fn set_remaining_timeout(
+    stream: &TcpStream,
+    deadline: Option<Instant>,
+    read: bool,
+) -> Result<(), StorageError> {
+    let timeout = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+    if timeout.is_some_and(|timeout| timeout.is_zero()) {
+        return Err(StorageError::backend("storage emulator operation timed out").into());
+    }
+    let result = if read {
+        stream.set_read_timeout(timeout)
+    } else {
+        stream.set_write_timeout(timeout)
+    };
+    result.map_err(|error| {
+        StorageError::backend(format!("storage emulator timeout setup failed: {error}"))
+    })
+}
+
+fn is_timeout_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+    )
+}
+
+fn write_with_deadline(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    deadline: Option<Instant>,
+) -> Result<(), StorageError> {
+    while !bytes.is_empty() {
+        set_remaining_timeout(stream, deadline, false)?;
+        let written = stream.write(bytes).map_err(|error| {
+            StorageError::backend(format!("storage emulator request failed: {error}"))
+        })?;
+        if written == 0 {
+            return Err(StorageError::backend(
+                "storage emulator request failed: write returned zero",
+            )
+            .into());
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
 impl StorageTransport for HttpStorageTransport {
     fn send(&self, request: &StorageRequest) -> Result<StorageResponse, Box<dyn Error>> {
         self.send_http(request).map_err(Into::into)
+    }
+
+    fn set_timeout(&mut self, timeout: Option<Duration>) {
+        self.timeout = timeout;
     }
 }
 
@@ -404,24 +469,18 @@ impl<T: StorageTransport> StorageEmulator<T> {
             return Err(StorageError::not_found(path).into());
         }
         if response.status == 413 {
-            return Err(StorageError::invalid_data(format!(
-                "storage object exceeds the emulator size limit: {}",
-                String::from_utf8_lossy(&response.body).trim()
-            ))
+            return Err(StorageError::invalid_data(
+                "storage object exceeds the emulator size limit",
+            )
             .into());
         }
         if response.status == 415 {
-            let detail = String::from_utf8_lossy(&response.body);
-            return Err(StorageError::invalid_content_type(detail.trim()).into());
+            return Err(
+                StorageError::invalid_content_type("emulator rejected content type").into(),
+            );
         }
-        let detail = String::from_utf8_lossy(&response.body);
-        let detail = if detail.trim().is_empty() {
-            String::new()
-        } else {
-            format!(": {}", detail.trim())
-        };
         Err(StorageError::backend(format!(
-            "storage emulator request failed with HTTP {}{detail}",
+            "storage emulator request failed with HTTP {}",
             response.status
         ))
         .into())
@@ -429,6 +488,14 @@ impl<T: StorageTransport> StorageEmulator<T> {
 }
 
 impl<T: StorageTransport> Storage for StorageEmulator<T> {
+    fn set_timeout(&mut self, timeout: Option<Duration>) {
+        self.transport.set_timeout(timeout);
+    }
+
+    fn supports_backend_timeout(&self) -> bool {
+        false
+    }
+
     fn upload(
         &mut self,
         path: &str,
@@ -880,6 +947,48 @@ mod tests {
             format!("{err}").contains("storage object not found"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn http_error_bodies_are_not_exposed() {
+        let transport = FakeTransport::new(vec![StorageResponse::new(500, "private-token")]);
+        let emulator = StorageEmulator::with_transport("p", transport).unwrap();
+        let err = emulator.download("object").unwrap_err().to_string();
+        assert!(err.contains("HTTP 500"), "{err}");
+        assert!(!err.contains("private-token"), "{err}");
+    }
+
+    #[test]
+    fn incremental_response_uses_one_operation_deadline() {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skip: sandbox does not permit local TCP listeners");
+                return;
+            }
+            Err(error) => panic!("could not bind local test server: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\na")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = stream.write_all(b"b");
+            std::thread::sleep(Duration::from_millis(20));
+            let _ = stream.write_all(b"b");
+        });
+        let mut transport = HttpStorageTransport::new(address.to_string()).unwrap();
+        transport.set_timeout(Some(Duration::from_millis(30)));
+        let error = transport
+            .send(&StorageRequest::new("GET", "/object", vec![]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("timed out"), "{error}");
+        server.join().unwrap();
     }
 
     #[test]

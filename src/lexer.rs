@@ -243,9 +243,7 @@ impl<'a> Lexer<'a> {
                         self.bump();
                         return Ok(Some(self.spanned(Token::AndAnd, span)));
                     }
-                    return Err(
-                        FlareError::lex("unexpected char: &", span.line, span.col).into(),
-                    );
+                    return Err(FlareError::lex("unexpected char: &", span.line, span.col).into());
                 }
                 '|' => {
                     let span = self.span();

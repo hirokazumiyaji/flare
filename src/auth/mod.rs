@@ -8,10 +8,12 @@
 #[cfg(feature = "emulator")]
 mod emulator;
 mod memory;
+mod unavailable;
 
 #[cfg(feature = "emulator")]
-pub use emulator::AuthEmulator;
+pub use emulator::{AuthEmulator, AuthEmulatorOptions, DEFAULT_AUTH_OPERATION_TIMEOUT};
 pub use memory::InMemoryAuth;
+pub use unavailable::UnavailableAuth;
 
 use std::error::Error;
 use std::fmt;
@@ -231,6 +233,16 @@ impl From<&str> for AuthToken {
 /// A backend owns the current local session.  `sign_out` only clears that
 /// local session; MVP does not revoke emulator-issued tokens on a server.
 pub trait Auth {
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn set_timeout(&mut self, _timeout: Option<std::time::Duration>) {}
+
+    fn supports_backend_timeout(&self) -> bool {
+        false
+    }
+
     fn sign_up(&mut self, email: &str, password: &str) -> Result<AuthSession, AuthError>;
     fn sign_in(&mut self, email: &str, password: &str) -> Result<AuthSession, AuthError>;
     fn current_user(&self) -> Result<Option<AuthUser>, AuthError>;
@@ -240,6 +252,42 @@ pub trait Auth {
 /// Forwarding adapter so boxed backends (CLI selection, service builders)
 /// satisfy the same bound as concrete backends.
 impl<T: Auth + ?Sized> Auth for Box<T> {
+    fn is_available(&self) -> bool {
+        (**self).is_available()
+    }
+
+    fn set_timeout(&mut self, timeout: Option<std::time::Duration>) {
+        (**self).set_timeout(timeout)
+    }
+
+    fn supports_backend_timeout(&self) -> bool {
+        (**self).supports_backend_timeout()
+    }
+
+    fn sign_up(&mut self, email: &str, password: &str) -> Result<AuthSession, AuthError> {
+        (**self).sign_up(email, password)
+    }
+    fn sign_in(&mut self, email: &str, password: &str) -> Result<AuthSession, AuthError> {
+        (**self).sign_in(email, password)
+    }
+    fn current_user(&self) -> Result<Option<AuthUser>, AuthError> {
+        (**self).current_user()
+    }
+    fn sign_out(&mut self) -> Result<(), AuthError> {
+        (**self).sign_out()
+    }
+}
+
+impl<T: Auth + ?Sized> Auth for &mut T {
+    fn is_available(&self) -> bool {
+        (**self).is_available()
+    }
+    fn set_timeout(&mut self, timeout: Option<std::time::Duration>) {
+        (**self).set_timeout(timeout)
+    }
+    fn supports_backend_timeout(&self) -> bool {
+        (**self).supports_backend_timeout()
+    }
     fn sign_up(&mut self, email: &str, password: &str) -> Result<AuthSession, AuthError> {
         (**self).sign_up(email, password)
     }

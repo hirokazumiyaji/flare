@@ -1,0 +1,8 @@
+Firestore.set(Firestore.doc("examples/services"), {ready: true})
+user = Auth.sign_up("all-services@example.com", "password123")
+Storage.upload("examples/services.txt", bytes("flare"))
+[
+  Firestore.get("examples/services")["ready"],
+  Auth.current_user()["email"],
+  Storage.download("examples/services.txt")
+]
