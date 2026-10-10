@@ -523,11 +523,9 @@ impl Parser {
         let expr = parser.parse_expr()?;
         parser.skip_separators();
         if !parser.at(&Token::Eof) {
-            return Err(FlareError::parse(
-                "interpolation must contain a single expression",
-                None,
-            )
-            .into());
+            return Err(
+                FlareError::parse("interpolation must contain a single expression", None).into(),
+            );
         }
         parser.validate_expr_limits(&expr)?;
         Ok(expr)

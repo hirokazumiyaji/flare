@@ -12,7 +12,7 @@ storage_upload("avatars/alice.bin", payload, content_type: "application/octet-st
 content = storage_download("avatars/alice.bin")
 ```
 
-The runtime also provides an MVP authentication API for the local Firebase Auth Emulator: `auth_sign_up`, `auth_sign_in`, `auth_current_user`, and `auth_sign_out`.
+The runtime also provides Auth and Storage APIs for local Firebase emulators. Scripts can use the original global functions or the `Firestore`, `Auth`, and `Storage` module namespaces.
 
 The complete language and API contract—including integer-only numbers, immutable variables, and atomic `batch` / `transaction` operations—is documented in the **[Language Specification / API Reference](docs/spec.md)**, the repository's sole authoritative specification.
 
@@ -85,7 +85,7 @@ Production Firestore and authenticated production Cloud Storage are not supporte
 
 ## Cloud Storage
 
-The MVP Storage CRUD API consists of the global functions `storage_upload`, `storage_download`, `storage_metadata`, and `storage_delete`. `bytes([0, 255])` is a byte sequence, not a UTF-8 string, and downloads are not converted to text. Unlike Firestore document paths, Storage object paths do not require an even or odd number of segments.
+The MVP Storage CRUD API consists of `Storage.upload`, `Storage.download`, `Storage.metadata`, and `Storage.delete`; the existing global functions remain aliases. `bytes([0, 255])` is a byte sequence, not a UTF-8 string, and downloads are not converted to text. Unlike Firestore document paths, Storage object paths do not require an even or odd number of segments.
 
 `firebase.json` configures local `storage.rules` and the emulator on port 9199. To test Storage by itself:
 
@@ -95,7 +95,7 @@ firebase emulators:exec --config firebase.emulators.json --only storage --projec
   'cargo test --features emulator --test storage_emulator --locked -- --nocapture'
 ```
 
-To use Firestore and Storage together, pass `--only firestore,storage`. `fl --storage-backend emulator` requires `FIREBASE_STORAGE_EMULATOR_HOST`. With the default `auto` setting, `fl` uses the Storage emulator when a host is set and otherwise uses in-memory storage. The bucket name is derived from `FIREBASE_PROJECT_ID`, or from `GCLOUD_PROJECT`, `FIRESTORE_PROJECT_ID`, and finally `flare-test`. You can override it with `FIREBASE_STORAGE_BUCKET`. For local rules tests, you may also set `FIREBASE_STORAGE_AUTH_TOKEN` explicitly. Automatic production token acquisition is outside the MVP scope.
+To use Firestore and Storage together, pass `--only firestore,storage`. `fl --storage-backend emulator` requires `FIREBASE_STORAGE_EMULATOR_HOST`. With the default `auto` setting, `fl` uses the Storage emulator when a host is set and otherwise uses in-memory storage. The CLI resolves one shared project from `FIREBASE_PROJECT_ID`, `GCLOUD_PROJECT`, and `FIRESTORE_PROJECT_ID`; multiple values must match, and the default is `flare-test`. `FIREBASE_STORAGE_BUCKET` overrides the emulator's default bucket. For local rules tests, you may also set `FIREBASE_STORAGE_AUTH_TOKEN` explicitly. Automatic production token acquisition is outside the MVP scope.
 
 To connect to the Auth emulator, set `FIREBASE_AUTH_EMULATOR_HOST`:
 
@@ -138,7 +138,7 @@ The defaults apply both to library embedding and the `fl` CLI.
 | Query results | 10,000 | Matching candidates scanned by one query (`limit` / `offset` apply afterward) |
 | Source length | 1 MiB | Number of UTF-8 bytes |
 | Tokens | 100,000 | Number of tokens, including those inside interpolation |
-| Backend timeout | 5,000 ms | One Firestore call (enforced by the built-in emulator backend) |
+| Backend timeout | 5,000 ms | Per backend operation; Auth covers its HTTP request, Firestore covers emulator RPCs, Storage applies socket timeouts but reports full-operation support as unavailable because synchronous DNS is not bounded |
 
 Set budgets through the embedding API:
 
@@ -162,7 +162,7 @@ println!("steps={} loops={} max_depth={}", usage.steps, usage.loop_iterations, u
 
 > **Stack safety:** The call-depth budget protects Rust's native stack. A single user-function call uses about 50 KiB of stack in a debug build, so a 2 MiB stack (such as a test thread) is exhausted at around 40 levels. The default of 32 stops before that point, making it safe for hosts with small stacks. To allow deeper recursion, raise the limit with `with_max_call_depth` only on hosts with more than 2 MiB of stack. Disabling the budget can make deep recursion overflow the stack and abort the process.
 
-The generic synchronous `Firestore` trait cannot forcibly interrupt an unresponsive backend, such as one waiting on a network. Therefore, only the built-in `FirestoreEmulator` enforces timeouts.
+Synchronous custom backends cannot be forcibly interrupted. Firestore and Auth emulator clients enforce operation timeouts; Storage bounds socket I/O but reports full-operation timeout support as false because synchronous DNS lookup is outside its deadline. `Runtime::service_backend_timeout_supported(ServiceId)` reports support for each selected backend. Firestore and Auth clients own a Tokio runtime, so construct and call them outside an active Tokio runtime; async hosts can move that work to a blocking task.
 
 The CLI lets you override each budget individually; see `fl --help` for the full list:
 
@@ -201,7 +201,7 @@ cargo test --locked --features emulator --test auth_emulator -- --nocapture     
 
 When connected to a persistent emulator, rerunning a command or splitting integration test binaries does not cause contention. Each test writes to its own `_flare_tests/<test-name>_<unique-run>/docs` hierarchy. If an environment variable is set but the connection fails, the test fails instead of skipping.
 
-`Firestore`, `InMemoryFirestore`, and `run_script` are available without features. `FirestoreEmulator` and `fl --backend emulator` are available only with the `emulator` feature. Consumers that use the emulator backend as a library must specify `features = ["emulator"]` in their dependency declaration.
+`Firestore`, `InMemoryFirestore`, `StorageEmulator`, and `run_script` are available without features. `FirestoreEmulator`, `AuthEmulator`, and `fl --backend emulator` are available with the `emulator` feature. Consumers that use those emulator backends as a library must specify `features = ["emulator"]` in their dependency declaration.
 
 ## CI / CD (GitHub Actions)
 

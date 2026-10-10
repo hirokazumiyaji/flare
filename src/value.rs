@@ -32,11 +32,38 @@ pub enum Value {
     /// A token projected out of an AuthSession for script field access.  The
     /// raw token is never represented as a script Value.
     RedactedToken(&'static str),
+    Module(BuiltinModule),
     DocRef(DocRef),
     CollectionRef(CollectionRef),
     CollectionGroupRef(CollectionGroupRef),
     QueryRef(QueryRef),
     Func(UserFunc),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltinModule {
+    Firestore,
+    Auth,
+    Storage,
+}
+
+impl BuiltinModule {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Firestore => "Firestore",
+            Self::Auth => "Auth",
+            Self::Storage => "Storage",
+        }
+    }
+
+    pub(crate) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "Firestore" => Some(Self::Firestore),
+            "Auth" => Some(Self::Auth),
+            "Storage" => Some(Self::Storage),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -357,6 +384,7 @@ impl Value {
                 session.expires_at
             ),
             Value::RedactedToken(name) => format!("<redacted:{name}>"),
+            Value::Module(module) => module.name().to_string(),
             Value::DocRef(d) => format!("#<DocRef path={}>", inspect_str(&d.path)),
             Value::CollectionRef(c) => format!("#<CollectionRef path={}>", inspect_str(&c.path)),
             Value::CollectionGroupRef(cg) => {

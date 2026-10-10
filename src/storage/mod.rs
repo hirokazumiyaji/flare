@@ -6,6 +6,7 @@
 
 mod emulator;
 mod memory;
+mod unavailable;
 
 pub use emulator::{
     HttpStorageTransport, StorageEmulator, StorageRequest, StorageResponse, StorageTransport,
@@ -15,6 +16,7 @@ pub use emulator::{
 pub type HttpTransport = HttpStorageTransport;
 pub type StorageHttpTransport = HttpStorageTransport;
 pub use memory::InMemoryStorage;
+pub use unavailable::UnavailableStorage;
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -215,6 +217,16 @@ impl Error for StorageError {}
 
 /// CRUD contract shared by the in-memory backend and the emulator adapter.
 pub trait Storage {
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn set_timeout(&mut self, _timeout: Option<std::time::Duration>) {}
+
+    fn supports_backend_timeout(&self) -> bool {
+        false
+    }
+
     fn upload(
         &mut self,
         path: &str,
@@ -233,6 +245,17 @@ pub trait Storage {
 // borrowed test backend (`run_script_with_storage(source, &mut storage)`)
 // without forcing callers to give up ownership of their fixture.
 impl<T: Storage + ?Sized> Storage for Box<T> {
+    fn is_available(&self) -> bool {
+        (**self).is_available()
+    }
+
+    fn set_timeout(&mut self, timeout: Option<std::time::Duration>) {
+        (**self).set_timeout(timeout)
+    }
+    fn supports_backend_timeout(&self) -> bool {
+        (**self).supports_backend_timeout()
+    }
+
     fn upload(
         &mut self,
         path: &str,
@@ -256,6 +279,17 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
 }
 
 impl<T: Storage + ?Sized> Storage for &mut T {
+    fn is_available(&self) -> bool {
+        (**self).is_available()
+    }
+
+    fn set_timeout(&mut self, timeout: Option<std::time::Duration>) {
+        (**self).set_timeout(timeout)
+    }
+    fn supports_backend_timeout(&self) -> bool {
+        (**self).supports_backend_timeout()
+    }
+
     fn upload(
         &mut self,
         path: &str,

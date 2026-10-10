@@ -40,11 +40,11 @@ The repository does not include a `.firebaserc`. No default project is selected 
 
 ## Authentication and Storage
 
-The current emulator configuration does not start Authentication. The runtime also does not handle production credentials, so the production rules deny every request.
+The runtime supports Auth and Storage emulator APIs, but it does not forward Auth tokens to Firestore or Storage. The runtime also does not handle production credentials, so the production rules deny every request.
 
-When adding Authentication support, implement a security policy for each read and write requirement. The policy must deny anonymous requests and authenticated requests without permission, and allow only owner and administrator requests. Add integration tests for allowed and denied operations against the `demo-flare` Firestore and Storage emulators.
+If Auth identity is later connected to Firestore or Storage, implement a security policy for each read and write requirement. The policy must deny anonymous requests and authenticated requests without permission, and allow only owner and administrator requests. Add integration tests for allowed and denied operations against the `demo-flare` Firestore and Storage emulators.
 
-Cloud Storage is not currently part of the runtime API. `storage.emulator.rules` is reserved for future local integration tests and must not be deployed to any project other than `demo-flare`. `firebase.json` refers to `storage.rules`, so an accidental Storage deployment still denies reads and writes.
+Cloud Storage is available through the runtime, but its emulator rules remain reserved for local integration tests and must not be deployed to any project other than `demo-flare`. `firebase.json` refers to `storage.rules`, so an accidental Storage deployment still denies reads and writes.
 
 ## Deployment guard tests
 

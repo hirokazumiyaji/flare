@@ -110,3 +110,51 @@ impl fmt::Display for FlareError {
 }
 
 impl Error for FlareError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceId {
+    Firestore,
+    Auth,
+    Storage,
+}
+
+impl fmt::Display for ServiceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Firestore => "Firestore",
+            Self::Auth => "Auth",
+            Self::Storage => "Storage",
+        };
+        f.write_str(name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityError {
+    pub service: ServiceId,
+    pub span: Option<Span>,
+}
+
+impl CapabilityError {
+    pub fn new(service: ServiceId) -> Self {
+        Self {
+            service,
+            span: None,
+        }
+    }
+
+    pub fn kind(&self) -> ErrorKind {
+        ErrorKind::Runtime
+    }
+}
+
+impl fmt::Display for CapabilityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(span) = self.span {
+            write!(f, "{span}: ")?;
+        }
+        write!(f, "service unavailable: {}", self.service)
+    }
+}
+
+impl Error for CapabilityError {}

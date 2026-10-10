@@ -70,6 +70,7 @@ puts "found #{rows}"
 | Timestamp | `timestamp(100)` / `now()` | Unix seconds (integer); no nanosecond precision |
 | Bytes | `bytes("fire")` / `bytes([102, 105, 114, 101])` | Immutable byte sequence. Strings become UTF-8 bytes; every integer array element must be in `0..=255`. |
 | Func | `fn f(a) { a }` | User-defined function |
+| BuiltinModule | `Firestore`, `Auth`, `Storage` | Immutable namespace value whose methods use the current Runtime's configured service |
 
 Special values for Firestore operations:
 
@@ -173,7 +174,7 @@ If an arithmetic operation (`+`, `-`, `*`, `/`) on Int values exceeds the i64 ra
 
 ### Expression Evaluation Order for Calls
 
-- For a method call with a receiver, **evaluate the receiver expression first**. A function call without a receiver begins by evaluating its arguments.
+- Reject duplicate keywords before evaluating the receiver. Then resolve the receiver exactly once, validate the call contract and service/context requirements, and only then evaluate arguments. A function call without a receiver also validates duplicate keywords and its call contract before evaluating arguments.
 - Evaluate arguments, positional and keyword alike, **from left to right in source order**. The parser preserves them as one ordered sequence and allows them to be interleaved. Evaluate each argument expression exactly once.
 - Evaluation order and parameter binding order are separate. In a function call, positional values fill parameters from left to right first; keywords then fill matching parameters by name. Thus, for `fn f(b, a) { ... }`, `f(a: first(), second())` evaluates `first()` then `second()`, but binds the positional value to `b` and the keyword value to `a`.
 - If evaluating a receiver or argument expression fails, return that error without evaluating the remaining expressions. If receiver evaluation or receiver type validation fails, later argument side effects do not occur. If the receiver succeeds and a later argument fails, side effects already caused by evaluating the receiver remain.
@@ -217,7 +218,7 @@ puts "x"                        # Parentheses may be omitted
 ```
 
 - Positional and keyword arguments can be mixed. Positional values bind first, then keywords bind by name. Missing, extra, or unknown arguments error.
-- **Keyword arguments are not supported for method calls with a receiver.**
+- Built-in module calls accept the same keyword arguments as their global aliases. Other receiver methods keep their documented contracts; query and collection methods do not accept keywords.
 - The parameter list may be omitted, as in `fn name { ... }`.
 - An array literal cannot be the **first argument of a call without parentheses**. `puts [1, 2]` is parsed as indexing `puts[1, 2]`; pass arrays with parentheses, as `puts([1, 2])`.
 
@@ -408,12 +409,12 @@ usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emula
   is printed, then the program exits.
 - With `--backend emulator` (when the `emulator` feature is enabled):
   - `FIRESTORE_EMULATOR_HOST` is **required**; missing values error immediately.
-  - `FIRESTORE_PROJECT_ID` defaults to `flare-test`, unless `FIREBASE_PROJECT_ID` is set.
-- `--storage-backend` selects Storage: `auto` (default), `in-memory`, or `emulator`. `auto` uses the Storage emulator when `FIREBASE_STORAGE_EMULATOR_HOST` is set, otherwise in-memory. Explicit `emulator` requires `FIREBASE_STORAGE_EMULATOR_HOST`; project ID precedence is `FIREBASE_PROJECT_ID` → `GCLOUD_PROJECT` → `FIRESTORE_PROJECT_ID` → `flare-test`.
+- `--storage-backend` selects Storage: `auto` (default), `in-memory`, or `emulator`. `auto` uses the Storage emulator when `FIREBASE_STORAGE_EMULATOR_HOST` is set, otherwise in-memory. Explicit `emulator` requires `FIREBASE_STORAGE_EMULATOR_HOST`.
 - With `--auth-backend emulator`:
   - `FIREBASE_AUTH_EMULATOR_HOST` is **required**; missing values error immediately.
-  - The project ID is selected in this order: `FIREBASE_PROJECT_ID`, `FIRESTORE_PROJECT_ID`, then `flare-test`.
-- Firestore and Auth accept the same two project ID variables but use different precedence (Firestore prefers `FIRESTORE_PROJECT_ID`; Auth prefers `FIREBASE_PROJECT_ID`). This preserves the existing Firestore precedence.
+- The CLI resolves `FIREBASE_PROJECT_ID`, `GCLOUD_PROJECT`, and `FIRESTORE_PROJECT_ID` once. Repeated identical values are accepted; conflicting values are a configuration error. If none is set, the project is `flare-test`. This one project is passed to each selected emulator backend. `FIREBASE_STORAGE_BUCKET`, when set, overrides the Storage emulator's default `{project_id}.appspot.com` bucket.
+- Auth emulator requests use a 5,000 ms operation timeout and `fake-api-key` by default. `FIREBASE_API_KEY` overrides the key. Rust callers can set `AuthEmulatorOptions` explicitly; that constructor does not read environment variables.
+- Auth and Firestore emulator clients are synchronous adapters that own a Tokio runtime. Construct and call them from synchronous code, not inside an active Tokio runtime; async hosts should move construction and script execution into a blocking task when the backend types permit it. Storage uses synchronous socket I/O and synchronous DNS lookup.
 - Firestore and Auth backends can be selected independently. If both use `emulator`, both emulators are connected to.
 - Backend configuration is validated before reading stdin or a file, so an invalid configuration will not leave the CLI waiting for stdin.
 - The result is printed as `=> <inspect representation>`.
@@ -422,6 +423,10 @@ usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emula
 ## 11. Auth API
 
 Authentication is provided through global functions, like Firestore. The Auth backend is independent of the Firestore backend and defaults to in-memory; select the emulator with `--auth-backend emulator` or `AuthEmulator`.
+
+The `Auth` module is an alias for the same handlers: `Auth.sign_up(email, password)`, `Auth.sign_in(email, password)`, `Auth.current_user()`, and `Auth.sign_out()`. The `Firestore` module exposes the Firestore global functions as methods, and `Storage` exposes the Storage global functions. Module values can be assigned or passed to functions; they contain no backend or credentials. Local variables and functions take precedence over module names.
+
+Rust embedders can compose services with `Services::in_memory()`, `with_firestore`, `with_auth`, `with_storage`, and `with_project`, then create a runtime with `Runtime::from_services`. `Services::empty(project)` leaves every service unavailable. A call requiring an unavailable service returns a typed `CapabilityError` before evaluating its arguments. Reference builders and Firestore sentinels remain usable without a Firestore backend. A configured Auth backend with no signed-in user returns `nil` from `Auth.current_user()`.
 
 | Function | Return value | Description |
 |------|--------|------|
@@ -512,9 +517,9 @@ Identity Toolkit error codes may include details after a colon (for example, `WE
 ### Build Features and Public API
 
 - The default feature set is empty. `cargo build` / `cargo test` build only the in-memory backend and library API; they do not link Firestore SDK, gRPC, or TLS dependencies.
-- Enabling the `emulator` feature enables the Firestore, Storage, and Auth emulator clients: `cargo build --features emulator`.
+- Enabling the `emulator` feature enables the Firestore and Auth emulator clients: `cargo build --features emulator`. The dependency-free Storage REST client is available without that feature.
 - `Firestore`, `InMemoryFirestore`, `run_script`, and `run_script_with_firestore` are available without features, so consumers embedding a custom in-memory backend do not pull in the SDK.
-- `FirestoreEmulator`, `StorageEmulator`, and `AuthEmulator` are not exposed in builds without the feature. The CLI still accepts `--backend emulator`, then reports a clear error after environment validation and explains how to enable the feature.
+- `FirestoreEmulator` and `AuthEmulator` are not exposed in builds without the feature. `StorageEmulator` remains available because its synchronous HTTP transport uses only the standard library.
 - Future clients should also be split into service-specific feature groups, following the emulator pattern.
 
 - Authenticated access to **production Firestore is unsupported** and out of scope.
@@ -547,7 +552,7 @@ Budgets reset for each `run` / `eval_program` call (they accumulate during that 
 | Query results | 10,000 | Matching candidates scanned by one query; `query result limit exceeded` |
 | Source length | 1 MiB | UTF-8 bytes |
 | Tokens | 100,000 | Lexical tokens, including interpolation |
-| Backend timeout | 5,000 ms | Per Firestore call; enforced by the built-in emulator |
+| Backend timeout | 5,000 ms | Per backend operation. Firestore and Auth enforce full operations; Storage applies one deadline across socket I/O but reports support as false because synchronous DNS is not bounded. |
 
 - All budget errors use `ErrorKind::Runtime` (or `Lex` / `Parse` when caused by lexing or parsing) and point to the start of the failed top-level statement. A wall-clock limit exceeded before evaluation starts points to `1:1`.
 - A budget error aborts `batch` without applying any writes and aborts a `transaction`, preserving the same atomicity as an ordinary runtime error. A budget error after commit is not reported as failure after successful persistent writes.

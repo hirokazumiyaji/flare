@@ -728,6 +728,12 @@ fn run_count_aggregation(
     parent: Option<&str>,
     query: StructuredAggregationQuery,
 ) -> Result<Option<i64>, Box<dyn Error>> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(std::io::Error::other(
+            "Firestore emulator calls cannot run inside an active Tokio runtime",
+        )
+        .into());
+    }
     let db = &fs.client.db;
     let parent = path::parent_path(&fs.client.project_id, parent);
     let values = fs.client.runtime.block_on(async move {
@@ -1020,6 +1026,12 @@ fn is_server_prefilter_safe(filter: &QueryFilter) -> bool {
 }
 
 fn run_count_fallback(fs: &FirestoreEmulator, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return Err(std::io::Error::other(
+            "Firestore emulator calls cannot run inside an active Tokio runtime",
+        )
+        .into());
+    }
     let server_filters = server_prefilters(&query.filters);
     let (parent, mut sq) = match &query.source {
         QuerySource::Collection(path) => {
