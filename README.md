@@ -22,7 +22,6 @@ The complete language and API contract—including integer-only numbers, immutab
 - [examples/scripts/](examples/scripts/): runnable example scripts
 - [Firebase rules separation and deployment safeguards](docs/firebase-security.md)
 - [Release checklist](docs/release-checklist.md)
-- [Archived MVP planning documents](docs/archive/mvp/)
 
 ## Reproducible builds
 
