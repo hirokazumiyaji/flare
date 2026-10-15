@@ -2579,6 +2579,47 @@ fn timestamp_comparison_diff_and_rfc3339() {
 }
 
 #[test]
+fn string_comparison_operators_support_utf8_lexicographical_order() {
+    let out = run_script("[\"a\" < \"b\", \"b\" > \"a\", \"a\" <= \"a\", \"a\" >= \"a\", \"abc\" < \"abd\", \"abc\" < \"abcd\"]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::Bool(true),
+        ])
+    );
+    let out = run_script("[\"b\" < \"a\", \"a\" > \"b\", \"b\" <= \"a\", \"a\" >= \"b\"]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::Bool(false),
+        ])
+    );
+    // UTF-8 multi-byte
+    let out = run_script("\"あ\" < \"い\"").unwrap();
+    assert_eq!(out, Value::Bool(true));
+    // Cross-type errors
+    let err = run_script("\"a\" < 1").unwrap_err();
+    assert!(format!("{err}").contains("unsupported < operands"), "{err}");
+    let err = run_script("\"a\" > 1").unwrap_err();
+    assert!(format!("{err}").contains("unsupported > operands"), "{err}");
+    let err = run_script("\"a\" <= 1").unwrap_err();
+    assert!(format!("{err}").contains("unsupported <= operands"), "{err}");
+    let err = run_script("\"a\" >= 1").unwrap_err();
+    assert!(format!("{err}").contains("unsupported >= operands"), "{err}");
+    // Conditional
+    let out = run_script("if \"alice\" < \"bob\" { 1 } else { 2 }").unwrap();
+    assert_eq!(out, Value::Int(1));
+}
+
+#[test]
 fn timestamp_add_seconds_overflow_is_an_error_not_a_panic() {
     // add_seconds の加算は i64 の境界で panic / wraparound しない。
     let err = run_script("timestamp(9223372036854775807).add_seconds(1)").unwrap_err();

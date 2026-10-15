@@ -905,24 +905,28 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a > b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds > b.seconds),
             (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a > b),
+            (Value::Str(a), Value::Str(b)) => Value::Bool(a > b),
             _ => return Err("unsupported > operands".into()),
         },
         BinOp::Lt => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a < b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds < b.seconds),
             (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a < b),
+            (Value::Str(a), Value::Str(b)) => Value::Bool(a < b),
             _ => return Err("unsupported < operands".into()),
         },
         BinOp::Ge => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a >= b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds >= b.seconds),
             (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a >= b),
+            (Value::Str(a), Value::Str(b)) => Value::Bool(a >= b),
             _ => return Err("unsupported >= operands".into()),
         },
         BinOp::Le => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a <= b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds <= b.seconds),
             (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a <= b),
+            (Value::Str(a), Value::Str(b)) => Value::Bool(a <= b),
             _ => return Err("unsupported <= operands".into()),
         },
         // `eval_expr` が `And` / `Or` を短絡評価して返すため、ここには到達しない。

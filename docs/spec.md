@@ -158,7 +158,7 @@ rows[0]["__name__"]  # => "users/1" (query-result Map indexing; __name__ is acce
 | 1 (lowest) | `\|\|` | Any value (short-circuits and returns the operand itself, as in Ruby) |
 | 2 | `&&` | Any value (short-circuits and returns the operand itself) |
 | 3 | `==` `!=` | Any values (structural equality) |
-| 3 | `>` `<` `>=` `<=` | Int / Timestamp / Bytes pairs (Bytes use unsigned-byte lexicographic order); other types are errors |
+| 3 | `>` `<` `>=` `<=` | Int / Timestamp / Bytes / Str pairs (Bytes use unsigned-byte lexicographic order, Str use UTF-8 lexicographic order); other types are errors |
 | 4 | `+` `-` | `+`: Int pairs / Str pairs (concatenation). `-`: Int pairs / Timestamp − Timestamp → Int (difference in seconds). Other types are errors |
 | 5 | `*` `/` | Int only. `/ 0` reports `division by zero`. |
 | 6 | `!` `-` (unary) | `!v` accepts any value and returns `Bool(!truthy(v))`. `-v` accepts Int only (`integer overflow` on overflow). |
