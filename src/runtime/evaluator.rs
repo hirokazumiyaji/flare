@@ -870,16 +870,70 @@ impl Evaluator<'_> {
                 Ok(ExecFlow::Value(Value::Int(bytes.len() as i64)))
             }
             MethodReceiver::Bytes(_) => Err(format!("unknown bytes method: {name}").into()),
-            MethodReceiver::Map(map) => {
-                // Map レシーバは `m.key` 形式のキーアクセス(Ruby の OpenStruct 風)のみ。
-                // 引数を取るメソッドは持たないので、Args がある場合はエラーにする。
-                if !args.is_empty() {
-                    return Err(format!("unknown map method: {name}").into());
+            MethodReceiver::Map(map) => match name {
+                "keys" => Ok(ExecFlow::Value(Value::Array(
+                    map.keys().cloned().map(Value::Str).collect(),
+                ))),
+                "values" => Ok(ExecFlow::Value(Value::Array(
+                    map.values().cloned().collect(),
+                ))),
+                "len" => Ok(ExecFlow::Value(Value::Int(map.len() as i64))),
+                "has_key" => {
+                    let key = match args.first() {
+                        Some(Value::Str(k)) => k,
+                        _ => return Err("has_key key must be a string".into()),
+                    };
+                    Ok(ExecFlow::Value(Value::Bool(map.contains_key(key))))
                 }
-                Ok(ExecFlow::Value(
-                    map.get(name).cloned().unwrap_or(Value::Nil),
-                ))
-            }
+                _ => {
+                    if !args.is_empty() {
+                        return Err(format!("unknown map method: {name}").into());
+                    }
+                    Ok(ExecFlow::Value(
+                        map.get(name).cloned().unwrap_or(Value::Nil),
+                    ))
+                }
+            },
+            MethodReceiver::Str(s) => match name {
+                "len" => Ok(ExecFlow::Value(Value::Int(s.chars().count() as i64))),
+                "trim" => Ok(ExecFlow::Value(Value::Str(s.trim().to_string()))),
+                "split" => {
+                    let sep = match args.first() {
+                        Some(Value::Str(sep)) => sep,
+                        _ => return Err("split separator must be a string".into()),
+                    };
+                    let parts = if sep.is_empty() {
+                        s.chars().map(|c| Value::Str(c.to_string())).collect()
+                    } else {
+                        s.split(sep.as_str())
+                            .map(|part| Value::Str(part.to_string()))
+                            .collect()
+                    };
+                    Ok(ExecFlow::Value(Value::Array(parts)))
+                }
+                "starts_with" => {
+                    let prefix = match args.first() {
+                        Some(Value::Str(prefix)) => prefix,
+                        _ => return Err("starts_with prefix must be a string".into()),
+                    };
+                    Ok(ExecFlow::Value(Value::Bool(s.starts_with(prefix.as_str()))))
+                }
+                "ends_with" => {
+                    let suffix = match args.first() {
+                        Some(Value::Str(suffix)) => suffix,
+                        _ => return Err("ends_with suffix must be a string".into()),
+                    };
+                    Ok(ExecFlow::Value(Value::Bool(s.ends_with(suffix.as_str()))))
+                }
+                "contains" => {
+                    let substr = match args.first() {
+                        Some(Value::Str(substr)) => substr,
+                        _ => return Err("contains substring must be a string".into()),
+                    };
+                    Ok(ExecFlow::Value(Value::Bool(s.contains(substr.as_str()))))
+                }
+                _ => Err(format!("unknown string method: {name}").into()),
+            },
             MethodReceiver::AuthSession(session) => {
                 if !args.is_empty() {
                     return Err(format!("unknown auth session method: {name}").into());
@@ -901,9 +955,6 @@ impl Evaluator<'_> {
         args: Vec<Value>,
         block: Option<&Block>,
     ) -> Result<ExecFlow, Box<dyn Error>> {
-        if !args.is_empty() {
-            return Err(format!("array method {name} does not take arguments").into());
-        }
         match name {
             "each" => {
                 let Some(block) = block else {
@@ -935,6 +986,61 @@ impl Evaluator<'_> {
                     }
                 }
                 Ok(ExecFlow::Value(Value::Array(out)))
+            }
+            "filter" => {
+                let Some(block) = block else {
+                    return Err("filter requires { ... } block".into());
+                };
+                check_block_arity(block, 1)?;
+                let mut out = vec![];
+                for item in items {
+                    self.consume_loop_iteration()?;
+                    match self.call_block(block, vec![item.clone()])? {
+                        ExecFlow::Value(v) => {
+                            if v.truthy() {
+                                out.push(item);
+                            }
+                        }
+                        ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
+                    }
+                }
+                Ok(ExecFlow::Value(Value::Array(out)))
+            }
+            "find" => {
+                let Some(block) = block else {
+                    return Err("find requires { ... } block".into());
+                };
+                check_block_arity(block, 1)?;
+                for item in items {
+                    self.consume_loop_iteration()?;
+                    match self.call_block(block, vec![item.clone()])? {
+                        ExecFlow::Value(v) => {
+                            if v.truthy() {
+                                return Ok(ExecFlow::Value(item));
+                            }
+                        }
+                        ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
+                    }
+                }
+                Ok(ExecFlow::Value(Value::Nil))
+            }
+            "contains" => {
+                let target = args.first().ok_or_else(|| "contains requires 1 argument")?;
+                let found = items.iter().any(|item| item == target);
+                Ok(ExecFlow::Value(Value::Bool(found)))
+            }
+            "join" => {
+                let sep = match args.first() {
+                    Some(Value::Str(sep)) => sep.as_str(),
+                    Some(_) => return Err("join separator must be a string".into()),
+                    None => "",
+                };
+                let out = items
+                    .iter()
+                    .map(|item| item.to_string())
+                    .collect::<Vec<_>>()
+                    .join(sep);
+                Ok(ExecFlow::Value(Value::Str(out)))
             }
             "len" => Ok(ExecFlow::Value(Value::Int(items.len() as i64))),
             _ => Err(format!("unknown array method: {name}").into()),

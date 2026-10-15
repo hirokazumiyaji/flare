@@ -3114,3 +3114,222 @@ get("users/with_clock")["c"]
     assert_eq!(out, Value::Timestamp(Timestamp { seconds: 3000 }));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn array_extended_methods_work() {
+    // filter
+    let out = run_script("[1, 2, 3, 4, 5].filter { |x| x > 2 }").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(3), Value::Int(4), Value::Int(5)])
+    );
+
+    // find
+    let out = run_script("[1, 2, 3, 4, 5].find { |x| x > 3 }").unwrap();
+    assert_eq!(out, Value::Int(4));
+    let out = run_script("[1, 2, 3].find { |x| x > 10 }").unwrap();
+    assert_eq!(out, Value::Nil);
+
+    // contains
+    let out = run_script("[[1, 2, 3].contains(2), [1, 2, 3].contains(99)]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Bool(true), Value::Bool(false)])
+    );
+
+    // join
+    let out = run_script("[\"a\", \"b\", \"c\"].join(\",\")").unwrap();
+    assert_eq!(out, Value::Str("a,b,c".to_string()));
+    let out = run_script("[\"a\", \"b\"].join()").unwrap();
+    assert_eq!(out, Value::Str("ab".to_string()));
+    let out = run_script("[1, 2, 3].join(\"-\")").unwrap();
+    assert_eq!(out, Value::Str("1-2-3".to_string()));
+    let out = run_script("[].join(\",\")").unwrap();
+    assert_eq!(out, Value::Str("".to_string()));
+
+    // Early return from block in filter / find
+    let out = run_script(
+        r#"
+fn test_filter_return() {
+    [1, 2, 3].filter { |x|
+        if x == 2 {
+            return 999
+        }
+        true
+    }
+    100
+}
+test_filter_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(999));
+
+    let out = run_script(
+        r#"
+fn test_find_return() {
+    [1, 2, 3].find { |x|
+        if x == 2 {
+            return 888
+        }
+        false
+    }
+    100
+}
+test_find_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(888));
+
+    // Arity and argument errors
+    let err = run_script("[1, 2].filter()").unwrap_err();
+    assert!(format!("{err}").contains("requires { ... } block"), "{err}");
+    let err = run_script("[1, 2].find()").unwrap_err();
+    assert!(format!("{err}").contains("requires { ... } block"), "{err}");
+    let err = run_script("[1, 2].contains()").unwrap_err();
+    assert!(format!("{err}").contains("missing positional arguments"), "{err}");
+    let err = run_script("[1, 2].join(123)").unwrap_err();
+    assert!(format!("{err}").contains("join separator must be a string"), "{err}");
+}
+
+#[test]
+fn string_extended_methods_and_indexing_work() {
+    // split
+    let out = run_script("\"a,b,c\".split(\",\")").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+            Value::Str("c".to_string()),
+        ])
+    );
+    let out = run_script("\"hello\".split(\"\")").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("h".to_string()),
+            Value::Str("e".to_string()),
+            Value::Str("l".to_string()),
+            Value::Str("l".to_string()),
+            Value::Str("o".to_string()),
+        ])
+    );
+
+    // starts_with & ends_with
+    let out = run_script("[\"hello\".starts_with(\"he\"), \"hello\".starts_with(\"wo\")]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Bool(true), Value::Bool(false)])
+    );
+    let out = run_script("[\"hello\".ends_with(\"lo\"), \"hello\".ends_with(\"he\")]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Bool(true), Value::Bool(false)])
+    );
+
+    // contains
+    let out = run_script("[\"hello world\".contains(\"world\"), \"hello\".contains(\"abc\")]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Bool(true), Value::Bool(false)])
+    );
+
+    // trim
+    let out = run_script("\"  hello world  \\n\".trim()").unwrap();
+    assert_eq!(out, Value::Str("hello world".to_string()));
+
+    // len
+    let out = run_script("\"hello\".len()").unwrap();
+    assert_eq!(out, Value::Int(5));
+    let out = run_script("\"こんにちは\".len()").unwrap();
+    assert_eq!(out, Value::Int(5));
+
+    // indexing
+    let out = run_script("s = \"hello\"\n[s[0], s[1], s[4], s[5], s[-1]]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("h".to_string()),
+            Value::Str("e".to_string()),
+            Value::Str("o".to_string()),
+            Value::Nil,
+            Value::Nil,
+        ])
+    );
+    let out = run_script("\"こんにちは\"[1]").unwrap();
+    assert_eq!(out, Value::Str("ん".to_string()));
+
+    // invalid index type
+    let err = run_script("\"hello\"[\"foo\"]").unwrap_err();
+    assert!(format!("{err}").contains("string index must be an int"), "{err}");
+
+    // invalid arguments
+    let err = run_script("\"hello\".split(123)").unwrap_err();
+    assert!(format!("{err}").contains("split separator must be a string"), "{err}");
+    let err = run_script("\"hello\".starts_with(123)").unwrap_err();
+    assert!(format!("{err}").contains("starts_with prefix must be a string"), "{err}");
+    let err = run_script("\"hello\".ends_with(123)").unwrap_err();
+    assert!(format!("{err}").contains("ends_with suffix must be a string"), "{err}");
+    let err = run_script("\"hello\".contains(123)").unwrap_err();
+    assert!(format!("{err}").contains("contains substring must be a string"), "{err}");
+    let err = run_script("\"hello\".trim(1)").unwrap_err();
+    assert!(format!("{err}").contains("too many positional arguments"), "{err}");
+    let err = run_script("\"hello\".unknown()").unwrap_err();
+    assert!(format!("{err}").contains("unknown string method: unknown"), "{err}");
+}
+
+#[test]
+fn map_extended_methods_work() {
+    let out = run_script(
+        r#"
+m = {name: "alice", age: 30}
+[m.keys(), m.values(), m.has_key("name"), m.has_key("missing"), m.len()]
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Array(vec![Value::Str("age".to_string()), Value::Str("name".to_string())]),
+            Value::Array(vec![Value::Int(30), Value::Str("alice".to_string())]),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Int(2),
+        ])
+    );
+
+    // empty map
+    let out = run_script(
+        r#"
+m = {}
+[m.keys(), m.values(), m.has_key("x"), m.len()]
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Array(vec![]),
+            Value::Array(vec![]),
+            Value::Bool(false),
+            Value::Int(0),
+        ])
+    );
+
+    // property access still works
+    let out = run_script("m = {name: \"bob\"}\nm.name").unwrap();
+    assert_eq!(out, Value::Str("bob".to_string()));
+
+    // argument errors
+    let err = run_script("{a: 1}.keys(1)").unwrap_err();
+    assert!(format!("{err}").contains("too many positional arguments"), "{err}");
+    let err = run_script("{a: 1}.values(1)").unwrap_err();
+    assert!(format!("{err}").contains("too many positional arguments"), "{err}");
+    let err = run_script("{a: 1}.has_key()").unwrap_err();
+    assert!(format!("{err}").contains("missing positional arguments"), "{err}");
+    let err = run_script("{a: 1}.has_key(123)").unwrap_err();
+    assert!(format!("{err}").contains("has_key key must be a string"), "{err}");
+}
+

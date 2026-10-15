@@ -142,14 +142,19 @@ m["name"]          # => "alice"
 m["nested"]["a"][1]  # => 2
 m.name             # => "alice" (syntactic sugar for m["name"] on Maps only)
 
+s = "hello"
+s[0]               # => "h"
+s[4]               # => "o"
+s[5]               # => nil
+
 rows = col("users").get()
 rows[0]["__name__"]  # => "users/1" (query-result Map indexing; __name__ is accessed the same way)
 ```
 
-- Map indices must be **Str**; Array indices must be **Int**. A type mismatch is an error.
+- Map indices must be **Str**; Array and Str indices must be **Int**. A type mismatch is an error.
 - Missing keys and out-of-range indices return **nil**, as in Ruby. Negative indices also return nil.
-- Indexing a receiver other than Map or Array is an error (`unsupported index receiver`).
-- The `m.key` form is limited to Map receivers to avoid conflicts with methods such as `.doc(..)` / `.where(..)` on Ref / Query values. A missing key returns nil. Calling it with arguments (`m.key(...)`) is an error.
+- Indexing a receiver other than Map, Array, or Str is an error (`unsupported index receiver`).
+- The `m.key` form is limited to Map receivers to avoid conflicts with methods such as `.doc(..)` / `.where(..)` on Ref / Query values. A missing key returns nil. Calling it with arguments (`m.key(...)`) is an error (unless calling a map method such as `.has_key(k)`).
 
 ### Operators and Precedence (Low to High)
 
@@ -237,10 +242,26 @@ total = len(rows)                                            # Number of items
 |----|------|
 | `array.each { \|item\| ... }` | Evaluates the block with each item bound to its parameter; returns nil. **Can be used directly on query results (`.get()`).** |
 | `array.map { \|item\| expr }` | Returns a new Array of block results for each item |
+| `array.filter { \|item\| expr }` | Returns a new Array of items for which the block evaluates to a truthy value |
+| `array.find { \|item\| expr }` | Returns the first item for which the block evaluates to a truthy value, or nil if none matches |
+| `array.contains(val)` | Returns Bool indicating whether the array contains `val` |
+| `array.join(sep = "")` | Joins array elements as a string using the separator |
 | `array.len()` / `len(array)` | Number of items (Int) |
-| `len(map)` / `len(str)` / `len(bytes)` | Number of Map keys / Str characters / Bytes bytes |
+| `map.keys()` | Returns an Array of all keys in the Map |
+| `map.values()` | Returns an Array of all values in the Map |
+| `map.has_key(key)` | Returns Bool indicating whether the Map contains the string key |
+| `map.len()` / `len(map)` | Number of Map entries (Int) |
+| `str.split(sep)` | Splits the string into an Array of substrings |
+| `str.starts_with(prefix)` | Returns Bool indicating whether the string begins with prefix |
+| `str.ends_with(suffix)` | Returns Bool indicating whether the string ends with suffix |
+| `str.contains(substr)` | Returns Bool indicating whether the string contains substr |
+| `str.trim()` | Returns a copy of the string with leading and trailing whitespace removed |
+| `str.len()` / `len(str)` | Number of Unicode characters in the string (Int) |
+| `len(bytes)` | Number of Bytes bytes |
 
-- A block is required (`each()` without one errors). The number of block parameters must match the number supplied by the caller (`[1].each { \|a, b\| ... }` errors; **this is checked even for empty arrays**). `each`, `map`, and `len` take no arguments (`[1].len(99)` errors).
+- A block is required for `each`, `map`, `filter`, and `find`. The number of block parameters must match the number supplied by the caller (`[1].each { \|a, b\| ... }` errors; **this is checked even for empty arrays**).
+- `each`, `map`, `filter`, `find`, `array.len()`, `map.keys()`, `map.values()`, `map.len()`, `str.trim()`, `str.len()` take no positional arguments.
+- `contains`, `has_key`, `split`, `starts_with`, `ends_with`, `str.contains` take exactly 1 argument. `array.join` takes 0 or 1 argument.
 - Assigning to an outer-scope name inside a block errors, consistent with variable immutability.
 - A `return` inside a block exits the block and becomes the return value of the **enclosing function**. Iteration in `each` / `map` stops there, so later items are not processed. This propagation applies only when returning from a block to an outer function. A `Return` within the function itself (the body or a block in that body) is consumed as that function’s result. A nested block’s `return` belongs to the innermost **function**.
 - There is no `for` statement; use `each` / `map` to iterate. `while` remains, but immutable variables make it unsuitable for iteration (it is intended for special cases such as waiting on side effects).
