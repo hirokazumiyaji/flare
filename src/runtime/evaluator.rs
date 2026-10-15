@@ -281,17 +281,21 @@ impl Evaluator<'_> {
         ) {
             // スカラー値は子が無いので depth 0 相当。ただし root 1 ノードと
             // して数え、ノード予算が 0 のときはここで弾く。
-            value::validate_value_limits(
+            value::validate_value_limits_with_sizes(
                 value,
                 self.limits.max_value_depth,
                 self.limits.max_value_nodes.map(|budget| budget.min(1)),
+                self.limits.max_string_bytes,
+                self.limits.max_bytes_size,
             )?;
             return Ok(());
         }
-        let observed_depth = value::validate_value_limits(
+        let observed_depth = value::validate_value_limits_with_sizes(
             value,
             self.limits.max_value_depth,
             self.limits.max_value_nodes,
+            self.limits.max_string_bytes,
+            self.limits.max_bytes_size,
         )?;
         self.usage.max_value_depth = self.usage.max_value_depth.max(observed_depth);
         Ok(())
@@ -516,13 +520,32 @@ impl Evaluator<'_> {
                 let mut out = String::new();
                 for piece in pieces {
                     match piece {
-                        StrPiece::Lit(s) => out.push_str(s),
+                        StrPiece::Lit(s) => {
+                            if let Some(max) = self.limits.max_string_bytes {
+                                if out.len().saturating_add(s.len()) > max {
+                                    return Err(FlareError::runtime(format!(
+                                        "string size limit exceeded (max {max})"
+                                    ))
+                                    .into());
+                                }
+                            }
+                            out.push_str(s);
+                        }
                         StrPiece::Expr(e) => {
                             let v = match self.eval_expr(e)? {
                                 ExecFlow::Value(v) => v,
                                 flow @ ExecFlow::Return(_) => return Ok(flow),
                             };
-                            out.push_str(&v.to_string());
+                            let s = v.to_string();
+                            if let Some(max) = self.limits.max_string_bytes {
+                                if out.len().saturating_add(s.len()) > max {
+                                    return Err(FlareError::runtime(format!(
+                                        "string size limit exceeded (max {max})"
+                                    ))
+                                    .into());
+                                }
+                            }
+                            out.push_str(&s);
                         }
                     }
                 }
@@ -562,6 +585,18 @@ impl Evaluator<'_> {
                             ExecFlow::Value(v) => v,
                             flow @ ExecFlow::Return(_) => return Ok(flow),
                         };
+                        if *op == BinOp::Add {
+                            if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
+                                if let Some(max) = self.limits.max_string_bytes {
+                                    if a.len().saturating_add(b.len()) > max {
+                                        return Err(FlareError::runtime(format!(
+                                            "string size limit exceeded (max {max})"
+                                        ))
+                                        .into());
+                                    }
+                                }
+                            }
+                        }
                         eval_binary(l, *op, r).map(ExecFlow::Value)
                     }
                 }
@@ -1559,7 +1594,7 @@ fn builtin_timestamp(
 }
 
 fn builtin_bytes(
-    _rt: &mut Evaluator<'_>,
+    rt: &mut Evaluator<'_>,
     args: Vec<Value>,
     kwargs: BTreeMap<String, Value>,
     block: Option<&Block>,
@@ -1570,14 +1605,34 @@ fn builtin_bytes(
     // `args.len() == 1` は上で保証されているので `next()` は必ず `Some`。
     // 取り出しを下の `match` にまとめ、到達不能な `ok_or` 分岐を作らない。
     let bytes = match args.into_iter().next() {
-        Some(Value::Str(s)) => s.into_bytes(),
-        Some(Value::Array(items)) => items
-            .into_iter()
-            .map(|value| match value {
-                Value::Int(byte) => u8::try_from(byte).map_err(|_| BYTES_ELEMENT_ERR.to_string()),
-                _ => Err(BYTES_ELEMENT_ERR.to_string()),
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+        Some(Value::Str(s)) => {
+            if let Some(max) = rt.limits.max_bytes_size {
+                if s.len() > max {
+                    return Err(FlareError::runtime(format!(
+                        "bytes size limit exceeded (max {max})"
+                    ))
+                    .into());
+                }
+            }
+            s.into_bytes()
+        }
+        Some(Value::Array(items)) => {
+            if let Some(max) = rt.limits.max_bytes_size {
+                if items.len() > max {
+                    return Err(FlareError::runtime(format!(
+                        "bytes size limit exceeded (max {max})"
+                    ))
+                    .into());
+                }
+            }
+            items
+                .into_iter()
+                .map(|value| match value {
+                    Value::Int(byte) => u8::try_from(byte).map_err(|_| BYTES_ELEMENT_ERR.to_string()),
+                    _ => Err(BYTES_ELEMENT_ERR.to_string()),
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
         _ => return Err(BYTES_USAGE.into()),
     };
     Ok(ExecFlow::Value(Value::Bytes(bytes)))
@@ -1677,11 +1732,16 @@ fn builtin_storage_download(
     expect_storage_arity("storage_download", &args, 1)?;
     let path = expect_storage_path(args.first())?;
     validate_storage_path(path)?;
-    rt.services
-        .storage
-        .download(path)
-        .map(|bytes| ExecFlow::Value(Value::Bytes(bytes)))
-        .map_err(backend_err)
+    let bytes = rt.services.storage.download(path).map_err(backend_err)?;
+    if let Some(max) = rt.limits.max_bytes_size {
+        if bytes.len() > max {
+            return Err(FlareError::runtime(format!(
+                "bytes size limit exceeded (max {max})"
+            ))
+            .into());
+        }
+    }
+    Ok(ExecFlow::Value(Value::Bytes(bytes)))
 }
 
 fn builtin_storage_metadata(

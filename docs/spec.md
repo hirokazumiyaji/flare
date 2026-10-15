@@ -549,6 +549,8 @@ Budgets reset for each `run` / `eval_program` call (they accumulate during that 
 | Interpolation depth | 32 | Nested `"#{...}"` |
 | Value nesting depth | 64 | Nesting of runtime `Value` arrays / maps. The root is depth 0, and the limit **includes that depth** (depth 64 is allowed; a child beyond it exceeds the limit). Childless values do not exceed the limit, so scalars and empty arrays/maps pass with a limit of 0. `value nesting limit exceeded`. The emulator `Value` ⇔ SDK codec uses the same recursion limit so deeply nested stored documents cannot exhaust the stack **before** runtime validation. |
 | Value nodes | 100,000 | Total nodes in runtime `Value`s. The root counts as one, so a limit of 0 rejects even scalar results. Nodes are counted **when children are added**, before a huge backend array is fully placed on the stack. `value node limit exceeded` |
+| String size | 10 MiB | Maximum byte size of a single `Value::Str`; `string size limit exceeded` |
+| Bytes size | 50 MiB | Maximum byte size of a single `Value::Bytes`; `bytes size limit exceeded` |
 | Query results | 10,000 | Matching candidates scanned by one query; `query result limit exceeded` |
 | Source length | 1 MiB | UTF-8 bytes |
 | Tokens | 100,000 | Lexical tokens, including interpolation |
@@ -559,6 +561,7 @@ Budgets reset for each `run` / `eval_program` call (they accumulate during that 
 - **Call depth protects the native stack.** A user function call uses about 50 KiB of stack in debug builds, including argument and receiver contract validation. On a host with a 2 MiB stack (such as a libtest thread), measurements show stack exhaustion at 40 levels, so the default limit of 32 stops beforehand. Hosts with larger stacks may raise `max_call_depth`; do not disable the budget on stacks smaller than 2 MiB, where deep recursion may cause a process abort from stack overflow.
 - An AST passed by an embedding application to `eval_program` bypasses the parser, so the same depth budget is checked before entering `eval_block`. The error is `Parse` and points to the start of the program, `1:1`.
 - The query-result limit applies to the **matching candidates scanned**. The backend stops when candidates exceed the budget (without materializing the one candidate that proves the excess), then applies `order_by` / `offset` / `limit` to produce the page for the script. Thus `limit(3)` succeeds with 20 candidates if they are within budget and returns three items.
+- The string-size and bytes-size limits apply to runtime `Value::Str` and `Value::Bytes` instances created via concatenation, string interpolation, `bytes(...)` conversions, or `storage_download()`. If a single string or byte sequence exceeds its budget, evaluation stops immediately with `string size limit exceeded` or `bytes size limit exceeded`.
 
 ### Embedding API
 
@@ -571,7 +574,7 @@ let out = rt.run(source)?;
 let usage = rt.usage();   // steps / loop_iterations / max_call_depth / ...
 ```
 
-Each budget can be overridden with `RuntimeLimits` builders such as `with_max_steps`, `with_max_loop_iterations`, `with_max_wall_clock`, `with_max_parser_depth`, `with_max_value_depth`, and `with_max_query_results`. `Runtime::set_limits` can change limits on a running runtime.
+Each budget can be overridden with `RuntimeLimits` builders such as `with_max_steps`, `with_max_loop_iterations`, `with_max_wall_clock`, `with_max_parser_depth`, `with_max_value_depth`, `with_max_string_bytes`, `with_max_bytes_size`, and `with_max_query_results`. `Runtime::set_limits` can change limits on a running runtime.
 
 ### Disabling Budgets (Trusted Scripts)
 

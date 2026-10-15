@@ -214,10 +214,48 @@ pub fn validate_value_limits(
     max_depth: Option<usize>,
     max_nodes: Option<usize>,
 ) -> Result<usize, Box<dyn Error>> {
+    validate_value_limits_with_sizes(value, max_depth, max_nodes, None, None)
+}
+
+fn check_value_size_leaf(
+    val: &Value,
+    max_string_bytes: Option<usize>,
+    max_bytes_size: Option<usize>,
+) -> Result<(), Box<dyn Error>> {
+    match val {
+        Value::Str(s) => {
+            if let Some(max) = max_string_bytes {
+                if s.len() > max {
+                    return Err(format!("string size limit exceeded (max {max})").into());
+                }
+            }
+        }
+        Value::Bytes(b) => {
+            if let Some(max) = max_bytes_size {
+                if b.len() > max {
+                    return Err(format!("bytes size limit exceeded (max {max})").into());
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Validate nesting, total node count, and individual string/bytes sizes of a runtime
+/// value in a single bounded pass.
+pub fn validate_value_limits_with_sizes(
+    value: &Value,
+    max_depth: Option<usize>,
+    max_nodes: Option<usize>,
+    max_string_bytes: Option<usize>,
+    max_bytes_size: Option<usize>,
+) -> Result<usize, Box<dyn Error>> {
     let mut stack = vec![(value, 0usize)];
     let mut nodes = 0usize;
     let mut observed_depth = 0usize;
     check_value_node_budget(&mut nodes, max_nodes)?;
+    check_value_size_leaf(value, max_string_bytes, max_bytes_size)?;
 
     while let Some((value, depth)) = stack.pop() {
         check_value_depth_budget(depth, max_depth)?;
@@ -232,6 +270,7 @@ pub fn validate_value_limits(
                     // not run for children that do not exist.
                     check_value_depth_budget(child_depth, max_depth)?;
                     check_value_node_budget(&mut nodes, max_nodes)?;
+                    check_value_size_leaf(item, max_string_bytes, max_bytes_size)?;
                     stack.push((item, child_depth));
                 }
             }
@@ -239,6 +278,7 @@ pub fn validate_value_limits(
                 for item in map.values() {
                     check_value_depth_budget(child_depth, max_depth)?;
                     check_value_node_budget(&mut nodes, max_nodes)?;
+                    check_value_size_leaf(item, max_string_bytes, max_bytes_size)?;
                     stack.push((item, child_depth));
                 }
             }

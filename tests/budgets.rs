@@ -531,3 +531,67 @@ fn a_transaction_that_outruns_its_budget_is_aborted_before_commit() {
         "the aborted transaction must not persist"
     );
 }
+
+#[test]
+fn string_size_budget_enforces_limit_on_concat_and_interpolation() {
+    let limits = RuntimeLimits::default().with_max_string_bytes(10);
+    let mut rt = runtime_with(limits);
+
+    // Concat exceeding limit
+    let err = rt.run("\"hello \" + \"world!\"").unwrap_err();
+    assert_budget_error(err, "string size limit exceeded");
+
+    // Concat within limit
+    let out = rt.run("\"hello\" + \"!\"").unwrap();
+    assert_eq!(out, Value::Str("hello!".to_string()));
+
+    // Interpolation exceeding limit
+    let err = rt.run("x = \"world\"\n\"hello #{x}!\"").unwrap_err();
+    assert_budget_error(err, "string size limit exceeded");
+
+    // Container holding large string
+    let err = rt.run("[\"a\" + \"b\" + \"c\" + \"d\" + \"e\" + \"f\" + \"g\" + \"h\" + \"i\" + \"j\" + \"k\"]").unwrap_err();
+    assert_budget_error(err, "string size limit exceeded");
+}
+
+#[test]
+fn bytes_size_budget_enforces_limit_on_bytes_and_storage() {
+    let limits = RuntimeLimits::default().with_max_bytes_size(5);
+    let mut rt = runtime_with(limits);
+
+    // bytes(...) exceeding limit
+    let err = rt.run("bytes([1, 2, 3, 4, 5, 6])").unwrap_err();
+    assert_budget_error(err, "bytes size limit exceeded");
+
+    // bytes(...) within limit
+    let out = rt.run("bytes([1, 2, 3, 4, 5])").unwrap();
+    assert_eq!(out, Value::Bytes(vec![1, 2, 3, 4, 5]));
+
+    // storage_download exceeding limit
+    let mut storage_rt = Runtime::new_unlimited(InMemoryFirestore::default());
+    storage_rt
+        .run("storage_upload(\"test.bin\", bytes([1, 2, 3, 4, 5, 6]))")
+        .unwrap();
+
+    storage_rt.set_limits(RuntimeLimits::default().with_max_bytes_size(4));
+    let err = storage_rt.run("storage_download(\"test.bin\")").unwrap_err();
+    assert_budget_error(err, "bytes size limit exceeded");
+}
+
+#[test]
+fn validate_value_limits_with_sizes_checks_bounds() {
+    use flare::validate_value_limits_with_sizes;
+
+    let leaf_str = Value::Str("hello world".to_string());
+    assert!(validate_value_limits_with_sizes(&leaf_str, None, None, Some(5), None).is_err());
+    assert!(validate_value_limits_with_sizes(&leaf_str, None, None, Some(20), None).is_ok());
+
+    let leaf_bytes = Value::Bytes(vec![0; 10]);
+    assert!(validate_value_limits_with_sizes(&leaf_bytes, None, None, None, Some(5)).is_err());
+    assert!(validate_value_limits_with_sizes(&leaf_bytes, None, None, None, Some(20)).is_ok());
+
+    let nested = Value::Array(vec![Value::Str("toolarge".to_string())]);
+    assert!(validate_value_limits_with_sizes(&nested, None, None, Some(4), None).is_err());
+}
+
+

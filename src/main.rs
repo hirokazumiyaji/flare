@@ -134,6 +134,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                     Some(parse_u64(&args, i, "--max-query-results")? as usize);
                 i += 2;
             }
+            Some("--max-string-bytes") => {
+                limits.max_string_bytes =
+                    Some(parse_u64(&args, i, "--max-string-bytes")? as usize);
+                i += 2;
+            }
+            Some("--max-bytes-size") => {
+                limits.max_bytes_size =
+                    Some(parse_u64(&args, i, "--max-bytes-size")? as usize);
+                i += 2;
+            }
             Some("--unlimited") => {
                 limits = RuntimeLimits::unlimited();
                 i += 1;
@@ -576,6 +586,14 @@ fn print_usage() {
     eprintln!(
         "    --max-query-results <n>     query candidates materialized (default {})",
         flare::DEFAULT_MAX_QUERY_RESULTS
+    );
+    eprintln!(
+        "    --max-string-bytes <n>      maximum string size in bytes (default {})",
+        flare::DEFAULT_MAX_STRING_BYTES
+    );
+    eprintln!(
+        "    --max-bytes-size <n>        maximum bytes size in bytes (default {})",
+        flare::DEFAULT_MAX_BYTES_SIZE
     );
     eprintln!("    --unlimited                 disable every budget (trusted scripts only;");
     eprintln!("                                recursion can then overflow the native stack)");
