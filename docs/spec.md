@@ -414,16 +414,25 @@ transaction {
 ## 10. CLI (`fl`)
 
 ```
-usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] (<script-file> | - | -e <script>)
+usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] [budget options] [--repl|-i] [<script-file> | - | -e <script>]
 ```
 
-- Specify exactly one script source: a file path, `-` (stdin), or `-e <script>` (inline script; repeated values are joined with newlines). With no arguments, read from piped stdin; with a terminal stdin, print usage and exit. Combining `-e` with a file or `-` is an error. `--help` / `-h` prints usage. Unknown options and unknown backends for either `--backend` or `--auth-backend` exit with an error.
+- Specify a script source: a file path, `-` (stdin), `-e <script>` (inline script; repeated values are joined with newlines), or `--repl` / `-i` (interactive REPL). When run without arguments, `fl` launches the REPL if connected to an interactive terminal (TTY), or reads from stdin if piped. Combining `--repl` / `-i` with a file, stdin, or `-e` is an error. `--help` / `-h` prints usage. Unknown options and unknown backends for either `--backend` or `--auth-backend` exit with an error.
   ```sh
   fl script.fl
   cargo run --features emulator --bin fl -- --backend emulator script.fl
   echo 'get("users/1")' | cargo run --features emulator --bin fl -- --backend emulator -
   fl -e 'col("users").get().len()'
+  fl            # Starts interactive REPL on a terminal (TTY)
+  fl --repl     # Explicitly starts interactive REPL
   ```
+- Interactive REPL features:
+  - Evaluates inputs line-by-line or block-by-block and prints results as `=> <inspect representation>`.
+  - Continuation prompt (`fl* `) for multiline blocks, functions, arrays, and maps until all brackets and quotes are balanced.
+  - Maintains variables, functions, and service sessions (Firestore, Auth, Storage) across statements.
+  - Allows top-level variable re-assignment and function re-definition within the interactive session.
+  - Line editing and persistent history via `rustyline` with Tab-completion for keywords, modules, builtins, and in-scope variables.
+  - Safe exit with `exit`, `quit`, or `Ctrl+D`. `Ctrl+C` cancels the current multiline input.
 - Binaries using `--backend emulator` must be built with the `emulator` feature.
   If specified without the feature, the following message is printed and the program exits:
   `emulator backend requires the \`emulator\` Cargo feature; rebuild with --features emulator`

@@ -229,6 +229,22 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         self.evaluator().eval_program_with_spans(stmts, spans)
     }
 
+    pub fn set_repl_mode(&mut self, enabled: bool) {
+        self.state.repl_mode = enabled;
+    }
+
+    pub fn repl_mode(&self) -> bool {
+        self.state.repl_mode
+    }
+
+    pub fn global_variable_names(&self) -> Vec<String> {
+        self.state
+            .scopes
+            .first()
+            .map(|s| s.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub fn run(&mut self, source: &str) -> Result<Value, Box<dyn Error>> {
         self.evaluator().run(source)
     }

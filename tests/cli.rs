@@ -773,3 +773,50 @@ fn fl_in_memory_storage_crud_is_available_by_default() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn fl_repl_flag_runs_interactive_stream_and_prints_inspect() {
+    let out = run_fl_with_piped_stdin(&["--repl"], "a = 42\na + 8\n");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "=> 42\n=> 50\n");
+
+    let out_short = run_fl_with_piped_stdin(&["-i"], "x = \"hello\"\nlen(x)\n");
+    assert!(
+        out_short.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_short.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out_short.stdout),
+        "=> \"hello\"\n=> 5\n"
+    );
+}
+
+#[test]
+fn fl_repl_rejects_combined_script_sources() {
+    let out = Command::new(FL_EXE)
+        .args(["--repl", "-e", "1"])
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--repl cannot be combined with a script file, stdin, or -e"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn fl_help_includes_repl_option() {
+    let out = Command::new(FL_EXE)
+        .arg("--help")
+        .output()
+        .expect("spawn fl");
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--repl, -i"), "{stderr}");
+}

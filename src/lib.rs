@@ -5,6 +5,7 @@ pub mod firestore;
 pub mod lexer;
 pub mod limits;
 pub mod parser;
+pub mod repl;
 pub mod runtime;
 pub mod services;
 pub mod storage;
