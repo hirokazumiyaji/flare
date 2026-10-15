@@ -1,5 +1,6 @@
 use crate::auth::{Auth, InMemoryAuth, UnavailableAuth};
 use crate::firestore::{Firestore, InMemoryFirestore, UnavailableFirestore};
+use crate::io::{Io, StdIo, UnavailableIO};
 use crate::storage::{InMemoryStorage, Storage, UnavailableStorage};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -12,6 +13,7 @@ pub struct Services<F: Firestore, S: Storage = InMemoryStorage> {
     pub(crate) firestore: F,
     pub(crate) storage: S,
     pub(crate) auth: Box<dyn Auth>,
+    pub(crate) io: Box<dyn Io>,
     pub(crate) project: ProjectConfig,
 }
 
@@ -19,6 +21,7 @@ pub(crate) struct ServiceAccess<'a> {
     pub(crate) firestore: &'a mut dyn Firestore,
     pub(crate) storage: &'a mut dyn Storage,
     pub(crate) auth: &'a mut dyn Auth,
+    pub(crate) io: &'a mut dyn Io,
     #[allow(dead_code)]
     pub(crate) project: &'a ProjectConfig,
 }
@@ -29,6 +32,7 @@ impl Services<InMemoryFirestore, InMemoryStorage> {
             firestore: InMemoryFirestore::default(),
             storage: InMemoryStorage::default(),
             auth: Box::new(InMemoryAuth::default()),
+            io: Box::new(StdIo),
             project: ProjectConfig::default(),
         }
     }
@@ -40,6 +44,7 @@ impl Services<UnavailableFirestore, UnavailableStorage> {
             firestore: UnavailableFirestore,
             storage: UnavailableStorage,
             auth: Box::new(UnavailableAuth),
+            io: Box::new(UnavailableIO),
             project,
         }
     }
@@ -51,6 +56,7 @@ impl<F: Firestore, S: Storage> Services<F, S> {
             firestore,
             storage: self.storage,
             auth: self.auth,
+            io: self.io,
             project: self.project,
         }
     }
@@ -60,12 +66,18 @@ impl<F: Firestore, S: Storage> Services<F, S> {
             firestore: self.firestore,
             storage,
             auth: self.auth,
+            io: self.io,
             project: self.project,
         }
     }
 
     pub fn with_auth<A: Auth + 'static>(mut self, auth: A) -> Self {
         self.auth = Box::new(auth);
+        self
+    }
+
+    pub fn with_io<I: Io + 'static>(mut self, io: I) -> Self {
+        self.io = Box::new(io);
         self
     }
 

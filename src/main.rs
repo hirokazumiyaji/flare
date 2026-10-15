@@ -8,13 +8,13 @@ use std::time::Duration;
 
 #[cfg(feature = "emulator")]
 use flare::AuthEmulatorOptions;
-#[cfg(feature = "emulator")]
-use flare::{
-    parse_timeout_ms as parse_library_timeout_ms, AuthEmulator, EmulatorConfig, FirestoreEmulator,
-};
 use flare::{
     Auth, Firestore, InMemoryAuth, InMemoryFirestore, InMemoryStorage, ProjectConfig,
     RuntimeLimits, Services, Storage, StorageEmulator,
+};
+#[cfg(feature = "emulator")]
+use flare::{
+    AuthEmulator, EmulatorConfig, FirestoreEmulator, parse_timeout_ms as parse_library_timeout_ms,
 };
 
 #[cfg(not(feature = "emulator"))]
@@ -145,6 +145,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             }
             Some("--max-bytes-size") => {
                 limits.max_bytes_size = Some(parse_u64(&args, i, "--max-bytes-size")? as usize);
+                i += 2;
+            }
+            Some("--max-file-io-bytes") => {
+                limits.max_file_io_bytes =
+                    Some(parse_u64(&args, i, "--max-file-io-bytes")? as usize);
                 i += 2;
             }
             Some("--unlimited") => {
@@ -585,6 +590,10 @@ fn print_usage() {
         "    --max-bytes-size <n>        maximum bytes size in bytes (default {})",
         flare::DEFAULT_MAX_BYTES_SIZE
     );
+    eprintln!(
+        "    --max-file-io-bytes <n>     file read/write size in bytes (default {})",
+        flare::DEFAULT_MAX_FILE_IO_BYTES
+    );
     eprintln!("    --unlimited                 disable every budget (trusted scripts only;");
     eprintln!("                                recursion can then overflow the native stack)");
     eprintln!();
@@ -633,12 +642,14 @@ mod project_config_tests {
         })
         .unwrap();
         assert_eq!(same.project_id.as_deref(), Some("demo"));
-        assert!(resolve_project_config(|key| match key {
-            "FIREBASE_PROJECT_ID" => Some("one".into()),
-            "FIRESTORE_PROJECT_ID" => Some("two".into()),
-            _ => None,
-        })
-        .is_err());
+        assert!(
+            resolve_project_config(|key| match key {
+                "FIREBASE_PROJECT_ID" => Some("one".into()),
+                "FIRESTORE_PROJECT_ID" => Some("two".into()),
+                _ => None,
+            })
+            .is_err()
+        );
     }
 
     #[test]

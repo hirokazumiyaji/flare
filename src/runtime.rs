@@ -181,6 +181,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
             ServiceId::Firestore => self.services.firestore.supports_backend_timeout(),
             ServiceId::Auth => self.services.auth.supports_backend_timeout(),
             ServiceId::Storage => self.services.storage.supports_backend_timeout(),
+            ServiceId::IO => false,
         }
     }
 
@@ -254,6 +255,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
             firestore: &mut self.services.firestore,
             storage: &mut self.services.storage,
             auth: self.services.auth.as_mut(),
+            io: self.services.io.as_mut(),
             project: &self.services.project,
         };
         Evaluator::new(services, &mut self.state)
@@ -404,7 +406,7 @@ struct CallContract {
 }
 
 impl CallContract {
-    fn exact(positional: usize) -> Self {
+    const fn exact(positional: usize) -> Self {
         Self {
             positional: PositionalArity::Exact(positional),
             keywords: &[],
@@ -414,26 +416,32 @@ impl CallContract {
         }
     }
 
-    fn range(min: usize, max: usize) -> Self {
+    const fn range(min: usize, max: usize) -> Self {
         Self {
             positional: PositionalArity::Range(min, max),
-            ..Self::exact(0)
+            keywords: &[],
+            block: BlockPolicy::Forbidden,
+            positional_keyword_conflicts: &[],
+            missing_hint: None,
         }
     }
 
-    fn any() -> Self {
+    const fn any() -> Self {
         Self {
             positional: PositionalArity::Any,
-            ..Self::exact(0)
+            keywords: &[],
+            block: BlockPolicy::Forbidden,
+            positional_keyword_conflicts: &[],
+            missing_hint: None,
         }
     }
 
-    fn with_keywords(mut self, keywords: &'static [&'static str]) -> Self {
+    const fn with_keywords(mut self, keywords: &'static [&'static str]) -> Self {
         self.keywords = keywords;
         self
     }
 
-    fn with_positional_keyword_conflicts(
+    const fn with_positional_keyword_conflicts(
         mut self,
         conflicts: &'static [(&'static str, usize)],
     ) -> Self {
@@ -441,12 +449,12 @@ impl CallContract {
         self
     }
 
-    fn with_missing_hint(mut self, hint: &'static str) -> Self {
+    const fn with_missing_hint(mut self, hint: &'static str) -> Self {
         self.missing_hint = Some(hint);
         self
     }
 
-    fn requiring_block(mut self) -> Self {
+    const fn requiring_block(mut self) -> Self {
         self.block = BlockPolicy::Required;
         self
     }
