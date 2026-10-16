@@ -311,7 +311,7 @@ impl Evaluator<'_> {
                 // 変数参照時(Expr::Var)は変数テーブルから読み出されるため構文上区別できる。
                 // 一方で fn 定義(Stmt::Def)は定義してもビルトインに隠されて呼び出せないため
                 // 禁止している。
-                if self.var_exists(name) {
+                if self.var_exists(name) && !(self.repl_mode && self.scopes.len() == 1) {
                     return Err(format!("reassignment is not allowed: {name}").into());
                 }
                 let flow = self.eval_expr(value)?;
@@ -327,7 +327,7 @@ impl Evaluator<'_> {
                 if is_builtin_name(name) {
                     return Err(format!("cannot redefine builtin: {name}").into());
                 }
-                if self.var_exists(name) {
+                if self.var_exists(name) && !(self.repl_mode && self.scopes.len() == 1) {
                     return Err(format!("reassignment is not allowed: {name}").into());
                 }
                 self.set_var(
@@ -1060,7 +1060,7 @@ impl Evaluator<'_> {
                 Ok(ExecFlow::Value(Value::Nil))
             }
             "contains" => {
-                let target = args.first().ok_or_else(|| "contains requires 1 argument")?;
+                let target = args.first().ok_or("contains requires 1 argument")?;
                 let found = items.iter().any(|item| item == target);
                 Ok(ExecFlow::Value(Value::Bool(found)))
             }
@@ -1271,7 +1271,8 @@ impl Evaluator<'_> {
     }
 
     pub(super) fn set_var(&mut self, name: &str, value: Value) -> Result<(), Box<dyn Error>> {
-        if self.scopes.last().expect("scope").contains_key(name) {
+        let is_reassign = self.scopes.last().expect("scope").contains_key(name);
+        if is_reassign && !(self.repl_mode && self.scopes.len() == 1) {
             return Err(format!("reassignment is not allowed: {name}").into());
         }
         self.scopes

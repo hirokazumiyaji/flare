@@ -15,6 +15,7 @@ pub(crate) struct RuntimeState {
     pub(super) call_depth: usize,
     pub(super) started_at: Option<Instant>,
     pub(super) execution_active: bool,
+    pub(super) repl_mode: bool,
 }
 
 impl RuntimeState {
@@ -28,6 +29,7 @@ impl RuntimeState {
             call_depth: 0,
             started_at: None,
             execution_active: false,
+            repl_mode: false,
         }
     }
 }

@@ -13,8 +13,8 @@ use flare::{
     parse_timeout_ms as parse_library_timeout_ms, AuthEmulator, EmulatorConfig, FirestoreEmulator,
 };
 use flare::{
-    run_script_with_services_and_limits, Auth, Firestore, InMemoryAuth, InMemoryFirestore,
-    InMemoryStorage, ProjectConfig, RuntimeLimits, Services, Storage, StorageEmulator,
+    Auth, Firestore, InMemoryAuth, InMemoryFirestore, InMemoryStorage, ProjectConfig,
+    RuntimeLimits, Services, Storage, StorageEmulator,
 };
 
 #[cfg(not(feature = "emulator"))]
@@ -41,6 +41,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut paths: Vec<PathBuf> = vec![];
     let mut inline: Vec<String> = vec![];
     let mut use_stdin = false;
+    let mut repl = false;
     // Every budget is finite by default: `fl` accepts arbitrary scripts, so an
     // unbounded recursion, loop, or nested value must be a reported error
     // rather than a hang or a stack overflow.
@@ -51,6 +52,10 @@ fn run() -> Result<(), Box<dyn Error>> {
             Some("--help" | "-h") => {
                 print_usage();
                 return Ok(());
+            }
+            Some("--repl" | "-i") => {
+                repl = true;
+                i += 1;
             }
             Some("--backend") => {
                 let b = args
@@ -135,13 +140,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                 i += 2;
             }
             Some("--max-string-bytes") => {
-                limits.max_string_bytes =
-                    Some(parse_u64(&args, i, "--max-string-bytes")? as usize);
+                limits.max_string_bytes = Some(parse_u64(&args, i, "--max-string-bytes")? as usize);
                 i += 2;
             }
             Some("--max-bytes-size") => {
-                limits.max_bytes_size =
-                    Some(parse_u64(&args, i, "--max-bytes-size")? as usize);
+                limits.max_bytes_size = Some(parse_u64(&args, i, "--max-bytes-size")? as usize);
                 i += 2;
             }
             Some("--unlimited") => {
@@ -269,26 +272,39 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let src = if !inline.is_empty() {
+    let is_repl = if repl {
+        if !inline.is_empty() || !paths.is_empty() || use_stdin {
+            eprintln!("error: --repl cannot be combined with a script file, stdin, or -e");
+            print_usage();
+            std::process::exit(1);
+        }
+        true
+    } else {
+        paths.is_empty() && inline.is_empty() && !use_stdin && std::io::stdin().is_terminal()
+    };
+
+    let src = if is_repl {
+        None
+    } else if !inline.is_empty() {
         if !paths.is_empty() || use_stdin {
             eprintln!("error: -e cannot be combined with a script file or stdin");
             print_usage();
             std::process::exit(1);
         }
         // 複数の -e は改行で連結する(Ruby 互換)。
-        inline.join("\n")
+        Some(inline.join("\n"))
     } else if use_stdin {
         if !paths.is_empty() {
             eprintln!("error: cannot read from both a script file and stdin");
             print_usage();
             std::process::exit(1);
         }
-        read_stdin()?
+        Some(read_stdin()?)
     } else if paths.len() == 1 {
-        fs::read_to_string(&paths[0])?
+        Some(fs::read_to_string(&paths[0])?)
     } else if paths.is_empty() && !std::io::stdin().is_terminal() {
-        // 引数なし + パイプ時は stdin から読む。端末直結の引数なしは usage エラー。
-        read_stdin()?
+        // 引数なし + パイプ時は stdin から読む。
+        Some(read_stdin()?)
     } else {
         if paths.is_empty() {
             print_usage();
@@ -322,7 +338,22 @@ fn run() -> Result<(), Box<dyn Error>> {
         .with_storage(storage)
         .with_auth(selected_auth)
         .with_project(project);
-    let out = run_script_with_services_and_limits(&src, services, limits)?;
+
+    let mut rt = flare::Runtime::from_services_with_limits(services, limits);
+
+    if is_repl {
+        if std::io::stdin().is_terminal() {
+            flare::repl::run_interactive(&mut rt)?;
+        } else {
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            flare::repl::run_stream(&mut rt, stdin.lock(), stdout.lock())?;
+        }
+        return Ok(());
+    }
+
+    let src = src.expect("source script is present when not in repl mode");
+    let out = rt.run(&src)?;
 
     println!("=> {}", out.inspect());
     Ok(())
@@ -482,14 +513,15 @@ fn resolve_project_config(
 
 fn print_usage() {
     eprintln!(
-        "usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] [budget options] (<script-file> | - | -e <script>)"
+        "usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] [budget options] [--repl|-i] [<script-file> | - | -e <script>]"
     );
     eprintln!();
-    eprintln!("  Script source (exactly one):");
+    eprintln!("  Script source:");
     eprintln!("    <script-file>  run a script file");
     eprintln!("    -             read a script from stdin");
     eprintln!("    -e <script>   run an inline script (repeatable, joined by newlines)");
-    eprintln!("    (no args)     read from stdin when piped, otherwise show this usage");
+    eprintln!("    --repl, -i    start interactive REPL");
+    eprintln!("    (no args)     start REPL when interactive (TTY), or read from stdin when piped");
     eprintln!();
     eprintln!("  Firestore backend:");
     eprintln!("    in-memory   (default) use the in-memory Firestore stub");
