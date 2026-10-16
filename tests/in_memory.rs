@@ -3815,3 +3815,52 @@ test_while_return()
         "{err}"
     );
 }
+
+#[test]
+fn modulo_operator_and_array_concatenation_work() {
+    let out = run_script("10 % 3").unwrap();
+    assert_eq!(out, Value::Int(1));
+
+    let out = run_script("10 % 5").unwrap();
+    assert_eq!(out, Value::Int(0));
+
+    let out = run_script("0 - 10 % 3").unwrap();
+    assert_eq!(out, Value::Int(-1));
+
+    let out = run_script("(0 - 10) % 3").unwrap();
+    assert_eq!(out, Value::Int(-1));
+
+    let err = run_script("10 % 0").unwrap_err();
+    assert!(format!("{err}").contains("division by zero"), "{err}");
+
+    let err = run_script("(0 - 9223372036854775807 - 1) % (0 - 1)").unwrap_err();
+    assert!(format!("{err}").contains("integer overflow"), "{err}");
+
+    let err = run_script("\"a\" % 2").unwrap_err();
+    assert!(format!("{err}").contains("unsupported % operands"), "{err}");
+
+    let out = run_script("[1, 2] + [3]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
+
+    let out = run_script("[] + []").unwrap();
+    assert_eq!(out, Value::Array(vec![]));
+
+    let out = run_script("[1] + [\"a\", true]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Str("a".to_string()),
+            Value::Bool(true)
+        ])
+    );
+
+    let err = run_script("[1] + 2").unwrap_err();
+    assert!(format!("{err}").contains("unsupported + operands"), "{err}");
+
+    let err = run_script("1 + [2]").unwrap_err();
+    assert!(format!("{err}").contains("unsupported + operands"), "{err}");
+}
