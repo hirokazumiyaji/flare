@@ -28,6 +28,7 @@ pub const DEFAULT_MAX_VALUE_NODES: usize = 100_000;
 pub const DEFAULT_MAX_STRING_BYTES: usize = 10 * 1024 * 1024;
 pub const DEFAULT_MAX_BYTES_SIZE: usize = 50 * 1024 * 1024;
 pub const DEFAULT_BACKEND_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_MAX_FILE_IO_BYTES: usize = 10 * 1024 * 1024;
 
 /// Resource limits for one [`crate::runtime::Runtime`] execution.
 ///
@@ -86,6 +87,8 @@ pub struct RuntimeLimits {
     /// [`crate::runtime::Runtime::backend_timeout_supported`] to inspect the
     /// capability when an embedding application supports multiple backends.
     pub backend_timeout: Option<Duration>,
+    /// Maximum number of bytes allowed for one file read or write.
+    pub max_file_io_bytes: Option<usize>,
 }
 
 impl Default for RuntimeLimits {
@@ -105,6 +108,7 @@ impl Default for RuntimeLimits {
             max_string_bytes: Some(DEFAULT_MAX_STRING_BYTES),
             max_bytes_size: Some(DEFAULT_MAX_BYTES_SIZE),
             backend_timeout: Some(Duration::from_millis(DEFAULT_BACKEND_TIMEOUT_MS)),
+            max_file_io_bytes: Some(DEFAULT_MAX_FILE_IO_BYTES),
         }
     }
 }
@@ -130,6 +134,7 @@ impl RuntimeLimits {
             max_string_bytes: None,
             max_bytes_size: None,
             backend_timeout: None,
+            max_file_io_bytes: None,
         }
     }
 
@@ -211,6 +216,11 @@ impl RuntimeLimits {
 
     pub fn with_backend_timeout(mut self, limit: Duration) -> Self {
         self.backend_timeout = Some(limit);
+        self
+    }
+
+    pub fn with_max_file_io_bytes(mut self, limit: usize) -> Self {
+        self.max_file_io_bytes = Some(limit);
         self
     }
 

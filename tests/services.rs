@@ -151,6 +151,10 @@ fn unavailable_services_report_typed_errors_with_source_spans() {
         ("storage_download(\"avatars/a\")", ServiceId::Storage),
         ("col(\"users\").get()", ServiceId::Firestore),
         ("col(\"users\").count()", ServiceId::Firestore),
+        ("File.read(\"x\")", ServiceId::IO),
+        ("File.write(\"x\", \"y\")", ServiceId::IO),
+        ("IO.File.read(\"x\")", ServiceId::IO),
+        ("IO.File.write(\"x\", \"y\")", ServiceId::IO),
     ] {
         let err = run_script_with_services(source, Services::empty(ProjectConfig::default()))
             .unwrap_err();

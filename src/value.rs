@@ -45,6 +45,11 @@ pub enum BuiltinModule {
     Firestore,
     Auth,
     Storage,
+    IO,
+    File,
+    JSON,
+    CSV,
+    YAML,
 }
 
 impl BuiltinModule {
@@ -53,6 +58,11 @@ impl BuiltinModule {
             Self::Firestore => "Firestore",
             Self::Auth => "Auth",
             Self::Storage => "Storage",
+            Self::IO => "IO",
+            Self::File => "File",
+            Self::JSON => "JSON",
+            Self::CSV => "CSV",
+            Self::YAML => "YAML",
         }
     }
 
@@ -61,6 +71,11 @@ impl BuiltinModule {
             "Firestore" => Some(Self::Firestore),
             "Auth" => Some(Self::Auth),
             "Storage" => Some(Self::Storage),
+            "IO" => Some(Self::IO),
+            "File" => Some(Self::File),
+            "JSON" => Some(Self::JSON),
+            "CSV" => Some(Self::CSV),
+            "YAML" => Some(Self::YAML),
             _ => None,
         }
     }

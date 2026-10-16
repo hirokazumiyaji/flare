@@ -54,13 +54,21 @@ signed_in_email()
         run_script_with_services("Auth = 3\nAuth", Services::in_memory()).unwrap(),
         Value::Int(3)
     );
-    assert_eq!(Value::Module(BuiltinModule::Auth).to_string(), "Auth");
-    assert_eq!(Value::Module(BuiltinModule::Auth).inspect(), "Auth");
-    assert!(Value::Module(BuiltinModule::Auth).truthy());
-    assert_eq!(
-        Value::Module(BuiltinModule::Auth),
-        Value::Module(BuiltinModule::Auth)
-    );
+    for m in [
+        BuiltinModule::Firestore,
+        BuiltinModule::Auth,
+        BuiltinModule::Storage,
+        BuiltinModule::IO,
+        BuiltinModule::File,
+        BuiltinModule::JSON,
+        BuiltinModule::CSV,
+        BuiltinModule::YAML,
+    ] {
+        assert_eq!(Value::Module(m).to_string(), m.name());
+        assert_eq!(Value::Module(m).inspect(), m.name());
+        assert!(Value::Module(m).truthy());
+        assert_eq!(Value::Module(m), Value::Module(m));
+    }
 }
 
 #[test]

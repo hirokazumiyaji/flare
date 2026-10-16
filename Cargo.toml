@@ -20,12 +20,14 @@ emulator = [
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+csv = "1"
 firestore = { version = "0.58", optional = true }
 gcloud-sdk = { version = "0.33", optional = true }
 prost-types = { version = "0.14", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json"], optional = true }
 rustyline = "18.0.1"
 serde_json = "1"
+serde_yaml = "0.9"
 tokio = { version = "1", features = ["net", "rt", "time"], optional = true }
 
 [dev-dependencies]

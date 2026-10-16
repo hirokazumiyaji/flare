@@ -672,3 +672,36 @@ There are currently no unresolved limitations in §7 `where` comparisons across 
 | Item | Current behavior | Planned |
 |------|-----------|------|
 | Auth session persistence | Sessions are held only in process memory and are not persisted between script runs. | backlog |
+
+## 17. IO and Data Format APIs
+
+Flare provides local file system IO and structured data format codecs (`JSON`, `CSV`, `YAML`) to support seed loading, fixtures, data migration, and export / backup workflows.
+
+### 17.1 IO and File Modules
+
+The hierarchical submodule structure `IO.File` is implemented through runtime module dispatch without modifying parser syntax: evaluating `IO.File` returns the submodule `Value::Module(BuiltinModule::File)`.
+
+| Function | Return value | Description |
+|------|--------|------|
+| `IO.File.read(path)` | Str or Bytes | Reads a local file. Returns UTF-8 `Str` if valid text, or `Bytes` if binary content. |
+| `IO.File.write(path, content)` | Int | Writes `Str` or `Bytes` to a local file, overwriting existing files and automatically creating parent directories. Returns the number of bytes written. |
+| `File.read(path)` / `IO.read(path)` | Str or Bytes | Shorthand aliases for `IO.File.read(path)`. |
+| `File.write(path, content)` / `IO.write(path, content)` | Int | Shorthand aliases for `IO.File.write(path, content)`. |
+
+#### Security and Resource Limits
+- `RuntimeLimits.max_file_io_bytes` (default 10 MiB, CLI `--max-file-io-bytes`) bounds file reads and writes. Oversized reads are stopped before allocating excessive memory.
+- `Services` provides `UnavailableIO` for sandboxed or embedded environments where local file access is forbidden. Invoking any file IO function returns `CapabilityError(ServiceId::IO)` before evaluating argument side effects.
+
+### 17.2 Data Format Codecs
+
+Data codecs operate purely in memory and remain available even when `UnavailableIO` is configured.
+
+| Module | Method | Return value | Description |
+|------|--------|--------|------|
+| `JSON` | `JSON.parse(str)` | Map / Array / Scalar | Parses a JSON string into corresponding flare `Value`s. |
+| `JSON` | `JSON.generate(value, pretty: false)` | Str | Serializes a value to JSON string. Set `pretty: true` for indented formatting. |
+| `CSV` | `CSV.parse(str, headers: false)` | Array | Parses CSV string. When `headers: true`, returns an Array of Maps keyed by header columns; otherwise returns an Array of Arrays of strings. |
+| `CSV` | `CSV.generate(rows)` | Str | Serializes an Array of Maps (with headers) or Array of Arrays to a CSV string. |
+| `YAML` | `YAML.parse(str)` | Map / Array / Scalar | Parses a YAML string into corresponding flare `Value`s. |
+| `YAML` | `YAML.generate(value)` | Str | Serializes a value to YAML string. |
+

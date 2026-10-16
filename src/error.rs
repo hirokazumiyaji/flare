@@ -116,6 +116,7 @@ pub enum ServiceId {
     Firestore,
     Auth,
     Storage,
+    IO,
 }
 
 impl fmt::Display for ServiceId {
@@ -124,6 +125,7 @@ impl fmt::Display for ServiceId {
             Self::Firestore => "Firestore",
             Self::Auth => "Auth",
             Self::Storage => "Storage",
+            Self::IO => "IO",
         };
         f.write_str(name)
     }

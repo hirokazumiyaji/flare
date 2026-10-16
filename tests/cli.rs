@@ -820,3 +820,56 @@ fn fl_help_includes_repl_option() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("--repl, -i"), "{stderr}");
 }
+
+#[test]
+fn fl_help_contains_max_file_io_bytes() {
+    let out = Command::new(FL_EXE)
+        .arg("--help")
+        .output()
+        .expect("spawn fl");
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--max-file-io-bytes"),
+        "expected --help to mention --max-file-io-bytes"
+    );
+}
+
+#[test]
+fn fl_max_file_io_bytes_limits_execution() {
+    let temp_file = std::env::temp_dir().join(format!("fl_cli_test_{}.txt", std::process::id()));
+    let out = Command::new(FL_EXE)
+        .args([
+            "--max-file-io-bytes",
+            "5",
+            "-e",
+            &format!("File.write(\"{}\", \"123456\")", temp_file.display()),
+        ])
+        .output()
+        .expect("spawn fl");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("max file io bytes (5)"));
+    let _ = std::fs::remove_file(temp_file);
+}
+
+#[test]
+fn fl_json_and_file_io_execution() {
+    let temp_file = std::env::temp_dir().join(format!("fl_cli_json_{}.json", std::process::id()));
+    let script = format!(
+        "File.write(\"{}\", JSON.generate({{val: 42}}))\nJSON.parse(File.read(\"{}\"))[\"val\"]",
+        temp_file.display(),
+        temp_file.display()
+    );
+    let out = Command::new(FL_EXE)
+        .args(["-e", &script])
+        .output()
+        .expect("spawn fl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "=> 42\n");
+    let _ = std::fs::remove_file(temp_file);
+}
