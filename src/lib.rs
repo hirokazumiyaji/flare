@@ -28,16 +28,20 @@ pub use firestore::{
 };
 pub use firestore::{Firestore, InMemoryFirestore, RequestClock, UnavailableFirestore};
 pub use limits::{
-    ParserLimits, RuntimeLimits, RuntimeUsage, DEFAULT_BACKEND_TIMEOUT_MS, DEFAULT_MAX_CALL_DEPTH,
-    DEFAULT_MAX_LOOP_ITERATIONS, DEFAULT_MAX_PARSER_DEPTH, DEFAULT_MAX_QUERY_RESULTS,
-    DEFAULT_MAX_STEPS, DEFAULT_MAX_VALUE_DEPTH, DEFAULT_MAX_WALL_CLOCK_MS,
+    ParserLimits, RuntimeLimits, RuntimeUsage, DEFAULT_BACKEND_TIMEOUT_MS, DEFAULT_MAX_BYTES_SIZE,
+    DEFAULT_MAX_CALL_DEPTH, DEFAULT_MAX_LOOP_ITERATIONS, DEFAULT_MAX_PARSER_DEPTH,
+    DEFAULT_MAX_QUERY_RESULTS, DEFAULT_MAX_STEPS, DEFAULT_MAX_STRING_BYTES,
+    DEFAULT_MAX_VALUE_DEPTH, DEFAULT_MAX_WALL_CLOCK_MS,
 };
 pub use storage::{
     HttpStorageTransport, HttpTransport, InMemoryStorage, Storage, StorageEmulator, StorageError,
     StorageErrorKind, StorageHttpTransport, StorageMetadata, StorageRequest, StorageResponse,
     StorageTransport, UnavailableStorage,
 };
-pub use value::{validate_value_depth, validate_value_limits, BuiltinModule, Value};
+pub use value::{
+    validate_value_depth, validate_value_limits, validate_value_limits_with_sizes, BuiltinModule,
+    Value,
+};
 
 pub fn run_script(source: &str) -> Result<Value, Box<dyn Error>> {
     run_script_with_services(source, Services::in_memory())
