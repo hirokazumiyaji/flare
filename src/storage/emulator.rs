@@ -237,7 +237,7 @@ fn set_remaining_timeout(
 ) -> Result<(), StorageError> {
     let timeout = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
     if timeout.is_some_and(|timeout| timeout.is_zero()) {
-        return Err(StorageError::backend("storage emulator operation timed out").into());
+        return Err(StorageError::backend("storage emulator operation timed out"));
     }
     let result = if read {
         stream.set_read_timeout(timeout)
@@ -269,8 +269,7 @@ fn write_with_deadline(
         if written == 0 {
             return Err(StorageError::backend(
                 "storage emulator request failed: write returned zero",
-            )
-            .into());
+            ));
         }
         bytes = &bytes[written..];
     }

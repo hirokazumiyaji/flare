@@ -470,48 +470,6 @@ fn resolve_project_config(
     })
 }
 
-#[cfg(test)]
-mod project_config_tests {
-    use super::*;
-
-    #[test]
-    fn project_variables_must_agree_and_default_to_flare_test() {
-        let empty = resolve_project_config(|_| None).unwrap();
-        assert_eq!(empty.project_id.as_deref(), Some("flare-test"));
-        for variable in [
-            "FIREBASE_PROJECT_ID",
-            "GCLOUD_PROJECT",
-            "FIRESTORE_PROJECT_ID",
-        ] {
-            let config =
-                resolve_project_config(|key| (key == variable).then(|| "demo".into())).unwrap();
-            assert_eq!(config.project_id.as_deref(), Some("demo"), "{variable}");
-        }
-        let same = resolve_project_config(|key| match key {
-            "FIREBASE_PROJECT_ID" | "GCLOUD_PROJECT" => Some("demo".into()),
-            _ => None,
-        })
-        .unwrap();
-        assert_eq!(same.project_id.as_deref(), Some("demo"));
-        assert!(resolve_project_config(|key| match key {
-            "FIREBASE_PROJECT_ID" => Some("one".into()),
-            "FIRESTORE_PROJECT_ID" => Some("two".into()),
-            _ => None,
-        })
-        .is_err());
-    }
-
-    #[test]
-    fn explicit_storage_bucket_is_kept_in_project_config() {
-        let config = resolve_project_config(|key| match key {
-            "FIREBASE_STORAGE_BUCKET" => Some("custom-bucket".into()),
-            _ => None,
-        })
-        .unwrap();
-        assert_eq!(config.storage_bucket.as_deref(), Some("custom-bucket"));
-    }
-}
-
 fn print_usage() {
     eprintln!(
         "usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] [budget options] (<script-file> | - | -e <script>)"
@@ -600,4 +558,46 @@ fn read_stdin() -> Result<String, Box<dyn Error>> {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod project_config_tests {
+    use super::*;
+
+    #[test]
+    fn project_variables_must_agree_and_default_to_flare_test() {
+        let empty = resolve_project_config(|_| None).unwrap();
+        assert_eq!(empty.project_id.as_deref(), Some("flare-test"));
+        for variable in [
+            "FIREBASE_PROJECT_ID",
+            "GCLOUD_PROJECT",
+            "FIRESTORE_PROJECT_ID",
+        ] {
+            let config =
+                resolve_project_config(|key| (key == variable).then(|| "demo".into())).unwrap();
+            assert_eq!(config.project_id.as_deref(), Some("demo"), "{variable}");
+        }
+        let same = resolve_project_config(|key| match key {
+            "FIREBASE_PROJECT_ID" | "GCLOUD_PROJECT" => Some("demo".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(same.project_id.as_deref(), Some("demo"));
+        assert!(resolve_project_config(|key| match key {
+            "FIREBASE_PROJECT_ID" => Some("one".into()),
+            "FIRESTORE_PROJECT_ID" => Some("two".into()),
+            _ => None,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn explicit_storage_bucket_is_kept_in_project_config() {
+        let config = resolve_project_config(|key| match key {
+            "FIREBASE_STORAGE_BUCKET" => Some("custom-bucket".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(config.storage_bucket.as_deref(), Some("custom-bucket"));
+    }
 }
