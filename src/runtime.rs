@@ -59,6 +59,7 @@ enum MethodReceiver {
     AuthSession(crate::auth::AuthSession),
     Map(BTreeMap<String, Value>),
     Module(BuiltinModule),
+    Str(String),
 }
 
 pub struct Runtime<F: Firestore, S: Storage = InMemoryStorage> {
@@ -257,6 +258,7 @@ fn into_method_receiver(value: Value) -> Result<MethodReceiver, Box<dyn Error>> 
         Value::AuthSession(value) => Ok(MethodReceiver::AuthSession(value)),
         Value::Map(value) => Ok(MethodReceiver::Map(value)),
         Value::Module(value) => Ok(MethodReceiver::Module(value)),
+        Value::Str(value) => Ok(MethodReceiver::Str(value)),
         _ => Err("unsupported method receiver".into()),
     }
 }
@@ -567,10 +569,27 @@ fn bytes_method_contract(name: &str) -> Option<CallContract> {
 
 fn array_method_contract(name: &str) -> Option<CallContract> {
     match name {
-        "each" => Some(CallContract::exact(0).requiring_block()),
-        "map" => Some(CallContract::exact(0).requiring_block()),
+        "each" | "map" | "filter" | "find" => Some(CallContract::exact(0).requiring_block()),
         "len" => Some(CallContract::exact(0)),
+        "contains" => Some(CallContract::exact(1)),
+        "join" => Some(CallContract::range(0, 1)),
         _ => None,
+    }
+}
+
+fn str_method_contract(name: &str) -> Option<CallContract> {
+    match name {
+        "len" | "trim" => Some(CallContract::exact(0)),
+        "split" | "starts_with" | "ends_with" | "contains" => Some(CallContract::exact(1)),
+        _ => None,
+    }
+}
+
+fn map_method_contract(name: &str) -> Option<CallContract> {
+    match name {
+        "keys" | "values" | "len" => Some(CallContract::exact(0)),
+        "has_key" => Some(CallContract::exact(1)),
+        _ => Some(CallContract::exact(0)),
     }
 }
 
@@ -589,12 +608,11 @@ fn method_contract(receiver: &MethodReceiver, name: &str) -> Option<CallContract
         | MethodReceiver::CollectionGroup(_)
         | MethodReceiver::Query(_) => query_method_contract(name),
         MethodReceiver::Array(_) => array_method_contract(name),
+        MethodReceiver::Str(_) => str_method_contract(name),
         MethodReceiver::Timestamp(_) => timestamp_method_contract(name),
         MethodReceiver::Bytes(_) => bytes_method_contract(name),
         MethodReceiver::AuthSession(_) => auth_session_method_contract(name),
-        // `m.key` is map key access rather than a fixed set of methods.  It
-        // still has a strict zero-argument/no-block contract.
-        MethodReceiver::Map(_) => Some(CallContract::exact(0)),
+        MethodReceiver::Map(_) => map_method_contract(name),
         MethodReceiver::Module(_) => None,
     }
 }
@@ -606,10 +624,14 @@ fn method_call_label(receiver: &MethodReceiver, name: &str) -> String {
         | MethodReceiver::CollectionGroup(_)
         | MethodReceiver::Query(_) => format!("query method {name}"),
         MethodReceiver::Array(_) => format!("array method {name}"),
+        MethodReceiver::Str(_) => format!("string method {name}"),
         MethodReceiver::Timestamp(_) => format!("timestamp method {name}"),
         MethodReceiver::Bytes(_) => format!("bytes method {name}"),
         MethodReceiver::AuthSession(_) => format!("auth session method {name}"),
-        MethodReceiver::Map(_) => format!("map key access {name}"),
+        MethodReceiver::Map(_) => match name {
+            "keys" | "values" | "len" | "has_key" => format!("map method {name}"),
+            _ => format!("map key access {name}"),
+        },
         MethodReceiver::Module(module) => format!("{}.{name}", module.name()),
     }
 }
@@ -649,6 +671,7 @@ fn validate_method_call(
         | MethodReceiver::CollectionGroup(_)
         | MethodReceiver::Query(_) => format!("unknown query method: {name}").into(),
         MethodReceiver::Array(_) => format!("unknown array method: {name}").into(),
+        MethodReceiver::Str(_) => format!("unknown string method: {name}").into(),
         MethodReceiver::Timestamp(_) => format!("unknown timestamp method: {name}").into(),
         MethodReceiver::Bytes(_) => format!("unknown bytes method: {name}").into(),
         MethodReceiver::AuthSession(_) => format!("unknown auth session method: {name}").into(),
@@ -866,6 +889,17 @@ fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {
             };
             Ok(items.get(index).cloned().unwrap_or(Value::Nil))
         }
+        (Value::Str(s), Value::Int(i)) => {
+            let index = match checked_array_index::<usize>(i) {
+                Some(index) => index,
+                None => return Ok(Value::Nil),
+            };
+            Ok(s.chars()
+                .nth(index)
+                .map(|c| Value::Str(c.to_string()))
+                .unwrap_or(Value::Nil))
+        }
+        (Value::Str(_), _) => Err("string index must be an int".into()),
         (Value::Map(_), _) => Err("map index must be a string".into()),
         (Value::Array(_), _) => Err("array index must be an int".into()),
         _ => Err("unsupported index receiver".into()),
