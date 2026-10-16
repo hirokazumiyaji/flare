@@ -108,8 +108,6 @@ impl Parser {
         match self.peek() {
             Token::Fn => self.parse_def(),
             Token::Return => self.parse_return(),
-            Token::If => self.parse_if(),
-            Token::While => self.parse_while(),
             Token::Ident(name) if self.peek_n(1) == Some(&Token::Eq) => {
                 let name = name.clone();
                 self.bump();
@@ -149,7 +147,7 @@ impl Parser {
             Ok(Stmt::Return(Some(self.parse_expr()?)))
         }
     }
-    fn parse_if(&mut self) -> Result<Stmt, Box<dyn Error>> {
+    fn parse_if(&mut self) -> Result<Expr, Box<dyn Error>> {
         self.expect(Token::If)?;
         self.suppress_block_calls += 1;
         let cond = self.parse_expr();
@@ -165,25 +163,28 @@ impl Parser {
                 self.enter_nesting()?;
                 let nested = self.parse_if();
                 self.leave_nesting();
-                else_body = vec![nested?];
+                else_body = vec![Stmt::Expr(nested?)];
             } else {
                 else_body = self.parse_brace_block()?;
             }
         }
-        Ok(Stmt::If {
-            cond,
+        Ok(Expr::If {
+            cond: Box::new(cond),
             then_body,
             else_body,
         })
     }
-    fn parse_while(&mut self) -> Result<Stmt, Box<dyn Error>> {
+    fn parse_while(&mut self) -> Result<Expr, Box<dyn Error>> {
         self.expect(Token::While)?;
         self.suppress_block_calls += 1;
         let cond = self.parse_expr();
         self.suppress_block_calls -= 1;
         let cond = cond?;
         let body = self.parse_brace_block()?;
-        Ok(Stmt::While { cond, body })
+        Ok(Expr::While {
+            cond: Box::new(cond),
+            body,
+        })
     }
     fn parse_expr(&mut self) -> Result<Expr, Box<dyn Error>> {
         self.parse_or()
@@ -363,6 +364,8 @@ impl Parser {
             }
             Token::LBrace => self.parse_map_literal(),
             Token::LBracket => self.parse_array_literal(),
+            Token::If => self.parse_if(),
+            Token::While => self.parse_while(),
             Token::Newline if self.depth > 0 => {
                 // delimiter の内側では改行を透過的に無視する(式の途中を含む)。
                 self.bump();
@@ -655,6 +658,8 @@ impl Parser {
                 | Token::Nil
                 | Token::LParen
                 | Token::Bang
+                | Token::If
+                | Token::While
         )
     }
     /// 文の区切り(改行または `;`)をスキップする。ブロック本文・プログラム
@@ -766,22 +771,6 @@ impl Parser {
                 }
                 Stmt::Return(Some(expr)) => self.validate_expr_depth(expr, depth, max)?,
                 Stmt::Return(None) => {}
-                Stmt::If {
-                    cond,
-                    then_body,
-                    else_body,
-                } => {
-                    self.validate_expr_depth(cond, depth, max)?;
-                    for child in then_body.iter().chain(else_body) {
-                        stack.push((child, depth + 1));
-                    }
-                }
-                Stmt::While { cond, body } => {
-                    self.validate_expr_depth(cond, depth, max)?;
-                    for child in body {
-                        stack.push((child, depth + 1));
-                    }
-                }
             }
         }
         Ok(())
@@ -861,6 +850,22 @@ impl Parser {
                         stack.push((item, child_depth));
                     }
                 }
+                Expr::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    stack.push((cond, child_depth));
+                    for child in then_body.iter().chain(else_body) {
+                        self.validate_stmt_depth_iterative(child, child_depth, max)?;
+                    }
+                }
+                Expr::While { cond, body } => {
+                    stack.push((cond, child_depth));
+                    for child in body {
+                        self.validate_stmt_depth_iterative(child, child_depth, max)?;
+                    }
+                }
                 Expr::Int(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Nil | Expr::Var(_) => {}
             }
         }
@@ -889,22 +894,6 @@ impl Parser {
                 }
                 Stmt::Return(Some(expr)) => self.validate_expr_depth(expr, child_depth, max)?,
                 Stmt::Return(None) => {}
-                Stmt::If {
-                    cond,
-                    then_body,
-                    else_body,
-                } => {
-                    self.validate_expr_depth(cond, child_depth, max)?;
-                    for child in then_body.iter().chain(else_body) {
-                        stack.push((child, child_depth));
-                    }
-                }
-                Stmt::While { cond, body } => {
-                    self.validate_expr_depth(cond, child_depth, max)?;
-                    for child in body {
-                        stack.push((child, child_depth));
-                    }
-                }
             }
         }
         Ok(())
@@ -1015,9 +1004,9 @@ mod tests {
     fn shallow_blocks_within_the_depth_limit_still_parse() {
         let source = "if 1 {\n".repeat(3) + "1\n" + &"}\n".repeat(3);
         let program = parse_with_depth(&source, 8).unwrap();
-        // 入れ子の `if` は外側の 1 つの Stmt::If になり、本体は内側に畳まれる。
+        // 入れ子の `if` は外側の 1 つの Expr::If になり、本体は内側に畳まれる。
         assert_eq!(program.len(), 1);
-        assert!(matches!(program[0], Stmt::If { .. }));
+        assert!(matches!(program[0], Stmt::Expr(Expr::If { .. })));
     }
 
     #[test]
