@@ -21,7 +21,11 @@ pub const KEYWORDS: &[&str] = &[
     "fn", "return", "if", "else", "while", "nil", "true", "false",
 ];
 
-pub const MODULES: &[&str] = &["Firestore", "Auth", "Storage"];
+pub const MODULES: &[&str] = &[
+    "Firestore", "Auth", "Storage", "IO", "File", "JSON", "CSV", "YAML",
+];
+
+pub const REPL_COMMANDS: &[&str] = &["exit", "quit"];
 
 pub const BUILTINS: &[&str] = &[
     "puts",
@@ -29,37 +33,60 @@ pub const BUILTINS: &[&str] = &[
     "col",
     "col_group",
     "array",
-    "map",
+    "len",
+    "now",
     "timestamp",
+    "bytes",
     "server_timestamp",
-    "increment",
     "array_union",
     "array_remove",
     "delete_field",
-    "bytes",
+    "increment",
     "get",
     "set",
     "update",
     "delete",
-    "where",
-    "order_by",
-    "limit",
-    "offset",
-    "count",
     "batch",
     "transaction",
-    "auth_sign_up",
-    "auth_sign_in",
-    "auth_sign_out",
-    "auth_current_user",
     "storage_upload",
     "storage_download",
-    "storage_delete",
     "storage_metadata",
-    "len",
-    "exit",
-    "quit",
+    "storage_delete",
+    "auth_sign_up",
+    "auth_sign_in",
+    "auth_current_user",
+    "auth_sign_out",
+    "io_file",
+    "io_read",
+    "io_write",
+    "file_read",
+    "file_write",
+    "json_parse",
+    "json_generate",
+    "csv_parse",
+    "csv_generate",
+    "yaml_parse",
+    "yaml_generate",
 ];
+
+pub fn default_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    for k in KEYWORDS {
+        candidates.push((*k).to_string());
+    }
+    for m in MODULES {
+        candidates.push((*m).to_string());
+    }
+    for b in crate::runtime::builtin_names() {
+        candidates.push(b.to_string());
+    }
+    for c in REPL_COMMANDS {
+        candidates.push((*c).to_string());
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
 
 #[derive(Default)]
 pub struct FlareHelper {
@@ -68,20 +95,8 @@ pub struct FlareHelper {
 
 impl FlareHelper {
     pub fn new() -> Self {
-        let mut candidates = Vec::new();
-        for k in KEYWORDS {
-            candidates.push((*k).to_string());
-        }
-        for m in MODULES {
-            candidates.push((*m).to_string());
-        }
-        for b in BUILTINS {
-            candidates.push((*b).to_string());
-        }
-        candidates.sort();
-        candidates.dedup();
         Self {
-            candidates: RefCell::new(candidates),
+            candidates: RefCell::new(default_candidates()),
         }
     }
 
@@ -212,16 +227,7 @@ pub fn run_interactive<F: Firestore, S: Storage>(
     loop {
         // Update candidates with current runtime variables
         if let Some(h) = rl.helper() {
-            let mut candidates = Vec::new();
-            for k in KEYWORDS {
-                candidates.push((*k).to_string());
-            }
-            for m in MODULES {
-                candidates.push((*m).to_string());
-            }
-            for b in BUILTINS {
-                candidates.push((*b).to_string());
-            }
+            let mut candidates = default_candidates();
             for v in rt.global_variable_names() {
                 candidates.push(v);
             }
