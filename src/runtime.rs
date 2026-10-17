@@ -60,6 +60,7 @@ enum MethodReceiver {
     Map(BTreeMap<String, Value>),
     Module(BuiltinModule),
     Str(String),
+    Int(i64),
 }
 
 pub struct Runtime<F: Firestore, S: Storage = InMemoryStorage> {
@@ -277,6 +278,7 @@ fn into_method_receiver(value: Value) -> Result<MethodReceiver, Box<dyn Error>> 
         Value::Map(value) => Ok(MethodReceiver::Map(value)),
         Value::Module(value) => Ok(MethodReceiver::Module(value)),
         Value::Str(value) => Ok(MethodReceiver::Str(value)),
+        Value::Int(value) => Ok(MethodReceiver::Int(value)),
         _ => Err("unsupported method receiver".into()),
     }
 }
@@ -593,10 +595,19 @@ fn bytes_method_contract(name: &str) -> Option<CallContract> {
 
 fn array_method_contract(name: &str) -> Option<CallContract> {
     match name {
-        "each" | "map" | "filter" | "find" => Some(CallContract::exact(0).requiring_block()),
+        "each" | "map" | "filter" | "select" | "reject" | "find" | "each_with_index"
+        | "map_with_index" => Some(CallContract::exact(0).requiring_block()),
+        "reduce" | "inject" => Some(CallContract::range(0, 1).requiring_block()),
         "len" => Some(CallContract::exact(0)),
         "contains" => Some(CallContract::exact(1)),
         "join" => Some(CallContract::range(0, 1)),
+        _ => None,
+    }
+}
+
+fn int_method_contract(name: &str) -> Option<CallContract> {
+    match name {
+        "times" => Some(CallContract::exact(0).requiring_block()),
         _ => None,
     }
 }
@@ -637,6 +648,7 @@ fn method_contract(receiver: &MethodReceiver, name: &str) -> Option<CallContract
         MethodReceiver::Bytes(_) => bytes_method_contract(name),
         MethodReceiver::AuthSession(_) => auth_session_method_contract(name),
         MethodReceiver::Map(_) => map_method_contract(name),
+        MethodReceiver::Int(_) => int_method_contract(name),
         MethodReceiver::Module(_) => None,
     }
 }
@@ -649,6 +661,7 @@ fn method_call_label(receiver: &MethodReceiver, name: &str) -> String {
         | MethodReceiver::Query(_) => format!("query method {name}"),
         MethodReceiver::Array(_) => format!("array method {name}"),
         MethodReceiver::Str(_) => format!("string method {name}"),
+        MethodReceiver::Int(_) => format!("int method {name}"),
         MethodReceiver::Timestamp(_) => format!("timestamp method {name}"),
         MethodReceiver::Bytes(_) => format!("bytes method {name}"),
         MethodReceiver::AuthSession(_) => format!("auth session method {name}"),
@@ -696,6 +709,7 @@ fn validate_method_call(
         | MethodReceiver::Query(_) => format!("unknown query method: {name}").into(),
         MethodReceiver::Array(_) => format!("unknown array method: {name}").into(),
         MethodReceiver::Str(_) => format!("unknown string method: {name}").into(),
+        MethodReceiver::Int(_) => format!("unknown int method: {name}").into(),
         MethodReceiver::Timestamp(_) => format!("unknown timestamp method: {name}").into(),
         MethodReceiver::Bytes(_) => format!("unknown bytes method: {name}").into(),
         MethodReceiver::AuthSession(_) => format!("unknown auth session method: {name}").into(),
