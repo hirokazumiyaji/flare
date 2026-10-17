@@ -8,6 +8,11 @@ use crate::limits::ParserLimits;
 
 type ParsedArgs = Vec<CallArg>;
 
+enum WalkNode<'a> {
+    Stmt(&'a Stmt, usize),
+    Expr(&'a Expr, usize),
+}
+
 /// 二項演算子の優先順位表(弱い順)。`parse_or` / `parse_and` より強く、
 /// 単項より弱い 3 段。和・積の各段は左結合。
 const BINARY_LEVELS: &[&[(Token, BinOp)]] = &[
@@ -751,149 +756,119 @@ impl Parser {
         let Some(max) = self.limits.max_depth else {
             return Ok(());
         };
-        let mut stack = vec![(stmt, 0usize)];
-        while let Some((stmt, depth)) = stack.pop() {
-            if depth > max {
-                return Err(self.parse_err(format!(
-                    "parser nesting limit exceeded (max {max}, observed {depth})"
-                )));
-            }
-            // 式は guard される nesting の一部ではないので、現在の深さを
-            // そのまま使う(`enter_nesting` と同じ基準: 最外の構築物が 0)。
-            //  Statements の本体だけが一階層深く入る。
-            match stmt {
-                Stmt::Expr(expr) => self.validate_expr_depth(expr, depth, max)?,
-                Stmt::Assign { value, .. } => self.validate_expr_depth(value, depth, max)?,
-                Stmt::Def { body, .. } => {
-                    for child in body {
-                        stack.push((child, depth + 1));
-                    }
-                }
-                Stmt::Return(Some(expr)) => self.validate_expr_depth(expr, depth, max)?,
-                Stmt::Return(None) => {}
-            }
-        }
-        Ok(())
+        self.validate_walk_depth(WalkNode::Stmt(stmt, 0), max)
     }
 
     fn validate_expr_limits(&self, expr: &Expr) -> Result<(), Box<dyn Error>> {
         let Some(max) = self.limits.max_depth else {
             return Ok(());
         };
-        self.validate_expr_depth(expr, 0, max)
+        self.validate_walk_depth(WalkNode::Expr(expr, 0), max)
     }
 
-    /// Iterative AST walk: validating with recursive Rust calls would itself
-    /// overflow on precisely the input this guard is meant to reject.
-    fn validate_expr_depth(
-        &self,
-        expr: &Expr,
-        initial_depth: usize,
-        max: usize,
-    ) -> Result<(), Box<dyn Error>> {
-        let mut stack = vec![(expr, initial_depth)];
-        while let Some((expr, depth)) = stack.pop() {
-            if depth > max {
-                return Err(self.parse_err(format!(
-                    "parser nesting limit exceeded (max {max}, observed {depth})"
-                )));
-            }
-            let child_depth = depth.saturating_add(1);
-            match expr {
-                Expr::StrInterp(pieces) => {
-                    for piece in pieces {
-                        if let StrPiece::Expr(child) = piece {
-                            stack.push((child, child_depth));
+    // Iterative because a recursive walk would overflow the stack on the very
+    // input this guard rejects; depth steps only per brace block, matching
+    // the parser's `enter_nesting`.
+    fn validate_walk_depth(&self, root: WalkNode<'_>, max: usize) -> Result<(), Box<dyn Error>> {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            match node {
+                WalkNode::Stmt(stmt, depth) => {
+                    if depth > max {
+                        return Err(self.parse_err(format!(
+                            "parser nesting limit exceeded (max {max}, observed {depth})"
+                        )));
+                    }
+                    let child_depth = depth.saturating_add(1);
+                    match stmt {
+                        Stmt::Expr(expr) => stack.push(WalkNode::Expr(expr, depth)),
+                        Stmt::Assign { value, .. } => stack.push(WalkNode::Expr(value, depth)),
+                        Stmt::Def { body, .. } => {
+                            for child in body {
+                                stack.push(WalkNode::Stmt(child, child_depth));
+                            }
                         }
+                        Stmt::Return(Some(expr)) => stack.push(WalkNode::Expr(expr, depth)),
+                        Stmt::Return(None) => {}
                     }
                 }
-                Expr::Binary { left, right, .. }
-                | Expr::Index {
-                    base: left,
-                    index: right,
-                } => {
-                    stack.push((left, child_depth));
-                    stack.push((right, child_depth));
-                }
-                Expr::Unary { expr, .. } => stack.push((expr, child_depth)),
-                Expr::Call {
-                    receiver,
-                    args,
-                    block,
-                    ..
-                } => {
-                    if let Some(receiver) = receiver {
-                        stack.push((receiver, child_depth));
+                WalkNode::Expr(expr, depth) => {
+                    if depth > max {
+                        return Err(self.parse_err(format!(
+                            "parser nesting limit exceeded (max {max}, observed {depth})"
+                        )));
                     }
-                    for arg in args {
-                        // Positional and keyword arguments share one ordered
-                        // sequence; the value expression lives in either arm.
-                        let value = match arg {
-                            CallArg::Positional(expr) => expr,
-                            CallArg::Keyword { value, .. } => value,
-                        };
-                        stack.push((value, child_depth));
-                    }
-                    if let Some(block) = block {
-                        for stmt in &block.body {
-                            self.validate_stmt_depth_iterative(stmt, child_depth, max)?;
+                    let child_depth = depth.saturating_add(1);
+                    match expr {
+                        Expr::StrInterp(pieces) => {
+                            for piece in pieces {
+                                if let StrPiece::Expr(child) = piece {
+                                    stack.push(WalkNode::Expr(child, child_depth));
+                                }
+                            }
                         }
+                        Expr::Binary { left, right, .. }
+                        | Expr::Index {
+                            base: left,
+                            index: right,
+                        } => {
+                            stack.push(WalkNode::Expr(left, child_depth));
+                            stack.push(WalkNode::Expr(right, child_depth));
+                        }
+                        Expr::Unary { expr, .. } => stack.push(WalkNode::Expr(expr, child_depth)),
+                        Expr::Call {
+                            receiver,
+                            args,
+                            block,
+                            ..
+                        } => {
+                            if let Some(receiver) = receiver {
+                                stack.push(WalkNode::Expr(receiver, child_depth));
+                            }
+                            for arg in args {
+                                // Positional and keyword arguments share one ordered
+                                // sequence; the value expression lives in either arm.
+                                let value = match arg {
+                                    CallArg::Positional(expr) => expr,
+                                    CallArg::Keyword { value, .. } => value,
+                                };
+                                stack.push(WalkNode::Expr(value, child_depth));
+                            }
+                            if let Some(block) = block {
+                                for stmt in &block.body {
+                                    stack.push(WalkNode::Stmt(stmt, child_depth));
+                                }
+                            }
+                        }
+                        Expr::Map(entries) => {
+                            for (_, value) in entries {
+                                stack.push(WalkNode::Expr(value, child_depth));
+                            }
+                        }
+                        Expr::Array(items) => {
+                            for item in items {
+                                stack.push(WalkNode::Expr(item, child_depth));
+                            }
+                        }
+                        Expr::If {
+                            cond,
+                            then_body,
+                            else_body,
+                        } => {
+                            stack.push(WalkNode::Expr(cond, child_depth));
+                            for child in then_body.iter().chain(else_body) {
+                                stack.push(WalkNode::Stmt(child, child_depth));
+                            }
+                        }
+                        Expr::While { cond, body } => {
+                            stack.push(WalkNode::Expr(cond, child_depth));
+                            for child in body {
+                                stack.push(WalkNode::Stmt(child, child_depth));
+                            }
+                        }
+                        Expr::Int(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Nil | Expr::Var(_) => {}
                     }
                 }
-                Expr::Map(entries) => {
-                    for (_, value) in entries {
-                        stack.push((value, child_depth));
-                    }
-                }
-                Expr::Array(items) => {
-                    for item in items {
-                        stack.push((item, child_depth));
-                    }
-                }
-                Expr::If {
-                    cond,
-                    then_body,
-                    else_body,
-                } => {
-                    stack.push((cond, child_depth));
-                    for child in then_body.iter().chain(else_body) {
-                        self.validate_stmt_depth_iterative(child, child_depth, max)?;
-                    }
-                }
-                Expr::While { cond, body } => {
-                    stack.push((cond, child_depth));
-                    for child in body {
-                        self.validate_stmt_depth_iterative(child, child_depth, max)?;
-                    }
-                }
-                Expr::Int(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Nil | Expr::Var(_) => {}
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_stmt_depth_iterative(
-        &self,
-        stmt: &Stmt,
-        initial_depth: usize,
-        max: usize,
-    ) -> Result<(), Box<dyn Error>> {
-        let mut stack = vec![(stmt, initial_depth)];
-        while let Some((stmt, depth)) = stack.pop() {
-            if depth > max {
-                return Err(self.parse_err(format!("parser nesting limit exceeded (max {max})")));
-            }
-            let child_depth = depth.saturating_add(1);
-            match stmt {
-                Stmt::Expr(expr) => self.validate_expr_depth(expr, child_depth, max)?,
-                Stmt::Assign { value, .. } => self.validate_expr_depth(value, child_depth, max)?,
-                Stmt::Def { body, .. } => {
-                    for child in body {
-                        stack.push((child, child_depth));
-                    }
-                }
-                Stmt::Return(Some(expr)) => self.validate_expr_depth(expr, child_depth, max)?,
-                Stmt::Return(None) => {}
             }
         }
         Ok(())
