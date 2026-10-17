@@ -1,0 +1,35 @@
+[package]
+name = "flare-fuzz"
+version = "0.0.0"
+publish = false
+license = "MIT"
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+flare = { path = ".." }
+
+# Prevent this from interfering with parent workspace
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "tokenize"
+path = "fuzz_targets/tokenize.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_program"
+path = "fuzz_targets/parse_program.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "run_script"
+path = "fuzz_targets/run_script.rs"
+test = false
+doc = false

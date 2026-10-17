@@ -142,3 +142,152 @@ fn repl_stream_enforces_source_size_budget_on_pending_buffer() {
     assert!(lines[0].contains("source size limit exceeded"));
     assert_eq!(lines[1], "=> 2");
 }
+
+#[test]
+fn repl_loop_handles_continuation_prompt_and_syntax_error_recovery() {
+    use flare::repl::run_repl_loop;
+    use rustyline::error::ReadlineError;
+
+    let mut rt = Runtime::new(InMemoryFirestore::default());
+
+    let mut prompts = Vec::new();
+    let mut history = Vec::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let lines = vec![
+        Ok("fn broken() {".to_string()),
+        Ok("  let invalid = 1 + ;".to_string()),
+        Ok("}".to_string()),
+        Ok("1 + 1".to_string()),
+        Ok("exit".to_string()),
+    ];
+    let mut line_iter = lines.into_iter();
+
+    run_repl_loop(
+        &mut rt,
+        |_rt, prompt| {
+            prompts.push(prompt.to_string());
+            line_iter.next().unwrap_or(Err(ReadlineError::Eof))
+        },
+        |entry| history.push(entry.to_string()),
+        &mut stdout,
+        &mut stderr,
+    )
+    .unwrap();
+
+    assert_eq!(prompts, vec!["fl> ", "fl* ", "fl* ", "fl> ", "fl> "]);
+    assert_eq!(
+        history,
+        vec!["fn broken() {\n  let invalid = 1 + ;\n}", "1 + 1"]
+    );
+
+    let err_str = String::from_utf8(stderr).unwrap();
+    assert!(err_str.contains("error:"));
+
+    let out_str = String::from_utf8(stdout).unwrap();
+    assert!(out_str.contains("=> 2"));
+}
+
+#[test]
+fn repl_loop_handles_ctrl_c_interrupted_branches() {
+    use flare::repl::run_repl_loop;
+    use rustyline::error::ReadlineError;
+
+    let mut rt = Runtime::new(InMemoryFirestore::default());
+
+    let mut prompts = Vec::new();
+    let mut history = Vec::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let lines = vec![
+        Err(ReadlineError::Interrupted),
+        Ok("fn pending() {".to_string()),
+        Err(ReadlineError::Interrupted),
+        Ok("10 + 20".to_string()),
+        Ok("exit".to_string()),
+    ];
+    let mut line_iter = lines.into_iter();
+
+    run_repl_loop(
+        &mut rt,
+        |_rt, prompt| {
+            prompts.push(prompt.to_string());
+            line_iter.next().unwrap_or(Err(ReadlineError::Eof))
+        },
+        |entry| history.push(entry.to_string()),
+        &mut stdout,
+        &mut stderr,
+    )
+    .unwrap();
+
+    assert_eq!(prompts, vec!["fl> ", "fl> ", "fl* ", "fl> ", "fl> "]);
+    assert_eq!(history, vec!["10 + 20"]);
+
+    let out_str = String::from_utf8(stdout).unwrap();
+    assert!(out_str.contains("^C\n^C\n=> 30"));
+}
+
+#[test]
+fn repl_loop_handles_ctrl_d_eof_branches() {
+    use flare::repl::run_repl_loop;
+    use rustyline::error::ReadlineError;
+
+    let mut rt = Runtime::new(InMemoryFirestore::default());
+
+    let mut prompts = Vec::new();
+    let mut history = Vec::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let lines = vec![
+        Ok("fn pending() {".to_string()),
+        Err(ReadlineError::Eof),
+        Ok("42".to_string()),
+        Err(ReadlineError::Eof),
+    ];
+    let mut line_iter = lines.into_iter();
+
+    run_repl_loop(
+        &mut rt,
+        |_rt, prompt| {
+            prompts.push(prompt.to_string());
+            line_iter.next().unwrap_or(Err(ReadlineError::Eof))
+        },
+        |entry| history.push(entry.to_string()),
+        &mut stdout,
+        &mut stderr,
+    )
+    .unwrap();
+
+    assert_eq!(prompts, vec!["fl> ", "fl* ", "fl> ", "fl> "]);
+    assert_eq!(history, vec!["42"]);
+
+    let out_str = String::from_utf8(stdout).unwrap();
+    assert!(out_str.contains("=> 42"));
+}
+
+#[test]
+fn repl_history_file_save_and_load_round_trip() {
+    use flare::repl::FlareHelper;
+    use rustyline::history::FileHistory;
+    use rustyline::Editor;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let history_path = temp_dir.path().join(".fl_history");
+
+    {
+        let mut rl = Editor::<FlareHelper, FileHistory>::new().unwrap();
+        rl.add_history_entry("a = 100").unwrap();
+        rl.add_history_entry("b = 200").unwrap();
+        rl.save_history(&history_path).unwrap();
+    }
+
+    {
+        let mut rl = Editor::<FlareHelper, FileHistory>::new().unwrap();
+        rl.load_history(&history_path).unwrap();
+        let entries: Vec<&str> = rl.history().iter().map(String::as_str).collect();
+        assert_eq!(entries, vec!["a = 100", "b = 200"]);
+    }
+}

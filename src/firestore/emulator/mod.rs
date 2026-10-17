@@ -24,6 +24,7 @@ use crate::value::{DocRef, QueryFilter, QueryOp, QueryRef, QuerySource, Value};
 const COUNT_ALIAS: &str = "all";
 
 pub use client::EmulatorAuth;
+pub use codec::{decode_field_value_bounded, encode_field_value_bounded};
 
 /// Default application-level deadline for one emulator RPC.
 ///
