@@ -31,6 +31,15 @@ pub enum Expr {
         base: Box<Expr>,
         index: Box<Expr>,
     },
+    If {
+        cond: Box<Expr>,
+        then_body: Vec<Stmt>,
+        else_body: Vec<Stmt>,
+    },
+    While {
+        cond: Box<Expr>,
+        body: Vec<Stmt>,
+    },
 }
 
 /// An argument to a call, retaining its position in the source.
@@ -79,15 +88,6 @@ pub enum Stmt {
         body: Vec<Stmt>,
     },
     Return(Option<Expr>),
-    If {
-        cond: Expr,
-        then_body: Vec<Stmt>,
-        else_body: Vec<Stmt>,
-    },
-    While {
-        cond: Expr,
-        body: Vec<Stmt>,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
