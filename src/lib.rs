@@ -41,9 +41,11 @@ pub use limits::{
 };
 pub use repl::ReplOptions;
 pub use storage::{
-    HttpStorageTransport, HttpTransport, InMemoryStorage, Storage, StorageEmulator, StorageError,
-    StorageErrorKind, StorageHttpTransport, StorageMetadata, StorageRequest, StorageResponse,
-    StorageTransport, UnavailableStorage,
+    parse_http_response, parse_http_response_with_limit, HttpStorageTransport, HttpTransport,
+    InMemoryStorage, Storage, StorageEmulator, StorageError, StorageErrorKind,
+    StorageHttpTransport, StorageMetadata, StorageRequest, StorageResponse, StorageTransport,
+    UnavailableStorage, DEFAULT_MAX_STORAGE_BODY_BYTES, DEFAULT_MAX_STORAGE_RESPONSE_BYTES,
+    STORAGE_HEADER_ALLOWANCE_BYTES,
 };
 pub use value::{
     validate_value_depth, validate_value_limits, validate_value_limits_with_sizes, BuiltinModule,

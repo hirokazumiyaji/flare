@@ -141,3 +141,97 @@ fn fake_transport_can_drive_the_emulator_contract() {
     // path above is the script-level vertical slice.
     assert_eq!(direct.transport().requests.borrow().len(), 1);
 }
+
+#[test]
+fn storage_emulator_rejects_response_exceeding_max_bytes_budget() {
+    struct HugeTransport;
+    impl StorageTransport for HugeTransport {
+        fn send(
+            &self,
+            _req: &StorageRequest,
+        ) -> Result<StorageResponse, Box<dyn std::error::Error>> {
+            Ok(StorageResponse::new(200, vec![0x42; 200]))
+        }
+    }
+    let storage = StorageEmulator::with_transport("p", HugeTransport).unwrap();
+    let limits = flare::limits::RuntimeLimits {
+        max_bytes_size: Some(100),
+        ..flare::limits::RuntimeLimits::default()
+    };
+    let mut runtime = flare::runtime::Runtime::with_storage_and_limits(
+        flare::InMemoryFirestore::default(),
+        storage,
+        limits,
+    );
+    let err = runtime
+        .run("storage_download(\"file.bin\")")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("response body size exceeds limit"), "{err}");
+}
+
+#[test]
+fn storage_emulator_with_unlimited_runtime_limits_allows_large_response() {
+    struct HugeTransport;
+    impl StorageTransport for HugeTransport {
+        fn send(
+            &self,
+            _req: &StorageRequest,
+        ) -> Result<StorageResponse, Box<dyn std::error::Error>> {
+            Ok(StorageResponse::new(200, vec![0x42; 60 * 1024 * 1024]))
+        }
+    }
+    let storage = StorageEmulator::with_transport("p", HugeTransport).unwrap();
+    let mut runtime = flare::runtime::Runtime::with_storage_and_limits(
+        flare::InMemoryFirestore::default(),
+        storage,
+        flare::limits::RuntimeLimits::unlimited(),
+    );
+    let result = runtime.run("storage_download(\"file.bin\")").unwrap();
+    match result {
+        flare::value::Value::Bytes(bytes) => assert_eq!(bytes.len(), 60 * 1024 * 1024),
+        other => panic!("expected bytes value, got {other:?}"),
+    }
+}
+
+#[test]
+fn runtime_set_limits_updates_storage_emulator_limits() {
+    struct TestTransport;
+    impl StorageTransport for TestTransport {
+        fn send(
+            &self,
+            _req: &StorageRequest,
+        ) -> Result<StorageResponse, Box<dyn std::error::Error>> {
+            Ok(StorageResponse::new(200, vec![0x42; 500]))
+        }
+    }
+    let storage = StorageEmulator::with_transport("p", TestTransport).unwrap();
+    let mut runtime =
+        flare::runtime::Runtime::with_storage(flare::InMemoryFirestore::default(), storage);
+
+    // Initial default limits (50 MiB) allow 500 bytes.
+    let result = runtime.run("storage_download(\"file.bin\")").unwrap();
+    match result {
+        flare::value::Value::Bytes(bytes) => assert_eq!(bytes.len(), 500),
+        other => panic!("expected bytes value, got {other:?}"),
+    }
+
+    // Lowering limit via set_limits constrains the storage emulator.
+    runtime.set_limits(flare::limits::RuntimeLimits {
+        max_bytes_size: Some(100),
+        ..flare::limits::RuntimeLimits::default()
+    });
+    let err = runtime
+        .run("storage_download(\"file.bin\")")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("response body size exceeds limit"), "{err}");
+
+    // Disabling limits via set_limits allows downloads of any size.
+    runtime.set_limits(flare::limits::RuntimeLimits::unlimited());
+    let result = runtime.run("storage_download(\"file.bin\")").unwrap();
+    match result {
+        flare::value::Value::Bytes(bytes) => assert_eq!(bytes.len(), 500),
+        other => panic!("expected bytes value, got {other:?}"),
+    }
+}

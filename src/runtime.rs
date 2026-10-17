@@ -167,6 +167,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         apply_backend_limits(&mut services.firestore, &limits);
         services.auth.set_timeout(limits.backend_timeout);
         services.storage.set_timeout(limits.backend_timeout);
+        services.storage.set_max_bytes_size(limits.max_bytes_size);
         Self {
             services,
             state: RuntimeState::new(limits),
@@ -228,6 +229,9 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         apply_backend_limits(&mut self.services.firestore, &self.state.limits);
         self.services.auth.set_timeout(limits.backend_timeout);
         self.services.storage.set_timeout(limits.backend_timeout);
+        self.services
+            .storage
+            .set_max_bytes_size(limits.max_bytes_size);
     }
 
     /// Return a snapshot of the counters consumed by the most recent run.

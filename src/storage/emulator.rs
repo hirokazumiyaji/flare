@@ -16,6 +16,18 @@ use std::time::{Duration, Instant};
 /// operating system's multi-minute TCP timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+use crate::limits::DEFAULT_MAX_BYTES_SIZE;
+
+/// Default maximum allowed body size for storage emulator responses (50 MiB).
+pub const DEFAULT_MAX_STORAGE_BODY_BYTES: usize = DEFAULT_MAX_BYTES_SIZE;
+
+/// Additional byte allowance for HTTP status line and response headers (64 KiB).
+pub const STORAGE_HEADER_ALLOWANCE_BYTES: usize = 64 * 1024;
+
+/// Default maximum allowed total raw response size (headers + body).
+pub const DEFAULT_MAX_STORAGE_RESPONSE_BYTES: usize =
+    DEFAULT_MAX_STORAGE_BODY_BYTES + STORAGE_HEADER_ALLOWANCE_BYTES;
+
 use serde_json::Value as JsonValue;
 
 use super::{validate_content_type, validate_storage_path, Storage, StorageError, StorageMetadata};
@@ -79,6 +91,7 @@ impl StorageResponse {
 pub trait StorageTransport {
     fn send(&self, request: &StorageRequest) -> Result<StorageResponse, Box<dyn Error>>;
     fn set_timeout(&mut self, _timeout: Option<Duration>) {}
+    fn set_limits(&mut self, _max_body_bytes: Option<usize>, _header_allowance: usize) {}
 }
 
 /// Minimal HTTP transport for `FIREBASE_STORAGE_EMULATOR_HOST` (which is an
@@ -87,6 +100,8 @@ pub struct HttpStorageTransport {
     address: String,
     host_header: String,
     timeout: Option<Duration>,
+    max_body_bytes: Option<usize>,
+    max_response_bytes: Option<usize>,
 }
 
 impl HttpStorageTransport {
@@ -118,7 +133,36 @@ impl HttpStorageTransport {
             address: without_path.to_string(),
             host_header: without_path.to_string(),
             timeout: Some(Duration::from_secs(30)),
+            max_body_bytes: Some(DEFAULT_MAX_STORAGE_BODY_BYTES),
+            max_response_bytes: Some(DEFAULT_MAX_STORAGE_RESPONSE_BYTES),
         })
+    }
+
+    pub fn with_limits(
+        mut self,
+        max_body_bytes: impl Into<Option<usize>>,
+        header_allowance: usize,
+    ) -> Self {
+        self.set_limits(max_body_bytes, header_allowance);
+        self
+    }
+
+    pub fn set_limits(
+        &mut self,
+        max_body_bytes: impl Into<Option<usize>>,
+        header_allowance: usize,
+    ) {
+        let max_body_bytes = max_body_bytes.into();
+        self.max_body_bytes = max_body_bytes;
+        self.max_response_bytes = max_body_bytes.map(|max| max.saturating_add(header_allowance));
+    }
+
+    pub fn max_body_bytes(&self) -> Option<usize> {
+        self.max_body_bytes
+    }
+
+    pub fn max_response_bytes(&self) -> Option<usize> {
+        self.max_response_bytes
     }
 
     pub fn address(&self) -> &str {
@@ -216,16 +260,36 @@ impl HttpStorageTransport {
             if read == 0 {
                 break;
             }
+            if let Some(max_response_bytes) = self.max_response_bytes {
+                if raw.len().saturating_add(read) > max_response_bytes {
+                    return Err(StorageError::backend(format!(
+                        "storage emulator response size limit exceeded (max {max_response_bytes} bytes)",
+                    )));
+                }
+            }
             raw.extend_from_slice(&buffer[..read]);
             // A response with Content-Length can be decoded before the peer
             // closes the socket. This also avoids waiting for keep-alive peers.
-            if let Ok((_, complete)) = parse_http_response(&raw) {
-                if complete {
-                    break;
+            match parse_http_response_with_limit(&raw, self.max_body_bytes) {
+                Ok((_, complete)) => {
+                    if complete {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if find_bytes(&raw, b"\r\n\r\n").is_none() {
+                        if raw.len() > STORAGE_HEADER_ALLOWANCE_BYTES {
+                            return Err(StorageError::backend(
+                                "storage emulator response headers exceeded size limit",
+                            ));
+                        }
+                    } else {
+                        return Err(e);
+                    }
                 }
             }
         }
-        let (response, _) = parse_http_response(&raw)?;
+        let (response, _) = parse_http_response_with_limit(&raw, self.max_body_bytes)?;
         Ok(response)
     }
 }
@@ -286,6 +350,10 @@ impl StorageTransport for HttpStorageTransport {
     fn set_timeout(&mut self, timeout: Option<Duration>) {
         self.timeout = timeout;
     }
+
+    fn set_limits(&mut self, max_body_bytes: Option<usize>, header_allowance: usize) {
+        HttpStorageTransport::set_limits(self, max_body_bytes, header_allowance);
+    }
 }
 
 /// Storage emulator backend. `T` is replaceable to make the REST contract
@@ -295,6 +363,7 @@ pub struct StorageEmulator<T = HttpStorageTransport> {
     project_id: String,
     bucket: String,
     auth_token: Option<String>,
+    max_bytes_size: Option<usize>,
 }
 
 impl StorageEmulator<HttpStorageTransport> {
@@ -336,7 +405,7 @@ impl StorageEmulator<HttpStorageTransport> {
 impl<T: StorageTransport> StorageEmulator<T> {
     pub fn with_transport(
         project_id: impl Into<String>,
-        transport: T,
+        mut transport: T,
     ) -> Result<Self, StorageError> {
         let project_id = project_id.into();
         if project_id.trim().is_empty()
@@ -349,12 +418,17 @@ impl<T: StorageTransport> StorageEmulator<T> {
                 "invalid storage project id: {project_id:?}"
             )));
         }
+        transport.set_limits(
+            Some(DEFAULT_MAX_STORAGE_BODY_BYTES),
+            STORAGE_HEADER_ALLOWANCE_BYTES,
+        );
         let bucket = format!("{project_id}.appspot.com");
         Ok(Self {
             transport,
             project_id,
             bucket,
             auth_token: None,
+            max_bytes_size: Some(DEFAULT_MAX_STORAGE_BODY_BYTES),
         })
     }
 
@@ -370,6 +444,22 @@ impl<T: StorageTransport> StorageEmulator<T> {
         transport: T,
     ) -> Result<Self, StorageError> {
         Self::with_transport(project_id, transport)
+    }
+
+    pub fn with_max_bytes_size(mut self, max: impl Into<Option<usize>>) -> Self {
+        self.set_max_bytes_size(max);
+        self
+    }
+
+    pub fn set_max_bytes_size(&mut self, max: impl Into<Option<usize>>) {
+        let max = max.into();
+        self.max_bytes_size = max;
+        self.transport
+            .set_limits(max, STORAGE_HEADER_ALLOWANCE_BYTES);
+    }
+
+    pub fn max_bytes_size(&self) -> Option<usize> {
+        self.max_bytes_size
     }
 
     /// Override the emulator bucket. Normally it is `{project_id}.appspot.com`.
@@ -463,6 +553,15 @@ impl<T: StorageTransport> StorageEmulator<T> {
         path: &str,
     ) -> Result<StorageResponse, Box<dyn Error>> {
         let response = self.transport.send(request)?;
+        if let Some(max) = self.max_bytes_size {
+            if response.body.len() > max {
+                return Err(StorageError::backend(format!(
+                    "storage emulator response body size exceeds limit: {} (max {max})",
+                    response.body.len()
+                ))
+                .into());
+            }
+        }
         if (200..300).contains(&response.status) {
             return Ok(response);
         }
@@ -491,6 +590,10 @@ impl<T: StorageTransport> StorageEmulator<T> {
 impl<T: StorageTransport> Storage for StorageEmulator<T> {
     fn set_timeout(&mut self, timeout: Option<Duration>) {
         self.transport.set_timeout(timeout);
+    }
+
+    fn set_max_bytes_size(&mut self, max_bytes_size: Option<usize>) {
+        self.set_max_bytes_size(max_bytes_size);
     }
 
     fn supports_backend_timeout(&self) -> bool {
@@ -719,12 +822,25 @@ fn percent_encode(value: &str) -> String {
     out
 }
 
-fn parse_http_response(raw: &[u8]) -> Result<(StorageResponse, bool), StorageError> {
+pub fn parse_http_response(raw: &[u8]) -> Result<(StorageResponse, bool), StorageError> {
+    parse_http_response_with_limit(raw, Some(DEFAULT_MAX_STORAGE_BODY_BYTES))
+}
+
+pub fn parse_http_response_with_limit(
+    raw: &[u8],
+    max_body_bytes: impl Into<Option<usize>>,
+) -> Result<(StorageResponse, bool), StorageError> {
+    let max_body_bytes = max_body_bytes.into();
     let Some(header_end) = find_bytes(raw, b"\r\n\r\n") else {
         return Err(StorageError::backend(
             "invalid storage emulator response: missing HTTP header terminator",
         ));
     };
+    if header_end > STORAGE_HEADER_ALLOWANCE_BYTES {
+        return Err(StorageError::backend(
+            "storage emulator response headers exceeded size limit",
+        ));
+    }
     let header_text = std::str::from_utf8(&raw[..header_end]).map_err(|e| {
         StorageError::backend(format!("invalid storage emulator response headers: {e}"))
     })?;
@@ -762,7 +878,7 @@ fn parse_http_response(raw: &[u8]) -> Result<(StorageResponse, bool), StorageErr
         name.eq_ignore_ascii_case("transfer-encoding") && value.contains("chunked")
     });
     if chunked {
-        let (decoded, complete) = decode_chunked_body(body)?;
+        let (decoded, complete) = decode_chunked_body(body, max_body_bytes)?;
         return Ok((
             StorageResponse {
                 status,
@@ -784,6 +900,13 @@ fn parse_http_response(raw: &[u8]) -> Result<(StorageResponse, bool), StorageErr
         });
     match content_length {
         Some(Ok(length)) => {
+            if let Some(max) = max_body_bytes {
+                if length > max {
+                    return Err(StorageError::backend(format!(
+                        "storage emulator response Content-Length exceeds limit: {length} (max {max})"
+                    )));
+                }
+            }
             if body.len() < length {
                 return Ok((
                     StorageResponse {
@@ -804,18 +927,31 @@ fn parse_http_response(raw: &[u8]) -> Result<(StorageResponse, bool), StorageErr
             ))
         }
         Some(Err(error)) => Err(error),
-        None => Ok((
-            StorageResponse {
-                status,
-                headers,
-                body: body.to_vec(),
-            },
-            false,
-        )),
+        None => {
+            if let Some(max) = max_body_bytes {
+                if body.len() > max {
+                    return Err(StorageError::backend(format!(
+                        "storage emulator response body size exceeds limit: {} (max {max})",
+                        body.len()
+                    )));
+                }
+            }
+            Ok((
+                StorageResponse {
+                    status,
+                    headers,
+                    body: body.to_vec(),
+                },
+                false,
+            ))
+        }
     }
 }
 
-fn decode_chunked_body(mut body: &[u8]) -> Result<(Vec<u8>, bool), StorageError> {
+fn decode_chunked_body(
+    mut body: &[u8],
+    max_body_bytes: Option<usize>,
+) -> Result<(Vec<u8>, bool), StorageError> {
     let mut out = Vec::new();
     loop {
         let Some(line_end) = find_bytes(body, b"\r\n") else {
@@ -828,6 +964,13 @@ fn decode_chunked_body(mut body: &[u8]) -> Result<(Vec<u8>, bool), StorageError>
         let size = usize::from_str_radix(size_text, 16).map_err(|e| {
             StorageError::backend(format!("invalid storage emulator chunk size: {e}"))
         })?;
+        if let Some(max) = max_body_bytes {
+            if out.len().saturating_add(size) > max {
+                return Err(StorageError::backend(format!(
+                    "storage emulator chunked response size exceeds limit (max {max} bytes)"
+                )));
+            }
+        }
         body = &body[line_end + 2..];
         if size == 0 {
             return Ok((out, true));
@@ -1022,5 +1165,129 @@ mod tests {
     fn percent_encoding_preserves_unicode_and_slash_separation() {
         assert_eq!(percent_encode("a/b c"), "a%2Fb%20c");
         assert_eq!(percent_encode("é"), "%C3%A9");
+    }
+
+    #[test]
+    fn fake_transport_response_exceeding_max_bytes_size_is_rejected() {
+        let transport = FakeTransport::new(vec![StorageResponse::new(200, vec![0xaa; 100])]);
+        let emulator = StorageEmulator::with_transport("p", transport)
+            .unwrap()
+            .with_max_bytes_size(50);
+        let err = emulator.download("test.bin").unwrap_err().to_string();
+        assert!(err.contains("response body size exceeds limit"), "{err}");
+    }
+
+    #[test]
+    fn parse_http_response_rejects_massive_content_length() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551615\r\n\r\n";
+        let err = parse_http_response_with_limit(raw, 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Content-Length exceeds limit"), "{err}");
+    }
+
+    #[test]
+    fn parse_http_response_rejects_chunked_size_exceeding_limit() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n100\r\n";
+        let err = parse_http_response_with_limit(raw, 50)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("chunked response size exceeds limit"), "{err}");
+    }
+
+    #[test]
+    fn parse_http_response_rejects_unbounded_body_without_content_length() {
+        let raw = b"HTTP/1.1 200 OK\r\n\r\n12345678901234567890";
+        let err = parse_http_response_with_limit(raw, 10)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("response body size exceeds limit"), "{err}");
+    }
+
+    #[test]
+    fn http_transport_aborts_immediately_on_content_length_exceeding_limit() {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skip: sandbox does not permit local TCP listeners");
+                return;
+            }
+            Err(error) => panic!("could not bind local test server: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 999999999\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            // Keep connection open without writing more bytes; client must fail immediately
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        let mut transport = HttpStorageTransport::new(address.to_string())
+            .unwrap()
+            .with_limits(1024, 1024);
+        transport.set_timeout(Some(Duration::from_secs(5)));
+        let err = transport
+            .send(&StorageRequest::new("GET", "/test", vec![]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Content-Length exceeds limit"), "{err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_transport_aborts_when_raw_stream_exceeds_max_response_bytes() {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skip: sandbox does not permit local TCP listeners");
+                return;
+            }
+            Err(error) => panic!("could not bind local test server: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 200\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let _ = stream.write_all(&[b'x'; 200]);
+        });
+
+        let transport = HttpStorageTransport::new(address.to_string())
+            .unwrap()
+            .with_limits(50, 50); // total max_response_bytes = 100
+        let err = transport
+            .send(&StorageRequest::new("GET", "/test", vec![]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("size limit exceeded"), "{err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn storage_emulator_with_http_transport_configures_limits_without_recursion() {
+        let transport = HttpStorageTransport::new("127.0.0.1:9199").unwrap();
+        let mut emulator = StorageEmulator::with_transport("project-test", transport)
+            .unwrap()
+            .with_max_bytes_size(4096);
+        assert_eq!(emulator.max_bytes_size(), Some(4096));
+        assert_eq!(emulator.transport().max_body_bytes(), Some(4096));
+        assert_eq!(
+            emulator.transport().max_response_bytes(),
+            Some(4096 + STORAGE_HEADER_ALLOWANCE_BYTES)
+        );
+
+        emulator.set_max_bytes_size(None);
+        assert_eq!(emulator.max_bytes_size(), None);
+        assert_eq!(emulator.transport().max_body_bytes(), None);
+        assert_eq!(emulator.transport().max_response_bytes(), None);
     }
 }
