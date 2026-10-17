@@ -3864,3 +3864,202 @@ fn modulo_operator_and_array_concatenation_work() {
     let err = run_script("1 + [2]").unwrap_err();
     assert!(format!("{err}").contains("unsupported + operands"), "{err}");
 }
+
+#[test]
+fn to_s_and_inspect_methods_and_functions() {
+    // to_s
+    assert_eq!(run_script("1.to_s()").unwrap(), Value::Str("1".into()));
+    assert_eq!(run_script("to_s(1)").unwrap(), Value::Str("1".into()));
+    assert_eq!(
+        run_script("true.to_s()").unwrap(),
+        Value::Str("true".into())
+    );
+    assert_eq!(
+        run_script("false.to_s()").unwrap(),
+        Value::Str("false".into())
+    );
+    assert_eq!(run_script("nil.to_s()").unwrap(), Value::Str("nil".into()));
+    assert_eq!(run_script("to_s(nil)").unwrap(), Value::Str("nil".into()));
+    assert_eq!(
+        run_script("\"hello\".to_s()").unwrap(),
+        Value::Str("hello".into())
+    );
+    assert_eq!(
+        run_script("[1, 2].to_s()").unwrap(),
+        Value::Str("[1, 2]".into())
+    );
+    assert_eq!(
+        run_script("{a: 1}.to_s()").unwrap(),
+        Value::Str("{\"a\" => 1}".into())
+    );
+
+    // inspect
+    assert_eq!(run_script("1.inspect()").unwrap(), Value::Str("1".into()));
+    assert_eq!(run_script("inspect(1)").unwrap(), Value::Str("1".into()));
+    assert_eq!(
+        run_script("\"hello\".inspect()").unwrap(),
+        Value::Str("\"hello\"".into())
+    );
+    assert_eq!(
+        run_script("inspect(\"hello\")").unwrap(),
+        Value::Str("\"hello\"".into())
+    );
+    assert_eq!(
+        run_script("nil.inspect()").unwrap(),
+        Value::Str("nil".into())
+    );
+    assert_eq!(
+        run_script("inspect(nil)").unwrap(),
+        Value::Str("nil".into())
+    );
+    assert_eq!(
+        run_script("[1, \"a\"].inspect()").unwrap(),
+        Value::Str("[1, \"a\"]".into())
+    );
+    assert_eq!(
+        run_script("inspect([1, \"a\"])").unwrap(),
+        Value::Str("[1, \"a\"]".into())
+    );
+
+    // argument errors
+    let err = run_script("1.to_s(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("to_s()").unwrap_err();
+    assert!(
+        format!("{err}").contains("missing positional arguments"),
+        "{err}"
+    );
+    let err = run_script("inspect()").unwrap_err();
+    assert!(
+        format!("{err}").contains("missing positional arguments"),
+        "{err}"
+    );
+}
+
+#[test]
+fn type_of_methods_and_functions() {
+    assert_eq!(run_script("1.type_of()").unwrap(), Value::Str("Int".into()));
+    assert_eq!(run_script("type_of(1)").unwrap(), Value::Str("Int".into()));
+    assert_eq!(
+        run_script("\"str\".type_of()").unwrap(),
+        Value::Str("Str".into())
+    );
+    assert_eq!(
+        run_script("true.type_of()").unwrap(),
+        Value::Str("Bool".into())
+    );
+    assert_eq!(
+        run_script("false.type_of()").unwrap(),
+        Value::Str("Bool".into())
+    );
+    assert_eq!(
+        run_script("nil.type_of()").unwrap(),
+        Value::Str("Nil".into())
+    );
+    assert_eq!(
+        run_script("[1].type_of()").unwrap(),
+        Value::Str("Array".into())
+    );
+    assert_eq!(
+        run_script("{a: 1}.type_of()").unwrap(),
+        Value::Str("Map".into())
+    );
+    assert_eq!(
+        run_script("now().type_of()").unwrap(),
+        Value::Str("Timestamp".into())
+    );
+    assert_eq!(
+        run_script("doc(\"users/alice\").type_of()").unwrap(),
+        Value::Str("DocRef".into())
+    );
+    assert_eq!(
+        run_script("col(\"users\").type_of()").unwrap(),
+        Value::Str("CollectionRef".into())
+    );
+    assert_eq!(
+        run_script("col_group(\"posts\").type_of()").unwrap(),
+        Value::Str("CollectionGroupRef".into())
+    );
+    assert_eq!(
+        run_script("col(\"users\").where(\"a\", \"==\", 1).type_of()").unwrap(),
+        Value::Str("QueryRef".into())
+    );
+    assert_eq!(
+        run_script("bytes([1, 2]).type_of()").unwrap(),
+        Value::Str("Bytes".into())
+    );
+
+    // type_of in branching
+    let src = r#"
+x = 10
+if x.type_of() == "Int" {
+  "number"
+} else {
+  "other"
+}
+"#;
+    assert_eq!(run_script(src).unwrap(), Value::Str("number".into()));
+
+    // argument errors
+    let err = run_script("1.type_of(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("type_of()").unwrap_err();
+    assert!(
+        format!("{err}").contains("missing positional arguments"),
+        "{err}"
+    );
+}
+
+#[test]
+fn to_i_methods_and_functions() {
+    assert_eq!(run_script("\"123\".to_i()").unwrap(), Value::Int(123));
+    assert_eq!(run_script("to_i(\"123\")").unwrap(), Value::Int(123));
+    assert_eq!(run_script("\"-456\".to_i()").unwrap(), Value::Int(-456));
+    assert_eq!(run_script("\"+789\".to_i()").unwrap(), Value::Int(789));
+    assert_eq!(run_script("\"  42  \".to_i()").unwrap(), Value::Int(42));
+    assert_eq!(run_script("123.to_i()").unwrap(), Value::Int(123));
+    assert_eq!(run_script("to_i(123)").unwrap(), Value::Int(123));
+
+    // parse errors
+    let err = run_script("\"abc\".to_i()").unwrap_err();
+    assert!(format!("{err}").contains("invalid integer: abc"), "{err}");
+    let err = run_script("to_i(\"abc\")").unwrap_err();
+    assert!(format!("{err}").contains("invalid integer: abc"), "{err}");
+    let err = run_script("\"12.34\".to_i()").unwrap_err();
+    assert!(format!("{err}").contains("invalid integer: 12.34"), "{err}");
+
+    // receiver / argument type errors
+    let err = run_script("true.to_i()").unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported method receiver"),
+        "{err}"
+    );
+    let err = run_script("[1].to_i()").unwrap_err();
+    assert!(
+        format!("{err}").contains("unknown array method: to_i"),
+        "{err}"
+    );
+    let err = run_script("to_i(true)").unwrap_err();
+    assert!(
+        format!("{err}").contains("to_i expects string or int argument"),
+        "{err}"
+    );
+
+    // argument count errors
+    let err = run_script("\"12\".to_i(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("to_i()").unwrap_err();
+    assert!(
+        format!("{err}").contains("missing positional arguments"),
+        "{err}"
+    );
+}

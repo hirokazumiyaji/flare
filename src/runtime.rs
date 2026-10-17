@@ -61,6 +61,43 @@ enum MethodReceiver {
     Module(BuiltinModule),
     Str(String),
     Int(i64),
+    Other(Value),
+}
+
+impl MethodReceiver {
+    pub fn into_value(self) -> Value {
+        match self {
+            Self::Collection(c) => Value::CollectionRef(c),
+            Self::CollectionGroup(cg) => Value::CollectionGroupRef(cg),
+            Self::Query(q) => Value::QueryRef(q),
+            Self::Array(a) => Value::Array(a),
+            Self::Timestamp(ts) => Value::Timestamp(ts),
+            Self::Bytes(b) => Value::Bytes(b),
+            Self::AuthSession(s) => Value::AuthSession(s),
+            Self::Map(m) => Value::Map(m),
+            Self::Module(m) => Value::Module(m),
+            Self::Str(s) => Value::Str(s),
+            Self::Int(i) => Value::Int(i),
+            Self::Other(v) => v,
+        }
+    }
+
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Collection(_) => "CollectionRef",
+            Self::CollectionGroup(_) => "CollectionGroupRef",
+            Self::Query(_) => "QueryRef",
+            Self::Array(_) => "Array",
+            Self::Timestamp(_) => "Timestamp",
+            Self::Bytes(_) => "Bytes",
+            Self::AuthSession(_) => "AuthSession",
+            Self::Map(_) => "Map",
+            Self::Module(_) => "Module",
+            Self::Str(_) => "Str",
+            Self::Int(_) => "Int",
+            Self::Other(v) => v.type_name(),
+        }
+    }
 }
 
 pub struct Runtime<F: Firestore, S: Storage = InMemoryStorage> {
@@ -267,20 +304,20 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
 /// dispatch. Keeping this conversion next to the dispatch match prevents a
 /// new receiver from being accepted by one path but rejected by the other.
 fn into_method_receiver(value: Value) -> Result<MethodReceiver, Box<dyn Error>> {
-    match value {
-        Value::CollectionRef(value) => Ok(MethodReceiver::Collection(value)),
-        Value::CollectionGroupRef(value) => Ok(MethodReceiver::CollectionGroup(value)),
-        Value::QueryRef(value) => Ok(MethodReceiver::Query(value)),
-        Value::Array(value) => Ok(MethodReceiver::Array(value)),
-        Value::Timestamp(value) => Ok(MethodReceiver::Timestamp(value)),
-        Value::Bytes(value) => Ok(MethodReceiver::Bytes(value)),
-        Value::AuthSession(value) => Ok(MethodReceiver::AuthSession(value)),
-        Value::Map(value) => Ok(MethodReceiver::Map(value)),
-        Value::Module(value) => Ok(MethodReceiver::Module(value)),
-        Value::Str(value) => Ok(MethodReceiver::Str(value)),
-        Value::Int(value) => Ok(MethodReceiver::Int(value)),
-        _ => Err("unsupported method receiver".into()),
-    }
+    Ok(match value {
+        Value::CollectionRef(value) => MethodReceiver::Collection(value),
+        Value::CollectionGroupRef(value) => MethodReceiver::CollectionGroup(value),
+        Value::QueryRef(value) => MethodReceiver::Query(value),
+        Value::Array(value) => MethodReceiver::Array(value),
+        Value::Timestamp(value) => MethodReceiver::Timestamp(value),
+        Value::Bytes(value) => MethodReceiver::Bytes(value),
+        Value::AuthSession(value) => MethodReceiver::AuthSession(value),
+        Value::Map(value) => MethodReceiver::Map(value),
+        Value::Module(value) => MethodReceiver::Module(value),
+        Value::Str(value) => MethodReceiver::Str(value),
+        Value::Int(value) => MethodReceiver::Int(value),
+        other => MethodReceiver::Other(other),
+    })
 }
 
 fn validate_unique_keywords(args: &[CallArg]) -> Result<(), Box<dyn Error>> {
@@ -608,13 +645,14 @@ fn array_method_contract(name: &str) -> Option<CallContract> {
 fn int_method_contract(name: &str) -> Option<CallContract> {
     match name {
         "times" => Some(CallContract::exact(0).requiring_block()),
+        "to_i" => Some(CallContract::exact(0)),
         _ => None,
     }
 }
 
 fn str_method_contract(name: &str) -> Option<CallContract> {
     match name {
-        "len" | "trim" => Some(CallContract::exact(0)),
+        "len" | "trim" | "to_i" => Some(CallContract::exact(0)),
         "split" | "starts_with" | "ends_with" | "contains" => Some(CallContract::exact(1)),
         _ => None,
     }
@@ -637,6 +675,9 @@ fn timestamp_method_contract(name: &str) -> Option<CallContract> {
 }
 
 fn method_contract(receiver: &MethodReceiver, name: &str) -> Option<CallContract> {
+    if matches!(name, "to_s" | "inspect" | "type_of") {
+        return Some(CallContract::exact(0));
+    }
     match receiver {
         MethodReceiver::Collection(_) if name == "doc" => Some(CallContract::exact(1)),
         MethodReceiver::Collection(_)
@@ -649,7 +690,7 @@ fn method_contract(receiver: &MethodReceiver, name: &str) -> Option<CallContract
         MethodReceiver::AuthSession(_) => auth_session_method_contract(name),
         MethodReceiver::Map(_) => map_method_contract(name),
         MethodReceiver::Int(_) => int_method_contract(name),
-        MethodReceiver::Module(_) => None,
+        MethodReceiver::Module(_) | MethodReceiver::Other(_) => None,
     }
 }
 
@@ -670,6 +711,7 @@ fn method_call_label(receiver: &MethodReceiver, name: &str) -> String {
             _ => format!("map key access {name}"),
         },
         MethodReceiver::Module(module) => format!("{}.{name}", module.name()),
+        MethodReceiver::Other(_) => format!("{} method {name}", receiver.type_name()),
     }
 }
 
@@ -717,6 +759,7 @@ fn validate_method_call(
         MethodReceiver::Module(module) => {
             format!("unknown module method: {}.{name}", module.name()).into()
         }
+        MethodReceiver::Other(_) => "unsupported method receiver".into(),
     })
 }
 

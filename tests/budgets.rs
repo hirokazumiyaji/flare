@@ -552,6 +552,12 @@ fn string_size_budget_enforces_limit_on_concat_and_interpolation() {
     // Container holding large string
     let err = rt.run("[\"a\" + \"b\" + \"c\" + \"d\" + \"e\" + \"f\" + \"g\" + \"h\" + \"i\" + \"j\" + \"k\"]").unwrap_err();
     assert_budget_error(err, "string size limit exceeded");
+
+    // to_s / inspect exceeding limit
+    let err = rt.run("[1, 2, 3, 4, 5, 6].to_s()").unwrap_err();
+    assert_budget_error(err, "string size limit exceeded");
+    let err = rt.run("inspect([1, 2, 3, 4, 5, 6])").unwrap_err();
+    assert_budget_error(err, "string size limit exceeded");
 }
 
 #[test]

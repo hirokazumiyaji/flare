@@ -914,6 +914,10 @@ impl Evaluator<'_> {
         _kwargs: BTreeMap<String, Value>,
         block: Option<&Block>,
     ) -> Result<ExecFlow, Box<dyn Error>> {
+        if let Some(handler) = universal_value_builtin(name) {
+            return handler(self, vec![receiver.into_value()], BTreeMap::new(), None);
+        }
+
         match receiver {
             MethodReceiver::Collection(collection) if name == "doc" => {
                 let id = expect_string(args.first())?;
@@ -1024,6 +1028,7 @@ impl Evaluator<'_> {
                 (spec.handler)(self, args, BTreeMap::new(), block)
             }
             MethodReceiver::Int(n) => self.eval_int_method(n, name, args, block),
+            MethodReceiver::Other(_) => Err("unsupported method receiver".into()),
         }
     }
 
@@ -1514,7 +1519,19 @@ const fn spec(
     }
 }
 
-pub(super) const BUILTIN_SPECS: [BuiltinSpec; 40] = {
+/// Methods applicable to any value, dispatched through the matching global
+/// builtin so both call forms share one implementation.
+fn universal_value_builtin(name: &str) -> Option<Builtin> {
+    match name {
+        "to_s" => Some(builtin_to_s),
+        "inspect" => Some(builtin_inspect),
+        "type_of" => Some(builtin_type_of),
+        "to_i" => Some(builtin_to_i),
+        _ => None,
+    }
+}
+
+pub(super) const BUILTIN_SPECS: [BuiltinSpec; 44] = {
     use BuiltinModule::{Auth, File, Firestore, Storage, CSV, IO, JSON, YAML};
     use ServiceId::{
         Auth as AuthService, Firestore as FirestoreService, Storage as StorageService,
@@ -1529,6 +1546,38 @@ pub(super) const BUILTIN_SPECS: [BuiltinSpec; 40] = {
             CallContract::any(),
             None,
             builtin_puts,
+        ),
+        spec(
+            None,
+            "to_s",
+            "to_s",
+            CallContract::exact(1),
+            None,
+            builtin_to_s,
+        ),
+        spec(
+            None,
+            "inspect",
+            "inspect",
+            CallContract::exact(1),
+            None,
+            builtin_inspect,
+        ),
+        spec(
+            None,
+            "type_of",
+            "type_of",
+            CallContract::exact(1),
+            None,
+            builtin_type_of,
+        ),
+        spec(
+            None,
+            "to_i",
+            "to_i",
+            CallContract::exact(1),
+            None,
+            builtin_to_i,
         ),
         spec(
             Some(Firestore),
@@ -1885,6 +1934,64 @@ fn builtin_puts(
         println!("{v}");
     }
     Ok(ExecFlow::Value(Value::Nil))
+}
+
+fn builtin_to_s(
+    rt: &mut Evaluator<'_>,
+    args: Vec<Value>,
+    _kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    let val = args.first().ok_or("expected 1 argument")?;
+    let res = Value::Str(val.to_string());
+    rt.check_value(&res)?;
+    Ok(ExecFlow::Value(res))
+}
+
+fn builtin_inspect(
+    rt: &mut Evaluator<'_>,
+    args: Vec<Value>,
+    _kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    let val = args.first().ok_or("expected 1 argument")?;
+    let res = Value::Str(val.inspect());
+    rt.check_value(&res)?;
+    Ok(ExecFlow::Value(res))
+}
+
+fn builtin_type_of(
+    rt: &mut Evaluator<'_>,
+    args: Vec<Value>,
+    _kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    let val = args.first().ok_or("expected 1 argument")?;
+    let res = Value::Str(val.type_name().to_string());
+    rt.check_value(&res)?;
+    Ok(ExecFlow::Value(res))
+}
+
+fn builtin_to_i(
+    rt: &mut Evaluator<'_>,
+    args: Vec<Value>,
+    _kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    let val = args.first().ok_or("expected 1 argument")?;
+    let res = match val {
+        Value::Int(i) => Value::Int(*i),
+        Value::Str(s) => {
+            let parsed = s
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| format!("invalid integer: {s}"))?;
+            Value::Int(parsed)
+        }
+        _ => return Err("to_i expects string or int argument".into()),
+    };
+    rt.check_value(&res)?;
+    Ok(ExecFlow::Value(res))
 }
 
 fn builtin_doc(
