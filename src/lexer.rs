@@ -28,6 +28,7 @@ pub enum Token {
     Minus,
     Star,
     Slash,
+    Percent,
     Eq,
     EqEq,
     Ne,
@@ -208,7 +209,8 @@ impl<'a> Lexer<'a> {
                     let token = self.lex_string_token()?;
                     return Ok(Some(self.spanned(token, span)));
                 }
-                '(' | ')' | ',' | '{' | '}' | '[' | ']' | '.' | ':' | '+' | '-' | '*' | '/' => {
+                '(' | ')' | ',' | '{' | '}' | '[' | ']' | '.' | ':' | '+' | '-' | '*' | '/'
+                | '%' => {
                     let span = self.span();
                     self.bump();
                     // or-pattern が single_char_token の定義域と一致するため、
@@ -442,6 +444,7 @@ fn single_char_token(c: char) -> Option<Token> {
         '-' => Token::Minus,
         '*' => Token::Star,
         '/' => Token::Slash,
+        '%' => Token::Percent,
         _ => return None,
     })
 }

@@ -20,7 +20,11 @@ const BINARY_LEVELS: &[&[(Token, BinOp)]] = &[
         (Token::Le, BinOp::Le),
     ],
     &[(Token::Plus, BinOp::Add), (Token::Minus, BinOp::Sub)],
-    &[(Token::Star, BinOp::Mul), (Token::Slash, BinOp::Div)],
+    &[
+        (Token::Star, BinOp::Mul),
+        (Token::Slash, BinOp::Div),
+        (Token::Percent, BinOp::Rem),
+    ],
 ];
 
 pub struct Parser {

@@ -164,8 +164,8 @@ rows[0]["__name__"]  # => "users/1" (query-result Map indexing; __name__ is acce
 | 2 | `&&` | Any value (short-circuits and returns the operand itself) |
 | 3 | `==` `!=` | Any values (structural equality) |
 | 3 | `>` `<` `>=` `<=` | Int / Timestamp / Bytes / Str pairs (Bytes use unsigned-byte lexicographic order, Str use UTF-8 lexicographic order); other types are errors |
-| 4 | `+` `-` | `+`: Int pairs / Str pairs (concatenation). `-`: Int pairs / Timestamp − Timestamp → Int (difference in seconds). Other types are errors |
-| 5 | `*` `/` | Int only. `/ 0` reports `division by zero`. |
+| 4 | `+` `-` | `+`: Int pairs / Str pairs (concatenation) / Array pairs (concatenation). `-`: Int pairs / Timestamp − Timestamp → Int (difference in seconds). Other types are errors |
+| 5 | `*` `/` `%` | Int only. `/ 0` and `% 0` report `division by zero`. |
 | 6 | `!` `-` (unary) | `!v` accepts any value and returns `Bool(!truthy(v))`. `-v` accepts Int only (`integer overflow` on overflow). |
 | 7 (highest) | `.method(...)` / `expr[expr]` | Method calls and indexing (see §4, Indexing) |
 
@@ -175,7 +175,7 @@ rows[0]["__name__"]  # => "users/1" (query-result Map indexing; __name__ is acce
 - Truthiness follows §3: only `false` and `nil` are false.
 - Unary minus cannot be used as the first argument of a call without parentheses. `puts -1` is parsed as `puts - 1` (subtraction), so use parentheses to pass a negative value (`puts(-1)`). `!` is allowed (`puts !x` means `puts(!x)`).
 
-If an arithmetic operation (`+`, `-`, `*`, `/`) on Int values exceeds the i64 range, it reports `integer overflow` (it does not panic in debug builds). `/ 0` reports `division by zero`.
+If an arithmetic operation (`+`, `-`, `*`, `/`, `%`) on Int values exceeds the i64 range, it reports `integer overflow` (it does not panic in debug builds). `/ 0` and `% 0` report `division by zero`.
 
 ### Expression Evaluation Order for Calls
 

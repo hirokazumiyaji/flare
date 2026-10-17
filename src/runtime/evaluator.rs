@@ -564,6 +564,48 @@ impl Evaluator<'_> {
                                     }
                                 }
                             }
+                            if let (Value::Array(a), Value::Array(b)) = (&l, &r) {
+                                if self.limits.max_value_nodes.is_some()
+                                    || self.limits.max_value_depth.is_some()
+                                {
+                                    let mut count = 1usize;
+                                    let mut stack: Vec<(&Value, usize)> =
+                                        a.iter().chain(b.iter()).map(|v| (v, 1usize)).collect();
+                                    while let Some((val, depth)) = stack.pop() {
+                                        if let Some(max) = self.limits.max_value_depth {
+                                            if depth > max {
+                                                return Err(FlareError::runtime(format!(
+                                                    "value nesting limit exceeded (max {max})"
+                                                ))
+                                                .into());
+                                            }
+                                        }
+                                        if let Some(max) = self.limits.max_value_nodes {
+                                            count = count.saturating_add(1);
+                                            if count > max {
+                                                return Err(FlareError::runtime(format!(
+                                                    "value node limit exceeded (max {max})"
+                                                ))
+                                                .into());
+                                            }
+                                        }
+                                        let child_depth = depth.saturating_add(1);
+                                        match val {
+                                            Value::Array(items)
+                                            | Value::ArrayUnion(items)
+                                            | Value::ArrayRemove(items) => {
+                                                stack
+                                                    .extend(items.iter().map(|v| (v, child_depth)));
+                                            }
+                                            Value::Map(map) => {
+                                                stack
+                                                    .extend(map.values().map(|v| (v, child_depth)));
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
                         }
                         eval_binary(l, *op, r).map(ExecFlow::Value)
                     }

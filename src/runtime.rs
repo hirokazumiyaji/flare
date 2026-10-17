@@ -949,6 +949,10 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
         BinOp::Add => match (l, r) {
             (Value::Int(a), Value::Int(b)) => int_binop(a, b, |a, b| a.checked_add(b))?,
             (Value::Str(a), Value::Str(b)) => Value::Str(format!("{a}{b}")),
+            (Value::Array(mut a), Value::Array(b)) => {
+                a.extend(b);
+                Value::Array(a)
+            }
             _ => return Err("unsupported + operands".into()),
         },
         BinOp::Sub => match (l, r) {
@@ -970,6 +974,15 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
                 int_binop(a, b, |a, b| a.checked_div(b))?
             }
             _ => return Err("unsupported / operands".into()),
+        },
+        BinOp::Rem => match (l, r) {
+            (Value::Int(a), Value::Int(b)) => {
+                if b == 0 {
+                    return Err("division by zero".into());
+                }
+                int_binop(a, b, |a, b| a.checked_rem(b))?
+            }
+            _ => return Err("unsupported % operands".into()),
         },
         BinOp::Eq => Value::Bool(l == r),
         BinOp::Ne => Value::Bool(l != r),

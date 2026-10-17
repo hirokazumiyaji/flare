@@ -595,3 +595,27 @@ fn validate_value_limits_with_sizes_checks_bounds() {
     let nested = Value::Array(vec![Value::Str("toolarge".to_string())]);
     assert!(validate_value_limits_with_sizes(&nested, None, None, Some(4), None).is_err());
 }
+
+#[test]
+fn array_concatenation_respects_value_node_budget() {
+    let limits = RuntimeLimits::default().with_max_value_nodes(4);
+    let mut rt = Runtime::with_limits(InMemoryFirestore::default(), limits);
+    let err = rt.run("[1, 2] + [3, 4]").unwrap_err();
+    assert_budget_error(err, "value node limit exceeded");
+}
+
+#[test]
+fn nested_array_concatenation_respects_value_node_budget() {
+    let limits = RuntimeLimits::default().with_max_value_nodes(6);
+    let mut rt = Runtime::with_limits(InMemoryFirestore::default(), limits);
+    let err = rt.run("[[1, 2]] + [[3, 4]]").unwrap_err();
+    assert_budget_error(err, "value node limit exceeded");
+}
+
+#[test]
+fn array_concatenation_respects_value_depth_budget() {
+    let limits = RuntimeLimits::default().with_max_value_depth(1);
+    let mut rt = Runtime::with_limits(InMemoryFirestore::default(), limits);
+    let err = rt.run("[[1]] + []").unwrap_err();
+    assert_budget_error(err, "value nesting limit exceeded");
+}
