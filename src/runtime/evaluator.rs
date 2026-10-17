@@ -45,18 +45,19 @@ impl DerefMut for Evaluator<'_> {
 /// and panic unwinding.
 pub(super) struct ScopeGuard<'guard, 'runtime> {
     pub(super) runtime: &'guard mut Evaluator<'runtime>,
-    // `Some` is a function frame and contains the caller-local suffix. `None`
+    // `Some` is a function frame and contains the previous frame base. `None`
     // is a block frame, which is removed from the end on drop.
-    saved: Option<Vec<HashMap<String, Value>>>,
+    saved_base: Option<usize>,
 }
 
 impl<'guard, 'runtime> ScopeGuard<'guard, 'runtime> {
     pub(super) fn function(runtime: &'guard mut Evaluator<'runtime>) -> Self {
-        let saved = runtime.scopes.split_off(1);
+        let saved_base = runtime.current_frame_base;
+        runtime.current_frame_base = runtime.scopes.len();
         runtime.scopes.push(HashMap::new());
         Self {
             runtime,
-            saved: Some(saved),
+            saved_base: Some(saved_base),
         }
     }
 
@@ -64,18 +65,19 @@ impl<'guard, 'runtime> ScopeGuard<'guard, 'runtime> {
         runtime.scopes.push(HashMap::new());
         Self {
             runtime,
-            saved: None,
+            saved_base: None,
         }
     }
 }
 
 impl Drop for ScopeGuard<'_, '_> {
     fn drop(&mut self) {
-        if let Some(mut saved) = self.saved.take() {
-            // Keep the global frame and discard every frame created while the
-            // function was running before restoring the caller-local suffix.
-            self.runtime.scopes.truncate(1);
-            self.runtime.scopes.append(&mut saved);
+        if let Some(saved_base) = self.saved_base {
+            // Keep the caller frames and discard every frame created while the
+            // function was running before restoring the caller frame base.
+            let base = self.runtime.current_frame_base;
+            self.runtime.scopes.truncate(base);
+            self.runtime.current_frame_base = saved_base;
         } else {
             self.runtime.scopes.pop();
         }
@@ -166,6 +168,7 @@ impl Evaluator<'_> {
             self.usage.elapsed = started_at.elapsed();
         }
         self.call_depth = 0;
+        self.current_frame_base = 0;
         self.execution_active = false;
     }
 
@@ -232,7 +235,9 @@ impl Evaluator<'_> {
     }
 
     pub(super) fn consume_step(&mut self) -> Result<(), Box<dyn Error>> {
-        self.check_wall_clock()?;
+        if self.usage.steps & 1023 == 0 {
+            self.check_wall_clock()?;
+        }
         if let Some(max) = self.limits.max_steps {
             if self.usage.steps >= max {
                 return Err(BudgetError::new(format!("step limit exceeded (max {max})")).into());
@@ -243,7 +248,9 @@ impl Evaluator<'_> {
     }
 
     pub(super) fn consume_loop_iteration(&mut self) -> Result<(), Box<dyn Error>> {
-        self.check_wall_clock()?;
+        if self.usage.loop_iterations & 1023 == 0 {
+            self.check_wall_clock()?;
+        }
         if let Some(max) = self.limits.max_loop_iterations {
             if self.usage.loop_iterations >= max {
                 return Err(
@@ -256,7 +263,9 @@ impl Evaluator<'_> {
     }
 
     pub(super) fn enter_call(&mut self) -> Result<(), Box<dyn Error>> {
-        self.check_wall_clock()?;
+        if self.call_depth & 127 == 0 {
+            self.check_wall_clock()?;
+        }
         if let Some(max) = self.limits.max_call_depth {
             if self.call_depth >= max {
                 return Err(
@@ -280,32 +289,50 @@ impl Evaluator<'_> {
     /// すでに 1 ノードである」ことで拒否する。Composite 値のときは子を展開
     /// しながら数えるので、巨大な配列を 1 ノードとして誤認しない。
     pub(super) fn check_value(&mut self, value: &Value) -> Result<(), Box<dyn Error>> {
-        let res = if !matches!(
+        if !matches!(
             value,
             Value::Array(_) | Value::ArrayUnion(_) | Value::ArrayRemove(_) | Value::Map(_)
         ) {
             // スカラー値は子が無いので depth 0 相当。ただし root 1 ノードと
             // して数え、ノード予算が 0 のときはここで弾く。
-            value::validate_value_limits_with_sizes(
-                value,
-                self.limits.max_value_depth,
-                self.limits.max_value_nodes.map(|budget| budget.min(1)),
-                self.limits.max_string_bytes,
-                self.limits.max_bytes_size,
-            )
-            .map(|_| ())
-        } else {
-            let observed_depth = value::validate_value_limits_with_sizes(
-                value,
-                self.limits.max_value_depth,
-                self.limits.max_value_nodes,
-                self.limits.max_string_bytes,
-                self.limits.max_bytes_size,
-            )?;
-            self.usage.max_value_depth = self.usage.max_value_depth.max(observed_depth);
-            Ok(())
-        };
-        res.map_err(|e| BudgetError::new(e.to_string()).into())
+            if let Some(0) = self.limits.max_value_nodes {
+                return Err(BudgetError::new("value node limit exceeded (max 0)").into());
+            }
+            match value {
+                Value::Str(s) => {
+                    if let Some(max) = self.limits.max_string_bytes {
+                        if s.len() > max {
+                            return Err(BudgetError::new(format!(
+                                "string size limit exceeded (max {max})"
+                            ))
+                            .into());
+                        }
+                    }
+                }
+                Value::Bytes(b) => {
+                    if let Some(max) = self.limits.max_bytes_size {
+                        if b.len() > max {
+                            return Err(BudgetError::new(format!(
+                                "bytes size limit exceeded (max {max})"
+                            ))
+                            .into());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        let observed_depth = value::validate_value_limits_with_sizes(
+            value,
+            self.limits.max_value_depth,
+            self.limits.max_value_nodes,
+            self.limits.max_string_bytes,
+            self.limits.max_bytes_size,
+        )
+        .map_err(|e| BudgetError::new(e.to_string()))?;
+        self.usage.max_value_depth = self.usage.max_value_depth.max(observed_depth);
+        Ok(())
     }
 
     pub(super) fn eval_stmt(&mut self, stmt: &Stmt) -> Result<ExecFlow, Box<dyn Error>> {
@@ -318,7 +345,9 @@ impl Evaluator<'_> {
                 // 変数参照時(Expr::Var)は変数テーブルから読み出されるため構文上区別できる。
                 // 一方で fn 定義(Stmt::Def)は定義してもビルトインに隠されて呼び出せないため
                 // 禁止している。
-                if self.var_exists(name) && !(self.repl_mode && self.scopes.len() == 1) {
+                if self.var_exists(name)
+                    && !(self.repl_mode && self.current_frame_base == 0 && self.scopes.len() == 1)
+                {
                     return Err(format!("reassignment is not allowed: {name}").into());
                 }
                 let flow = self.eval_expr(value)?;
@@ -334,15 +363,14 @@ impl Evaluator<'_> {
                 if is_builtin_name(name) {
                     return Err(format!("cannot redefine builtin: {name}").into());
                 }
-                if self.var_exists(name) && !(self.repl_mode && self.scopes.len() == 1) {
+                if self.var_exists(name)
+                    && !(self.repl_mode && self.current_frame_base == 0 && self.scopes.len() == 1)
+                {
                     return Err(format!("reassignment is not allowed: {name}").into());
                 }
                 self.set_var(
                     name,
-                    Value::Func(UserFunc {
-                        params: params.clone(),
-                        body: body.clone(),
-                    }),
+                    Value::Func(UserFunc::new(params.clone(), body.clone())),
                 )?;
                 Ok(ExecFlow::Value(Value::Nil))
             }
@@ -796,10 +824,10 @@ impl Evaluator<'_> {
             }
             ExprKind::Fn { params, body } => {
                 validate_func_params(params, "function")?;
-                Ok(ExecFlow::Value(Value::Func(UserFunc {
-                    params: params.clone(),
-                    body: body.clone(),
-                })))
+                Ok(ExecFlow::Value(Value::Func(UserFunc::new(
+                    params.clone(),
+                    body.clone(),
+                ))))
             }
             ExprKind::Invoke {
                 callee,
@@ -867,6 +895,12 @@ impl Evaluator<'_> {
                 )?),
                 None => None,
             };
+            let has_keywords = args.iter().any(|a| matches!(a, CallArg::Keyword { .. }));
+            let keyword_names = if has_keywords {
+                keyword_names(args)
+            } else {
+                BTreeMap::new()
+            };
             let spec = if let Some(MethodReceiver::Module(module)) = receiver_value.as_ref() {
                 let spec = lookup_module_builtin(*module, name)
                     .ok_or_else(|| format!("unknown module method: {}.{name}", module.name()))?;
@@ -874,17 +908,15 @@ impl Evaluator<'_> {
                 validate_call_contract(
                     &label,
                     positional_arg_count(args),
-                    &keyword_names(args),
+                    &keyword_names,
                     block,
                     spec.contract,
                 )?;
                 Some(spec)
             } else if let Some(rec) = receiver_value.as_ref() {
-                let keyword_names = keyword_names(args);
                 validate_method_call(rec, name, positional_arg_count(args), &keyword_names, block)?;
                 None
             } else if let Some(spec) = lookup_global_builtin(name) {
-                let keyword_names = keyword_names(args);
                 validate_call_contract(
                     name,
                     positional_arg_count(args),
@@ -894,7 +926,7 @@ impl Evaluator<'_> {
                 )?;
                 Some(spec)
             } else {
-                let Some(var) = self.get_var(name).cloned() else {
+                let Some(var) = self.get_var(name) else {
                     return Err(format!("undefined function: {name}").into());
                 };
                 let Value::Func(func) = var else {
@@ -921,11 +953,11 @@ impl Evaluator<'_> {
             // `args` is one ordered sequence; splitting it into
             // positional/keyword collections for binding must not change
             // the order in which the expressions above are evaluated.
-            let (argv, kw) = match self.eval_call_args(args)? {
+            let call_args = match self.eval_call_args(args)? {
                 ControlFlow::Continue(pair) => pair,
                 ControlFlow::Break(flow) => return Ok(flow),
             };
-            self.eval_call(receiver_value, name, argv, kw, block, call_span)
+            self.eval_call(receiver_value, name, spec, call_args, block, call_span)
         }
     }
 
@@ -1036,14 +1068,15 @@ impl Evaluator<'_> {
         &mut self,
         receiver: Option<MethodReceiver>,
         name: &str,
-        args: Vec<Value>,
-        kwargs: BTreeMap<String, Value>,
+        spec: Option<BuiltinSpec>,
+        (args, kwargs): CallArgValues,
         block: Option<&Block>,
         call_span: Span,
     ) -> Result<ExecFlow, Box<dyn Error>> {
         if let Some(rec) = receiver {
             if let MethodReceiver::Module(module) = rec {
-                let spec = lookup_module_builtin(module, name)
+                let spec = spec
+                    .or_else(|| lookup_module_builtin(module, name))
                     .ok_or_else(|| format!("unknown module method: {}.{name}", module.name()))?;
                 return (spec.handler)(self, args, kwargs, block);
             }
@@ -1055,7 +1088,7 @@ impl Evaluator<'_> {
 
         // ビルトインはテーブル駆動で引く。ユーザー定義より優先されるため、
         // 同名の fn 定義は `Stmt::Def` 側でエラーにする(is_builtin_name)。
-        if let Some(spec) = lookup_global_builtin(name) {
+        if let Some(spec) = spec.or_else(|| lookup_global_builtin(name)) {
             return (spec.handler)(self, args, kwargs, block);
         }
 
@@ -1077,40 +1110,40 @@ impl Evaluator<'_> {
         args: Vec<Value>,
         mut kwargs: BTreeMap<String, Value>,
     ) -> Result<ExecFlow, Box<dyn Error>> {
-        // Callers must pre-validate via `validate_user_call_contract` so default
-        // expressions do not run on invalid calls and side effects stay off.
-        let mut bound = Vec::with_capacity(func.params.len());
-        let mut idx = 0;
         let scope = ScopeGuard::function(self);
-        for param in &func.params {
-            if idx < args.len() {
-                bound.push((param.name.clone(), args[idx].clone()));
-                idx += 1;
-                continue;
+        if kwargs.is_empty() && args.len() == func.params.len() {
+            for (param, value) in func.params.iter().zip(args) {
+                scope.runtime.set_var(&param.name, value)?;
             }
-            if let Some(v) = kwargs.remove(&param.name) {
-                bound.push((param.name.clone(), v));
-                continue;
+        } else {
+            // Callers must pre-validate via `validate_user_call_contract` so default
+            // expressions do not run on invalid calls and side effects stay off.
+            let mut bound = Vec::with_capacity(func.params.len());
+            let mut idx = 0;
+            for param in &*func.params {
+                if idx < args.len() {
+                    bound.push((param.name.clone(), args[idx].clone()));
+                    idx += 1;
+                    continue;
+                }
+                if let Some(v) = kwargs.remove(&param.name) {
+                    bound.push((param.name.clone(), v));
+                    continue;
+                }
+                if let Some(default_expr) = &param.default {
+                    let flow = scope.runtime.eval_expr(default_expr)?;
+                    let v = match flow {
+                        ExecFlow::Value(v) => v,
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    };
+                    bound.push((param.name.clone(), v));
+                    continue;
+                }
+                unreachable!("missing argument caught by pre-validation");
             }
-            if let Some(default_expr) = &param.default {
-                let flow = scope.runtime.eval_expr(default_expr)?;
-                let v = match flow {
-                    ExecFlow::Value(v) => v,
-                    flow @ ExecFlow::Return(_) => return Ok(flow),
-                };
-                bound.push((param.name.clone(), v));
-                continue;
+            for (name, val) in bound {
+                scope.runtime.set_var(&name, val)?;
             }
-            unreachable!("missing argument caught by pre-validation");
-        }
-
-        // 呼び出し元のローカル変数・呼び出された関数自身のローカルは隠す。
-        //
-        // caller scope の保存と frame の破棄を guard に任せる。引数の
-        // binding、本体の runtime error、panic unwind のいずれでも同じ復元が
-        // 進み、手動の cleanup 処理に依存しない。
-        for (name, val) in bound {
-            scope.runtime.set_var(&name, val)?;
         }
         let result = scope.runtime.eval_block(&func.body);
         drop(scope);
@@ -1837,8 +1870,13 @@ impl Evaluator<'_> {
     }
 
     pub(super) fn get_var(&self, name: &str) -> Option<&Value> {
-        for scope in self.scopes.iter().rev() {
+        for scope in self.scopes[self.current_frame_base..].iter().rev() {
             if let Some(v) = scope.get(name) {
+                return Some(v);
+            }
+        }
+        if self.current_frame_base > 0 {
+            if let Some(v) = self.scopes[0].get(name) {
                 return Some(v);
             }
         }
@@ -1847,7 +1885,9 @@ impl Evaluator<'_> {
 
     pub(super) fn set_var(&mut self, name: &str, value: Value) -> Result<(), Box<dyn Error>> {
         let is_reassign = self.scopes.last().expect("scope").contains_key(name);
-        if is_reassign && !(self.repl_mode && self.scopes.len() == 1) {
+        if is_reassign
+            && !(self.repl_mode && self.current_frame_base == 0 && self.scopes.len() == 1)
+        {
             return Err(format!("reassignment is not allowed: {name}").into());
         }
         self.scopes
@@ -1858,7 +1898,11 @@ impl Evaluator<'_> {
     }
 
     pub(super) fn var_exists(&self, name: &str) -> bool {
-        self.scopes.iter().rev().any(|s| s.contains_key(name))
+        self.scopes[self.current_frame_base..]
+            .iter()
+            .rev()
+            .any(|s| s.contains_key(name))
+            || (self.current_frame_base > 0 && self.scopes[0].contains_key(name))
     }
 
     fn require_service(&self, service: ServiceId) -> Result<(), Box<dyn Error>> {
@@ -2318,22 +2362,40 @@ pub(super) const BUILTIN_SPECS: [BuiltinSpec; 45] = {
     ]
 };
 
+static GLOBAL_BUILTINS: std::sync::OnceLock<std::collections::HashMap<&'static str, BuiltinSpec>> =
+    std::sync::OnceLock::new();
+static MODULE_BUILTINS: std::sync::OnceLock<
+    std::collections::HashMap<(BuiltinModule, &'static str), BuiltinSpec>,
+> = std::sync::OnceLock::new();
+
 pub(super) fn builtin_specs() -> &'static [BuiltinSpec] {
     &BUILTIN_SPECS
 }
 
 pub(super) fn lookup_global_builtin(name: &str) -> Option<BuiltinSpec> {
-    builtin_specs()
-        .iter()
-        .copied()
-        .find(|spec| spec.global_name == name)
+    let map = GLOBAL_BUILTINS.get_or_init(|| {
+        let specs = builtin_specs();
+        let mut m = std::collections::HashMap::with_capacity(specs.len());
+        for &spec in specs {
+            m.insert(spec.global_name, spec);
+        }
+        m
+    });
+    map.get(name).copied()
 }
 
 pub(super) fn lookup_module_builtin(module: BuiltinModule, method: &str) -> Option<BuiltinSpec> {
-    builtin_specs()
-        .iter()
-        .copied()
-        .find(|spec| spec.module == Some(module) && spec.method == method)
+    let map = MODULE_BUILTINS.get_or_init(|| {
+        let specs = builtin_specs();
+        let mut m = std::collections::HashMap::with_capacity(specs.len());
+        for &spec in specs {
+            if let Some(mod_) = spec.module {
+                m.insert((mod_, spec.method), spec);
+            }
+        }
+        m
+    });
+    map.get(&(module, method)).copied()
 }
 
 pub(super) fn is_builtin_name(name: &str) -> bool {

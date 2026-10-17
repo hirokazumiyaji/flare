@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ast::Stmt;
@@ -40,7 +41,7 @@ pub enum Value {
     Func(UserFunc),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuiltinModule {
     Firestore,
     Auth,
@@ -178,8 +179,20 @@ pub struct QueryFilter {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserFunc {
-    pub params: Vec<crate::ast::FuncParam>,
-    pub body: Vec<Stmt>,
+    pub params: Rc<[crate::ast::FuncParam]>,
+    pub body: Rc<[Stmt]>,
+}
+
+impl UserFunc {
+    pub fn new(
+        params: impl Into<Rc<[crate::ast::FuncParam]>>,
+        body: impl Into<Rc<[Stmt]>>,
+    ) -> Self {
+        Self {
+            params: params.into(),
+            body: body.into(),
+        }
+    }
 }
 
 /// Validate a runtime value without recursively walking its Rust data
@@ -266,6 +279,16 @@ pub fn validate_value_limits_with_sizes(
     max_string_bytes: Option<usize>,
     max_bytes_size: Option<usize>,
 ) -> Result<usize, Box<dyn Error>> {
+    if !matches!(
+        value,
+        Value::Array(_) | Value::ArrayUnion(_) | Value::ArrayRemove(_) | Value::Map(_)
+    ) {
+        let mut nodes = 0usize;
+        check_value_node_budget(&mut nodes, max_nodes)?;
+        check_value_size_leaf(value, max_string_bytes, max_bytes_size)?;
+        return Ok(0);
+    }
+
     let mut stack = vec![(value, 0usize)];
     let mut nodes = 0usize;
     let mut observed_depth = 0usize;

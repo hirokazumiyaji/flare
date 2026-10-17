@@ -399,6 +399,21 @@ pub(super) fn validate_user_call_contract(
     if block.is_some() {
         return Err(format!("{name} does not take a block (block is not allowed)").into());
     }
+    let has_keywords = args
+        .iter()
+        .any(|arg| matches!(arg, CallArg::Keyword { .. }));
+    if !has_keywords {
+        let pos_len = args.len();
+        if pos_len > params.len() {
+            return Err("too many positional args".into());
+        }
+        for param in &params[pos_len..] {
+            if param.default.is_none() {
+                return Err(format!("missing argument: {}", param.name).into());
+            }
+        }
+        return Ok(());
+    }
     let positional_count = positional_arg_count(args);
     if positional_count > params.len() {
         return Err("too many positional args".into());
