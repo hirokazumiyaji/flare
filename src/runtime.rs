@@ -1,33 +1,39 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
+use std::collections::HashSet;
 use std::error::Error;
 use std::time::{Duration, Instant};
 
 use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
-use crate::auth::{Auth, AuthError};
+use crate::auth::Auth;
 use crate::error::{CapabilityError, FlareError, ServiceId, Span};
-use crate::firestore::{
-    normalize_query_field_path, validate_firestore_id, validate_write_data, Firestore,
-    QueryCandidates, QueryResultLimitExceeded, WriteOp,
-};
+use crate::firestore::{validate_firestore_id, Firestore, WriteOp};
 use crate::limits::{RuntimeLimits, RuntimeUsage};
 use crate::parser::Parser;
 use crate::services::ServiceAccess;
 use crate::services::Services;
-use crate::storage::{validate_content_type, validate_storage_path, InMemoryStorage, Storage};
-use crate::value::{
-    self, BuiltinModule, CollectionGroupRef, CollectionRef, Direction, DocRef, QueryFilter,
-    QueryOp, QueryRef, Timestamp, UserFunc, Value,
-};
+use crate::storage::{InMemoryStorage, Storage};
+use crate::value::{self, UserFunc, Value};
+#[cfg(test)]
+use crate::value::QueryRef;
 
+pub(crate) mod builtins;
+pub(crate) mod contract;
+pub(crate) mod error;
 mod evaluator;
+pub(crate) mod methods;
 mod state;
 
-use evaluator::{auth_session_field, Evaluator};
+use builtins::auth::auth_session_field;
 #[cfg(test)]
-use evaluator::{builtin_specs, is_builtin_name, ScopeGuard};
+use builtins::{builtin_specs, is_builtin_name};
+pub(crate) use evaluator::Evaluator;
+#[cfg(test)]
+use evaluator::ScopeGuard;
 use state::RuntimeState;
 
-enum ExecCtx {
+#[derive(Debug)]
+pub(crate) enum ExecCtx {
     Normal,
     Batch { writes: Vec<WriteOp> },
     Transaction { writes: Vec<WriteOp> },
@@ -47,19 +53,6 @@ fn apply_backend_limits<F: Firestore>(fs: &mut F, limits: &RuntimeLimits) {
             .max_value_depth
             .unwrap_or(crate::limits::DEFAULT_MAX_VALUE_DEPTH),
     );
-}
-
-enum MethodReceiver {
-    Collection(CollectionRef),
-    CollectionGroup(CollectionGroupRef),
-    Query(QueryRef),
-    Array(Vec<Value>),
-    Timestamp(Timestamp),
-    Bytes(Vec<u8>),
-    AuthSession(crate::auth::AuthSession),
-    Map(BTreeMap<String, Value>),
-    Module(BuiltinModule),
-    Str(String),
 }
 
 pub struct Runtime<F: Firestore, S: Storage = InMemoryStorage> {
@@ -262,451 +255,11 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
     }
 }
 
-/// Convert an evaluated receiver into the exhaustive set accepted by method
-/// dispatch. Keeping this conversion next to the dispatch match prevents a
-/// new receiver from being accepted by one path but rejected by the other.
-fn into_method_receiver(value: Value) -> Result<MethodReceiver, Box<dyn Error>> {
-    match value {
-        Value::CollectionRef(value) => Ok(MethodReceiver::Collection(value)),
-        Value::CollectionGroupRef(value) => Ok(MethodReceiver::CollectionGroup(value)),
-        Value::QueryRef(value) => Ok(MethodReceiver::Query(value)),
-        Value::Array(value) => Ok(MethodReceiver::Array(value)),
-        Value::Timestamp(value) => Ok(MethodReceiver::Timestamp(value)),
-        Value::Bytes(value) => Ok(MethodReceiver::Bytes(value)),
-        Value::AuthSession(value) => Ok(MethodReceiver::AuthSession(value)),
-        Value::Map(value) => Ok(MethodReceiver::Map(value)),
-        Value::Module(value) => Ok(MethodReceiver::Module(value)),
-        Value::Str(value) => Ok(MethodReceiver::Str(value)),
-        _ => Err("unsupported method receiver".into()),
-    }
-}
-
-fn validate_unique_keywords(args: &[CallArg]) -> Result<(), Box<dyn Error>> {
-    let mut seen = BTreeSet::<&str>::new();
-    for arg in args {
-        if let CallArg::Keyword { name, .. } = arg {
-            if !seen.insert(name.as_str()) {
-                return Err(format!("duplicate keyword argument: {name}").into());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn positional_arg_count(args: &[CallArg]) -> usize {
-    args.iter()
-        .filter(|arg| matches!(arg, CallArg::Positional(_)))
-        .count()
-}
-
-fn validate_unique_params(params: &[String], kind: &str) -> Result<(), Box<dyn Error>> {
-    let mut seen = HashSet::with_capacity(params.len());
-    for param in params {
-        if !seen.insert(param.as_str()) {
-            return Err(format!("duplicate {kind} parameter: {param}").into());
-        }
-    }
-    Ok(())
-}
-
-fn keyword_names(args: &[CallArg]) -> BTreeMap<String, Value> {
-    args.iter()
-        .filter_map(|arg| match arg {
-            CallArg::Keyword { name, .. } => Some((name.clone(), Value::Nil)),
-            _ => None,
-        })
-        .collect()
-}
-
-fn validate_user_call_contract(
-    name: &str,
-    params: &[String],
-    args: &[CallArg],
-    block: Option<&Block>,
-) -> Result<(), Box<dyn Error>> {
-    if block.is_some() {
-        return Err(format!("{name} does not take a block (block is not allowed)").into());
-    }
-    bind_function_args(
-        params,
-        vec![Value::Nil; positional_arg_count(args)],
-        keyword_names(args),
-    )
-    .map(|_| ())
-}
-
-fn bind_function_args(
-    params: &[String],
-    positional: Vec<Value>,
-    mut kwargs: BTreeMap<String, Value>,
-) -> Result<Vec<(String, Value)>, Box<dyn Error>> {
-    if positional.len() > params.len() {
-        return Err("too many positional args".into());
-    }
-    let mut out = vec![];
-    let mut idx = 0;
-    for param in params {
-        if idx < positional.len() {
-            if kwargs.contains_key(param) {
-                return Err(format!(
-                    "duplicate argument {param}: specified both positionally and as a keyword"
-                )
-                .into());
-            }
-            out.push((param.clone(), positional[idx].clone()));
-            idx += 1;
-            continue;
-        }
-        if let Some(v) = kwargs.remove(param) {
-            out.push((param.clone(), v));
-            continue;
-        }
-        return Err(format!("missing argument: {param}").into());
-    }
-    if !kwargs.is_empty() {
-        let keys: Vec<String> = kwargs.keys().cloned().collect();
-        return Err(format!("unknown keyword arguments: {}", keys.join(", ")).into());
-    }
-    Ok(out)
-}
-
 /// `bytes(...)` の引数エラー文言。3 箇所から使うので定数にまとめる。
-const BYTES_USAGE: &str = "bytes expects one string or an array of integers from 0 to 255";
-const BYTES_ELEMENT_ERR: &str = "bytes array elements must be integers from 0 to 255";
+pub(crate) const BYTES_USAGE: &str = "bytes expects one string or an array of integers from 0 to 255";
+pub(crate) const BYTES_ELEMENT_ERR: &str = "bytes array elements must be integers from 0 to 255";
 
-/// The positional part of a call contract.
-#[derive(Clone, Copy)]
-enum PositionalArity {
-    Exact(usize),
-    Range(usize, usize),
-    Any,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BlockPolicy {
-    Forbidden,
-    Required,
-}
-
-/// Runtime validation shared by builtin functions and built-in methods.
-///
-/// `keywords` is intentionally small: the language's builtin API is
-/// positional except for `set(..., merge: true)`.  `array` and `puts` use
-/// `PositionalArity::Any` because their variable-arity behavior is part of
-/// the API.
-#[derive(Clone, Copy)]
-struct CallContract {
-    positional: PositionalArity,
-    keywords: &'static [&'static str],
-    block: BlockPolicy,
-    /// Keywords that occupy the same slot as a positional argument.
-    positional_keyword_conflicts: &'static [(&'static str, usize)],
-    /// Optional compatibility/detail hint for a missing argument.
-    missing_hint: Option<&'static str>,
-}
-
-impl CallContract {
-    const fn exact(positional: usize) -> Self {
-        Self {
-            positional: PositionalArity::Exact(positional),
-            keywords: &[],
-            block: BlockPolicy::Forbidden,
-            positional_keyword_conflicts: &[],
-            missing_hint: None,
-        }
-    }
-
-    const fn range(min: usize, max: usize) -> Self {
-        Self {
-            positional: PositionalArity::Range(min, max),
-            keywords: &[],
-            block: BlockPolicy::Forbidden,
-            positional_keyword_conflicts: &[],
-            missing_hint: None,
-        }
-    }
-
-    const fn any() -> Self {
-        Self {
-            positional: PositionalArity::Any,
-            keywords: &[],
-            block: BlockPolicy::Forbidden,
-            positional_keyword_conflicts: &[],
-            missing_hint: None,
-        }
-    }
-
-    const fn with_keywords(mut self, keywords: &'static [&'static str]) -> Self {
-        self.keywords = keywords;
-        self
-    }
-
-    const fn with_positional_keyword_conflicts(
-        mut self,
-        conflicts: &'static [(&'static str, usize)],
-    ) -> Self {
-        self.positional_keyword_conflicts = conflicts;
-        self
-    }
-
-    const fn with_missing_hint(mut self, hint: &'static str) -> Self {
-        self.missing_hint = Some(hint);
-        self
-    }
-
-    const fn requiring_block(mut self) -> Self {
-        self.block = BlockPolicy::Required;
-        self
-    }
-}
-
-fn validate_call_contract(
-    name: &str,
-    positional_len: usize,
-    kwargs: &BTreeMap<String, Value>,
-    block: Option<&Block>,
-    contract: CallContract,
-) -> Result<(), Box<dyn Error>> {
-    // Check this before arity/type checks so a call which supplies the same
-    // option in two ways always gets the actionable duplicate-argument error.
-    for (keyword, position) in contract.positional_keyword_conflicts {
-        if positional_len > *position && kwargs.contains_key(*keyword) {
-            return Err(format!(
-                "duplicate argument {keyword}: specified both positionally and as a keyword"
-            )
-            .into());
-        }
-    }
-
-    match contract.positional {
-        PositionalArity::Any => {}
-        PositionalArity::Exact(expected) => {
-            if positional_len < expected {
-                let hint = contract
-                    .missing_hint
-                    .map(|hint| format!(" ({hint})"))
-                    .unwrap_or_default();
-                return Err(format!(
-                    "{name} is missing positional arguments: expected {expected}, got {positional_len}{hint}"
-                )
-                .into());
-            }
-            if positional_len > expected {
-                return Err(too_many_positional_error(
-                    name,
-                    expected,
-                    positional_len,
-                    true,
-                ));
-            }
-        }
-        PositionalArity::Range(min, max) => {
-            if positional_len < min {
-                return Err(format!(
-                    "{name} expects at least {min} positional arguments, got {positional_len}"
-                )
-                .into());
-            }
-            if positional_len > max {
-                return Err(too_many_positional_error(name, max, positional_len, false));
-            }
-        }
-    }
-
-    let unknown: Vec<&str> = kwargs
-        .keys()
-        .filter(|key| {
-            !contract
-                .keywords
-                .iter()
-                .any(|allowed| allowed == &key.as_str())
-        })
-        .map(String::as_str)
-        .collect();
-    if !unknown.is_empty() {
-        return Err(format!("unknown keyword arguments: {}", unknown.join(", ")).into());
-    }
-
-    match (contract.block, block) {
-        (BlockPolicy::Forbidden, Some(_)) => {
-            return Err(format!("{name} does not take a block (block is not allowed)").into());
-        }
-        (BlockPolicy::Required, None) => {
-            return Err(format!("{name} requires {{ ... }} block").into());
-        }
-        _ => {}
-    }
-
-    Ok(())
-}
-
-fn too_many_positional_error(
-    name: &str,
-    expected: usize,
-    actual: usize,
-    exact: bool,
-) -> Box<dyn Error> {
-    if expected == 0 {
-        // Keep the long-standing array-method wording while making the
-        // contract failure explicit for new callers and diagnostics.
-        format!(
-            "{name} does not take arguments: too many positional arguments (expected 0, got {actual})"
-        )
-        .into()
-    } else {
-        let expectation = if exact { "exactly" } else { "at most" };
-        format!(
-            "too many positional arguments for {name} (expected {expectation} {expected}, got {actual})"
-        )
-        .into()
-    }
-}
-
-fn unknown_keyword_arguments(kwargs: &BTreeMap<String, Value>) -> Box<dyn Error> {
-    let keys: Vec<&str> = kwargs.keys().map(String::as_str).collect();
-    format!("unknown keyword arguments: {}", keys.join(", ")).into()
-}
-
-fn query_method_contract(name: &str) -> Option<CallContract> {
-    match name {
-        "where" => Some(CallContract::exact(3)),
-        "order_by" => Some(CallContract::exact(2)),
-        "limit" | "offset" => Some(CallContract::exact(1)),
-        "count" | "get" => Some(CallContract::exact(0)),
-        _ => None,
-    }
-}
-
-fn auth_session_method_contract(name: &str) -> Option<CallContract> {
-    // Field-style access has no fixed method set; any name with no args is a
-    // field read, anything else is rejected by dispatch.
-    let _ = name;
-    Some(CallContract::exact(0))
-}
-
-fn bytes_method_contract(name: &str) -> Option<CallContract> {
-    match name {
-        "len" => Some(CallContract::exact(0)),
-        _ => None,
-    }
-}
-
-fn array_method_contract(name: &str) -> Option<CallContract> {
-    match name {
-        "each" | "map" | "filter" | "find" => Some(CallContract::exact(0).requiring_block()),
-        "len" => Some(CallContract::exact(0)),
-        "contains" => Some(CallContract::exact(1)),
-        "join" => Some(CallContract::range(0, 1)),
-        _ => None,
-    }
-}
-
-fn str_method_contract(name: &str) -> Option<CallContract> {
-    match name {
-        "len" | "trim" => Some(CallContract::exact(0)),
-        "split" | "starts_with" | "ends_with" | "contains" => Some(CallContract::exact(1)),
-        _ => None,
-    }
-}
-
-fn map_method_contract(name: &str) -> Option<CallContract> {
-    match name {
-        "keys" | "values" | "len" => Some(CallContract::exact(0)),
-        "has_key" => Some(CallContract::exact(1)),
-        _ => Some(CallContract::exact(0)),
-    }
-}
-
-fn timestamp_method_contract(name: &str) -> Option<CallContract> {
-    match name {
-        "to_unix" | "to_rfc3339" => Some(CallContract::exact(0)),
-        "add_seconds" => Some(CallContract::exact(1)),
-        _ => None,
-    }
-}
-
-fn method_contract(receiver: &MethodReceiver, name: &str) -> Option<CallContract> {
-    match receiver {
-        MethodReceiver::Collection(_) if name == "doc" => Some(CallContract::exact(1)),
-        MethodReceiver::Collection(_)
-        | MethodReceiver::CollectionGroup(_)
-        | MethodReceiver::Query(_) => query_method_contract(name),
-        MethodReceiver::Array(_) => array_method_contract(name),
-        MethodReceiver::Str(_) => str_method_contract(name),
-        MethodReceiver::Timestamp(_) => timestamp_method_contract(name),
-        MethodReceiver::Bytes(_) => bytes_method_contract(name),
-        MethodReceiver::AuthSession(_) => auth_session_method_contract(name),
-        MethodReceiver::Map(_) => map_method_contract(name),
-        MethodReceiver::Module(_) => None,
-    }
-}
-
-fn method_call_label(receiver: &MethodReceiver, name: &str) -> String {
-    match receiver {
-        MethodReceiver::Collection(_) if name == "doc" => format!("collection method {name}"),
-        MethodReceiver::Collection(_)
-        | MethodReceiver::CollectionGroup(_)
-        | MethodReceiver::Query(_) => format!("query method {name}"),
-        MethodReceiver::Array(_) => format!("array method {name}"),
-        MethodReceiver::Str(_) => format!("string method {name}"),
-        MethodReceiver::Timestamp(_) => format!("timestamp method {name}"),
-        MethodReceiver::Bytes(_) => format!("bytes method {name}"),
-        MethodReceiver::AuthSession(_) => format!("auth session method {name}"),
-        MethodReceiver::Map(_) => match name {
-            "keys" | "values" | "len" | "has_key" => format!("map method {name}"),
-            _ => format!("map key access {name}"),
-        },
-        MethodReceiver::Module(module) => format!("{}.{name}", module.name()),
-    }
-}
-
-fn validate_method_call(
-    receiver: &MethodReceiver,
-    name: &str,
-    positional_len: usize,
-    kwargs: &BTreeMap<String, Value>,
-    block: Option<&Block>,
-) -> Result<(), Box<dyn Error>> {
-    if let Some(contract) = method_contract(receiver, name) {
-        return validate_call_contract(
-            &method_call_label(receiver, name),
-            positional_len,
-            kwargs,
-            block,
-            contract,
-        );
-    }
-
-    // Even an unknown method must not silently accept keyword arguments or a
-    // block.  The eventual dispatch error (unknown method / unsupported
-    // receiver) is returned only after these contract-level mistakes.
-    if !kwargs.is_empty() {
-        return Err(unknown_keyword_arguments(kwargs));
-    }
-    if block.is_some() {
-        return Err(format!(
-            "{} does not take a block (block is not allowed)",
-            method_call_label(receiver, name)
-        )
-        .into());
-    }
-    Err(match receiver {
-        MethodReceiver::Collection(_)
-        | MethodReceiver::CollectionGroup(_)
-        | MethodReceiver::Query(_) => format!("unknown query method: {name}").into(),
-        MethodReceiver::Array(_) => format!("unknown array method: {name}").into(),
-        MethodReceiver::Str(_) => format!("unknown string method: {name}").into(),
-        MethodReceiver::Timestamp(_) => format!("unknown timestamp method: {name}").into(),
-        MethodReceiver::Bytes(_) => format!("unknown bytes method: {name}").into(),
-        MethodReceiver::AuthSession(_) => format!("unknown auth session method: {name}").into(),
-        MethodReceiver::Map(_) => format!("unknown map method: {name}").into(),
-        MethodReceiver::Module(module) => {
-            format!("unknown module method: {}.{name}", module.name()).into()
-        }
-    })
-}
-
-fn parse_timestamp_arg(v: Option<&Value>) -> Result<i64, Box<dyn Error>> {
+pub(crate) fn parse_timestamp_arg(v: Option<&Value>) -> Result<i64, Box<dyn Error>> {
     match v {
         Some(Value::Int(i)) => Ok(*i),
         Some(Value::Str(s)) => parse_rfc3339_to_unix(s),
@@ -714,7 +267,7 @@ fn parse_timestamp_arg(v: Option<&Value>) -> Result<i64, Box<dyn Error>> {
     }
 }
 
-fn parse_rfc3339_to_unix(s: &str) -> Result<i64, Box<dyn Error>> {
+pub(crate) fn parse_rfc3339_to_unix(s: &str) -> Result<i64, Box<dyn Error>> {
     let time = s
         .split_once(['T', 't'])
         .map(|(_, time)| time)
@@ -732,35 +285,35 @@ fn parse_rfc3339_to_unix(s: &str) -> Result<i64, Box<dyn Error>> {
         .timestamp())
 }
 
-fn expect_string(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
+pub(crate) fn expect_string(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
     match v {
         Some(Value::Str(s)) => Ok(s),
         _ => Err("expected string argument".into()),
     }
 }
 
-fn expect_int(v: Option<&Value>) -> Result<i64, Box<dyn Error>> {
+pub(crate) fn expect_int(v: Option<&Value>) -> Result<i64, Box<dyn Error>> {
     match v {
         Some(Value::Int(i)) => Ok(*i),
         _ => Err("expected int argument".into()),
     }
 }
 
-fn expect_map(v: Option<&Value>) -> Result<&BTreeMap<String, Value>, Box<dyn Error>> {
+pub(crate) fn expect_map(v: Option<&Value>) -> Result<&BTreeMap<String, Value>, Box<dyn Error>> {
     match v {
         Some(Value::Map(m)) => Ok(m),
         _ => Err("expected map argument".into()),
     }
 }
 
-fn expect_array(v: Option<&Value>) -> Result<&Vec<Value>, Box<dyn Error>> {
+pub(crate) fn expect_array(v: Option<&Value>) -> Result<&Vec<Value>, Box<dyn Error>> {
     match v {
         Some(Value::Array(a)) => Ok(a),
         _ => Err("expected array argument".into()),
     }
 }
 
-fn expect_doc_path(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
+pub(crate) fn expect_doc_path(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
     match v {
         Some(Value::Str(s)) => {
             validate_doc_path(s)?;
@@ -777,15 +330,15 @@ fn expect_doc_path(v: Option<&Value>) -> Result<&str, Box<dyn Error>> {
 }
 
 /// 単一 ID 引数(`col().doc()` / `col_group()`)を検証する。
-fn validate_document_id(id: &str) -> Result<(), Box<dyn Error>> {
+pub(crate) fn validate_document_id(id: &str) -> Result<(), Box<dyn Error>> {
     validate_standalone_id(id, "document id")
 }
 
-fn validate_collection_group_id(id: &str) -> Result<(), Box<dyn Error>> {
+pub(crate) fn validate_collection_group_id(id: &str) -> Result<(), Box<dyn Error>> {
     validate_standalone_id(id, "collection group id")
 }
 
-fn validate_standalone_id(id: &str, kind: &str) -> Result<(), Box<dyn Error>> {
+pub(crate) fn validate_standalone_id(id: &str, kind: &str) -> Result<(), Box<dyn Error>> {
     // 空文字と `/` は既存の error format を保ちつつ、他の ID 制約も同じ
     // runtime エラーにする。
     if id.is_empty() || id.contains('/') {
@@ -802,15 +355,15 @@ fn validate_standalone_id(id: &str, kind: &str) -> Result<(), Box<dyn Error>> {
 /// 各セグメントは Firestore の document / collection ID 制約も満たす。
 /// runtime 層で検証するため、in-memory / emulator のどちらのバックエンド
 /// でも同じエラーになる。
-fn validate_doc_path(path: &str) -> Result<(), Box<dyn Error>> {
+pub(crate) fn validate_doc_path(path: &str) -> Result<(), Box<dyn Error>> {
     validate_path(path, false)
 }
 
-fn validate_collection_path(path: &str) -> Result<(), Box<dyn Error>> {
+pub(crate) fn validate_collection_path(path: &str) -> Result<(), Box<dyn Error>> {
     validate_path(path, true)
 }
 
-fn validate_path(path: &str, collection: bool) -> Result<(), Box<dyn Error>> {
+pub(crate) fn validate_path(path: &str, collection: bool) -> Result<(), Box<dyn Error>> {
     let segments: Vec<&str> = path.split('/').collect();
     if segments.iter().any(|s| s.is_empty()) {
         return Err(format!("invalid path: {path} (empty path segment)").into());
@@ -845,7 +398,7 @@ fn validate_path(path: &str, collection: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn check_block_arity(block: &Block, yielded: usize) -> Result<(), Box<dyn Error>> {
+pub(crate) fn check_block_arity(block: &Block, yielded: usize) -> Result<(), Box<dyn Error>> {
     if block.params.len() != yielded {
         return Err(format!(
             "block expects {} argument(s), got {}",
@@ -858,7 +411,7 @@ fn check_block_arity(block: &Block, yielded: usize) -> Result<(), Box<dyn Error>
 }
 
 /// バックエンドが page 処理済みの候補に相対パスの `__name__` を付ける。
-fn wrap_doc(path: &str, doc: &BTreeMap<String, Value>) -> Value {
+pub(crate) fn wrap_doc(path: &str, doc: &BTreeMap<String, Value>) -> Value {
     let mut out = doc.clone();
     out.insert("__name__".to_string(), Value::Str(path.to_string()));
     Value::Map(out)
@@ -868,7 +421,7 @@ fn wrap_doc(path: &str, doc: &BTreeMap<String, Value>) -> Value {
 /// can instantiate a narrower target width on a 64-bit host and exercise the
 /// real `TryFrom` conversion rather than a test-only limit check. Production
 /// always uses `usize`.
-fn checked_array_index<T: TryFrom<i64>>(index: i64) -> Option<T> {
+pub(crate) fn checked_array_index<T: TryFrom<i64>>(index: i64) -> Option<T> {
     T::try_from(index).ok()
 }
 
@@ -877,7 +430,7 @@ fn checked_array_index<T: TryFrom<i64>>(index: i64) -> Option<T> {
 /// Only the secret-bearing Auth variants are checked here.  Broader
 /// "writable value" validation (issue #67) is deliberately left to the
 /// Firestore layer so this check stays a small, security-focused guard.
-fn reject_non_document_value(field: &str, value: &Value) -> Result<(), Box<dyn Error>> {
+pub(crate) fn reject_non_document_value(field: &str, value: &Value) -> Result<(), Box<dyn Error>> {
     match value {
         Value::AuthSession(_) => Err(format!(
             "cannot write auth session to field {field:?}: auth sessions are runtime-only values"
@@ -902,7 +455,7 @@ fn reject_non_document_value(field: &str, value: &Value) -> Result<(), Box<dyn E
     }
 }
 
-fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {
+pub(crate) fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {
     match (base, index) {
         (Value::Map(map), Value::Str(key)) => Ok(map.get(&key).cloned().unwrap_or(Value::Nil)),
         (Value::AuthSession(session), Value::Str(key)) => Ok(auth_session_field(&session, &key)),
@@ -930,7 +483,7 @@ fn eval_index(base: Value, index: Value) -> Result<Value, Box<dyn Error>> {
     }
 }
 
-fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
+pub(crate) fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
     Ok(match op {
         BinOp::Add => match (l, r) {
             (Value::Int(a), Value::Int(b)) => int_binop(a, b, |a, b| a.checked_add(b))?,
@@ -992,7 +545,7 @@ fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dyn Error>> {
     })
 }
 
-fn int_binop(a: i64, b: i64, f: impl Fn(i64, i64) -> Option<i64>) -> Result<Value, Box<dyn Error>> {
+pub(crate) fn int_binop(a: i64, b: i64, f: impl Fn(i64, i64) -> Option<i64>) -> Result<Value, Box<dyn Error>> {
     f(a, b)
         .map(Value::Int)
         .ok_or_else(|| "integer overflow".into())
@@ -1003,11 +556,11 @@ fn int_binop(a: i64, b: i64, f: impl Fn(i64, i64) -> Option<i64>) -> Result<Valu
 /// ミリ秒固定だと 500µs のような sub-millisecond 予算が "max 0ms" と
 /// 誤表示され、単位も分からない。`Duration` の `Debug` 表現は設定した
 /// 単位に合わせて出るため、予算と診断文がずれない。
-fn format_duration(duration: Duration) -> String {
+pub(crate) fn format_duration(duration: Duration) -> String {
     format!("{duration:?}")
 }
 
-fn backend_err(e: Box<dyn Error>) -> Box<dyn Error> {
+pub(crate) fn backend_err(e: Box<dyn Error>) -> Box<dyn Error> {
     if e.downcast_ref::<FlareError>().is_some() {
         e
     } else {
@@ -1018,7 +571,7 @@ fn backend_err(e: Box<dyn Error>) -> Box<dyn Error> {
 /// eval 失敗時にトップレベル文の位置を付与する。既に span を持つ
 /// FlareError (lex/parse/backendで付与済み)はそのまま通し、
 /// span なしの FlareError と String 系エラーは Runtime として包む。
-fn attach_span(e: Box<dyn Error>, span: Option<Span>) -> Box<dyn Error> {
+pub(crate) fn attach_span(e: Box<dyn Error>, span: Option<Span>) -> Box<dyn Error> {
     let Some(span) = span else {
         return wrap_as_runtime(e);
     };
@@ -1041,7 +594,7 @@ fn attach_span(e: Box<dyn Error>, span: Option<Span>) -> Box<dyn Error> {
     }
 }
 
-fn wrap_as_runtime(e: Box<dyn Error>) -> Box<dyn Error> {
+pub(crate) fn wrap_as_runtime(e: Box<dyn Error>) -> Box<dyn Error> {
     if e.downcast_ref::<FlareError>().is_some() || e.downcast_ref::<CapabilityError>().is_some() {
         e
     } else {
@@ -1049,13 +602,13 @@ fn wrap_as_runtime(e: Box<dyn Error>) -> Box<dyn Error> {
     }
 }
 
-enum ExecFlow {
+pub(crate) enum ExecFlow {
     Value(Value),
     Return(Value),
 }
 
 impl ExecFlow {
-    fn into_value(self) -> Value {
+    pub(crate) fn into_value(self) -> Value {
         match self {
             ExecFlow::Value(v) | ExecFlow::Return(v) => v,
         }

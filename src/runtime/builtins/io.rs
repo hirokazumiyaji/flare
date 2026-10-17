@@ -1,0 +1,96 @@
+use std::collections::BTreeMap;
+use std::error::Error;
+
+use crate::ast::Block;
+use crate::runtime::evaluator::{Evaluator, ExecFlow};
+use crate::runtime::expect_string;
+use crate::value::{validate_value_limits, BuiltinModule, Value};
+
+pub fn builtin_io_file(
+    _rt: &mut Evaluator<'_>,
+    _args: Vec<Value>,
+    _kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    Ok(ExecFlow::Value(Value::Module(BuiltinModule::File)))
+}
+
+pub fn builtin_file_read(
+    rt: &mut Evaluator<'_>,
+    args: Vec<Value>,
+    _kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    let path_str = expect_string(args.first())?;
+    let path = std::path::Path::new(path_str);
+    let max_bytes = rt.state.limits.max_file_io_bytes;
+    let data = rt.services.io.read(path, max_bytes)?;
+    let val = match String::from_utf8(data) {
+        Ok(s) => Value::Str(s),
+        Err(e) => Value::Bytes(e.into_bytes()),
+    };
+    validate_value_limits(
+        &val,
+        rt.state.limits.max_value_depth,
+        rt.state.limits.max_value_nodes,
+    )?;
+    Ok(ExecFlow::Value(val))
+}
+
+pub fn builtin_file_write(
+    rt: &mut Evaluator<'_>,
+    args: Vec<Value>,
+    _kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    let path_str = expect_string(args.first())?;
+    let path = std::path::Path::new(path_str);
+    let content = args.get(1).ok_or("expected content argument")?;
+    let bytes: &[u8] = match content {
+        Value::Str(s) => s.as_bytes(),
+        Value::Bytes(b) => b.as_slice(),
+        _ => return Err("File.write expects str or bytes content".into()),
+    };
+    let max_bytes = rt.state.limits.max_file_io_bytes;
+    rt.services.io.write(path, bytes, max_bytes)?;
+    Ok(ExecFlow::Value(Value::Int(bytes.len() as i64)))
+}
+
+pub struct BoundedWriter<W> {
+    inner: W,
+    written: usize,
+    max_bytes: Option<usize>,
+}
+
+impl<W> BoundedWriter<W> {
+    pub fn new(inner: W, max_bytes: Option<usize>) -> Self {
+        Self {
+            inner,
+            written: 0,
+            max_bytes,
+        }
+    }
+
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for BoundedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(limit) = self.max_bytes {
+            if self.written.saturating_add(buf.len()) > limit {
+                return Err(std::io::Error::other(format!(
+                    "resource limit exceeded: max file io bytes ({limit})"
+                )));
+            }
+        }
+        let n = self.inner.write(buf)?;
+        self.written += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
