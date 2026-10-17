@@ -6,6 +6,7 @@ pub mod io;
 pub mod lexer;
 pub mod limits;
 pub mod parser;
+#[cfg(feature = "cli")]
 pub mod repl;
 pub mod runtime;
 pub mod services;

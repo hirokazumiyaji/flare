@@ -70,7 +70,7 @@ jobs:
       - name: Verify default feature set is in-memory-only
         run: |
           set -euo pipefail
-          test "$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["features"].get("default", []))')" = "[]"
+          test "$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["features"].get("default", []))')" = "['cli']"
           # The main acceptance criterion is that an in-memory-only build does
           # not link the emulator SDK. Assert the resolved dependency graph, not
           # just the declared feature list: re-declaring firestore / gcloud-sdk
@@ -79,6 +79,11 @@ jobs:
           if cargo tree --prefix none --edges normal --no-default-features \
             | grep -E '^(firestore|gcloud-sdk|prost-types) v'; then
             echo "emulator SDK must not be in the default dependency graph" >&2
+            exit 1
+          fi
+          if cargo tree --prefix none --edges normal --no-default-features \
+            | grep -E '^rustyline v'; then
+            echo "rustyline must not be in the minimal dependency graph" >&2
             exit 1
           fi
 
