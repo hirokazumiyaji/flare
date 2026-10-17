@@ -39,6 +39,7 @@ pub use limits::{
     DEFAULT_MAX_PARSER_DEPTH, DEFAULT_MAX_QUERY_RESULTS, DEFAULT_MAX_STEPS,
     DEFAULT_MAX_STRING_BYTES, DEFAULT_MAX_VALUE_DEPTH, DEFAULT_MAX_WALL_CLOCK_MS,
 };
+pub use repl::ReplOptions;
 pub use storage::{
     HttpStorageTransport, HttpTransport, InMemoryStorage, Storage, StorageEmulator, StorageError,
     StorageErrorKind, StorageHttpTransport, StorageMetadata, StorageRequest, StorageResponse,

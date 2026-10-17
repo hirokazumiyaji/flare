@@ -42,6 +42,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut inline: Vec<String> = vec![];
     let mut use_stdin = false;
     let mut repl = false;
+    let mut no_history = false;
+    let mut history_file: Option<PathBuf> = None;
     // Every budget is finite by default: `fl` accepts arbitrary scripts, so an
     // unbounded recursion, loop, or nested value must be a reported error
     // rather than a hang or a stack overflow.
@@ -56,6 +58,18 @@ fn run() -> Result<(), Box<dyn Error>> {
             Some("--repl" | "-i") => {
                 repl = true;
                 i += 1;
+            }
+            Some("--no-history") => {
+                no_history = true;
+                i += 1;
+            }
+            Some("--history-file") => {
+                let b = args.get(i + 1).ok_or("--history-file requires a path")?;
+                let path = b
+                    .to_str()
+                    .ok_or("--history-file value must be valid UTF-8")?;
+                history_file = Some(PathBuf::from(path));
+                i += 2;
             }
             Some("--backend") => {
                 let b = args
@@ -347,8 +361,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut rt = flare::Runtime::from_services_with_limits(services, limits);
 
     if is_repl {
+        let mut repl_options = flare::repl::ReplOptions::resolve();
+        if no_history {
+            repl_options = repl_options.with_no_history(true);
+        } else if let Some(hf) = history_file {
+            repl_options = repl_options.with_history_file(Some(hf));
+        }
+
         if std::io::stdin().is_terminal() {
-            flare::repl::run_interactive(&mut rt)?;
+            flare::repl::run_interactive_with_options(&mut rt, repl_options)?;
         } else {
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
@@ -518,7 +539,7 @@ fn resolve_project_config(
 
 fn print_usage() {
     eprintln!(
-        "usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] [budget options] [--repl|-i] [<script-file> | - | -e <script>]"
+        "usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] [budget options] [--repl|-i] [--no-history] [--history-file <path>] [<script-file> | - | -e <script>]"
     );
     eprintln!();
     eprintln!("  Script source:");
@@ -611,6 +632,12 @@ fn print_usage() {
     eprintln!(
         "    emulator    use FIREBASE_AUTH_EMULATOR_HOST and shared Firebase project settings"
     );
+    eprintln!();
+    eprintln!("  REPL options:");
+    eprintln!("    --no-history                disable persistent REPL history");
+    eprintln!("    --history-file <path>       custom path for REPL history file");
+    eprintln!("    FL_HISTORY_FILE             environment override for history file");
+    eprintln!("    FL_NO_HISTORY               set to 1 to disable history persistence");
 }
 
 fn read_stdin() -> Result<String, Box<dyn Error>> {
