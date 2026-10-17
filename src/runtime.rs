@@ -628,7 +628,7 @@ fn unknown_keyword_arguments(kwargs: &BTreeMap<String, Value>) -> Box<dyn Error>
 fn query_method_contract(name: &str) -> Option<CallContract> {
     match name {
         "where" => Some(CallContract::exact(3)),
-        "order_by" => Some(CallContract::exact(2)),
+        "order_by" => Some(CallContract::range(1, 2)),
         "limit" | "offset" => Some(CallContract::exact(1)),
         "count" | "get" => Some(CallContract::exact(0)),
         _ => None,

@@ -1713,7 +1713,10 @@ impl Evaluator<'_> {
             }
             "order_by" => {
                 let field = normalize_query_field_path(expect_string(args.first())?)?;
-                let dir = Direction::parse(expect_string(args.get(1))?)?;
+                let dir = match args.get(1) {
+                    Some(val) => Direction::parse(expect_string(Some(val))?)?,
+                    None => Direction::Asc,
+                };
                 query.order_by.push((field, dir));
                 Ok(Value::QueryRef(query))
             }
