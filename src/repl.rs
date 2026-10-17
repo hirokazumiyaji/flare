@@ -58,6 +58,10 @@ pub const BUILTINS: &[&str] = &[
     "storage_delete",
     "storage_metadata",
     "len",
+    "to_s",
+    "inspect",
+    "type_of",
+    "to_i",
     "exit",
     "quit",
 ];

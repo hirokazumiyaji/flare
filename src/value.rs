@@ -400,6 +400,34 @@ impl CollectionGroupRef {
 }
 
 impl Value {
+    /// Flare の型名を返す。`type_of(v)` および `v.type_of()` に使う。
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Int(_) => "Int",
+            Self::Str(_) => "Str",
+            Self::Bytes(_) => "Bytes",
+            Self::Bool(_) => "Bool",
+            Self::Nil => "Nil",
+            Self::Array(_) => "Array",
+            Self::Map(_) => "Map",
+            Self::Timestamp(_) => "Timestamp",
+            Self::ServerTimestamp => "ServerTimestamp",
+            Self::ArrayUnion(_) => "ArrayUnion",
+            Self::ArrayRemove(_) => "ArrayRemove",
+            Self::DeleteField => "DeleteField",
+            Self::Increment(_) => "Increment",
+            Self::Opaque(_) => "Opaque",
+            Self::AuthSession(_) => "AuthSession",
+            Self::RedactedToken(_) => "RedactedToken",
+            Self::Module(_) => "Module",
+            Self::DocRef(_) => "DocRef",
+            Self::CollectionRef(_) => "CollectionRef",
+            Self::CollectionGroupRef(_) => "CollectionGroupRef",
+            Self::QueryRef(_) => "QueryRef",
+            Self::Func(_) => "Function",
+        }
+    }
+
     /// Ruby の `inspect` 風の開発者向け表現。`fl` の最終結果・複合値の
     /// `to_s` に使う。Str はダブルクォート付き、それ以外は素直な文字列表現。
     pub fn inspect(&self) -> String {

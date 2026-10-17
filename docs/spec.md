@@ -258,6 +258,10 @@ total = len(rows)                                            # Number of items
 | `str.trim()` | Returns a copy of the string with leading and trailing whitespace removed |
 | `str.len()` / `len(str)` | Number of Unicode characters in the string (Int) |
 | `len(bytes)` | Number of Bytes bytes |
+| `val.to_s()` / `to_s(val)` | String representation of the value (matching string interpolation) |
+| `val.inspect()` / `inspect(val)` | Developer-oriented inspect string representation |
+| `val.type_of()` / `type_of(val)` | Type name as string (`"Int"`, `"Str"`, `"Bool"`, `"Nil"`, `"Array"`, `"Map"`, `"Timestamp"`, `"Bytes"`, etc.) |
+| `str.to_i()` / `to_i(val)` | Parses base-10 integer from string or returns integer as-is |
 
 | `range(end)` / `range(start, end[, step])` | Returns an Array of Int from start to end (exclusive), bounded by `max_value_nodes` |
 | `n.times { \|i\| ... }` | Evaluates the block `n` times with index `0..n-1` (or 0 block parameters); returns `n` |
@@ -266,9 +270,9 @@ total = len(rows)                                            # Number of items
 | `array.map_with_index { \|item, i\| expr }` | Returns a new Array of block results for each item and its 0-based index (Int) |
 | `array.select { \|item\| expr }` | Alias for `filter` |
 | `array.reject { \|item\| expr }` | Returns a new Array of items for which the block evaluates to a falsey value |
-| `contains`, `has_key`, `split`, `starts_with`, `ends_with`, `str.contains` take exactly 1 argument. `array.join` and `array.reduce` take 0 or 1 argument. `range` takes 1 to 3 arguments.
+- `contains`, `has_key`, `split`, `starts_with`, `ends_with`, `str.contains`, `to_s(val)`, `inspect(val)`, `type_of(val)`, `to_i(val)` take exactly 1 argument. `array.join` and `array.reduce` take 0 or 1 argument. `range` takes 1 to 3 arguments.
 - A block is required for `each`, `map`, `filter`, `select`, `reject`, `find`, `each_with_index`, `map_with_index`, `reduce`, `inject`, and `int.times`. The number of block parameters must match the number supplied by the caller (`[1].each { \|a, b\| ... }` errors; **this is checked even for empty arrays**).
-- `each`, `map`, `filter`, `select`, `reject`, `find`, `each_with_index`, `map_with_index`, `int.times`, `array.len()`, `map.keys()`, `map.values()`, `map.len()`, `str.trim()`, `str.len()` take no positional arguments.
+- `each`, `map`, `filter`, `select`, `reject`, `find`, `each_with_index`, `map_with_index`, `int.times`, `array.len()`, `map.keys()`, `map.values()`, `map.len()`, `str.trim()`, `str.len()`, `val.to_s()`, `val.inspect()`, `val.type_of()`, `str.to_i()` take no positional arguments.
 - Assigning to an outer-scope name inside a block errors, consistent with variable immutability.
 - A `return` inside a block exits the block and becomes the return value of the **enclosing function**. Iteration in `each` / `map` / `reduce` / `times` stops there, so later items are not processed. This propagation applies only when returning from a block to an outer function. A `Return` within the function itself (the body or a block in that body) is consumed as that function’s result. A nested block’s `return` belongs to the innermost **function**.
 - There is no `for` statement. For bounded loops and iteration without reassignment, use `range(...)`, `n.times { ... }`, `each`, `each_with_index`, `map`, `map_with_index`, `reduce`, and `select`. `while` remains for special cases such as waiting on external side effects.
