@@ -13,8 +13,8 @@ use flare::{
     parse_timeout_ms as parse_library_timeout_ms, AuthEmulator, EmulatorConfig, FirestoreEmulator,
 };
 use flare::{
-    Auth, Firestore, InMemoryAuth, InMemoryFirestore, InMemoryStorage, ProjectConfig,
-    RuntimeLimits, Services, Storage, StorageEmulator,
+    validate_emulator_host, Auth, Firestore, InMemoryAuth, InMemoryFirestore, InMemoryStorage,
+    ProjectConfig, RuntimeLimits, Services, Storage, StorageEmulator,
 };
 
 #[cfg(not(feature = "emulator"))]
@@ -224,6 +224,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "emulator" => {
             let host = env::var("FIRESTORE_EMULATOR_HOST")
                 .map_err(|_| "FIRESTORE_EMULATOR_HOST must be set when using --backend emulator")?;
+            validate_emulator_host(&host)?;
             Some(EmulatorConfig {
                 host,
                 project_id: project.project_id.clone().unwrap(),
@@ -256,11 +257,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         // a non-UTF-8 value) must not make Firestore-only scripts fail before
         // they ever use Storage.
         "auto" => match env::var("FIREBASE_STORAGE_EMULATOR_HOST") {
-            Ok(host) => Some((
-                host,
-                project.project_id.clone().unwrap(),
-                project.storage_bucket.clone(),
-            )),
+            Ok(host) => {
+                if validate_emulator_host(&host).is_ok() {
+                    Some((
+                        host,
+                        project.project_id.clone().unwrap(),
+                        project.storage_bucket.clone(),
+                    ))
+                } else {
+                    None
+                }
+            }
             Err(_) => None,
         },
         "in-memory" => None,
@@ -277,6 +284,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     return Err("FIREBASE_STORAGE_EMULATOR_HOST must be valid UTF-8".into());
                 }
             };
+            validate_emulator_host(&host)?;
             Some((
                 host,
                 project.project_id.clone().unwrap(),
@@ -471,6 +479,7 @@ fn select_auth(mode: &str, _project_id: &str) -> Result<Box<dyn Auth>, Box<dyn E
                     return Err("FIREBASE_AUTH_EMULATOR_HOST must be valid UTF-8".into());
                 }
             };
+            validate_emulator_host(&host)?;
             #[cfg(feature = "emulator")]
             {
                 Ok(Box::new(AuthEmulator::new_with_options(

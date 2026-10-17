@@ -1283,3 +1283,16 @@ fn emulator_documented_values_and_direct_transforms_remain_writable() {
         Some(Value::Timestamp(_))
     ));
 }
+
+#[test]
+fn firestore_emulator_rejects_remote_host() {
+    let err = match FirestoreEmulator::new("192.168.1.1:8080".into(), "project".into()) {
+        Ok(_) => panic!("expected remote emulator host to fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("emulator host must be a loopback address"),
+        "{err}"
+    );
+}
