@@ -22,6 +22,7 @@ Use before tagging a release or publishing binaries.
    - `cargo check --no-default-features --all-targets --locked`
    - `cargo check --features emulator --all-targets --locked`
    - `cargo test --all-targets --locked`
+   - `cargo test --features emulator --all-targets --locked`
    - `cargo test --locked --test firebase_config`
    - `cargo build --release --features emulator --bin fl --locked`
 
