@@ -3741,3 +3741,77 @@ fn array_select_and_reject_methods_work() {
         "{err}"
     );
 }
+
+#[test]
+fn if_and_while_expressions_work() {
+    // if as expression in variable binding
+    let out = run_script("x = if true { 10 } else { 20 }\nx").unwrap();
+    assert_eq!(out, Value::Int(10));
+
+    let out = run_script("x = if false { 10 } else { 20 }\nx").unwrap();
+    assert_eq!(out, Value::Int(20));
+
+    // if without else returns nil when falsy
+    let out = run_script("x = if false { 10 }\nx").unwrap();
+    assert_eq!(out, Value::Nil);
+
+    // else if chain as expression
+    let out = run_script("x = if false { 1 } else if true { 2 } else { 3 }\nx").unwrap();
+    assert_eq!(out, Value::Int(2));
+
+    let out = run_script("x = if false { 1 } else if false { 2 }\nx").unwrap();
+    assert_eq!(out, Value::Nil);
+
+    // if expression in arithmetic and data structures
+    let out = run_script("1 + if true { 5 } else { 0 }").unwrap();
+    assert_eq!(out, Value::Int(6));
+
+    let out = run_script("[if true { 1 } else { 2 }, if false { 3 } else { 4 }]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1), Value::Int(4)]));
+
+    let out = run_script("m = {val: if true { \"yes\" } else { \"no\" }}\nm[\"val\"]").unwrap();
+    assert_eq!(out, Value::Str("yes".to_string()));
+
+    // while as expression returns nil when not executed
+    let out = run_script("x = while false { 1 }\nx").unwrap();
+    assert_eq!(out, Value::Nil);
+
+    // return from inside if expression propagates through enclosing function
+    let out = run_script(
+        r#"
+fn test_if_return() {
+    x = if true {
+        return 99
+    } else {
+        1
+    }
+    x
+}
+test_if_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(99));
+
+    // return from inside while expression propagates through enclosing function
+    let out = run_script(
+        r#"
+fn test_while_return() {
+    x = while true {
+        return 42
+    }
+    x
+}
+test_while_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(42));
+
+    // method call with block in condition is still forbidden
+    let err = run_script("if [1].each { |x| x } { 1 }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block parameters are not allowed here"),
+        "{err}"
+    );
+}

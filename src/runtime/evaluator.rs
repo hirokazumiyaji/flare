@@ -350,39 +350,6 @@ impl Evaluator<'_> {
                 };
                 Ok(ExecFlow::Return(value))
             }
-            Stmt::If {
-                cond,
-                then_body,
-                else_body,
-            } => {
-                let cond = match self.eval_expr(cond)? {
-                    ExecFlow::Value(v) => v,
-                    flow @ ExecFlow::Return(_) => return Ok(flow),
-                };
-                let body = if cond.truthy() { then_body } else { else_body };
-                self.eval_block(body)
-            }
-            Stmt::While { cond, body } => {
-                let mut last = Value::Nil;
-                loop {
-                    // The condition evaluation itself is a checkpoint: a long
-                    // body must not be able to hide past the wall-clock budget.
-                    self.check_wall_clock()?;
-                    let cond = match self.eval_expr(cond)? {
-                        ExecFlow::Value(v) => v,
-                        flow @ ExecFlow::Return(_) => return Ok(flow),
-                    };
-                    if !cond.truthy() {
-                        break;
-                    }
-                    self.consume_loop_iteration()?;
-                    match self.eval_block(body)? {
-                        ExecFlow::Value(v) => last = v,
-                        ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
-                    }
-                }
-                Ok(ExecFlow::Value(last))
-            }
         }
     }
 
@@ -661,6 +628,39 @@ impl Evaluator<'_> {
                 let outcome = self.eval_call_body(receiver.as_deref(), name, args, block.as_ref());
                 self.leave_call();
                 outcome
+            }
+            Expr::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                let cond = match self.eval_expr(cond)? {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                };
+                let body = if cond.truthy() { then_body } else { else_body };
+                self.eval_block(body)
+            }
+            Expr::While { cond, body } => {
+                let mut last = Value::Nil;
+                loop {
+                    // The condition evaluation itself is a checkpoint: a long
+                    // body must not be able to hide past the wall-clock budget.
+                    self.check_wall_clock()?;
+                    let cond = match self.eval_expr(cond)? {
+                        ExecFlow::Value(v) => v,
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    };
+                    if !cond.truthy() {
+                        break;
+                    }
+                    self.consume_loop_iteration()?;
+                    match self.eval_block(body)? {
+                        ExecFlow::Value(v) => last = v,
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    }
+                }
+                Ok(ExecFlow::Value(last))
             }
         }
     }
