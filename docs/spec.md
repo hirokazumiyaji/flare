@@ -546,7 +546,7 @@ Identity Toolkit error codes may include details after a colon (for example, `WE
 
 ### Build Features and Public API
 
-- The default feature set is empty. `cargo build` / `cargo test` build only the in-memory backend and library API; they do not link Firestore SDK, gRPC, or TLS dependencies.
+- The default feature set enables `cli` (`default = ["cli"]`), providing the `fl` CLI and interactive REPL. Embedding `flare` without terminal control dependencies can use `default-features = false` for a minimal headless build. Neither build links Firestore SDK, gRPC, or TLS dependencies.
 - Enabling the `emulator` feature enables the Firestore and Auth emulator clients: `cargo build --features emulator`. The dependency-free Storage REST client is available without that feature.
 - `Firestore`, `InMemoryFirestore`, `run_script`, and `run_script_with_firestore` are available without features, so consumers embedding a custom in-memory backend do not pull in the SDK.
 - `FirestoreEmulator` and `AuthEmulator` are not exposed in builds without the feature. `StorageEmulator` remains available because its synchronous HTTP transport uses only the standard library.
