@@ -358,7 +358,7 @@ fn argument() {
   set("effects/argument", {ran: true})
   1
 }
-1.add_seconds(argument())
+true.add_seconds(argument())
 "#;
     let err = run_in(&mut runtime, source).unwrap_err();
     assert!(
@@ -3419,6 +3419,325 @@ m = {}
     let err = run_script("{a: 1}.has_key(123)").unwrap_err();
     assert!(
         format!("{err}").contains("has_key key must be a string"),
+        "{err}"
+    );
+}
+
+#[test]
+fn range_builtin_generates_bounded_int_arrays() {
+    let out = run_script("range(3)").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(0), Value::Int(1), Value::Int(2)])
+    );
+
+    let out = run_script("range(1, 4)").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
+
+    let out = run_script("range(0, 6, 2)").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(0), Value::Int(2), Value::Int(4)])
+    );
+
+    let out = run_script("range(5, 0, -1)").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(5),
+            Value::Int(4),
+            Value::Int(3),
+            Value::Int(2),
+            Value::Int(1),
+        ])
+    );
+
+    let out = run_script("range(3, 3)").unwrap();
+    assert_eq!(out, Value::Array(vec![]));
+
+    let out = run_script("range(5, 2)").unwrap();
+    assert_eq!(out, Value::Array(vec![]));
+
+    let out = run_script("range(2, 5, -1)").unwrap();
+    assert_eq!(out, Value::Array(vec![]));
+
+    // Range near boundary
+    let out = run_script("range(9223372036854775805, 9223372036854775807)").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(9223372036854775805),
+            Value::Int(9223372036854775806),
+        ])
+    );
+
+    // Zero step error
+    let err = run_script("range(0, 3, 0)").unwrap_err();
+    assert!(
+        format!("{err}").contains("range step cannot be zero"),
+        "{err}"
+    );
+
+    // Type error
+    let err = run_script("range(\"0\", 3)").unwrap_err();
+    assert!(format!("{err}").contains("expected int argument"), "{err}");
+
+    // Value node limits enforcement
+    let limits = RuntimeLimits::default().with_max_value_nodes(10);
+    let err = run_script_with_limits("range(0, 20)", limits).unwrap_err();
+    assert!(
+        format!("{err}").contains("value node limit exceeded (max 10)"),
+        "{err}"
+    );
+
+    // Iterating over range results
+    let out = run_script("range(1, 4).map { |x| x * 10 }").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(10), Value::Int(20), Value::Int(30)])
+    );
+}
+
+#[test]
+fn int_times_method_executes_iteration_and_enforces_limits() {
+    let out = run_script(
+        r#"
+fn test_times_collect() {
+    range(3).map { |i| i + 1 }
+}
+test_times_collect()
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
+
+    // times returns the integer receiver
+    let out = run_script(
+        r#"
+3.times { |i|
+    i
+}
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(3));
+
+    // 0 params block is allowed
+    let out = run_script(
+        r#"
+2.times {
+    1
+}
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(2));
+
+    // <= 0 times
+    let out = run_script("0.times { |i| i }").unwrap();
+    assert_eq!(out, Value::Int(0));
+    let out = run_script("(-5).times { |i| i }").unwrap();
+    assert_eq!(out, Value::Int(-5));
+
+    // block arity check (> 1 params rejected)
+    let err = run_script("3.times { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 0 or 1 argument(s), got 2"),
+        "{err}"
+    );
+    let err = run_script("0.times { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 0 or 1 argument(s), got 2"),
+        "{err}"
+    );
+
+    // early return from block
+    let out = run_script(
+        r#"
+fn test_times_return() {
+    5.times { |i|
+        if i == 2 {
+            return 777
+        }
+    }
+    100
+}
+test_times_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(777));
+
+    // loop iteration budget
+    let limits = RuntimeLimits::default().with_max_loop_iterations(5);
+    let err = run_script_with_limits("10.times { |i| i }", limits).unwrap_err();
+    assert!(
+        format!("{err}").contains("loop iteration limit exceeded (max 5)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn array_reduce_and_inject_accumulate_elements() {
+    // With initial accumulator
+    let out = run_script("[1, 2, 3, 4].reduce(0) { |acc, x| acc + x }").unwrap();
+    assert_eq!(out, Value::Int(10));
+
+    // Without initial accumulator
+    let out = run_script("[1, 2, 3, 4].reduce { |acc, x| acc * x }").unwrap();
+    assert_eq!(out, Value::Int(24));
+
+    // Empty array with init returns init
+    let out = run_script("[].reduce(42) { |acc, x| acc + x }").unwrap();
+    assert_eq!(out, Value::Int(42));
+
+    // Empty array without init returns nil
+    let out = run_script("[].reduce { |acc, x| acc + x }").unwrap();
+    assert_eq!(out, Value::Nil);
+
+    // Single item without init returns item
+    let out = run_script("[99].reduce { |acc, x| acc + x }").unwrap();
+    assert_eq!(out, Value::Int(99));
+
+    // inject alias
+    let out = run_script("[1, 2, 3].inject(10) { |acc, x| acc + x }").unwrap();
+    assert_eq!(out, Value::Int(16));
+
+    // Block arity check (must have 2 params)
+    let err = run_script("[1, 2].reduce(0) { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 1 argument(s), got 2"),
+        "{err}"
+    );
+    let err = run_script("[].reduce(0) { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 1 argument(s), got 2"),
+        "{err}"
+    );
+
+    // Early return from block
+    let out = run_script(
+        r#"
+fn test_reduce_return() {
+    [1, 2, 3, 4].reduce(0) { |acc, x|
+        if x == 3 {
+            return 555
+        }
+        acc + x
+    }
+    100
+}
+test_reduce_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(555));
+
+    // Loop iteration limit
+    let limits = RuntimeLimits::default().with_max_loop_iterations(2);
+    let err =
+        run_script_with_limits("[1, 2, 3, 4].reduce(0) { |acc, x| acc + x }", limits).unwrap_err();
+    assert!(
+        format!("{err}").contains("loop iteration limit exceeded (max 2)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn array_each_with_index_and_map_with_index_work() {
+    // each_with_index returns nil
+    let out = run_script("[10, 20, 30].each_with_index { |x, i| x + i }").unwrap();
+    assert_eq!(out, Value::Nil);
+
+    // map_with_index returns transformed array
+    let out = run_script("[10, 20, 30].map_with_index { |x, i| [x, i] }").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Array(vec![Value::Int(10), Value::Int(0)]),
+            Value::Array(vec![Value::Int(20), Value::Int(1)]),
+            Value::Array(vec![Value::Int(30), Value::Int(2)]),
+        ])
+    );
+
+    // Block arity check (expects 2)
+    let err = run_script("[1].each_with_index { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 1 argument(s), got 2"),
+        "{err}"
+    );
+    let err = run_script("[].each_with_index { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 1 argument(s), got 2"),
+        "{err}"
+    );
+
+    let err = run_script("[1].map_with_index { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 1 argument(s), got 2"),
+        "{err}"
+    );
+    let err = run_script("[].map_with_index { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 1 argument(s), got 2"),
+        "{err}"
+    );
+
+    // Early return from block
+    let out = run_script(
+        r#"
+fn test_ewi_return() {
+    [10, 20, 30].each_with_index { |x, i|
+        if i == 1 {
+            return 333
+        }
+    }
+    100
+}
+test_ewi_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(333));
+}
+
+#[test]
+fn array_select_and_reject_methods_work() {
+    let out = run_script("[1, 2, 3, 4, 5].select { |x| x > 2 }").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(3), Value::Int(4), Value::Int(5)])
+    );
+
+    let out = run_script("[1, 2, 3, 4, 5].reject { |x| x > 2 }").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1), Value::Int(2)]));
+
+    // Block arity check (expects 1)
+    let err = run_script("[1].select { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+    let err = run_script("[].select { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+
+    let err = run_script("[1].reject { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+    let err = run_script("[].reject { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
         "{err}"
     );
 }

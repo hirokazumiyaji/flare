@@ -981,6 +981,46 @@ impl Evaluator<'_> {
                     .ok_or_else(|| format!("unknown module method: {}.{name}", module.name()))?;
                 (spec.handler)(self, args, BTreeMap::new(), block)
             }
+            MethodReceiver::Int(n) => self.eval_int_method(n, name, args, block),
+        }
+    }
+
+    pub(super) fn eval_int_method(
+        &mut self,
+        n: i64,
+        name: &str,
+        _args: Vec<Value>,
+        block: Option<&Block>,
+    ) -> Result<ExecFlow, Box<dyn Error>> {
+        match name {
+            "times" => {
+                let Some(block) = block else {
+                    return Err("times requires { ... } block".into());
+                };
+                if block.params.len() > 1 {
+                    return Err(format!(
+                        "block expects 0 or 1 argument(s), got {}",
+                        block.params.len()
+                    )
+                    .into());
+                }
+                if n > 0 {
+                    for i in 0..n {
+                        self.consume_loop_iteration()?;
+                        let args = if block.params.is_empty() {
+                            vec![]
+                        } else {
+                            vec![Value::Int(i)]
+                        };
+                        match self.call_block(block, args)? {
+                            ExecFlow::Value(_) => {}
+                            ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
+                        }
+                    }
+                }
+                Ok(ExecFlow::Value(Value::Int(n)))
+            }
+            _ => Err(format!("unknown int method: {name}").into()),
         }
     }
 
@@ -1023,9 +1063,9 @@ impl Evaluator<'_> {
                 }
                 Ok(ExecFlow::Value(Value::Array(out)))
             }
-            "filter" => {
+            "filter" | "select" => {
                 let Some(block) = block else {
-                    return Err("filter requires { ... } block".into());
+                    return Err(format!("{name} requires {{ ... }} block").into());
                 };
                 check_block_arity(block, 1)?;
                 let mut out = vec![];
@@ -1041,6 +1081,85 @@ impl Evaluator<'_> {
                     }
                 }
                 Ok(ExecFlow::Value(Value::Array(out)))
+            }
+            "reject" => {
+                let Some(block) = block else {
+                    return Err("reject requires { ... } block".into());
+                };
+                check_block_arity(block, 1)?;
+                let mut out = vec![];
+                for item in items {
+                    self.consume_loop_iteration()?;
+                    match self.call_block(block, vec![item.clone()])? {
+                        ExecFlow::Value(v) => {
+                            if !v.truthy() {
+                                out.push(item);
+                            }
+                        }
+                        ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
+                    }
+                }
+                Ok(ExecFlow::Value(Value::Array(out)))
+            }
+            "each_with_index" => {
+                let Some(block) = block else {
+                    return Err("each_with_index requires { ... } block".into());
+                };
+                check_block_arity(block, 2)?;
+                for (i, item) in items.into_iter().enumerate() {
+                    self.consume_loop_iteration()?;
+                    match self.call_block(block, vec![item, Value::Int(i as i64)])? {
+                        ExecFlow::Value(_) => {}
+                        ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
+                    }
+                }
+                Ok(ExecFlow::Value(Value::Nil))
+            }
+            "map_with_index" => {
+                let Some(block) = block else {
+                    return Err("map_with_index requires { ... } block".into());
+                };
+                check_block_arity(block, 2)?;
+                let mut out = Vec::with_capacity(items.len());
+                for (i, item) in items.into_iter().enumerate() {
+                    self.consume_loop_iteration()?;
+                    match self.call_block(block, vec![item, Value::Int(i as i64)])? {
+                        ExecFlow::Value(v) => out.push(v),
+                        ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
+                    }
+                }
+                Ok(ExecFlow::Value(Value::Array(out)))
+            }
+            "reduce" | "inject" => {
+                let Some(block) = block else {
+                    return Err(format!("{name} requires {{ ... }} block").into());
+                };
+                check_block_arity(block, 2)?;
+                if let Some(init) = args.into_iter().next() {
+                    let mut acc = init;
+                    for item in items {
+                        self.consume_loop_iteration()?;
+                        match self.call_block(block, vec![acc, item])? {
+                            ExecFlow::Value(v) => acc = v,
+                            ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
+                        }
+                    }
+                    Ok(ExecFlow::Value(acc))
+                } else {
+                    let mut iter = items.into_iter();
+                    let Some(first) = iter.next() else {
+                        return Ok(ExecFlow::Value(Value::Nil));
+                    };
+                    let mut acc = first;
+                    for item in iter {
+                        self.consume_loop_iteration()?;
+                        match self.call_block(block, vec![acc, item])? {
+                            ExecFlow::Value(v) => acc = v,
+                            ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
+                        }
+                    }
+                    Ok(ExecFlow::Value(acc))
+                }
             }
             "find" => {
                 let Some(block) = block else {
@@ -1353,7 +1472,7 @@ const fn spec(
     }
 }
 
-pub(super) const BUILTIN_SPECS: [BuiltinSpec; 39] = {
+pub(super) const BUILTIN_SPECS: [BuiltinSpec; 40] = {
     use BuiltinModule::{Auth, File, Firestore, Storage, CSV, IO, JSON, YAML};
     use ServiceId::{
         Auth as AuthService, Firestore as FirestoreService, Storage as StorageService,
@@ -1400,6 +1519,14 @@ pub(super) const BUILTIN_SPECS: [BuiltinSpec; 39] = {
             CallContract::any(),
             None,
             builtin_array,
+        ),
+        spec(
+            None,
+            "range",
+            "range",
+            CallContract::range(1, 3),
+            None,
+            builtin_range,
         ),
         spec(
             None,
@@ -1764,6 +1891,60 @@ fn builtin_array(
     _block: Option<&Block>,
 ) -> Result<ExecFlow, Box<dyn Error>> {
     Ok(ExecFlow::Value(Value::Array(args)))
+}
+
+fn builtin_range(
+    rt: &mut Evaluator<'_>,
+    args: Vec<Value>,
+    _kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    let (start, end, step) = match args.len() {
+        1 => (0i64, expect_int(args.first())?, 1i64),
+        2 => (expect_int(args.first())?, expect_int(args.get(1))?, 1i64),
+        3 => {
+            let step = expect_int(args.get(2))?;
+            if step == 0 {
+                return Err("range step cannot be zero".into());
+            }
+            (expect_int(args.first())?, expect_int(args.get(1))?, step)
+        }
+        _ => return Err("range expects 1, 2, or 3 arguments".into()),
+    };
+
+    let count: usize = if step > 0 {
+        if start >= end {
+            0
+        } else {
+            let diff = (end as i128) - (start as i128);
+            let steps = (diff - 1) / (step as i128) + 1;
+            usize::try_from(steps).map_err(|_| "range count exceeds addressable size")?
+        }
+    } else if start <= end {
+        0
+    } else {
+        let diff = (start as i128) - (end as i128);
+        let pos_step = -(step as i128);
+        let steps = (diff - 1) / pos_step + 1;
+        usize::try_from(steps).map_err(|_| "range count exceeds addressable size")?
+    };
+
+    let total_nodes = count.saturating_add(1);
+    if let Some(limit) = rt.state.limits.max_value_nodes {
+        if total_nodes > limit {
+            return Err(format!("value node limit exceeded (max {limit})").into());
+        }
+    }
+
+    let mut items = Vec::with_capacity(count);
+    let mut cur = start;
+    for i in 0..count {
+        items.push(Value::Int(cur));
+        if i + 1 < count {
+            cur = cur.checked_add(step).ok_or("range overflow")?;
+        }
+    }
+    Ok(ExecFlow::Value(Value::Array(items)))
 }
 
 fn builtin_len(

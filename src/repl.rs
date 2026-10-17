@@ -29,6 +29,7 @@ pub const BUILTINS: &[&str] = &[
     "col",
     "col_group",
     "array",
+    "range",
     "map",
     "timestamp",
     "server_timestamp",
