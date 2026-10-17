@@ -190,48 +190,30 @@ pub fn is_complete_input_with_limits(source: &str, limits: ParserLimits) -> bool
     open_delim <= 0
 }
 
-/// Run the interactive REPL using Rustyline for terminal line-editing and history.
-pub fn run_interactive<F: Firestore, S: Storage>(
+/// Core REPL loop parameterized by input provider, history recorder, and output streams.
+/// This allows comprehensive unit testing of continuation prompts, syntax errors during continuation,
+/// Ctrl-C (Interrupted), and Ctrl-D (Eof) behavior.
+pub fn run_repl_loop<F, S, InputFn, HistFn, OutW, ErrW>(
     rt: &mut Runtime<F, S>,
-) -> Result<(), Box<dyn Error>> {
+    mut readline: InputFn,
+    mut add_history: HistFn,
+    mut stdout: OutW,
+    mut stderr: ErrW,
+) -> Result<(), Box<dyn Error>>
+where
+    F: Firestore,
+    S: Storage,
+    InputFn: FnMut(&mut Runtime<F, S>, &str) -> Result<String, ReadlineError>,
+    HistFn: FnMut(&str),
+    OutW: Write,
+    ErrW: Write,
+{
     rt.set_repl_mode(true);
-
-    let helper = FlareHelper::new();
-    let mut rl = Editor::<FlareHelper, FileHistory>::new()?;
-    rl.set_helper(Some(helper));
-
-    let history_file = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".fl_history"));
-    if let Some(ref path) = history_file {
-        let _ = rl.load_history(path);
-    }
-
-    println!("Flare interactive console (type exit or quit to leave)");
-
     let mut buffer = String::new();
 
     loop {
-        // Update candidates with current runtime variables
-        if let Some(h) = rl.helper() {
-            let mut candidates = Vec::new();
-            for k in KEYWORDS {
-                candidates.push((*k).to_string());
-            }
-            for m in MODULES {
-                candidates.push((*m).to_string());
-            }
-            for b in BUILTINS {
-                candidates.push((*b).to_string());
-            }
-            for v in rt.global_variable_names() {
-                candidates.push(v);
-            }
-            candidates.sort();
-            candidates.dedup();
-            h.set_candidates(candidates);
-        }
-
         let prompt = if buffer.is_empty() { "fl> " } else { "fl* " };
-        let readline = rl.readline(prompt);
+        let readline = readline(rt, prompt);
 
         match readline {
             Ok(line) => {
@@ -248,7 +230,7 @@ pub fn run_interactive<F: Firestore, S: Storage>(
                         buffer.len() + 1 + line.len()
                     };
                     if next_len > max {
-                        eprintln!("error: source size limit exceeded (max {max})");
+                        writeln!(stderr, "error: source size limit exceeded (max {max})")?;
                         buffer.clear();
                         continue;
                     }
@@ -269,45 +251,98 @@ pub fn run_interactive<F: Firestore, S: Storage>(
                     continue;
                 }
 
-                let _ = rl.add_history_entry(trimmed_input);
+                add_history(trimmed_input);
 
                 match rt.run(&input) {
                     Ok(val) => {
-                        println!("=> {}", val.inspect());
+                        writeln!(stdout, "=> {}", val.inspect())?;
                     }
                     Err(err) => {
-                        eprintln!("error: {err}");
+                        writeln!(stderr, "error: {err}")?;
                     }
                 }
             }
             Err(ReadlineError::Interrupted) => {
                 if buffer.is_empty() {
-                    println!("^C");
+                    writeln!(stdout, "^C")?;
                 } else {
                     buffer.clear();
-                    println!("^C");
+                    writeln!(stdout, "^C")?;
                 }
             }
             Err(ReadlineError::Eof) => {
                 if !buffer.is_empty() {
                     buffer.clear();
-                    println!();
+                    writeln!(stdout)?;
                 } else {
                     break;
                 }
             }
             Err(err) => {
-                eprintln!("error: {err}");
+                writeln!(stderr, "error: {err}")?;
                 break;
             }
         }
     }
 
+    Ok(())
+}
+
+/// Run the interactive REPL using Rustyline for terminal line-editing and history.
+pub fn run_interactive<F: Firestore, S: Storage>(
+    rt: &mut Runtime<F, S>,
+) -> Result<(), Box<dyn Error>> {
+    rt.set_repl_mode(true);
+
+    let helper = FlareHelper::new();
+    let mut rl = Editor::<FlareHelper, FileHistory>::new()?;
+    rl.set_helper(Some(helper));
+
+    let history_file = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".fl_history"));
+    if let Some(ref path) = history_file {
+        let _ = rl.load_history(path);
+    }
+
+    println!("Flare interactive console (type exit or quit to leave)");
+
+    let rl = RefCell::new(rl);
+    let res = run_repl_loop(
+        rt,
+        |rt, prompt| {
+            let mut rl_ref = rl.borrow_mut();
+            if let Some(h) = rl_ref.helper() {
+                let mut candidates = Vec::new();
+                for k in KEYWORDS {
+                    candidates.push((*k).to_string());
+                }
+                for m in MODULES {
+                    candidates.push((*m).to_string());
+                }
+                for b in BUILTINS {
+                    candidates.push((*b).to_string());
+                }
+                for v in rt.global_variable_names() {
+                    candidates.push(v);
+                }
+                candidates.sort();
+                candidates.dedup();
+                h.set_candidates(candidates);
+            }
+            rl_ref.readline(prompt)
+        },
+        |entry| {
+            let _ = rl.borrow_mut().add_history_entry(entry);
+        },
+        std::io::stdout(),
+        std::io::stderr(),
+    );
+
+    let mut rl = rl.into_inner();
     if let Some(ref path) = history_file {
         let _ = rl.save_history(path);
     }
 
-    Ok(())
+    res
 }
 
 /// Run REPL over a plain input reader and output writer (e.g., piped stdin or tests).

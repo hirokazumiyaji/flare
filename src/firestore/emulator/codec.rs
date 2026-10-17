@@ -44,7 +44,7 @@ pub(super) fn encode_fields_bounded(
 /// `DocRef` is deliberately not accepted here. In this API references are
 /// query-filter values; the write codec remains restricted to the documented
 /// writable field values and reports an unsupported value for references.
-pub(super) fn encode_field_value_bounded(
+pub fn encode_field_value_bounded(
     v: &Value,
     depth: usize,
     max_depth: usize,
@@ -150,7 +150,7 @@ pub(super) fn decode_document_bounded(
 /// A stored document can be nested far deeper than the runtime's own budget
 /// allows, so the decoder has to stop with an error instead of overflowing the
 /// native stack before any later validation could run.
-pub(super) fn decode_field_value_bounded(
+pub fn decode_field_value_bounded(
     v: &SdkValue,
     resource_root: &str,
     depth: usize,

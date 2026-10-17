@@ -7,8 +7,9 @@ mod unavailable;
 
 #[cfg(feature = "emulator")]
 pub use emulator::{
-    parse_timeout_ms, EmulatorAuth, EmulatorConfig, EmulatorConnectionError, FirestoreEmulator,
-    FirestoreEmulatorOptions, DEFAULT_OPERATION_TIMEOUT, OPERATION_TIMEOUT_ENV,
+    decode_field_value_bounded, encode_field_value_bounded, parse_timeout_ms, EmulatorAuth,
+    EmulatorConfig, EmulatorConnectionError, FirestoreEmulator, FirestoreEmulatorOptions,
+    DEFAULT_OPERATION_TIMEOUT, OPERATION_TIMEOUT_ENV,
 };
 pub use memory::{InMemoryFirestore, RequestClock};
 pub use unavailable::UnavailableFirestore;
