@@ -9,9 +9,7 @@
 //! agree on the visible script contract.
 
 use flare::runtime::Runtime;
-use flare::{
-    run_script_with_auth, AuthEmulator, AuthErrorKind, FlareError, InMemoryFirestore,
-};
+use flare::{run_script_with_auth, AuthEmulator, AuthErrorKind, FlareError, InMemoryFirestore};
 
 fn emulator() -> Option<AuthEmulator> {
     AuthEmulator::from_env().expect("FIREBASE_AUTH_EMULATOR_HOST must be valid UTF-8 when set")

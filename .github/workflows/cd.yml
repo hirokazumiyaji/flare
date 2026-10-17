@@ -53,15 +53,23 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: scripts/validate-release-tag.sh "$RELEASE_TAG"
 
-  release:
-    name: Publish release package
+  build-release:
+    name: Build release package (${{ matrix.platform }})
     needs:
       - quality-gate
       - validate-version
-    permissions:
-      contents: write
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            platform: aarch64-apple-darwin
+            target: aarch64-apple-darwin
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -85,6 +93,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            lock_sha="$(sha256sum Cargo.lock | awk '{print $1}')"
+          else
+            lock_sha="$(shasum -a 256 Cargo.lock | awk '{print $1}')"
+          fi
           {
             echo "release_tag=${GITHUB_REF_NAME}"
             echo "commit=${GITHUB_SHA}"
@@ -95,11 +108,14 @@ jobs:
             rustup show active-toolchain
             echo "rust=$(rustc --version)"
             echo "cargo=$(cargo --version)"
-            echo "target=x86_64-unknown-linux-gnu"
-            echo "cargo_lock_sha256=$(sha256sum Cargo.lock | awk '{print $1}')"
+            echo "target=${{ matrix.target }}"
+            echo "cargo_lock_sha256=${lock_sha}"
             echo "firebase-tools=${FIREBASE_TOOLS_VERSION}"
-          } > dist/tool-versions.txt
-          cat dist/tool-versions.txt
+          } > "dist/tool-versions-${{ matrix.platform }}.txt"
+          if [ "${{ matrix.platform }}" = "linux-x86_64" ]; then
+            cp "dist/tool-versions-${{ matrix.platform }}.txt" dist/tool-versions.txt
+          fi
+          cat "dist/tool-versions-${{ matrix.platform }}.txt"
 
       - name: Build release binary
         run: cargo build --release --features emulator --bin fl --locked
@@ -109,7 +125,7 @@ jobs:
         # the archive's .sha256 sidecar.
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-        run: scripts/package-release.sh "$RELEASE_TAG" target/release/fl dist
+        run: scripts/package-release.sh "$RELEASE_TAG" target/release/fl dist "${{ matrix.platform }}"
 
       - name: Verify release package before upload
         env:
@@ -117,30 +133,54 @@ jobs:
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
-          archive="dist/flare-${version}-linux-x86_64.tar.gz"
+          archive="dist/flare-${version}-${{ matrix.platform }}.tar.gz"
           checksum="${archive}.sha256"
           test -f "$archive"
           test -f "$checksum"
-          (cd dist && sha256sum -c "$(basename "$checksum")")
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum -c "$(basename "$checksum")")
+          else
+            (cd dist && shasum -a 256 -c "$(basename "$checksum")")
+          fi
           verify_dir="$(mktemp -d)"
           trap 'rm -rf "$verify_dir"' EXIT
           tar -xzf "$archive" -C "$verify_dir"
-          package_dir="$verify_dir/flare-${version}-linux-x86_64"
+          package_dir="$verify_dir/flare-${version}-${{ matrix.platform }}"
           test -x "$package_dir/fl"
           test -f "$package_dir/README.md"
           test -f "$package_dir/LICENSE"
           test -f "$package_dir/docs/spec.md"
-          (cd "$package_dir" && sha256sum -c SHA256SUMS)
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd "$package_dir" && sha256sum -c SHA256SUMS)
+          else
+            (cd "$package_dir" && shasum -a 256 -c SHA256SUMS)
+          fi
 
       - name: Upload release package to workflow artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: flare-${{ github.ref_name }}
+          name: flare-${{ matrix.platform }}
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
-            dist/tool-versions.txt
+            dist/tool-versions*.txt
           if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release assets
+    needs:
+      - build-release
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download all release packages
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: flare-*
+          path: dist
+          merge-multiple: true
 
       - name: Publish GitHub Release assets
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
@@ -149,6 +189,6 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
-            dist/tool-versions.txt
+            dist/tool-versions*.txt
           fail_on_unmatched_files: true
           generate_release_notes: true

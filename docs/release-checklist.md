@@ -65,7 +65,7 @@ Use before tagging a release or publishing binaries.
 
 6. **Verify a downloaded release**
    - Put the `.tar.gz` and `.tar.gz.sha256` files in the same directory.
-   - Run `sha256sum -c flare-<version>-linux-x86_64.tar.gz.sha256`.
+   - Run `sha256sum -c flare-<version>-<platform>.tar.gz.sha256` (e.g. `linux-x86_64` or `aarch64-apple-darwin`).
    - Extract it and run `sha256sum -c SHA256SUMS` from the extracted directory.
    - Read the attached `tool-versions.txt` for the Rust/Cargo versions, the
      `Cargo.lock` SHA-256, the runner image, and the Firebase CLI version CI uses.

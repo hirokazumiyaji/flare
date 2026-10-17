@@ -2,7 +2,7 @@
 //!
 //! The language runtime deliberately talks to this small trait instead of a
 //! particular Firebase SDK.  The in-memory implementation is used by the
-//! default runtime, while [`AuthEmulator`] talks to the local Firebase Auth
+//! default runtime, while `AuthEmulator` talks to the local Firebase Auth
 //! Emulator over its Identity Toolkit HTTP API.
 
 #[cfg(feature = "emulator")]

@@ -8,13 +8,13 @@ use std::time::Duration;
 
 #[cfg(feature = "emulator")]
 use flare::AuthEmulatorOptions;
+#[cfg(feature = "emulator")]
+use flare::{
+    parse_timeout_ms as parse_library_timeout_ms, AuthEmulator, EmulatorConfig, FirestoreEmulator,
+};
 use flare::{
     Auth, Firestore, InMemoryAuth, InMemoryFirestore, InMemoryStorage, ProjectConfig,
     RuntimeLimits, Services, Storage, StorageEmulator,
-};
-#[cfg(feature = "emulator")]
-use flare::{
-    AuthEmulator, EmulatorConfig, FirestoreEmulator, parse_timeout_ms as parse_library_timeout_ms,
 };
 
 #[cfg(not(feature = "emulator"))]
@@ -642,14 +642,12 @@ mod project_config_tests {
         })
         .unwrap();
         assert_eq!(same.project_id.as_deref(), Some("demo"));
-        assert!(
-            resolve_project_config(|key| match key {
-                "FIREBASE_PROJECT_ID" => Some("one".into()),
-                "FIRESTORE_PROJECT_ID" => Some("two".into()),
-                _ => None,
-            })
-            .is_err()
-        );
+        assert!(resolve_project_config(|key| match key {
+            "FIREBASE_PROJECT_ID" => Some("one".into()),
+            "FIRESTORE_PROJECT_ID" => Some("two".into()),
+            _ => None,
+        })
+        .is_err());
     }
 
     #[test]

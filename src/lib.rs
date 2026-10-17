@@ -25,16 +25,16 @@ pub use auth::{AuthEmulator, AuthEmulatorOptions, DEFAULT_AUTH_OPERATION_TIMEOUT
 pub use error::{CapabilityError, ErrorKind, FlareError, ServiceId, Span};
 #[cfg(feature = "emulator")]
 pub use firestore::{
-    DEFAULT_OPERATION_TIMEOUT, EmulatorAuth, EmulatorConfig, EmulatorConnectionError,
-    FirestoreEmulator, FirestoreEmulatorOptions, OPERATION_TIMEOUT_ENV, parse_timeout_ms,
+    parse_timeout_ms, EmulatorAuth, EmulatorConfig, EmulatorConnectionError, FirestoreEmulator,
+    FirestoreEmulatorOptions, DEFAULT_OPERATION_TIMEOUT, OPERATION_TIMEOUT_ENV,
 };
 pub use firestore::{Firestore, InMemoryFirestore, RequestClock, UnavailableFirestore};
 pub use io::{InMemoryIo, Io, StdIo, UnavailableIO, UnavailableIo};
 pub use limits::{
-    DEFAULT_BACKEND_TIMEOUT_MS, DEFAULT_MAX_BYTES_SIZE, DEFAULT_MAX_CALL_DEPTH,
-    DEFAULT_MAX_FILE_IO_BYTES, DEFAULT_MAX_LOOP_ITERATIONS, DEFAULT_MAX_PARSER_DEPTH,
-    DEFAULT_MAX_QUERY_RESULTS, DEFAULT_MAX_STEPS, DEFAULT_MAX_STRING_BYTES,
-    DEFAULT_MAX_VALUE_DEPTH, DEFAULT_MAX_WALL_CLOCK_MS, ParserLimits, RuntimeLimits, RuntimeUsage,
+    ParserLimits, RuntimeLimits, RuntimeUsage, DEFAULT_BACKEND_TIMEOUT_MS, DEFAULT_MAX_BYTES_SIZE,
+    DEFAULT_MAX_CALL_DEPTH, DEFAULT_MAX_FILE_IO_BYTES, DEFAULT_MAX_LOOP_ITERATIONS,
+    DEFAULT_MAX_PARSER_DEPTH, DEFAULT_MAX_QUERY_RESULTS, DEFAULT_MAX_STEPS,
+    DEFAULT_MAX_STRING_BYTES, DEFAULT_MAX_VALUE_DEPTH, DEFAULT_MAX_WALL_CLOCK_MS,
 };
 pub use storage::{
     HttpStorageTransport, HttpTransport, InMemoryStorage, Storage, StorageEmulator, StorageError,
@@ -42,8 +42,8 @@ pub use storage::{
     StorageTransport, UnavailableStorage,
 };
 pub use value::{
-    BuiltinModule, Value, validate_value_depth, validate_value_limits,
-    validate_value_limits_with_sizes,
+    validate_value_depth, validate_value_limits, validate_value_limits_with_sizes, BuiltinModule,
+    Value,
 };
 
 pub fn run_script(source: &str) -> Result<Value, Box<dyn Error>> {

@@ -574,7 +574,9 @@ fn bytes_size_budget_enforces_limit_on_bytes_and_storage() {
         .unwrap();
 
     storage_rt.set_limits(RuntimeLimits::default().with_max_bytes_size(4));
-    let err = storage_rt.run("storage_download(\"test.bin\")").unwrap_err();
+    let err = storage_rt
+        .run("storage_download(\"test.bin\")")
+        .unwrap_err();
     assert_budget_error(err, "bytes size limit exceeded");
 }
 
@@ -593,5 +595,3 @@ fn validate_value_limits_with_sizes_checks_bounds() {
     let nested = Value::Array(vec![Value::Str("toolarge".to_string())]);
     assert!(validate_value_limits_with_sizes(&nested, None, None, Some(4), None).is_err());
 }
-
-

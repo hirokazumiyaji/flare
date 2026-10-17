@@ -23,9 +23,52 @@ env:
   FIREBASE_TOOLS_VERSION: "15.31.0"
 
 jobs:
-  test:
+  cargo-deny:
+    name: Dependency check (cargo-deny)
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check dependencies with cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: ""
+          command-arguments: "advisories bans licenses sources"
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          # This action version fails when `toolchain` is empty and has no
+          # rust-toolchain.toml fallback, so keep this equal to the file's channel.
+          toolchain: 1.98.1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Build documentation
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-14
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -51,12 +94,17 @@ jobs:
           rustup show active-toolchain
           rustc --version --verbose
           cargo --version --verbose
-          echo "cargo_lock_sha256=$(sha256sum Cargo.lock | awk '{print $1}')"
+          if command -v sha256sum >/dev/null 2>&1; then
+            echo "cargo_lock_sha256=$(sha256sum Cargo.lock | awk '{print $1}')"
+          else
+            echo "cargo_lock_sha256=$(shasum -a 256 Cargo.lock | awk '{print $1}')"
+          fi
 
       - name: Verify locked dependency graph
         run: cargo metadata --locked --no-deps --format-version 1 >/dev/null
 
       - name: Format check
+        if: matrix.os == 'ubuntu-24.04'
         # cargo fmt has no dependency resolver; the --locked metadata check above
         # is the lockfile gate for this step.
         run: cargo fmt --check
@@ -68,6 +116,7 @@ jobs:
         run: cargo test --all-targets --locked
 
       - name: Verify default feature set is in-memory-only
+        if: matrix.os == 'ubuntu-24.04'
         run: |
           set -euo pipefail
           test "$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["features"].get("default", []))')" = "[]"

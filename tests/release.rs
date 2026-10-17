@@ -208,4 +208,33 @@ mod unix {
                 .expect("checksum path should be UTF-8"),
         ));
     }
+
+    #[test]
+    fn release_archive_supports_custom_platform_naming() {
+        let temp = TestDir::new();
+        let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let output_dir = temp.path().join("dist");
+        let binary = PathBuf::from(env!("CARGO_BIN_EXE_fl"));
+        let platform = "aarch64-apple-darwin";
+        let output = run_script(
+            "package-release.sh",
+            &[
+                &tag,
+                binary.to_str().expect("binary path should be UTF-8"),
+                output_dir.to_str().expect("output path should be UTF-8"),
+                platform,
+            ],
+        );
+        assert_success(&output);
+
+        let version = env!("CARGO_PKG_VERSION");
+        let package_name = format!("flare-{version}-{platform}");
+        let archive = output_dir.join(format!("{package_name}.tar.gz"));
+        let archive_checksum = output_dir.join(format!("{package_name}.tar.gz.sha256"));
+        assert!(archive.is_file(), "custom platform archive was not created");
+        assert!(
+            archive_checksum.is_file(),
+            "custom platform checksum was not created"
+        );
+    }
 }

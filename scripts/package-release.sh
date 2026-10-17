@@ -5,14 +5,15 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-if [[ $# -ne 3 ]]; then
-  echo "usage: $0 <vX.Y.Z> <binary> <output-directory>" >&2
+if [[ $# -lt 3 || $# -gt 4 ]]; then
+  echo "usage: $0 <vX.Y.Z> <binary> <output-directory> [target-platform]" >&2
   exit 2
 fi
 
 tag="$1"
 binary="$2"
 output_dir="$3"
+platform="${4:-linux-x86_64}"
 version="${tag#v}"
 
 if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -31,7 +32,7 @@ for required in README.md LICENSE docs/spec.md; do
 done
 
 mkdir -p "$output_dir"
-package_name="flare-${version}-linux-x86_64"
+package_name="flare-${version}-${platform}"
 staging_dir="$output_dir/$package_name"
 archive="$output_dir/${package_name}.tar.gz"
 checksum_file="$archive.sha256"

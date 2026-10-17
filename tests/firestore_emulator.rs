@@ -8,11 +8,11 @@
 mod common;
 
 use common::{test_collection, test_namespace, unique};
+use firestore::{FirestoreDb, FirestoreDbOptions};
 use flare::run_script_with_firestore;
 use flare::run_script_with_firestore_and_limits;
 use flare::runtime::Runtime;
 use flare::{EmulatorAuth, FirestoreEmulator, RuntimeLimits, Value};
-use firestore::{FirestoreDb, FirestoreDbOptions};
 use gcloud_sdk::google::firestore::v1::{
     value, write, ArrayValue, CommitRequest, Document, MapValue, Value as SdkValue, Write,
 };
@@ -86,20 +86,7 @@ fn seed_reference_documents(
         .expect("create test runtime");
     let options = FirestoreDbOptions::new(project_id.to_string()).with_firebase_api_url(url);
     let db = runtime
-        .block_on(FirestoreDb::with_options_token_source(
-            options,
-            gcloud_sdk::GCP_DEFAULT_SCOPES.clone(),
-            gcloud_sdk::TokenSourceType::ExternalSource(Box::new(
-                gcloud_sdk::ExternalJwtFunctionSource::new(|| {
-                    std::future::ready(Ok(gcloud_sdk::Token::new(
-                        "Bearer".to_string(),
-                        "owner".into(),
-                        firestore::FirestoreInstant::new(4_102_444_800, 0)
-                            .expect("valid token expiry"),
-                    )))
-                }),
-            )),
-        ))
+        .block_on(FirestoreDb::with_options(options))
         .expect("connect test Firestore client");
     // These documents hold values flare cannot write (double, geo_point,
     // external reference), so they are seeded with a raw Firestore `commit`
