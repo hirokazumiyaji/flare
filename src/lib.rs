@@ -14,7 +14,7 @@ pub mod value;
 
 use std::error::Error;
 
-pub use runtime::Runtime;
+pub use runtime::{builtin_names, Runtime};
 pub use services::{ProjectConfig, Services};
 
 pub use auth::{

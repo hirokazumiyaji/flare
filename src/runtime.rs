@@ -22,9 +22,9 @@ use crate::value::{
 mod evaluator;
 mod state;
 
-use evaluator::{auth_session_field, Evaluator};
+use evaluator::{auth_session_field, builtin_specs, Evaluator};
 #[cfg(test)]
-use evaluator::{builtin_specs, is_builtin_name, ScopeGuard};
+use evaluator::{is_builtin_name, ScopeGuard};
 use state::RuntimeState;
 
 enum ExecCtx {
@@ -250,6 +250,11 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         self.evaluator().run(source)
     }
 
+    /// Return the list of all global builtin function names.
+    pub fn builtin_names() -> Vec<&'static str> {
+        builtin_names()
+    }
+
     fn evaluator(&mut self) -> Evaluator<'_> {
         let services = ServiceAccess {
             firestore: &mut self.services.firestore,
@@ -260,6 +265,14 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         };
         Evaluator::new(services, &mut self.state)
     }
+}
+
+/// Return the list of all global builtin function names.
+pub fn builtin_names() -> Vec<&'static str> {
+    builtin_specs()
+        .iter()
+        .map(|spec| spec.global_name)
+        .collect()
 }
 
 /// Convert an evaluated receiver into the exhaustive set accepted by method
