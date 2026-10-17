@@ -1354,10 +1354,10 @@ const fn spec(
 }
 
 pub(super) const BUILTIN_SPECS: [BuiltinSpec; 39] = {
-    use BuiltinModule::{Auth, CSV, File, Firestore, IO, JSON, Storage, YAML};
+    use BuiltinModule::{Auth, File, Firestore, Storage, CSV, IO, JSON, YAML};
     use ServiceId::{
-        Auth as AuthService, Firestore as FirestoreService, IO as IOService,
-        Storage as StorageService,
+        Auth as AuthService, Firestore as FirestoreService, Storage as StorageService,
+        IO as IOService,
     };
 
     [

@@ -208,8 +208,8 @@ When connected to a persistent emulator, rerunning a command or splitting integr
 - **`feature-builds` job:** checks the default, `--no-default-features`, and `--features emulator` build boundaries.
 - **`integration-emulator` job:** starts the Firestore, Storage, and Auth emulators with Firebase CLI 15.31.0, logs tool versions, and runs each integration suite. It runs the Firestore emulator suite twice against the same emulator to detect test interference.
 - CI uses a reusable workflow. CD for a `v*` tag runs the same jobs, including integration tests. The release job depends on this gate and the tag version check, so a tag cannot be published if branch CI was skipped.
-- **CD:** builds and releases the Linux `fl` binary with `--features emulator` only when the tag without its `v` prefix (for example, `v0.1.0` → `0.1.0`) matches the `flare` package version from `cargo metadata --no-deps`.
-- Release assets are `flare-<version>-linux-x86_64.tar.gz` archives with SHA-256 `.sha256` sidecars, not raw binaries. Each archive contains the executable `fl`, `README.md`, `LICENSE`, `docs/spec.md`, and a per-file `SHA256SUMS` manifest.
+- **CD:** builds and releases the Linux (`linux-x86_64`) and macOS (`aarch64-apple-darwin`) `fl` binaries with `--features emulator` only when the tag without its `v` prefix (for example, `v0.1.0` → `0.1.0`) matches the `flare` package version from `cargo metadata --no-deps`.
+- Release assets are `flare-<version>-linux-x86_64.tar.gz` and `flare-<version>-aarch64-apple-darwin.tar.gz` archives with SHA-256 `.sha256` sidecars, not raw binaries. Each archive contains the executable `fl`, `README.md`, `LICENSE`, `docs/spec.md`, and a per-file `SHA256SUMS` manifest.
 
 After downloading, place the archive and its sidecar in the same directory and verify them as follows:
 

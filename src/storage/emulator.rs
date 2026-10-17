@@ -237,7 +237,9 @@ fn set_remaining_timeout(
 ) -> Result<(), StorageError> {
     let timeout = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
     if timeout.is_some_and(|timeout| timeout.is_zero()) {
-        return Err(StorageError::backend("storage emulator operation timed out"));
+        return Err(StorageError::backend(
+            "storage emulator operation timed out",
+        ));
     }
     let result = if read {
         stream.set_read_timeout(timeout)

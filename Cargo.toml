@@ -2,6 +2,7 @@
 name = "flare"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 autobins = false
 
 [features]
@@ -13,6 +14,7 @@ default = []
 emulator = [
     "dep:firestore",
     "dep:gcloud-sdk",
+    "dep:http",
     "dep:prost-types",
     "dep:reqwest",
     "dep:tokio",
@@ -23,6 +25,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 csv = "1"
 firestore = { version = "0.58", optional = true }
 gcloud-sdk = { version = "0.33", optional = true }
+http = { version = "1", optional = true }
 prost-types = { version = "0.14", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json"], optional = true }
 rustyline = "18.0.1"

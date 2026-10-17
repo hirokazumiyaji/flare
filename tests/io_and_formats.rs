@@ -2,8 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use flare::{
-    CapabilityError, InMemoryIo, ProjectConfig, RuntimeLimits, ServiceId, Services, Value,
-    run_script, run_script_with_services, run_script_with_services_and_limits,
+    run_script, run_script_with_services, run_script_with_services_and_limits, CapabilityError,
+    InMemoryIo, ProjectConfig, RuntimeLimits, ServiceId, Services, Value,
 };
 
 struct TempDirGuard {

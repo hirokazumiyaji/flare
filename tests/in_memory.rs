@@ -2611,9 +2611,15 @@ fn string_comparison_operators_support_utf8_lexicographical_order() {
     let err = run_script("\"a\" > 1").unwrap_err();
     assert!(format!("{err}").contains("unsupported > operands"), "{err}");
     let err = run_script("\"a\" <= 1").unwrap_err();
-    assert!(format!("{err}").contains("unsupported <= operands"), "{err}");
+    assert!(
+        format!("{err}").contains("unsupported <= operands"),
+        "{err}"
+    );
     let err = run_script("\"a\" >= 1").unwrap_err();
-    assert!(format!("{err}").contains("unsupported >= operands"), "{err}");
+    assert!(
+        format!("{err}").contains("unsupported >= operands"),
+        "{err}"
+    );
     // Conditional
     let out = run_script("if \"alice\" < \"bob\" { 1 } else { 2 }").unwrap();
     assert_eq!(out, Value::Int(1));
@@ -3229,9 +3235,15 @@ test_find_return()
     let err = run_script("[1, 2].find()").unwrap_err();
     assert!(format!("{err}").contains("requires { ... } block"), "{err}");
     let err = run_script("[1, 2].contains()").unwrap_err();
-    assert!(format!("{err}").contains("missing positional arguments"), "{err}");
+    assert!(
+        format!("{err}").contains("missing positional arguments"),
+        "{err}"
+    );
     let err = run_script("[1, 2].join(123)").unwrap_err();
-    assert!(format!("{err}").contains("join separator must be a string"), "{err}");
+    assert!(
+        format!("{err}").contains("join separator must be a string"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -3271,7 +3283,8 @@ fn string_extended_methods_and_indexing_work() {
     );
 
     // contains
-    let out = run_script("[\"hello world\".contains(\"world\"), \"hello\".contains(\"abc\")]").unwrap();
+    let out =
+        run_script("[\"hello world\".contains(\"world\"), \"hello\".contains(\"abc\")]").unwrap();
     assert_eq!(
         out,
         Value::Array(vec![Value::Bool(true), Value::Bool(false)])
@@ -3304,21 +3317,42 @@ fn string_extended_methods_and_indexing_work() {
 
     // invalid index type
     let err = run_script("\"hello\"[\"foo\"]").unwrap_err();
-    assert!(format!("{err}").contains("string index must be an int"), "{err}");
+    assert!(
+        format!("{err}").contains("string index must be an int"),
+        "{err}"
+    );
 
     // invalid arguments
     let err = run_script("\"hello\".split(123)").unwrap_err();
-    assert!(format!("{err}").contains("split separator must be a string"), "{err}");
+    assert!(
+        format!("{err}").contains("split separator must be a string"),
+        "{err}"
+    );
     let err = run_script("\"hello\".starts_with(123)").unwrap_err();
-    assert!(format!("{err}").contains("starts_with prefix must be a string"), "{err}");
+    assert!(
+        format!("{err}").contains("starts_with prefix must be a string"),
+        "{err}"
+    );
     let err = run_script("\"hello\".ends_with(123)").unwrap_err();
-    assert!(format!("{err}").contains("ends_with suffix must be a string"), "{err}");
+    assert!(
+        format!("{err}").contains("ends_with suffix must be a string"),
+        "{err}"
+    );
     let err = run_script("\"hello\".contains(123)").unwrap_err();
-    assert!(format!("{err}").contains("contains substring must be a string"), "{err}");
+    assert!(
+        format!("{err}").contains("contains substring must be a string"),
+        "{err}"
+    );
     let err = run_script("\"hello\".trim(1)").unwrap_err();
-    assert!(format!("{err}").contains("too many positional arguments"), "{err}");
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
     let err = run_script("\"hello\".unknown()").unwrap_err();
-    assert!(format!("{err}").contains("unknown string method: unknown"), "{err}");
+    assert!(
+        format!("{err}").contains("unknown string method: unknown"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -3333,7 +3367,10 @@ m = {name: "alice", age: 30}
     assert_eq!(
         out,
         Value::Array(vec![
-            Value::Array(vec![Value::Str("age".to_string()), Value::Str("name".to_string())]),
+            Value::Array(vec![
+                Value::Str("age".to_string()),
+                Value::Str("name".to_string())
+            ]),
             Value::Array(vec![Value::Int(30), Value::Str("alice".to_string())]),
             Value::Bool(true),
             Value::Bool(false),
@@ -3365,12 +3402,23 @@ m = {}
 
     // argument errors
     let err = run_script("{a: 1}.keys(1)").unwrap_err();
-    assert!(format!("{err}").contains("too many positional arguments"), "{err}");
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
     let err = run_script("{a: 1}.values(1)").unwrap_err();
-    assert!(format!("{err}").contains("too many positional arguments"), "{err}");
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
     let err = run_script("{a: 1}.has_key()").unwrap_err();
-    assert!(format!("{err}").contains("missing positional arguments"), "{err}");
+    assert!(
+        format!("{err}").contains("missing positional arguments"),
+        "{err}"
+    );
     let err = run_script("{a: 1}.has_key(123)").unwrap_err();
-    assert!(format!("{err}").contains("has_key key must be a string"), "{err}");
+    assert!(
+        format!("{err}").contains("has_key key must be a string"),
+        "{err}"
+    );
 }
-
