@@ -515,3 +515,56 @@ fn repl_history_omits_multiline_sensitive_entries() {
     let history: Vec<String> = rl.history().iter().map(|s| s.to_string()).collect();
     assert_eq!(history, vec!["fn add(a, b) {\n  a + b\n}", "result = 42",]);
 }
+
+#[test]
+fn repl_builtins_match_builtin_table() {
+    let mut expected = flare::builtin_names();
+    expected.sort();
+    let mut actual = flare::repl::BUILTINS.to_vec();
+    actual.sort();
+    assert_eq!(
+        actual, expected,
+        "repl BUILTINS does not match builtin_specs"
+    );
+}
+
+#[test]
+fn repl_completions_include_all_builtins_and_no_methods() {
+    use flare::repl::{default_candidates, FlareHelper};
+    use rustyline::completion::Completer;
+    use rustyline::history::DefaultHistory;
+    use rustyline::Context;
+
+    let helper = FlareHelper::new();
+    let history = DefaultHistory::new();
+    let ctx = Context::new(&history);
+    let candidates = default_candidates();
+
+    // All builtins are present in candidates
+    for name in flare::builtin_names() {
+        assert!(
+            candidates.contains(&name.to_string()),
+            "missing builtin completion candidate: {name}"
+        );
+    }
+
+    // "now" and "len" should be present and completable
+    let (_, matches) = helper.complete("no", 2, &ctx).unwrap();
+    assert!(matches.iter().any(|m| m.display == "now"));
+
+    let (_, matches) = helper.complete("le", 2, &ctx).unwrap();
+    assert!(matches.iter().any(|m| m.display == "len"));
+
+    // Methods like "map", "where", "order_by", "limit", "offset", "count"
+    // must not be in the global builtin list or completions
+    for not_builtin in &["where", "order_by", "limit", "offset", "count", "map"] {
+        assert!(
+            !flare::repl::BUILTINS.contains(not_builtin),
+            "BUILTINS contains non-builtin method: {not_builtin}"
+        );
+        assert!(
+            !candidates.contains(&not_builtin.to_string()),
+            "candidates contains non-builtin method: {not_builtin}"
+        );
+    }
+}

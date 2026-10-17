@@ -25,8 +25,9 @@ pub(crate) mod methods;
 mod state;
 
 use builtins::auth::auth_session_field;
+use builtins::builtin_specs;
 #[cfg(test)]
-use builtins::{builtin_specs, is_builtin_name};
+use builtins::is_builtin_name;
 use evaluator::Evaluator;
 #[cfg(test)]
 use evaluator::ScopeGuard;
@@ -256,6 +257,14 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         };
         Evaluator::new(services, &mut self.state)
     }
+}
+
+/// Return the list of all global builtin function names.
+pub fn builtin_names() -> Vec<&'static str> {
+    builtin_specs()
+        .iter()
+        .map(|spec| spec.global_name)
+        .collect()
 }
 
 /// `bytes(...)` の引数エラー文言。3 箇所から使うので定数にまとめる。
