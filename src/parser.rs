@@ -190,6 +190,37 @@ impl Parser {
             body,
         })
     }
+    fn parse_try_rescue(&mut self) -> Result<Expr, Box<dyn Error>> {
+        self.expect(Token::Try)?;
+        let try_body = self.parse_brace_block()?;
+        self.skip_newlines();
+        self.expect(Token::Rescue)?;
+        self.skip_newlines();
+        let err_param = if self.at(&Token::OrOr) {
+            self.bump();
+            None
+        } else if self.at(&Token::Pipe) {
+            self.bump();
+            self.skip_newlines();
+            let param = if self.at(&Token::Pipe) {
+                None
+            } else {
+                let name = self.expect_ident()?;
+                self.skip_newlines();
+                Some(name)
+            };
+            self.expect(Token::Pipe)?;
+            param
+        } else {
+            None
+        };
+        let rescue_body = self.parse_brace_block()?;
+        Ok(Expr::TryRescue {
+            try_body,
+            err_param,
+            rescue_body,
+        })
+    }
     fn parse_expr(&mut self) -> Result<Expr, Box<dyn Error>> {
         self.parse_or()
     }
@@ -370,6 +401,7 @@ impl Parser {
             Token::LBracket => self.parse_array_literal(),
             Token::If => self.parse_if_expr(),
             Token::While => self.parse_while_expr(),
+            Token::Try => self.parse_try_rescue(),
             Token::Newline if self.depth > 0 => {
                 // delimiter の内側では改行を透過的に無視する(式の途中を含む)。
                 self.bump();
@@ -868,6 +900,15 @@ impl Parser {
                 Expr::While { cond, body } => {
                     stack.push((cond, child_depth));
                     for child in body {
+                        self.validate_stmt_depth_iterative(child, child_depth, max)?;
+                    }
+                }
+                Expr::TryRescue {
+                    try_body,
+                    rescue_body,
+                    ..
+                } => {
+                    for child in try_body.iter().chain(rescue_body) {
                         self.validate_stmt_depth_iterative(child, child_depth, max)?;
                     }
                 }

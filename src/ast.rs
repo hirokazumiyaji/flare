@@ -40,6 +40,11 @@ pub enum Expr {
         cond: Box<Expr>,
         body: Vec<Stmt>,
     },
+    TryRescue {
+        try_body: Vec<Stmt>,
+        err_param: Option<String>,
+        rescue_body: Vec<Stmt>,
+    },
 }
 
 /// An argument to a call, retaining its position in the source.

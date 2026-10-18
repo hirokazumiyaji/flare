@@ -18,13 +18,14 @@ use crate::runtime::Runtime;
 use crate::storage::Storage;
 
 pub const KEYWORDS: &[&str] = &[
-    "fn", "return", "if", "else", "while", "nil", "true", "false",
+    "fn", "return", "if", "else", "while", "try", "rescue", "nil", "true", "false",
 ];
 
 pub const MODULES: &[&str] = &["Firestore", "Auth", "Storage"];
 
 pub const BUILTINS: &[&str] = &[
     "puts",
+    "raise",
     "doc",
     "col",
     "col_group",

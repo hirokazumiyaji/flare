@@ -194,7 +194,7 @@ a = 2   # Error: reassignment is not allowed: a
 ```
 
 - Variables cannot be reassigned. Function names share the same namespace and cannot be redefined.
-- Defining a function with a built-in name (`puts`, `get`, `set`, `update`, `delete`, `batch`, `transaction`, `doc`, `col`, `col_group`, `array`, `len`, `now`, `timestamp`, `bytes`, `server_timestamp`, `array_union`, `array_remove`, `delete_field`, `increment`, `storage_upload`, `storage_download`, `storage_metadata`, `storage_delete`, `auth_sign_up`, `auth_sign_in`, `auth_current_user`, `auth_sign_out`) errors with `cannot redefine builtin: <name>`. Built-in calls always take precedence.
+- Defining a function with a built-in name (`puts`, `raise`, `get`, `set`, `update`, `delete`, `batch`, `transaction`, `doc`, `col`, `col_group`, `array`, `range`, `len`, `now`, `timestamp`, `bytes`, `server_timestamp`, `array_union`, `array_remove`, `delete_field`, `increment`, `storage_upload`, `storage_download`, `storage_metadata`, `storage_delete`, `auth_sign_up`, `auth_sign_in`, `auth_current_user`, `auth_sign_out`, `to_s`, `inspect`, `type_of`, `to_i`) errors with `cannot redefine builtin: <name>`. Built-in calls always take precedence.
 - Assigning to a name visible from an outer scope inside a function errors; shadowing is not allowed. **Function parameters** may have the same names as outer variables.
 - Parameter names cannot repeat within a function or block definition. Duplicate parameters cause a parse or definition error.
 
@@ -291,15 +291,22 @@ t2 = t1.add_seconds(10)   # t1 remains 100
 ```ruby
 if cond { ... } else if cond { ... } else { ... }   # else / else if are optional; else if may be repeated
 while cond { ... }
+try { ... } rescue |err| { ... }                    # err binding is optional; returns last evaluated value
 ```
 
-Blocks always use `{ ... }`. `if` and `while` are expressions that return the last evaluated value (`while` returns nil if it never runs).
+Blocks always use `{ ... }`. `if`, `while`, and `try / rescue` are expressions that return the last evaluated value (`while` returns nil if it never runs).
 
 A method call inside an `if` / `while` **condition cannot have a block**, to distinguish it from the body `{ ... }`. Conditions such as `if m.active { ... }` and `if f() { ... }` are valid, but calls with blocks such as `rows.each { ... }` must be written as statements.
 
-### Built-in Output
+`try { ... } rescue |err| { ... }` evaluates the `try` body. If an error occurs (such as from `raise(message)` or a backend failure like updating a missing document), the error is caught and `err` is bound to a Map `{kind: "...", message: "..."}` (with `err.kind` and `err.message` accessible via dot syntax or map index).
+Budget exceeded errors (step, wall-clock, call depth, memory limits) are uncatchable to prevent scripts from bypassing resource controls.
+When an error is rescued inside a `batch` or `transaction`, Firestore writes staged within the failing `try` block are discarded (rolled back from the batch/transaction's pending write buffer) while preserving any writes staged prior to entering `try`, allowing the enclosing batch or transaction to continue. Unstaged external side effects (such as `File.write`) are not rolled back.
+
+### Built-in Output and Error Handling
 
 `puts(v, ...)` prints each value on its own line using `to_s` and returns nil. `to_s` prints Str without quotes and all other values in `inspect` form. `inspect` is Ruby-like: `[1, "x"]`, `{"a" => 1}`, `nil`, and `"str"` (Str is double-quoted; Map keys are sorted). Bytes are shown as hex, up to the first 32 bytes, as `Bytes(00ff)`. Longer values use `Bytes(<first 32 bytes>, <omitted byte count> more bytes)`; Bytes are not decoded as Unicode. The final `fl` result prints as `=> <inspect>` (top-level Str values are quoted too). Interpolation (`#{expression}`) embeds `to_s` output, so Bytes use the same bounded `Bytes(...)` representation.
+
+`raise(message)` raises a runtime error with the given message string (or value converted to string) causing `fl` to exit with status 1 when uncaught.
 
 ## 6. Firestore API
 

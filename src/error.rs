@@ -160,3 +160,74 @@ impl fmt::Display for CapabilityError {
 }
 
 impl Error for CapabilityError {}
+
+/// An error explicitly raised by user code via `raise(msg)`.
+///
+/// Distinguishing user-raised errors from engine/budget limit errors ensures
+/// that `try / rescue` can always catch user errors, even if the message
+/// contains phrases like `"step limit exceeded"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserRaisedError {
+    pub message: String,
+    pub span: Option<Span>,
+}
+
+impl UserRaisedError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            span: None,
+        }
+    }
+
+    pub fn with_span(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
+    }
+}
+
+impl fmt::Display for UserRaisedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.span {
+            Some(span) => write!(f, "{span}: {}", self.message),
+            None => write!(f, "{}", self.message),
+        }
+    }
+}
+
+impl Error for UserRaisedError {}
+
+/// An engine-enforced budget or resource limit error.
+///
+/// Budget limit errors (e.g. step count, wall-clock time, call depth, memory/value nesting)
+/// bypass `try / rescue` blocks and propagate to terminate script execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetError {
+    pub message: String,
+    pub span: Option<Span>,
+}
+
+impl BudgetError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            span: None,
+        }
+    }
+
+    pub fn with_span(mut self, span: Span) -> Self {
+        self.span = Some(span);
+        self
+    }
+}
+
+impl fmt::Display for BudgetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.span {
+            Some(span) => write!(f, "{span}: {}", self.message),
+            None => write!(f, "{}", self.message),
+        }
+    }
+}
+
+impl Error for BudgetError {}
