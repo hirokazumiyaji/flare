@@ -510,8 +510,9 @@ fn fl_default_budgets_stop_infinite_recursion() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("call depth limit exceeded"), "{stderr:?}");
-    // The position of the failing top-level statement (`f()`), not of the fn.
-    assert!(stderr.starts_with("error: 1:16: "), "{stderr:?}");
+    // The position of the failing call inside f(), and stack trace contains top-level call.
+    assert!(stderr.starts_with("error: 1:10: "), "{stderr:?}");
+    assert!(stderr.contains("in f at 1:16"), "{stderr:?}");
 }
 
 #[test]

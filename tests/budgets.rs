@@ -351,18 +351,22 @@ fn scalar_results_count_against_the_value_node_limit() {
 
 #[test]
 fn external_asts_are_depth_checked_before_evaluation() {
-    use flare::ast::{Expr, Stmt, UnOp};
+    use flare::ast::{Expr, ExprKind, Stmt, UnOp};
+    use flare::Span;
 
     // An embedder can hand the public API an AST it built itself, so the
     // parser-depth budget has to hold for ASTs that never went through the
     // parser. A unary chain far past the default depth of 128 would otherwise
     // recurse through `eval_expr` until the thread stack is gone.
-    let mut expr = Expr::Int(1);
+    let mut expr = Expr::new(ExprKind::Int(1), Span::new(1, 1));
     for _ in 0..5_000 {
-        expr = Expr::Unary {
-            op: UnOp::Neg,
-            expr: Box::new(expr),
-        };
+        expr = Expr::new(
+            ExprKind::Unary {
+                op: UnOp::Neg,
+                expr: Box::new(expr),
+            },
+            Span::new(1, 1),
+        );
     }
     let stmt = Stmt::Expr(expr);
     let mut rt = runtime_with(RuntimeLimits::default());

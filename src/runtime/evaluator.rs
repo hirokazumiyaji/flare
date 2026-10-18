@@ -1,6 +1,9 @@
 use std::ops::{ControlFlow, Deref, DerefMut};
 
-use crate::error::{BudgetError, CapabilityError, ErrorKind, ServiceId, UserRaisedError};
+use crate::ast::ExprKind;
+use crate::error::{
+    add_call_frame, BudgetError, CapabilityError, ErrorKind, ServiceId, Span, UserRaisedError,
+};
 use crate::services::ServiceAccess;
 use crate::value::validate_value_limits;
 
@@ -476,9 +479,12 @@ impl Evaluator<'_> {
     /// result cannot be materialized and handed to the script before the
     /// budget rejects it.
     pub(super) fn eval_expr(&mut self, expr: &Expr) -> Result<ExecFlow, Box<dyn Error>> {
-        let flow = self.eval_expr_inner(expr)?;
+        let flow = self
+            .eval_expr_inner(expr)
+            .map_err(|e| attach_expr_span(e, expr.span))?;
         if let ExecFlow::Value(value) = &flow {
-            self.check_value(value)?;
+            self.check_value(value)
+                .map_err(|e| attach_expr_span(e, expr.span))?;
         }
         Ok(flow)
     }
@@ -489,10 +495,10 @@ impl Evaluator<'_> {
     }
 
     pub(super) fn eval_expr_inner(&mut self, expr: &Expr) -> Result<ExecFlow, Box<dyn Error>> {
-        match expr {
-            Expr::Int(i) => Ok(ExecFlow::Value(Value::Int(*i))),
-            Expr::Str(s) => Ok(ExecFlow::Value(Value::Str(s.clone()))),
-            Expr::StrInterp(pieces) => {
+        match &expr.kind {
+            ExprKind::Int(i) => Ok(ExecFlow::Value(Value::Int(*i))),
+            ExprKind::Str(s) => Ok(ExecFlow::Value(Value::Str(s.clone()))),
+            ExprKind::StrInterp(pieces) => {
                 let mut out = String::new();
                 for piece in pieces {
                     match piece {
@@ -527,15 +533,15 @@ impl Evaluator<'_> {
                 }
                 Ok(ExecFlow::Value(Value::Str(out)))
             }
-            Expr::Bool(b) => Ok(ExecFlow::Value(Value::Bool(*b))),
-            Expr::Nil => Ok(ExecFlow::Value(Value::Nil)),
-            Expr::Var(name) => match self.get_var(name).cloned() {
+            ExprKind::Bool(b) => Ok(ExecFlow::Value(Value::Bool(*b))),
+            ExprKind::Nil => Ok(ExecFlow::Value(Value::Nil)),
+            ExprKind::Var(name) => match self.get_var(name).cloned() {
                 Some(value) => Ok(ExecFlow::Value(value)),
                 None => BuiltinModule::from_name(name)
                     .map(|module| ExecFlow::Value(Value::Module(module)))
                     .ok_or_else(|| format!("undefined variable: {name}").into()),
             },
-            Expr::Binary { left, op, right } => {
+            ExprKind::Binary { left, op, right } => {
                 let l = match self.eval_expr(left)? {
                     ExecFlow::Value(v) => v,
                     flow @ ExecFlow::Return(_) => return Ok(flow),
@@ -619,7 +625,7 @@ impl Evaluator<'_> {
                     }
                 }
             }
-            Expr::Unary { op, expr } => {
+            ExprKind::Unary { op, expr } => {
                 let v = match self.eval_expr(expr)? {
                     ExecFlow::Value(v) => v,
                     flow @ ExecFlow::Return(_) => return Ok(flow),
@@ -628,11 +634,15 @@ impl Evaluator<'_> {
                     UnOp::Not => Value::Bool(!v.truthy()),
                     UnOp::Neg => match v {
                         Value::Int(i) => Value::Int(i.checked_neg().ok_or("integer overflow")?),
-                        _ => return Err("unsupported unary - operand".into()),
+                        _ => {
+                            return Err(
+                                format!("unsupported unary - operand: {}", v.type_name()).into()
+                            )
+                        }
                     },
                 }))
             }
-            Expr::Map(entries) => {
+            ExprKind::Map(entries) => {
                 let mut out = BTreeMap::new();
                 for (k, expr) in entries {
                     match self.eval_expr(expr)? {
@@ -644,7 +654,7 @@ impl Evaluator<'_> {
                 }
                 Ok(ExecFlow::Value(Value::Map(out)))
             }
-            Expr::Array(items) => {
+            ExprKind::Array(items) => {
                 let mut out = vec![];
                 for item in items {
                     match self.eval_expr(item)? {
@@ -654,7 +664,7 @@ impl Evaluator<'_> {
                 }
                 Ok(ExecFlow::Value(Value::Array(out)))
             }
-            Expr::Index { base, index } => {
+            ExprKind::Index { base, index } => {
                 let base = match self.eval_expr(base)? {
                     ExecFlow::Value(v) => v,
                     flow @ ExecFlow::Return(_) => return Ok(flow),
@@ -665,14 +675,14 @@ impl Evaluator<'_> {
                 };
                 eval_index(base, index).map(ExecFlow::Value)
             }
-            Expr::FieldAccess { receiver, name } => {
+            ExprKind::FieldAccess { receiver, name } => {
                 let base = match self.eval_expr(receiver)? {
                     ExecFlow::Value(v) => v,
                     flow @ ExecFlow::Return(_) => return Ok(flow),
                 };
                 self.eval_field_access(base, name).map(ExecFlow::Value)
             }
-            Expr::Call {
+            ExprKind::Call {
                 receiver,
                 name,
                 args,
@@ -682,11 +692,12 @@ impl Evaluator<'_> {
                 // nested call expression must consume depth as well, so the
                 // guard is entered before the receiver runs.
                 self.enter_call()?;
-                let outcome = self.eval_call_body(receiver.as_deref(), name, args, block.as_ref());
+                let outcome =
+                    self.eval_call_body(receiver.as_deref(), name, args, block.as_ref(), expr.span);
                 self.leave_call();
                 outcome
             }
-            Expr::If {
+            ExprKind::If {
                 cond,
                 then_body,
                 else_body,
@@ -698,7 +709,7 @@ impl Evaluator<'_> {
                 let body = if cond.truthy() { then_body } else { else_body };
                 self.eval_block(body)
             }
-            Expr::While { cond, body } => {
+            ExprKind::While { cond, body } => {
                 let mut last = Value::Nil;
                 loop {
                     // The condition evaluation itself is a checkpoint: a long
@@ -719,7 +730,7 @@ impl Evaluator<'_> {
                 }
                 Ok(ExecFlow::Value(last))
             }
-            Expr::TryRescue {
+            ExprKind::TryRescue {
                 try_body,
                 err_param,
                 rescue_body,
@@ -783,20 +794,20 @@ impl Evaluator<'_> {
                     }
                 }
             }
-            Expr::Fn { params, body } => {
+            ExprKind::Fn { params, body } => {
                 validate_func_params(params, "function")?;
                 Ok(ExecFlow::Value(Value::Func(UserFunc {
                     params: params.clone(),
                     body: body.clone(),
                 })))
             }
-            Expr::Invoke {
+            ExprKind::Invoke {
                 callee,
                 args,
                 block,
             } => {
                 self.enter_call()?;
-                let outcome = self.eval_invoke_body(callee, args, block.as_ref());
+                let outcome = self.eval_invoke_body(callee, args, block.as_ref(), expr.span);
                 self.leave_call();
                 outcome
             }
@@ -833,6 +844,7 @@ impl Evaluator<'_> {
         name: &str,
         args: &[CallArg],
         block: Option<&Block>,
+        call_span: Span,
     ) -> Result<ExecFlow, Box<dyn Error>> {
         {
             // Validate the call shape before evaluating argument
@@ -846,10 +858,13 @@ impl Evaluator<'_> {
             // can run.
             validate_unique_keywords(args)?;
             let receiver_value = match receiver {
-                Some(expr) => Some(into_method_receiver(match self.eval_expr(expr)? {
-                    ExecFlow::Value(v) => v,
-                    flow @ ExecFlow::Return(_) => return Ok(flow),
-                })?),
+                Some(expr) => Some(into_method_receiver(
+                    match self.eval_expr(expr)? {
+                        ExecFlow::Value(v) => v,
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    },
+                    name,
+                )?),
                 None => None,
             };
             let spec = if let Some(MethodReceiver::Module(module)) = receiver_value.as_ref() {
@@ -910,7 +925,7 @@ impl Evaluator<'_> {
                 ControlFlow::Continue(pair) => pair,
                 ControlFlow::Break(flow) => return Ok(flow),
             };
-            self.eval_call(receiver_value, name, argv, kw, block)
+            self.eval_call(receiver_value, name, argv, kw, block, call_span)
         }
     }
 
@@ -919,6 +934,7 @@ impl Evaluator<'_> {
         callee: &Expr,
         args: &[CallArg],
         block: Option<&Block>,
+        call_span: Span,
     ) -> Result<ExecFlow, Box<dyn Error>> {
         validate_unique_keywords(args)?;
         let callee_val = match self.eval_expr(callee)? {
@@ -942,6 +958,7 @@ impl Evaluator<'_> {
             ControlFlow::Break(flow) => return Ok(flow),
         };
         self.call_user_func(&func, argv, kw)
+            .map_err(|e| add_call_frame(e, "<anonymous>", call_span))
     }
 
     /// Evaluate a call argument list into positional and keyword value
@@ -1022,6 +1039,7 @@ impl Evaluator<'_> {
         args: Vec<Value>,
         kwargs: BTreeMap<String, Value>,
         block: Option<&Block>,
+        call_span: Span,
     ) -> Result<ExecFlow, Box<dyn Error>> {
         if let Some(rec) = receiver {
             if let MethodReceiver::Module(module) = rec {
@@ -1050,6 +1068,7 @@ impl Evaluator<'_> {
             );
         };
         self.call_user_func(&func, args, kwargs)
+            .map_err(|e| add_call_frame(e, name, call_span))
     }
 
     pub(super) fn call_user_func(
