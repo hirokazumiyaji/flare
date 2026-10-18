@@ -340,6 +340,12 @@ impl Value {
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
             (Value::Timestamp(x), Value::Timestamp(y)) => x.seconds.cmp(&y.seconds),
             (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
+            (Value::Array(x), Value::Array(y)) => x
+                .iter()
+                .zip(y.iter())
+                .map(|(a, b)| a.cmp_for_order(b))
+                .find(|o| o.is_ne())
+                .unwrap_or_else(|| x.len().cmp(&y.len())),
             _ => type_rank(self).cmp(&type_rank(other)),
         }
     }

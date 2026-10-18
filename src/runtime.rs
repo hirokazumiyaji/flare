@@ -633,10 +633,15 @@ fn bytes_method_contract(name: &str) -> Option<CallContract> {
 fn array_method_contract(name: &str) -> Option<CallContract> {
     match name {
         "each" | "map" | "filter" | "select" | "reject" | "find" | "each_with_index"
-        | "map_with_index" => Some(CallContract::exact(0).requiring_block()),
+        | "map_with_index" | "sort_by" | "any" | "all" => {
+            Some(CallContract::exact(0).requiring_block())
+        }
         "reduce" | "inject" => Some(CallContract::range(0, 1).requiring_block()),
-        "len" => Some(CallContract::exact(0)),
+        "len" | "sort" | "reverse" | "first" | "last" | "uniq" | "flatten" => {
+            Some(CallContract::exact(0))
+        }
         "contains" => Some(CallContract::exact(1)),
+        "slice" => Some(CallContract::exact(2)),
         "join" => Some(CallContract::range(0, 1)),
         _ => None,
     }
@@ -652,16 +657,17 @@ fn int_method_contract(name: &str) -> Option<CallContract> {
 
 fn str_method_contract(name: &str) -> Option<CallContract> {
     match name {
-        "len" | "trim" | "to_i" => Some(CallContract::exact(0)),
+        "len" | "trim" | "to_i" | "upcase" | "downcase" => Some(CallContract::exact(0)),
         "split" | "starts_with" | "ends_with" | "contains" => Some(CallContract::exact(1)),
+        "replace" | "slice" => Some(CallContract::exact(2)),
         _ => None,
     }
 }
 
 fn map_method_contract(name: &str) -> Option<CallContract> {
     match name {
-        "keys" | "values" | "len" => Some(CallContract::exact(0)),
-        "has_key" => Some(CallContract::exact(1)),
+        "keys" | "values" | "len" | "entries" => Some(CallContract::exact(0)),
+        "has_key" | "delete" | "merge" => Some(CallContract::exact(1)),
         _ => Some(CallContract::exact(0)),
     }
 }
@@ -707,7 +713,9 @@ fn method_call_label(receiver: &MethodReceiver, name: &str) -> String {
         MethodReceiver::Bytes(_) => format!("bytes method {name}"),
         MethodReceiver::AuthSession(_) => format!("auth session method {name}"),
         MethodReceiver::Map(_) => match name {
-            "keys" | "values" | "len" | "has_key" => format!("map method {name}"),
+            "keys" | "values" | "len" | "has_key" | "entries" | "delete" | "merge" => {
+                format!("map method {name}")
+            }
             _ => format!("map key access {name}"),
         },
         MethodReceiver::Module(module) => format!("{}.{name}", module.name()),

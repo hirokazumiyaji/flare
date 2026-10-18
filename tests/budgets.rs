@@ -625,3 +625,27 @@ fn array_concatenation_respects_value_depth_budget() {
     let err = rt.run("[[1]] + []").unwrap_err();
     assert_budget_error(err, "value nesting limit exceeded");
 }
+
+#[test]
+fn extended_array_methods_charge_loop_iterations() {
+    let items: Vec<String> = (0..50).rev().map(|i| i.to_string()).collect();
+    let src = format!("[{}].sort()", items.join(","));
+    let mut rt = runtime_with(RuntimeLimits::default().with_max_loop_iterations(5));
+    let err = rt.run(&src).unwrap_err();
+    assert_budget_error(err, "loop iteration limit exceeded");
+
+    let src = format!("[{}].sort_by {{ |x| x }}", items.join(","));
+    let mut rt = runtime_with(RuntimeLimits::default().with_max_loop_iterations(5));
+    let err = rt.run(&src).unwrap_err();
+    assert_budget_error(err, "loop iteration limit exceeded");
+
+    let src = format!("[{}].uniq()", items.join(","));
+    let mut rt = runtime_with(RuntimeLimits::default().with_max_loop_iterations(5));
+    let err = rt.run(&src).unwrap_err();
+    assert_budget_error(err, "loop iteration limit exceeded");
+
+    let src = format!("[{}].flatten()", items.join(","));
+    let mut rt = runtime_with(RuntimeLimits::default().with_max_loop_iterations(5));
+    let err = rt.run(&src).unwrap_err();
+    assert_budget_error(err, "loop iteration limit exceeded");
+}
