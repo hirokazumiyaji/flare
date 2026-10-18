@@ -372,7 +372,12 @@ pub fn ensure_file_0600(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("create_dir_all failed for {}: {e}", parent.display()),
+                )
+            })?;
         }
     }
     if !path.exists() {
@@ -381,9 +386,20 @@ pub fn ensure_file_0600(path: &std::path::Path) -> std::io::Result<()> {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .open(path)?;
+            .open(path)
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("open mode 0600 failed for {}: {e}", path.display()),
+                )
+            })?;
     } else {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("set_permissions failed for {}: {e}", path.display()),
+            )
+        })?;
     }
     Ok(())
 }
@@ -397,7 +413,12 @@ pub fn ensure_file_0600(_path: &std::path::Path) -> std::io::Result<()> {
 pub fn set_file_mode_0600(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     if path.exists() {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("set_file_mode_0600 failed for {}: {e}", path.display()),
+            )
+        })?;
     }
     Ok(())
 }

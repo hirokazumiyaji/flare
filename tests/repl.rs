@@ -428,7 +428,7 @@ fn history_file_permissions_are_0600() {
     use flare::repl::{ensure_file_0600, set_file_mode_0600};
     use std::os::unix::fs::PermissionsExt;
 
-    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_dir = tempfile::tempdir_in("/tmp").unwrap();
     let history_path = temp_dir.path().join("sub").join(".fl_history");
 
     // ensure_file_0600 creates parent dir and file with 0600

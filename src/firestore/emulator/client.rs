@@ -57,6 +57,8 @@ pub(super) fn connect(
         )
         .into());
     }
+    crate::services::validate_emulator_host(host)
+        .map_err(|e| format!("FIRESTORE_EMULATOR_HOST is invalid: {e}"))?;
     let runtime = RuntimeBuilder::new_current_thread()
         .enable_all()
         .build()

@@ -96,6 +96,7 @@ pub trait StorageTransport {
 
 /// Minimal HTTP transport for `FIREBASE_STORAGE_EMULATOR_HOST` (which is an
 /// HTTP endpoint, normally `127.0.0.1:9199`).
+#[derive(Debug)]
 pub struct HttpStorageTransport {
     address: String,
     host_header: String,
@@ -127,6 +128,8 @@ impl HttpStorageTransport {
                 "invalid storage emulator host: {raw} (expected host:port)"
             )));
         }
+        crate::services::validate_emulator_host(without_path)
+            .map_err(|e| StorageError::backend(format!("storage emulator host is invalid: {e}")))?;
         // `TcpStream::connect` accepts the familiar host:port spelling,
         // including bracketed IPv6 addresses.
         Ok(Self {
@@ -1256,7 +1259,7 @@ mod tests {
             let mut request = [0_u8; 1024];
             let _ = stream.read(&mut request);
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 200\r\nConnection: close\r\n\r\n")
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
                 .unwrap();
             let _ = stream.write_all(&[b'x'; 200]);
         });
@@ -1289,5 +1292,15 @@ mod tests {
         assert_eq!(emulator.max_bytes_size(), None);
         assert_eq!(emulator.transport().max_body_bytes(), None);
         assert_eq!(emulator.transport().max_response_bytes(), None);
+    }
+
+    #[test]
+    fn http_storage_transport_rejects_remote_host() {
+        let err = HttpStorageTransport::new("192.168.1.1:9199").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("emulator host must be a loopback address"),
+            "{err}"
+        );
     }
 }

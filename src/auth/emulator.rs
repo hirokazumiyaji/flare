@@ -138,7 +138,8 @@ impl AuthEmulator {
             ));
         }
         // The public Identity Toolkit endpoints authenticate with the API key
-        // query parameter.  No OAuth2 `Authorization` header is sent on purpose:
+        // query parameter (`?key=`). The `X-Goog-Api-Key` header is also sent for
+        // compatibility. No OAuth2 `Authorization` header is sent on purpose:
         // the emulator treats such a request as an Admin SDK call, and the
         // sign-up operation then returns a user record *without* issuing ID or
         // refresh tokens.
@@ -278,6 +279,9 @@ fn normalize_base_url(host: &str) -> Result<String, AuthError> {
             "FIREBASE_AUTH_EMULATOR_HOST contains whitespace".into(),
         ));
     }
+    crate::services::validate_emulator_host(host).map_err(|e| {
+        AuthError::Configuration(format!("FIREBASE_AUTH_EMULATOR_HOST is invalid: {e}"))
+    })?;
     let candidate = if host.contains("://") {
         host.to_string()
     } else {
@@ -291,11 +295,27 @@ fn normalize_base_url(host: &str) -> Result<String, AuthError> {
             "FIREBASE_AUTH_EMULATOR_HOST must use http or https".into(),
         ));
     }
-    if parsed.host_str().is_none() {
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(AuthError::Configuration(
-            "FIREBASE_AUTH_EMULATOR_HOST must include a host".into(),
+            "FIREBASE_AUTH_EMULATOR_HOST must not contain credentials".into(),
         ));
     }
+    if parsed.query().is_some() {
+        return Err(AuthError::Configuration(
+            "FIREBASE_AUTH_EMULATOR_HOST must not contain query parameters".into(),
+        ));
+    }
+    if parsed.path() != "" && parsed.path() != "/" {
+        return Err(AuthError::Configuration(
+            "FIREBASE_AUTH_EMULATOR_HOST must not contain path segments".into(),
+        ));
+    }
+    let host_str = parsed.host_str().ok_or_else(|| {
+        AuthError::Configuration("FIREBASE_AUTH_EMULATOR_HOST must include a host".into())
+    })?;
+    crate::services::validate_emulator_host(host_str).map_err(|e| {
+        AuthError::Configuration(format!("FIREBASE_AUTH_EMULATOR_HOST is invalid: {e}"))
+    })?;
     Ok(candidate.trim_end_matches('/').to_string())
 }
 
@@ -577,5 +597,65 @@ mod tests {
             }
         });
         assert!(matches!(construction, AuthError::Configuration(_)));
+    }
+
+    #[test]
+    fn auth_emulator_rejects_remote_host() {
+        let err = normalize_base_url("192.168.1.1:9099").unwrap_err();
+        assert!(matches!(err, AuthError::Configuration(ref msg) if msg.contains("loopback")));
+    }
+
+    #[test]
+    fn auth_emulator_rejects_paths_and_credentials() {
+        assert!(normalize_base_url("http://localhost:9099/proxy").is_err());
+        assert!(normalize_base_url("http://user:pass@localhost:9099").is_err());
+        assert!(normalize_base_url("http://localhost:9099?query=1").is_err());
+    }
+
+    #[test]
+    fn auth_emulator_sends_api_key() {
+        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skip: sandbox does not permit local TCP listeners");
+                return;
+            }
+            Err(error) => panic!("could not bind local test server: {error}"),
+        };
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let read = std::io::Read::read(&mut stream, &mut request).unwrap();
+            let req_str = std::str::from_utf8(&request[..read]).unwrap();
+            let path = req_str.lines().next().unwrap();
+            assert!(
+                path.contains("key=my-secret-api-key"),
+                "path must contain api key: {path}"
+            );
+            assert!(
+                req_str
+                    .to_lowercase()
+                    .contains("x-goog-api-key: my-secret-api-key"),
+                "request must contain x-goog-api-key header: {req_str}"
+            );
+            std::io::Write::write_all(
+                &mut stream,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+            )
+            .unwrap();
+        });
+        let auth = AuthEmulator::new_with_options(
+            address.to_string(),
+            "project",
+            AuthEmulatorOptions {
+                api_key: "my-secret-api-key".into(),
+                ..AuthEmulatorOptions::default()
+            },
+        )
+        .unwrap();
+        let resp = auth.post("accounts:lookup", json!({})).unwrap();
+        assert_eq!(resp, json!({}));
+        server.join().unwrap();
     }
 }

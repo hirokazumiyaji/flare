@@ -320,6 +320,10 @@ fn validate_config(name: &str, value: &str) -> Result<(), Box<dyn Error>> {
     if value.trim().is_empty() {
         return Err(format!("{name} must not be empty").into());
     }
+    if name == "FIRESTORE_EMULATOR_HOST" {
+        crate::services::validate_emulator_host(value)
+            .map_err(|e| format!("{name} is invalid: {e}"))?;
+    }
     Ok(())
 }
 
