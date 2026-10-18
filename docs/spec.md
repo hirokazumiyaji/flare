@@ -154,7 +154,9 @@ rows[0]["__name__"]  # => "users/1" (query-result Map indexing; __name__ is acce
 - Map indices must be **Str**; Array and Str indices must be **Int**. A type mismatch is an error.
 - Missing keys and out-of-range indices return **nil**, as in Ruby. Negative indices also return nil.
 - Indexing a receiver other than Map, Array, or Str is an error (`unsupported index receiver`).
-- The `m.key` form is limited to Map receivers to avoid conflicts with methods such as `.doc(..)` / `.where(..)` on Ref / Query values. A missing key returns nil. Calling it with arguments (`m.key(...)`) is an error (unless calling a map method such as `.has_key(k)`).
+- The `m.key` form without parentheses is field access on Maps (and AuthSession). It accesses the map key directly, even when the key matches a Map method name (`keys`, `values`, `len`, `has_key`, `entries`, `delete`, `merge`). A missing key returns **nil**.
+- Calling `m.method(...)` with parentheses or a block is a method call. Map methods are `.keys()`, `.values()`, `.len()`, `.has_key(k)`, `.entries()`, `.delete(k)`, and `.merge(other)`. Calling an unknown method with parentheses on a Map reports an error (`unknown map method: ...`).
+- Receivers other than Map (such as Array, Str, Bytes) do not support field access; unparenthesized `a.len` is an error (`field access is only supported on map`). Use `a.len()` or `len(a)` instead.
 
 ### Operators and Precedence (Low to High)
 

@@ -665,6 +665,13 @@ impl Evaluator<'_> {
                 };
                 eval_index(base, index).map(ExecFlow::Value)
             }
+            Expr::FieldAccess { receiver, name } => {
+                let base = match self.eval_expr(receiver)? {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                };
+                self.eval_field_access(base, name).map(ExecFlow::Value)
+            }
             Expr::Call {
                 receiver,
                 name,
@@ -793,6 +800,28 @@ impl Evaluator<'_> {
                 self.leave_call();
                 outcome
             }
+        }
+    }
+
+    fn eval_field_access(&mut self, base: Value, name: &str) -> Result<Value, Box<dyn Error>> {
+        match base {
+            Value::Map(map) => Ok(map.get(name).cloned().unwrap_or(Value::Nil)),
+            Value::AuthSession(session) => Ok(auth_session_field(&session, name)),
+            Value::Module(module) => {
+                if let Some(spec) = lookup_module_builtin(module, name) {
+                    if spec.contract.positional == PositionalArity::Exact(0)
+                        && spec.contract.block == BlockPolicy::Forbidden
+                    {
+                        if let Some(service) = spec.required_service {
+                            self.require_service(service)?;
+                        }
+                        let flow = (spec.handler)(self, vec![], BTreeMap::new(), None)?;
+                        return Ok(flow.into_value());
+                    }
+                }
+                Err(format!("unknown module method: {}.{name}", module.name()).into())
+            }
+            _ => Err("field access is only supported on map".into()),
         }
     }
 
@@ -1170,14 +1199,7 @@ impl Evaluator<'_> {
                     new_map.extend(other.clone());
                     Ok(ExecFlow::Value(Value::Map(new_map)))
                 }
-                _ => {
-                    if !args.is_empty() {
-                        return Err(format!("unknown map method: {name}").into());
-                    }
-                    Ok(ExecFlow::Value(
-                        map.get(name).cloned().unwrap_or(Value::Nil),
-                    ))
-                }
+                _ => Err(format!("unknown map method: {name}").into()),
             },
             MethodReceiver::Str(s) => match name {
                 "len" => Ok(ExecFlow::Value(Value::Int(s.chars().count() as i64))),
@@ -1252,11 +1274,8 @@ impl Evaluator<'_> {
                 }
                 _ => Err(format!("unknown string method: {name}").into()),
             },
-            MethodReceiver::AuthSession(session) => {
-                if !args.is_empty() {
-                    return Err(format!("unknown auth session method: {name}").into());
-                }
-                Ok(ExecFlow::Value(auth_session_field(&session, name)))
+            MethodReceiver::AuthSession(_) => {
+                Err(format!("unknown auth session method: {name}").into())
             }
             MethodReceiver::Module(module) => {
                 let spec = lookup_module_builtin(module, name)

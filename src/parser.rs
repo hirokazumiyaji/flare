@@ -339,13 +339,22 @@ impl Parser {
                 self.bump();
                 self.skip_newlines_inside_delimiter();
                 let name = self.expect_ident()?;
-                let args = self.parse_args()?;
-                expr = Expr::Call {
-                    receiver: Some(Box::new(expr)),
-                    name,
-                    args,
-                    block: self.parse_optional_brace_block()?,
-                };
+                if self.at(&Token::LParen)
+                    || (self.at(&Token::LBrace) && self.suppress_block_calls == 0)
+                {
+                    let args = self.parse_args()?;
+                    expr = Expr::Call {
+                        receiver: Some(Box::new(expr)),
+                        name,
+                        args,
+                        block: self.parse_optional_brace_block()?,
+                    };
+                } else {
+                    expr = Expr::FieldAccess {
+                        receiver: Box::new(expr),
+                        name,
+                    };
+                }
             } else if self.at(&Token::LBracket) {
                 self.bump();
                 self.enter_nesting()?;
@@ -905,7 +914,9 @@ impl Parser {
                     stack.push((left, child_depth));
                     stack.push((right, child_depth));
                 }
-                Expr::Unary { expr, .. } => stack.push((expr, child_depth)),
+                Expr::Unary { expr, .. } | Expr::FieldAccess { receiver: expr, .. } => {
+                    stack.push((expr, child_depth))
+                }
                 Expr::Call {
                     receiver,
                     args,

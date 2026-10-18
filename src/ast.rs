@@ -25,6 +25,10 @@ pub enum Expr {
         args: Vec<CallArg>,
         block: Option<Block>,
     },
+    FieldAccess {
+        receiver: Box<Expr>,
+        name: String,
+    },
     Map(Vec<(String, Expr)>),
     Array(Vec<Expr>),
     Index {

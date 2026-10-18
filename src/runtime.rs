@@ -421,7 +421,7 @@ const BYTES_USAGE: &str = "bytes expects one string or an array of integers from
 const BYTES_ELEMENT_ERR: &str = "bytes array elements must be integers from 0 to 255";
 
 /// The positional part of a call contract.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum PositionalArity {
     Exact(usize),
     Range(usize, usize),
@@ -623,11 +623,8 @@ fn query_method_contract(name: &str) -> Option<CallContract> {
     }
 }
 
-fn auth_session_method_contract(name: &str) -> Option<CallContract> {
-    // Field-style access has no fixed method set; any name with no args is a
-    // field read, anything else is rejected by dispatch.
-    let _ = name;
-    Some(CallContract::exact(0))
+fn auth_session_method_contract(_name: &str) -> Option<CallContract> {
+    None
 }
 
 fn bytes_method_contract(name: &str) -> Option<CallContract> {
@@ -675,7 +672,7 @@ fn map_method_contract(name: &str) -> Option<CallContract> {
     match name {
         "keys" | "values" | "len" | "entries" => Some(CallContract::exact(0)),
         "has_key" | "delete" | "merge" => Some(CallContract::exact(1)),
-        _ => Some(CallContract::exact(0)),
+        _ => None,
     }
 }
 
@@ -719,12 +716,7 @@ fn method_call_label(receiver: &MethodReceiver, name: &str) -> String {
         MethodReceiver::Timestamp(_) => format!("timestamp method {name}"),
         MethodReceiver::Bytes(_) => format!("bytes method {name}"),
         MethodReceiver::AuthSession(_) => format!("auth session method {name}"),
-        MethodReceiver::Map(_) => match name {
-            "keys" | "values" | "len" | "has_key" | "entries" | "delete" | "merge" => {
-                format!("map method {name}")
-            }
-            _ => format!("map key access {name}"),
-        },
+        MethodReceiver::Map(_) => format!("map method {name}"),
         MethodReceiver::Module(module) => format!("{}.{name}", module.name()),
         MethodReceiver::Other(_) => format!("{} method {name}", receiver.type_name()),
     }
