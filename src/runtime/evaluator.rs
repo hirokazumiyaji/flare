@@ -1037,6 +1037,31 @@ impl Evaluator<'_> {
                     };
                     Ok(ExecFlow::Value(Value::Bool(map.contains_key(key))))
                 }
+                "entries" => {
+                    let entries = map
+                        .iter()
+                        .map(|(k, v)| Value::Array(vec![Value::Str(k.clone()), v.clone()]))
+                        .collect();
+                    Ok(ExecFlow::Value(Value::Array(entries)))
+                }
+                "delete" => {
+                    let key = match args.first() {
+                        Some(Value::Str(k)) => k,
+                        _ => return Err("delete key must be a string".into()),
+                    };
+                    let mut new_map = map.clone();
+                    new_map.remove(key);
+                    Ok(ExecFlow::Value(Value::Map(new_map)))
+                }
+                "merge" => {
+                    let other = match args.first() {
+                        Some(Value::Map(m)) => m,
+                        _ => return Err("merge argument must be a map".into()),
+                    };
+                    let mut new_map = map.clone();
+                    new_map.extend(other.clone());
+                    Ok(ExecFlow::Value(Value::Map(new_map)))
+                }
                 _ => {
                     if !args.is_empty() {
                         return Err(format!("unknown map method: {name}").into());
@@ -1049,6 +1074,39 @@ impl Evaluator<'_> {
             MethodReceiver::Str(s) => match name {
                 "len" => Ok(ExecFlow::Value(Value::Int(s.chars().count() as i64))),
                 "trim" => Ok(ExecFlow::Value(Value::Str(s.trim().to_string()))),
+                "upcase" => Ok(ExecFlow::Value(Value::Str(s.to_uppercase()))),
+                "downcase" => Ok(ExecFlow::Value(Value::Str(s.to_lowercase()))),
+                "replace" => {
+                    let from = match args.first() {
+                        Some(Value::Str(from)) => from,
+                        _ => return Err("replace pattern must be a string".into()),
+                    };
+                    let to = match args.get(1) {
+                        Some(Value::Str(to)) => to,
+                        _ => return Err("replace replacement must be a string".into()),
+                    };
+                    Ok(ExecFlow::Value(Value::Str(s.replace(from, to))))
+                }
+                "slice" => {
+                    let start = match args.first() {
+                        Some(Value::Int(start)) => *start,
+                        _ => return Err("slice start must be an int".into()),
+                    };
+                    let len = match args.get(1) {
+                        Some(Value::Int(len)) => *len,
+                        _ => return Err("slice len must be an int".into()),
+                    };
+                    if start < 0 {
+                        return Err("slice start must be >= 0".into());
+                    }
+                    if len < 0 {
+                        return Err("slice len must be >= 0".into());
+                    }
+                    let start = start as usize;
+                    let len = len as usize;
+                    let out: String = s.chars().skip(start).take(len).collect();
+                    Ok(ExecFlow::Value(Value::Str(out)))
+                }
                 "split" => {
                     let sep = match args.first() {
                         Some(Value::Str(sep)) => sep,
@@ -1315,6 +1373,139 @@ impl Evaluator<'_> {
                 Ok(ExecFlow::Value(Value::Str(out)))
             }
             "len" => Ok(ExecFlow::Value(Value::Int(items.len() as i64))),
+            "sort" => {
+                let mut sorted = items;
+                let mut sort_err: Option<Box<dyn Error>> = None;
+                sorted.sort_by(|a, b| {
+                    if sort_err.is_some() {
+                        return std::cmp::Ordering::Equal;
+                    }
+                    if let Err(e) = self.consume_loop_iteration() {
+                        sort_err = Some(e);
+                        return std::cmp::Ordering::Equal;
+                    }
+                    Value::cmp_for_order(a, b)
+                });
+                if let Some(err) = sort_err {
+                    return Err(err);
+                }
+                Ok(ExecFlow::Value(Value::Array(sorted)))
+            }
+            "sort_by" => {
+                let Some(block) = block else {
+                    return Err("sort_by requires { ... } block".into());
+                };
+                check_block_arity(block, 1)?;
+                let mut keyed = Vec::with_capacity(items.len());
+                for item in items {
+                    self.consume_loop_iteration()?;
+                    match self.call_block(block, vec![item.clone()])? {
+                        ExecFlow::Value(k) => keyed.push((k, item)),
+                        ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
+                    }
+                }
+                let mut sort_err: Option<Box<dyn Error>> = None;
+                keyed.sort_by(|(k1, _), (k2, _)| {
+                    if sort_err.is_some() {
+                        return std::cmp::Ordering::Equal;
+                    }
+                    if let Err(e) = self.consume_loop_iteration() {
+                        sort_err = Some(e);
+                        return std::cmp::Ordering::Equal;
+                    }
+                    k1.cmp_for_order(k2)
+                });
+                if let Some(err) = sort_err {
+                    return Err(err);
+                }
+                let sorted = keyed.into_iter().map(|(_, item)| item).collect();
+                Ok(ExecFlow::Value(Value::Array(sorted)))
+            }
+            "reverse" => {
+                let mut rev = items;
+                rev.reverse();
+                Ok(ExecFlow::Value(Value::Array(rev)))
+            }
+            "first" => Ok(ExecFlow::Value(
+                items.first().cloned().unwrap_or(Value::Nil),
+            )),
+            "last" => Ok(ExecFlow::Value(items.last().cloned().unwrap_or(Value::Nil))),
+            "slice" => {
+                let start = match args.first() {
+                    Some(Value::Int(start)) => *start,
+                    _ => return Err("slice start must be an int".into()),
+                };
+                let len = match args.get(1) {
+                    Some(Value::Int(len)) => *len,
+                    _ => return Err("slice len must be an int".into()),
+                };
+                if start < 0 {
+                    return Err("slice start must be >= 0".into());
+                }
+                if len < 0 {
+                    return Err("slice len must be >= 0".into());
+                }
+                let start = (start as usize).min(items.len());
+                let end = start.saturating_add(len as usize).min(items.len());
+                Ok(ExecFlow::Value(Value::Array(items[start..end].to_vec())))
+            }
+            "uniq" => {
+                let mut out = Vec::new();
+                for item in items {
+                    self.consume_loop_iteration()?;
+                    if !out.contains(&item) {
+                        out.push(item);
+                    }
+                }
+                Ok(ExecFlow::Value(Value::Array(out)))
+            }
+            "flatten" => {
+                let mut out = Vec::new();
+                for item in items {
+                    self.consume_loop_iteration()?;
+                    match item {
+                        Value::Array(nested) => out.extend(nested),
+                        other => out.push(other),
+                    }
+                }
+                Ok(ExecFlow::Value(Value::Array(out)))
+            }
+            "any" => {
+                let Some(block) = block else {
+                    return Err("any requires { ... } block".into());
+                };
+                check_block_arity(block, 1)?;
+                for item in items {
+                    self.consume_loop_iteration()?;
+                    match self.call_block(block, vec![item])? {
+                        ExecFlow::Value(v) => {
+                            if v.truthy() {
+                                return Ok(ExecFlow::Value(Value::Bool(true)));
+                            }
+                        }
+                        ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
+                    }
+                }
+                Ok(ExecFlow::Value(Value::Bool(false)))
+            }
+            "all" => {
+                let Some(block) = block else {
+                    return Err("all requires { ... } block".into());
+                };
+                check_block_arity(block, 1)?;
+                for item in items {
+                    self.consume_loop_iteration()?;
+                    match self.call_block(block, vec![item])? {
+                        ExecFlow::Value(v) => {
+                            if !v.truthy() {
+                                return Ok(ExecFlow::Value(Value::Bool(false)));
+                            }
+                        }
+                        ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
+                    }
+                }
+                Ok(ExecFlow::Value(Value::Bool(true)))
+            }
             _ => Err(format!("unknown array method: {name}").into()),
         }
     }

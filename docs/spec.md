@@ -247,14 +247,31 @@ total = len(rows)                                            # Number of items
 | `array.contains(val)` | Returns Bool indicating whether the array contains `val` |
 | `array.join(sep = "")` | Joins array elements as a string using the separator |
 | `array.len()` / `len(array)` | Number of items (Int) |
+| `array.sort()` | Returns a new Array with elements sorted using the total ordering (same order as `order_by`) |
+| `array.sort_by { \|item\| expr }` | Returns a new Array stably sorted by the keys evaluated by the block |
+| `array.reverse()` | Returns a new Array with elements in reverse order |
+| `array.first()` | Returns the first item in the Array, or nil if empty |
+| `array.last()` | Returns the last item in the Array, or nil if empty |
+| `array.slice(start, len)` | Returns a subarray of up to `len` elements starting at index `start`; truncated to the available range when `start` or `start + len` is past the end |
+| `array.uniq()` | Returns a new Array with duplicate elements removed, preserving first-seen order |
+| `array.flatten()` | Returns a new Array with one level of nested arrays flattened |
+| `array.any { \|item\| expr }` | Returns Bool indicating whether the block evaluates to truthy for any item |
+| `array.all { \|item\| expr }` | Returns Bool indicating whether the block evaluates to truthy for all items |
 | `map.keys()` | Returns an Array of all keys in the Map |
 | `map.values()` | Returns an Array of all values in the Map |
 | `map.has_key(key)` | Returns Bool indicating whether the Map contains the string key |
+| `map.entries()` | Returns an Array of `[key, value]` pairs, sorted by key |
+| `map.delete(key)` | Returns a copy of the Map with `key` removed |
+| `map.merge(other)` | Returns a new Map with entries from `other` merged into a copy of `self`; on key collision, the value in `other` wins |
 | `map.len()` / `len(map)` | Number of Map entries (Int) |
 | `str.split(sep)` | Splits the string into an Array of substrings |
 | `str.starts_with(prefix)` | Returns Bool indicating whether the string begins with prefix |
 | `str.ends_with(suffix)` | Returns Bool indicating whether the string ends with suffix |
 | `str.contains(substr)` | Returns Bool indicating whether the string contains substr |
+| `str.upcase()` | Returns a copy of the string converted to uppercase |
+| `str.downcase()` | Returns a copy of the string converted to lowercase |
+| `str.replace(from, to)` | Returns a copy of the string with all occurrences of `from` replaced by `to` |
+| `str.slice(start, len)` | Returns a substring of up to `len` Unicode characters starting at `start`; truncated to the available range when `start` or `start + len` is past the end |
 | `str.trim()` | Returns a copy of the string with leading and trailing whitespace removed |
 | `str.len()` / `len(str)` | Number of Unicode characters in the string (Int) |
 | `len(bytes)` | Number of Bytes bytes |
@@ -270,11 +287,11 @@ total = len(rows)                                            # Number of items
 | `array.map_with_index { \|item, i\| expr }` | Returns a new Array of block results for each item and its 0-based index (Int) |
 | `array.select { \|item\| expr }` | Alias for `filter` |
 | `array.reject { \|item\| expr }` | Returns a new Array of items for which the block evaluates to a falsey value |
-- `contains`, `has_key`, `split`, `starts_with`, `ends_with`, `str.contains`, `to_s(val)`, `inspect(val)`, `type_of(val)`, `to_i(val)` take exactly 1 argument. `array.join` and `array.reduce` take 0 or 1 argument. `range` takes 1 to 3 arguments.
-- A block is required for `each`, `map`, `filter`, `select`, `reject`, `find`, `each_with_index`, `map_with_index`, `reduce`, `inject`, and `int.times`. The number of block parameters must match the number supplied by the caller (`[1].each { \|a, b\| ... }` errors; **this is checked even for empty arrays**).
-- `each`, `map`, `filter`, `select`, `reject`, `find`, `each_with_index`, `map_with_index`, `int.times`, `array.len()`, `map.keys()`, `map.values()`, `map.len()`, `str.trim()`, `str.len()`, `val.to_s()`, `val.inspect()`, `val.type_of()`, `str.to_i()` take no positional arguments.
+- `contains`, `has_key`, `split`, `starts_with`, `ends_with`, `str.contains`, `map.delete`, `map.merge`, `to_s(val)`, `inspect(val)`, `type_of(val)`, `to_i(val)` take exactly 1 argument. `array.slice`, `str.slice`, `str.replace` take exactly 2 arguments. `array.join` and `array.reduce` take 0 or 1 argument. `range` takes 1 to 3 arguments.
+- A block is required for `each`, `map`, `filter`, `select`, `reject`, `find`, `each_with_index`, `map_with_index`, `reduce`, `inject`, `sort_by`, `any`, `all`, and `int.times`. The number of block parameters must match the number supplied by the caller (`[1].each { \|a, b\| ... }` errors; **this is checked even for empty arrays**).
+- `each`, `map`, `filter`, `select`, `reject`, `find`, `each_with_index`, `map_with_index`, `int.times`, `sort_by`, `any`, `all`, `array.len()`, `array.sort()`, `array.reverse()`, `array.first()`, `array.last()`, `array.uniq()`, `array.flatten()`, `map.keys()`, `map.values()`, `map.len()`, `map.entries()`, `str.trim()`, `str.len()`, `str.upcase()`, `str.downcase()`, `val.to_s()`, `val.inspect()`, `val.type_of()`, `str.to_i()` take no positional arguments.
 - Assigning to an outer-scope name inside a block errors, consistent with variable immutability.
-- A `return` inside a block exits the block and becomes the return value of the **enclosing function**. Iteration in `each` / `map` / `reduce` / `times` stops there, so later items are not processed. This propagation applies only when returning from a block to an outer function. A `Return` within the function itself (the body or a block in that body) is consumed as that function’s result. A nested block’s `return` belongs to the innermost **function**.
+- A `return` inside a block exits the block and becomes the return value of the **enclosing function**. Iteration in `each` / `map` / `reduce` / `times` / `find` / `filter` / `sort_by` / `any` / `all` stops there, so later items are not processed. This propagation applies only when returning from a block to an outer function. A `Return` within the function itself (the body or a block in that body) is consumed as that function’s result. A nested block’s `return` belongs to the innermost **function**.
 - There is no `for` statement. For bounded loops and iteration without reassignment, use `range(...)`, `n.times { ... }`, `each`, `each_with_index`, `map`, `map_with_index`, `reduce`, and `select`. `while` remains for special cases such as waiting on external side effects.
 
 ### Methods and Immutability

@@ -4322,3 +4322,407 @@ try {
         Value::Str("Backend: resource limit exceeded: firestore quota exhausted".into())
     );
 }
+
+#[test]
+fn array_extended_methods_issue_182() {
+    // sort() and sort_by()
+    let out = run_script("[3, 1, 4, 1, 5, 9, 2, 6].sort()").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4),
+            Value::Int(5),
+            Value::Int(6),
+            Value::Int(9),
+        ])
+    );
+
+    // sort() with mixed types follows cmp_for_order (Nil < Bool < Int < Str < Array)
+    let out = run_script(r#"[ [1], "b", 2, nil, true, 1, "a", false ].sort()"#).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Nil,
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Int(1),
+            Value::Int(2),
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+            Value::Array(vec![Value::Int(1)]),
+        ])
+    );
+
+    // sort() on nested arrays orders elements lexicographically
+    let out = run_script("[ [2, 1], [1, 2], [1, 1], [2] ].sort()").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Array(vec![Value::Int(1), Value::Int(1)]),
+            Value::Array(vec![Value::Int(1), Value::Int(2)]),
+            Value::Array(vec![Value::Int(2)]),
+            Value::Array(vec![Value::Int(2), Value::Int(1)]),
+        ])
+    );
+
+    // sort_by
+    let out = run_script(
+        r#"
+items = [{name: "banana", score: 2}, {name: "apple", score: 5}, {name: "cherry", score: 1}]
+items.sort_by { |item| item.score }.map { |item| item.name }
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("cherry".to_string()),
+            Value::Str("banana".to_string()),
+            Value::Str("apple".to_string()),
+        ])
+    );
+
+    // sort_by early return
+    let out = run_script(
+        r#"
+fn test_sort_by_return() {
+  [1, 2, 3].sort_by { |x|
+    if x == 2 {
+      return "early"
+    }
+    x
+  }
+  "after"
+}
+test_sort_by_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Str("early".to_string()));
+
+    // reverse()
+    let out = run_script("[1, 2, 3].reverse()").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(3), Value::Int(2), Value::Int(1)])
+    );
+    assert_eq!(run_script("[].reverse()").unwrap(), Value::Array(vec![]));
+
+    // first() and last()
+    assert_eq!(run_script("[10, 20, 30].first()").unwrap(), Value::Int(10));
+    assert_eq!(run_script("[10, 20, 30].last()").unwrap(), Value::Int(30));
+    assert_eq!(run_script("[].first()").unwrap(), Value::Nil);
+    assert_eq!(run_script("[].last()").unwrap(), Value::Nil);
+
+    // slice(start, len)
+    assert_eq!(
+        run_script("[10, 20, 30, 40, 50].slice(1, 3)").unwrap(),
+        Value::Array(vec![Value::Int(20), Value::Int(30), Value::Int(40)])
+    );
+    assert_eq!(
+        run_script("[10, 20, 30].slice(0, 10)").unwrap(),
+        Value::Array(vec![Value::Int(10), Value::Int(20), Value::Int(30)])
+    );
+    assert_eq!(
+        run_script("[10, 20, 30].slice(5, 2)").unwrap(),
+        Value::Array(vec![])
+    );
+    assert_eq!(
+        run_script("[10, 20, 30].slice(1, 0)").unwrap(),
+        Value::Array(vec![])
+    );
+
+    // slice validations
+    let err = run_script("[1].slice(-1, 2)").unwrap_err();
+    assert!(
+        format!("{err}").contains("slice start must be >= 0"),
+        "{err}"
+    );
+    let err = run_script("[1].slice(0, -2)").unwrap_err();
+    assert!(format!("{err}").contains("slice len must be >= 0"), "{err}");
+    let err = run_script("[1].slice(\"a\", 2)").unwrap_err();
+    assert!(
+        format!("{err}").contains("slice start must be an int"),
+        "{err}"
+    );
+    let err = run_script("[1].slice(0, \"b\")").unwrap_err();
+    assert!(
+        format!("{err}").contains("slice len must be an int"),
+        "{err}"
+    );
+
+    // uniq()
+    let out = run_script("[1, 2, 2, 3, 1, 4, 3].uniq()").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4)
+        ])
+    );
+    assert_eq!(run_script("[].uniq()").unwrap(), Value::Array(vec![]));
+
+    // flatten()
+    let out = run_script("[[1, 2], [3], 4, [[5]]].flatten()").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4),
+            Value::Array(vec![Value::Int(5)]),
+        ])
+    );
+    assert_eq!(run_script("[].flatten()").unwrap(), Value::Array(vec![]));
+
+    // any { |x| ... } and all { |x| ... }
+    assert_eq!(
+        run_script("[1, 2, 3].any { |x| x == 2 }").unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        run_script("[1, 2, 3].any { |x| x == 5 }").unwrap(),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        run_script("[].any { |x| x == 1 }").unwrap(),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        run_script("[1, 2, 3].all { |x| x > 0 }").unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        run_script("[1, 2, 3].all { |x| x > 1 }").unwrap(),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        run_script("[].all { |x| x > 0 }").unwrap(),
+        Value::Bool(true)
+    );
+
+    // block arity check on empty array
+    let err = run_script("[].any { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+    let err = run_script("[].all { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+    let err = run_script("[].sort_by { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+
+    // call contract checks
+    let err = run_script("[1].sort(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("[1].reverse(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("[1].first(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("[1].last(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("[1].uniq(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("[1].flatten(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+}
+
+#[test]
+fn str_extended_methods_issue_182() {
+    // upcase and downcase
+    assert_eq!(
+        run_script(r#""hello World!".upcase()"#).unwrap(),
+        Value::Str("HELLO WORLD!".to_string())
+    );
+    assert_eq!(
+        run_script(r#""HELLO World!".downcase()"#).unwrap(),
+        Value::Str("hello world!".to_string())
+    );
+
+    // replace
+    assert_eq!(
+        run_script(r#""banana".replace("a", "o")"#).unwrap(),
+        Value::Str("bonono".to_string())
+    );
+    assert_eq!(
+        run_script(r#""hello".replace("xyz", "abc")"#).unwrap(),
+        Value::Str("hello".to_string())
+    );
+
+    // slice
+    assert_eq!(
+        run_script(r#""hello world".slice(6, 5)"#).unwrap(),
+        Value::Str("world".to_string())
+    );
+    assert_eq!(
+        run_script(r#""hello world".slice(0, 5)"#).unwrap(),
+        Value::Str("hello".to_string())
+    );
+    assert_eq!(
+        run_script(r#""hello".slice(10, 2)"#).unwrap(),
+        Value::Str("".to_string())
+    );
+    assert_eq!(
+        run_script(r#""こんにちは".slice(1, 3)"#).unwrap(),
+        Value::Str("んにち".to_string())
+    );
+
+    // slice validations
+    let err = run_script(r#""abc".slice(-1, 2)"#).unwrap_err();
+    assert!(
+        format!("{err}").contains("slice start must be >= 0"),
+        "{err}"
+    );
+    let err = run_script(r#""abc".slice(0, -2)"#).unwrap_err();
+    assert!(format!("{err}").contains("slice len must be >= 0"), "{err}");
+    let err = run_script(r#""abc".slice("a", 2)"#).unwrap_err();
+    assert!(
+        format!("{err}").contains("slice start must be an int"),
+        "{err}"
+    );
+    let err = run_script(r#""abc".slice(0, "b")"#).unwrap_err();
+    assert!(
+        format!("{err}").contains("slice len must be an int"),
+        "{err}"
+    );
+
+    // replace validations
+    let err = run_script(r#""abc".replace(1, "x")"#).unwrap_err();
+    assert!(
+        format!("{err}").contains("replace pattern must be a string"),
+        "{err}"
+    );
+    let err = run_script(r#""abc".replace("a", 2)"#).unwrap_err();
+    assert!(
+        format!("{err}").contains("replace replacement must be a string"),
+        "{err}"
+    );
+}
+
+#[test]
+fn map_extended_methods_issue_182() {
+    // merge
+    let out = run_script(
+        r#"
+m1 = {a: 1, b: 2}
+m2 = {b: 20, c: 30}
+merged = m1.merge(m2)
+[m1, m2, merged]
+"#,
+    )
+    .unwrap();
+    let mut expected_m1 = std::collections::BTreeMap::new();
+    expected_m1.insert("a".to_string(), Value::Int(1));
+    expected_m1.insert("b".to_string(), Value::Int(2));
+
+    let mut expected_m2 = std::collections::BTreeMap::new();
+    expected_m2.insert("b".to_string(), Value::Int(20));
+    expected_m2.insert("c".to_string(), Value::Int(30));
+
+    let mut expected_merged = std::collections::BTreeMap::new();
+    expected_merged.insert("a".to_string(), Value::Int(1));
+    expected_merged.insert("b".to_string(), Value::Int(20));
+    expected_merged.insert("c".to_string(), Value::Int(30));
+
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Map(expected_m1),
+            Value::Map(expected_m2),
+            Value::Map(expected_merged),
+        ])
+    );
+
+    // delete
+    let out = run_script(
+        r#"
+orig = {a: 1, b: 2, c: 3}
+deleted = orig.delete("b")
+no_op = orig.delete("non_existent")
+[orig, deleted, no_op]
+"#,
+    )
+    .unwrap();
+    let mut expected_orig = std::collections::BTreeMap::new();
+    expected_orig.insert("a".to_string(), Value::Int(1));
+    expected_orig.insert("b".to_string(), Value::Int(2));
+    expected_orig.insert("c".to_string(), Value::Int(3));
+
+    let mut expected_deleted = std::collections::BTreeMap::new();
+    expected_deleted.insert("a".to_string(), Value::Int(1));
+    expected_deleted.insert("c".to_string(), Value::Int(3));
+
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Map(expected_orig.clone()),
+            Value::Map(expected_deleted),
+            Value::Map(expected_orig),
+        ])
+    );
+
+    // entries
+    let out = run_script(
+        r#"
+m = {b: 2, a: 1}
+m.entries()
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Array(vec![Value::Str("a".to_string()), Value::Int(1)]),
+            Value::Array(vec![Value::Str("b".to_string()), Value::Int(2)]),
+        ])
+    );
+    assert_eq!(run_script("{}.entries()").unwrap(), Value::Array(vec![]));
+
+    // type & contract errors
+    let err = run_script("{a: 1}.merge(123)").unwrap_err();
+    assert!(
+        format!("{err}").contains("merge argument must be a map"),
+        "{err}"
+    );
+    let err = run_script("{a: 1}.delete(123)").unwrap_err();
+    assert!(
+        format!("{err}").contains("delete key must be a string"),
+        "{err}"
+    );
+    let err = run_script("{a: 1}.entries(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+}
