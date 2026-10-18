@@ -1192,7 +1192,7 @@ fn builtin_call_contracts_reject_excess_arguments_and_keywords() {
             "too many positional arguments",
         ),
         ("[1].len(2)", "too many positional arguments"),
-        ("{a: 1}.a(2)", "too many positional arguments"),
+        ("{a: 1}.len(2)", "too many positional arguments"),
         (
             "set(\"users/1\", {}, mearge: true)",
             "unknown keyword arguments: mearge",
@@ -1213,7 +1213,7 @@ fn builtin_call_contracts_reject_excess_arguments_and_keywords() {
             "timestamp(1).to_unix(nope: true)",
             "unknown keyword arguments: nope",
         ),
-        ("{a: 1}.a(nope: true)", "unknown keyword arguments: nope"),
+        ("{a: 1}.len(nope: true)", "unknown keyword arguments: nope"),
     ] {
         let err = run_script(source).unwrap_err();
         assert!(format!("{err}").contains(expected), "{source}: {err}");
@@ -1324,7 +1324,7 @@ fn builtin_and_method_call_contracts_validate_block_policies() {
         ("get(\"users/1\") {}", "does not take a block"),
         ("set(\"users/1\", {}) {}", "does not take a block"),
         ("[1].len() {}", "does not take a block"),
-        ("{a: 1}.a {}", "does not take a block"),
+        ("{a: 1}.len {}", "does not take a block"),
     ] {
         let err = run_script(source).unwrap_err();
         assert!(format!("{err}").contains(expected), "{source}: {err}");
@@ -4970,4 +4970,77 @@ fn f(a, b = side_effect()) { a + b }
     );
     let hit = run_in(&mut runtime, "get(\"effects/default_eval\")[\"hit\"]").unwrap();
     assert_eq!(hit, Value::Bool(false));
+}
+
+#[test]
+fn issue_184_map_dot_access_does_not_shadow_methods_and_distinguishes_syntax() {
+    // 1. Unparenthesized access accesses keys directly, even if matching method names
+    assert_eq!(run_script("{keys: 1}.keys").unwrap(), Value::Int(1));
+    assert_eq!(run_script("{values: 1}.values").unwrap(), Value::Int(1));
+    assert_eq!(run_script("{has_key: 1}.has_key").unwrap(), Value::Int(1));
+    assert_eq!(run_script("{len: 1, a: 2}.len").unwrap(), Value::Int(1));
+
+    // 2. Parenthesized access calls the method
+    assert_eq!(
+        run_script("{keys: 1}.keys()").unwrap(),
+        Value::Array(vec![Value::Str("keys".to_string())])
+    );
+    assert_eq!(
+        run_script("{values: 1}.values()").unwrap(),
+        Value::Array(vec![Value::Int(1)])
+    );
+    assert_eq!(
+        run_script("{has_key: 1}.has_key(\"has_key\")").unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        run_script("{has_key: 1}.has_key(\"other\")").unwrap(),
+        Value::Bool(false)
+    );
+    assert_eq!(run_script("{len: 1, a: 2}.len()").unwrap(), Value::Int(2));
+
+    // 3. Missing keys return nil
+    assert_eq!(run_script("{a: 1}.keys").unwrap(), Value::Nil);
+    assert_eq!(run_script("{a: 1}.values").unwrap(), Value::Nil);
+    assert_eq!(run_script("{a: 1}.len").unwrap(), Value::Nil);
+    assert_eq!(run_script("{a: 1}.has_key").unwrap(), Value::Nil);
+    assert_eq!(run_script("{a: 1}.missing").unwrap(), Value::Nil);
+
+    // 4. Calling non-existent method with parens is an error
+    let err = run_script("{a: 1}.missing()").unwrap_err();
+    assert!(
+        format!("{err}").contains("unknown map method: missing"),
+        "{err}"
+    );
+
+    // 5. Unparenthesized field access on non-map types is an error
+    let err = run_script("[1, 2].len").unwrap_err();
+    assert!(
+        format!("{err}").contains("field access is only supported on map"),
+        "{err}"
+    );
+    let err = run_script("\"hello\".len").unwrap_err();
+    assert!(
+        format!("{err}").contains("field access is only supported on map"),
+        "{err}"
+    );
+    let err = run_script("bytes([1, 2]).len").unwrap_err();
+    assert!(
+        format!("{err}").contains("field access is only supported on map"),
+        "{err}"
+    );
+
+    // 6. Parenthesized method calls on array, string, bytes work as expected
+    assert_eq!(run_script("[1, 2].len()").unwrap(), Value::Int(2));
+    assert_eq!(run_script("\"hello\".len()").unwrap(), Value::Int(5));
+    assert_eq!(run_script("bytes([1, 2]).len()").unwrap(), Value::Int(2));
+
+    // 7. Chained field access and method calls
+    assert_eq!(
+        run_script("m = {a: {keys: 42}}\n[m.a.keys, m.a.keys()]").unwrap(),
+        Value::Array(vec![
+            Value::Int(42),
+            Value::Array(vec![Value::Str("keys".to_string())])
+        ])
+    );
 }
