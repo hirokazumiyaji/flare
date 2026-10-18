@@ -2723,10 +2723,29 @@ fn order_by_sorts_and_excludes_docs_missing_the_field() {
     ))
     .unwrap();
     assert_eq!(out, Value::Array(vec![Value::Str("nested/n1".to_string())]));
+    // dir を省略するとデフォルトで "asc" になる。
+    let out_default = run_script(&format!(
+        "{setup}\ncol(\"users\").order_by(\"age\").get().map {{ |r| r[\"__name__\"] }}"
+    ))
+    .unwrap();
+    assert_eq!(
+        out_default,
+        Value::Array(vec![
+            Value::Str("users/ob2".to_string()),
+            Value::Str("users/ob3".to_string()),
+            Value::Str("users/ob1".to_string()),
+        ])
+    );
     // 不正な向きは呼び出し時にエラー。
     let err = run_script("col(\"users\").order_by(\"age\", \"up\")").unwrap_err();
     assert!(
         format!("{err}").contains("order_by direction must be \"asc\" or \"desc\""),
+        "{err}"
+    );
+    // 引数 0 個はエラー
+    let err = run_script("col(\"users\").order_by()").unwrap_err();
+    assert!(
+        format!("{err}").contains("expects at least 1 positional arguments, got 0"),
         "{err}"
     );
 }
