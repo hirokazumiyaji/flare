@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::error::Error;
 
-use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
+use crate::ast::{BinOp, Block, CallArg, Expr, FuncParam, Stmt, StrPiece, UnOp};
 use crate::error::{FlareError, Span};
 use crate::lexer::{SpannedToken, StrPart, Token};
 use crate::limits::ParserLimits;
@@ -110,7 +110,7 @@ impl Parser {
     }
     fn parse_stmt(&mut self) -> Result<Stmt, Box<dyn Error>> {
         match self.peek() {
-            Token::Fn => self.parse_def(),
+            Token::Fn if matches!(self.peek_n(1), Some(Token::Ident(_))) => self.parse_def(),
             Token::Return => self.parse_return(),
             Token::Ident(name) if self.peek_n(1) == Some(&Token::Eq) => {
                 let name = name.clone();
@@ -127,18 +127,43 @@ impl Parser {
     fn parse_def(&mut self) -> Result<Stmt, Box<dyn Error>> {
         self.expect(Token::Fn)?;
         let name = self.expect_ident()?;
+        let params = self.parse_fn_params()?;
+        let body = self.parse_brace_block()?;
+        Ok(Stmt::Def { name, params, body })
+    }
+    fn parse_fn_params(&mut self) -> Result<Vec<FuncParam>, Box<dyn Error>> {
         let mut params = vec![];
         if self.at(&Token::LParen) {
             self.bump();
+            // Newlines inside default expressions must be transparent, as in `parse_args`.
+            self.enter_nesting()?;
+            self.depth += 1;
             let mut seen = HashSet::new();
+            let mut seen_default = false;
             let parsed = self.parse_comma_separated(Token::RParen, |p| {
-                p.parse_unique_param(&mut seen, "function")
+                let name = p.parse_unique_param(&mut seen, "function")?;
+                let default = if p.at(&Token::Eq) {
+                    p.bump();
+                    seen_default = true;
+                    Some(p.parse_expr()?)
+                } else {
+                    if seen_default {
+                        return Err(FlareError::parse(
+                            "parameter without default cannot follow parameter with default",
+                            p.peek_span(),
+                        )
+                        .into());
+                    }
+                    None
+                };
+                Ok(FuncParam { name, default })
             });
+            self.depth -= 1;
+            self.leave_nesting();
             params = parsed?;
             self.expect(Token::RParen)?;
         }
-        let body = self.parse_brace_block()?;
-        Ok(Stmt::Def { name, params, body })
+        Ok(params)
     }
     fn parse_return(&mut self) -> Result<Stmt, Box<dyn Error>> {
         self.expect(Token::Return)?;
@@ -336,6 +361,18 @@ impl Parser {
                     base: Box::new(expr),
                     index: Box::new(index),
                 };
+            } else if self.at(&Token::LParen) {
+                let args = self.parse_args()?;
+                let block = if self.suppress_block_calls == 0 {
+                    self.parse_optional_brace_block()?
+                } else {
+                    None
+                };
+                expr = Expr::Invoke {
+                    callee: Box::new(expr),
+                    args,
+                    block,
+                };
             } else {
                 break;
             }
@@ -363,6 +400,17 @@ impl Parser {
             Token::Nil => {
                 self.bump();
                 Ok(Expr::Nil)
+            }
+            Token::Fn => {
+                self.bump();
+                if let Token::Ident(_) = self.peek() {
+                    return Err(
+                        self.parse_err("named function definition cannot be used as an expression")
+                    );
+                }
+                let params = self.parse_fn_params()?;
+                let body = self.parse_brace_block()?;
+                Ok(Expr::Fn { params, body })
             }
             Token::Ident(name) => {
                 self.bump();
@@ -801,7 +849,12 @@ impl Parser {
             match stmt {
                 Stmt::Expr(expr) => self.validate_expr_depth(expr, depth, max)?,
                 Stmt::Assign { value, .. } => self.validate_expr_depth(value, depth, max)?,
-                Stmt::Def { body, .. } => {
+                Stmt::Def { params, body, .. } => {
+                    for param in params {
+                        if let Some(default) = &param.default {
+                            self.validate_expr_depth(default, depth + 1, max)?;
+                        }
+                    }
                     for child in body {
                         stack.push((child, depth + 1));
                     }
@@ -910,6 +963,35 @@ impl Parser {
                 } => {
                     for child in try_body.iter().chain(rescue_body) {
                         self.validate_stmt_depth_iterative(child, child_depth, max)?;
+                    }
+                }
+                Expr::Fn { params, body } => {
+                    for param in params {
+                        if let Some(default) = &param.default {
+                            stack.push((default, child_depth));
+                        }
+                    }
+                    for child in body {
+                        self.validate_stmt_depth_iterative(child, child_depth, max)?;
+                    }
+                }
+                Expr::Invoke {
+                    callee,
+                    args,
+                    block,
+                } => {
+                    stack.push((callee, child_depth));
+                    for arg in args {
+                        let value = match arg {
+                            CallArg::Positional(expr) => expr,
+                            CallArg::Keyword { value, .. } => value,
+                        };
+                        stack.push((value, child_depth));
+                    }
+                    if let Some(block) = block {
+                        for stmt in &block.body {
+                            self.validate_stmt_depth_iterative(stmt, child_depth, max)?;
+                        }
                     }
                 }
                 Expr::Int(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Nil | Expr::Var(_) => {}
@@ -1042,6 +1124,13 @@ mod tests {
         // `max_tokens` に遠く及ばない深さなので、token budget では防げない。
         // block の再帰に depth guard が無いとスタックを枯渇させる。
         let source = "if 1 {\n".repeat(64) + "1\n" + &"}\n".repeat(64);
+        let err = parse_with_depth(&source, 8).unwrap_err();
+        assert!(format!("{err}").contains("nesting limit exceeded"), "{err}");
+    }
+
+    #[test]
+    fn deeply_nested_anonymous_functions_are_rejected_by_the_depth_guard() {
+        let source = "fn() {\n".repeat(64) + "1\n" + &"}\n".repeat(64);
         let err = parse_with_depth(&source, 8).unwrap_err();
         assert!(format!("{err}").contains("nesting limit exceeded"), "{err}");
     }

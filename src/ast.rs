@@ -45,6 +45,21 @@ pub enum Expr {
         err_param: Option<String>,
         rescue_body: Vec<Stmt>,
     },
+    Fn {
+        params: Vec<FuncParam>,
+        body: Vec<Stmt>,
+    },
+    Invoke {
+        callee: Box<Expr>,
+        args: Vec<CallArg>,
+        block: Option<Block>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuncParam {
+    pub name: String,
+    pub default: Option<Expr>,
 }
 
 /// An argument to a call, retaining its position in the source.
@@ -90,7 +105,7 @@ pub enum Stmt {
     },
     Def {
         name: String,
-        params: Vec<String>,
+        params: Vec<FuncParam>,
         body: Vec<Stmt>,
     },
     Return(Option<Expr>),
