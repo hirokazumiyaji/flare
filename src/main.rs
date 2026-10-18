@@ -338,7 +338,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     let selected_auth = select_auth(&auth_backend, project.project_id.as_deref().unwrap())?;
     let storage: Box<dyn Storage> = match selected_storage {
         SelectedStorage::Memory => Box::new(InMemoryStorage::default()),
-        SelectedStorage::Emulator(storage) => Box::new(storage),
+        SelectedStorage::Emulator(mut storage) => {
+            storage.set_max_bytes_size(limits.max_bytes_size);
+            Box::new(storage)
+        }
     };
     #[cfg(feature = "emulator")]
     let mut firestore: Box<dyn Firestore> = Box::new(InMemoryFirestore::default());
