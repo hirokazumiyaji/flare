@@ -459,7 +459,7 @@ transaction {
 ## 10. CLI (`fl`)
 
 ```
-usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] [budget options] [--repl|-i] [<script-file> | - | -e <script>]
+usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] [budget options] [--repl|-i] [--no-history] [--history-file <path>] [<script-file> | - | -e <script>]
 ```
 
 - Specify a script source: a file path, `-` (stdin), `-e <script>` (inline script; repeated values are joined with newlines), or `--repl` / `-i` (interactive REPL). When run without arguments, `fl` launches the REPL if connected to an interactive terminal (TTY), or reads from stdin if piped. Combining `--repl` / `-i` with a file, stdin, or `-e` is an error. `--help` / `-h` prints usage. Unknown options and unknown backends for either `--backend` or `--auth-backend` exit with an error.
@@ -477,6 +477,8 @@ usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emula
   - Maintains variables, functions, and service sessions (Firestore, Auth, Storage) across statements.
   - Allows top-level variable re-assignment and function re-definition within the interactive session.
   - Line editing and persistent history via `rustyline` with Tab-completion for keywords, modules, builtins, and in-scope variables.
+  - Command history is saved to `~/.fl_history` with `0600` permissions on Unix. The path can be configured with `--history-file <path>` or `FL_HISTORY_FILE`, and disabled with `--no-history` or `FL_NO_HISTORY=1`.
+  - Sensitive credential-bearing calls (`auth_sign_up`, `auth_sign_in`, `Auth.sign_*`) are automatically excluded from command history to prevent saving passwords in plain text.
   - Safe exit with `exit`, `quit`, or `Ctrl+D`. `Ctrl+C` cancels the current multiline input.
 - Binaries using `--backend emulator` must be built with the `emulator` feature.
   If specified without the feature, the following message is printed and the program exits:
