@@ -51,8 +51,8 @@ pub use storage::{
     STORAGE_HEADER_ALLOWANCE_BYTES,
 };
 pub use value::{
-    validate_value_depth, validate_value_limits, validate_value_limits_with_sizes, BuiltinModule,
-    Value,
+    drop_value_iteratively, validate_value_depth, validate_value_limits,
+    validate_value_limits_with_sizes, BuiltinModule, Value, DEFAULT_MAX_INSPECT_DEPTH,
 };
 
 pub fn run_script(source: &str) -> Result<Value, Box<dyn Error>> {
