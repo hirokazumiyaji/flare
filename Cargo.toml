@@ -46,6 +46,10 @@ path = "src/main.rs"
 name = "query_payload"
 harness = false
 
+[[bench]]
+name = "interpreter"
+harness = false
+
 [[test]]
 name = "firestore_emulator"
 path = "tests/firestore_emulator.rs"

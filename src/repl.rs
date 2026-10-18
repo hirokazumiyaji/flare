@@ -371,13 +371,26 @@ fn contains_ident_word(text: &str, word: &str) -> bool {
 pub fn ensure_file_0600(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!("create_dir_all failed for {}: {e}", parent.display()),
-                )
-            })?;
+        if !parent.as_os_str().is_empty() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("create_dir_all failed for {}: {e}", parent.display()),
+                    )
+                })?;
+            }
+            if let Ok(meta) = std::fs::metadata(parent) {
+                let mode = meta.permissions().mode();
+                // If directory lacks user execute permission (e.g. created while another
+                // thread temporarily set a restrictive umask), ensure user has 0700.
+                if mode & 0o100 == 0 {
+                    let _ = std::fs::set_permissions(
+                        parent,
+                        std::fs::Permissions::from_mode(mode | 0o700),
+                    );
+                }
+            }
         }
     }
     if !path.exists() {
