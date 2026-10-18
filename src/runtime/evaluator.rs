@@ -1,4 +1,4 @@
-use std::ops::{Deref, DerefMut};
+use std::ops::{ControlFlow, Deref, DerefMut};
 
 use crate::error::{BudgetError, CapabilityError, ErrorKind, ServiceId, UserRaisedError};
 use crate::services::ServiceAccess;
@@ -6,6 +6,8 @@ use crate::value::validate_value_limits;
 
 use super::state::RuntimeState;
 use super::*;
+
+type CallArgValues = (Vec<Value>, BTreeMap<String, Value>);
 
 pub(crate) struct Evaluator<'a> {
     pub(crate) services: ServiceAccess<'a>,
@@ -325,7 +327,7 @@ impl Evaluator<'_> {
                 Ok(ExecFlow::Value(v))
             }
             Stmt::Def { name, params, body } => {
-                validate_unique_params(params, "function")?;
+                validate_func_params(params, "function")?;
                 if is_builtin_name(name) {
                     return Err(format!("cannot redefine builtin: {name}").into());
                 }
@@ -774,6 +776,23 @@ impl Evaluator<'_> {
                     }
                 }
             }
+            Expr::Fn { params, body } => {
+                validate_func_params(params, "function")?;
+                Ok(ExecFlow::Value(Value::Func(UserFunc {
+                    params: params.clone(),
+                    body: body.clone(),
+                })))
+            }
+            Expr::Invoke {
+                callee,
+                args,
+                block,
+            } => {
+                self.enter_call()?;
+                let outcome = self.eval_invoke_body(callee, args, block.as_ref());
+                self.leave_call();
+                outcome
+            }
         }
     }
 
@@ -831,8 +850,15 @@ impl Evaluator<'_> {
                 )?;
                 Some(spec)
             } else {
-                let Some(Value::Func(func)) = self.get_var(name).cloned() else {
+                let Some(var) = self.get_var(name).cloned() else {
                     return Err(format!("undefined function: {name}").into());
+                };
+                let Value::Func(func) = var else {
+                    return Err(format!(
+                        "cannot call non-function value of type {}",
+                        var.type_name()
+                    )
+                    .into());
                 };
                 validate_user_call_contract(name, &func.params, args, block)?;
                 None
@@ -851,24 +877,67 @@ impl Evaluator<'_> {
             // `args` is one ordered sequence; splitting it into
             // positional/keyword collections for binding must not change
             // the order in which the expressions above are evaluated.
-            let mut argv = vec![];
-            let mut kw = BTreeMap::new();
-            for arg in args {
-                match arg {
-                    CallArg::Positional(expr) => match self.eval_expr(expr)? {
-                        ExecFlow::Value(v) => argv.push(v),
-                        flow @ ExecFlow::Return(_) => return Ok(flow),
-                    },
-                    CallArg::Keyword { name, value } => match self.eval_expr(value)? {
-                        ExecFlow::Value(v) => {
-                            kw.insert(name.clone(), v);
-                        }
-                        flow @ ExecFlow::Return(_) => return Ok(flow),
-                    },
-                }
-            }
+            let (argv, kw) = match self.eval_call_args(args)? {
+                ControlFlow::Continue(pair) => pair,
+                ControlFlow::Break(flow) => return Ok(flow),
+            };
             self.eval_call(receiver_value, name, argv, kw, block)
         }
+    }
+
+    pub(super) fn eval_invoke_body(
+        &mut self,
+        callee: &Expr,
+        args: &[CallArg],
+        block: Option<&Block>,
+    ) -> Result<ExecFlow, Box<dyn Error>> {
+        validate_unique_keywords(args)?;
+        let callee_val = match self.eval_expr(callee)? {
+            ExecFlow::Value(v) => v,
+            flow @ ExecFlow::Return(_) => return Ok(flow),
+        };
+        let func = match callee_val {
+            Value::Func(f) => f,
+            other => {
+                return Err(format!(
+                    "cannot call non-function value of type {}",
+                    other.type_name()
+                )
+                .into());
+            }
+        };
+        validate_user_call_contract("anonymous function", &func.params, args, block)?;
+
+        let (argv, kw) = match self.eval_call_args(args)? {
+            ControlFlow::Continue(pair) => pair,
+            ControlFlow::Break(flow) => return Ok(flow),
+        };
+        self.call_user_func(&func, argv, kw)
+    }
+
+    /// Evaluate a call argument list into positional and keyword value
+    /// collections, short-circuiting on `Return` from any argument expression.
+    fn eval_call_args(
+        &mut self,
+        args: &[CallArg],
+    ) -> Result<ControlFlow<ExecFlow, CallArgValues>, Box<dyn Error>> {
+        let mut argv = vec![];
+        let mut kw = BTreeMap::new();
+        for arg in args {
+            match arg {
+                CallArg::Positional(expr) => match self.eval_expr(expr)? {
+                    ExecFlow::Value(v) => argv.push(v),
+                    flow @ ExecFlow::Return(_) => return Ok(ControlFlow::Break(flow)),
+                },
+                CallArg::Keyword { name, value } => match self.eval_expr(value)? {
+                    ExecFlow::Value(v) => {
+                        kw.insert(name.clone(), v);
+                    }
+                    flow @ ExecFlow::Return(_) => return Ok(ControlFlow::Break(flow)),
+                },
+            }
+        }
+        Ok(ControlFlow::Continue((argv, kw)))
     }
 
     fn validate_call_context(
@@ -943,18 +1012,57 @@ impl Evaluator<'_> {
             return (spec.handler)(self, args, kwargs, block);
         }
 
-        let Some(Value::Func(func)) = self.get_var(name).cloned() else {
+        let Some(var) = self.get_var(name).cloned() else {
             return Err(format!("undefined function: {name}").into());
         };
-        let bound = bind_function_args(&func.params, args, kwargs)?;
+        let Value::Func(func) = var else {
+            return Err(
+                format!("cannot call non-function value of type {}", var.type_name()).into(),
+            );
+        };
+        self.call_user_func(&func, args, kwargs)
+    }
+
+    pub(super) fn call_user_func(
+        &mut self,
+        func: &UserFunc,
+        args: Vec<Value>,
+        mut kwargs: BTreeMap<String, Value>,
+    ) -> Result<ExecFlow, Box<dyn Error>> {
+        // Callers must pre-validate via `validate_user_call_contract` so default
+        // expressions do not run on invalid calls and side effects stay off.
+        let mut bound = Vec::with_capacity(func.params.len());
+        let mut idx = 0;
+        let scope = ScopeGuard::function(self);
+        for param in &func.params {
+            if idx < args.len() {
+                bound.push((param.name.clone(), args[idx].clone()));
+                idx += 1;
+                continue;
+            }
+            if let Some(v) = kwargs.remove(&param.name) {
+                bound.push((param.name.clone(), v));
+                continue;
+            }
+            if let Some(default_expr) = &param.default {
+                let flow = scope.runtime.eval_expr(default_expr)?;
+                let v = match flow {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                };
+                bound.push((param.name.clone(), v));
+                continue;
+            }
+            unreachable!("missing argument caught by pre-validation");
+        }
+
         // 呼び出し元のローカル変数・呼び出された関数自身のローカルは隠す。
         //
         // caller scope の保存と frame の破棄を guard に任せる。引数の
         // binding、本体の runtime error、panic unwind のいずれでも同じ復元が
         // 進み、手動の cleanup 処理に依存しない。
-        let scope = ScopeGuard::function(self);
-        for (param, value) in bound {
-            scope.runtime.set_var(&param, value)?;
+        for (name, val) in bound {
+            scope.runtime.set_var(&name, val)?;
         }
         let result = scope.runtime.eval_block(&func.body);
         drop(scope);

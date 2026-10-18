@@ -213,16 +213,24 @@ g()      # Error: undefined variable: x
 - Assigning to an already visible name (global, parameter, or function local) inside a function errors. A name that exists only in the caller can be defined as a function local.
 - Block parameters (`each`, `map`, etc.) follow the same rule and may reuse outer names. Block bodies can read outer-scope variables because they are evaluated in the caller’s environment.
 
-### Function Definitions and Calls
+### Function Definitions, Anonymous Functions, and Calls
 
 ```ruby
-fn add(a, b) { return a + b }   # return is optional (the last expression is the result)
+fn add(a, b = 0) { return a + b }   # default argument b = 0; return is optional
 add(2, 3)
-add(a: 2, b: 3)                 # Ruby-style keyword arguments
-puts "x"                        # Parentheses may be omitted
+add(a: 2, b: 3)                    # Ruby-style keyword arguments
+add(5)                             # Uses default value for b (returns 5)
+puts "x"                           # Parentheses may be omitted
+
+# Anonymous functions (first-class values)
+f = fn(x, step = 1) { x + step }
+f(10)                              # 11
+(fn(x) { x * 2 })(3)               # 6
 ```
 
 - Positional and keyword arguments can be mixed. Positional values bind first, then keywords bind by name. Missing, extra, or unknown arguments error.
+- **Default arguments**: Parameters can define defaults using `param = expr` (e.g. `fn f(a, b = 2)`). Default expressions are evaluated at call time only when the argument is omitted. They are evaluated in the function scope where only globals are visible (they cannot access other parameters or caller locals). Parameters without defaults cannot follow parameters with defaults.
+- **Anonymous functions**: `fn(params) { body }` expressions create anonymous functions as first-class `Func` values. They follow Flare's static scope rules (only global variables and function parameters are accessible; caller locals are not captured).
 - Built-in module calls accept the same keyword arguments as their global aliases. Other receiver methods keep their documented contracts; query and collection methods do not accept keywords.
 - The parameter list may be omitted, as in `fn name { ... }`.
 - An array literal cannot be the **first argument of a call without parentheses**. `puts [1, 2]` is parsed as indexing `puts[1, 2]`; pass arrays with parentheses, as `puts([1, 2])`.

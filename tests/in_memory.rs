@@ -4726,3 +4726,248 @@ m.entries()
         "{err}"
     );
 }
+
+#[test]
+fn anonymous_functions_and_invocations() {
+    let out = run_script("f = fn(x) { x + 1 }\nf(2)").unwrap();
+    assert_eq!(out, Value::Int(3));
+
+    let out = run_script("(fn(x) { x * 2 })(3)").unwrap();
+    assert_eq!(out, Value::Int(6));
+
+    let out = run_script("fn(x) { x * 3 }(4)").unwrap();
+    assert_eq!(out, Value::Int(12));
+
+    let out = run_script(
+        r#"
+fn apply(g, x) { g(x) }
+apply(fn(x) { x + 5 }, 10)
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(15));
+
+    let out = run_script(
+        r#"
+funcs = [fn(x) { x + 1 }, fn(x) { x + 2 }]
+funcs[0](10) + funcs[1](20)
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(33));
+
+    let out = run_script(
+        r#"
+fn factory() { fn(x) { x + 10 } }
+f = factory()
+f(5)
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(15));
+
+    // Return inside an anonymous function does not return from caller
+    let out = run_script(
+        r#"
+fn test_anon_return() {
+  f = fn() { return 1 }
+  f()
+  2
+}
+test_anon_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(2));
+
+    let out = run_script("(fn() { return 42 })()").unwrap();
+    assert_eq!(out, Value::Int(42));
+
+    // Global variable is visible to anonymous function
+    let out = run_script(
+        r#"
+global_val = 100
+fn run() {
+  f = fn(x) { global_val + x }
+  f(5)
+}
+run()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(105));
+
+    // Caller local variable is NOT visible to anonymous function
+    let err = run_script(
+        r#"
+fn run() {
+  local_val = 20
+  f = fn() { local_val }
+  f()
+}
+run()
+"#,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("undefined variable: local_val"),
+        "{err}"
+    );
+
+    // Invoking a non-function value returns error
+    let err = run_script("x = 42\nx(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("cannot call non-function value of type Int"),
+        "{err}"
+    );
+
+    // Named fn definition cannot be used as expression
+    let err = run_script("f = fn named(x) { x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("named function definition cannot be used as an expression"),
+        "{err}"
+    );
+}
+
+#[test]
+fn default_function_arguments() {
+    let script = r#"
+fn f(a, b = 2) { a + b }
+[f(1), f(1, 10), f(a: 5), f(a: 5, b: 3), f(5, b: 4)]
+"#;
+    let out = run_script(script).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(3),
+            Value::Int(11),
+            Value::Int(7),
+            Value::Int(8),
+            Value::Int(9),
+        ])
+    );
+
+    let script = r#"
+f = fn(a, b = 10) { a * b }
+[f(3), f(3, 4), (fn(x = 42) { x })()]
+"#;
+    let out = run_script(script).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(30), Value::Int(12), Value::Int(42),])
+    );
+
+    let script = r#"
+fn multi(a, b = 2, c = 3) { a + b + c }
+[multi(1), multi(1, 5), multi(1, 5, 10), multi(1, c: 20)]
+"#;
+    let out = run_script(script).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(6),
+            Value::Int(9),
+            Value::Int(16),
+            Value::Int(23),
+        ])
+    );
+
+    // Default arguments are evaluated at call time
+    let script = r#"
+set("counter/doc", {n: 0})
+fn tick() {
+  doc = get("counter/doc")
+  next_n = doc["n"] + 1
+  set("counter/doc", {n: next_n})
+  next_n
+}
+fn f(x = tick()) { x }
+[f(), f(), f(100), f()]
+"#;
+    let out = run_script(script).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(100),
+            Value::Int(3),
+        ])
+    );
+
+    // Default arguments cannot reference other parameters
+    let err = run_script("fn f(a, b = a) { b }\nf(1)").unwrap_err();
+    assert!(format!("{err}").contains("undefined variable: a"), "{err}");
+
+    // Required parameter after default is rejected at parse time
+    let err = run_script("fn f(a = 1, b) { a + b }").unwrap_err();
+    assert!(
+        format!("{err}").contains("parameter without default cannot follow parameter with default"),
+        "{err}"
+    );
+
+    let err = run_script("f = fn(a = 1, b) { a + b }").unwrap_err();
+    assert!(
+        format!("{err}").contains("parameter without default cannot follow parameter with default"),
+        "{err}"
+    );
+
+    // Duplicate parameter is rejected at parse time
+    let err = run_script("fn f(a, a = 1) { a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("duplicate function parameter: a"),
+        "{err}"
+    );
+
+    let err = run_script("f = fn(a, a = 1) { a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("duplicate function parameter: a"),
+        "{err}"
+    );
+
+    // Missing required argument error
+    let err = run_script("fn f(a, b = 2) { a + b }\nf()").unwrap_err();
+    assert!(format!("{err}").contains("missing argument: a"), "{err}");
+
+    // Too many positional args
+    let err = run_script("fn f(a = 1) { a }\nf(1, 2)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional args"),
+        "{err}"
+    );
+
+    // Duplicate positional and keyword
+    let err = run_script("fn f(a = 1) { a }\nf(2, a: 3)").unwrap_err();
+    assert!(format!("{err}").contains("duplicate argument a"), "{err}");
+
+    // Unknown keyword
+    let err = run_script("fn f(a = 1) { a }\nf(b: 2)").unwrap_err();
+    assert!(
+        format!("{err}").contains("unknown keyword arguments: b"),
+        "{err}"
+    );
+
+    // Default arguments must not evaluate if the call has a contract error
+    let setup = r#"
+set("effects/default_eval", {hit: false})
+fn side_effect() {
+  set("effects/default_eval", {hit: true})
+  1
+}
+fn f(a, b = side_effect()) { a + b }
+"#;
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    run_in(&mut runtime, setup).unwrap();
+    let err = run_in(&mut runtime, "f()").unwrap_err();
+    assert!(format!("{err}").contains("missing argument: a"), "{err}");
+    let hit = run_in(&mut runtime, "get(\"effects/default_eval\")[\"hit\"]").unwrap();
+    assert_eq!(hit, Value::Bool(false));
+
+    let err = run_in(&mut runtime, "f(1, extra: 2)").unwrap_err();
+    assert!(
+        format!("{err}").contains("unknown keyword arguments: extra"),
+        "{err}"
+    );
+    let hit = run_in(&mut runtime, "get(\"effects/default_eval\")[\"hit\"]").unwrap();
+    assert_eq!(hit, Value::Bool(false));
+}

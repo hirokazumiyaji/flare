@@ -178,7 +178,7 @@ pub struct QueryFilter {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserFunc {
-    pub params: Vec<String>,
+    pub params: Vec<crate::ast::FuncParam>,
     pub body: Vec<Stmt>,
 }
 
