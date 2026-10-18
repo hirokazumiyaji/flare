@@ -22,7 +22,9 @@ pub use auth::{
 };
 #[cfg(feature = "emulator")]
 pub use auth::{AuthEmulator, AuthEmulatorOptions, DEFAULT_AUTH_OPERATION_TIMEOUT};
-pub use error::{CapabilityError, ErrorKind, FlareError, ServiceId, Span};
+pub use error::{
+    BudgetError, CapabilityError, ErrorKind, FlareError, ServiceId, Span, UserRaisedError,
+};
 #[cfg(feature = "emulator")]
 pub use firestore::{
     parse_timeout_ms, EmulatorAuth, EmulatorConfig, EmulatorConnectionError, FirestoreEmulator,

@@ -1,6 +1,6 @@
 use std::ops::{Deref, DerefMut};
 
-use crate::error::{CapabilityError, ServiceId};
+use crate::error::{BudgetError, CapabilityError, ErrorKind, ServiceId, UserRaisedError};
 use crate::services::ServiceAccess;
 use crate::value::validate_value_limits;
 
@@ -217,7 +217,7 @@ impl Evaluator<'_> {
         };
         let elapsed = started_at.elapsed();
         if elapsed >= limit {
-            return Err(FlareError::runtime(format!(
+            return Err(BudgetError::new(format!(
                 "wall-clock limit exceeded (max {})",
                 format_duration(limit)
             ))
@@ -230,7 +230,7 @@ impl Evaluator<'_> {
         self.check_wall_clock()?;
         if let Some(max) = self.limits.max_steps {
             if self.usage.steps >= max {
-                return Err(FlareError::runtime(format!("step limit exceeded (max {max})")).into());
+                return Err(BudgetError::new(format!("step limit exceeded (max {max})")).into());
             }
         }
         self.usage.steps = self.usage.steps.saturating_add(1);
@@ -241,10 +241,9 @@ impl Evaluator<'_> {
         self.check_wall_clock()?;
         if let Some(max) = self.limits.max_loop_iterations {
             if self.usage.loop_iterations >= max {
-                return Err(FlareError::runtime(format!(
-                    "loop iteration limit exceeded (max {max})"
-                ))
-                .into());
+                return Err(
+                    BudgetError::new(format!("loop iteration limit exceeded (max {max})")).into(),
+                );
             }
         }
         self.usage.loop_iterations = self.usage.loop_iterations.saturating_add(1);
@@ -256,7 +255,7 @@ impl Evaluator<'_> {
         if let Some(max) = self.limits.max_call_depth {
             if self.call_depth >= max {
                 return Err(
-                    FlareError::runtime(format!("call depth limit exceeded (max {max})")).into(),
+                    BudgetError::new(format!("call depth limit exceeded (max {max})")).into(),
                 );
             }
         }
@@ -276,7 +275,7 @@ impl Evaluator<'_> {
     /// すでに 1 ノードである」ことで拒否する。Composite 値のときは子を展開
     /// しながら数えるので、巨大な配列を 1 ノードとして誤認しない。
     pub(super) fn check_value(&mut self, value: &Value) -> Result<(), Box<dyn Error>> {
-        if !matches!(
+        let res = if !matches!(
             value,
             Value::Array(_) | Value::ArrayUnion(_) | Value::ArrayRemove(_) | Value::Map(_)
         ) {
@@ -288,18 +287,20 @@ impl Evaluator<'_> {
                 self.limits.max_value_nodes.map(|budget| budget.min(1)),
                 self.limits.max_string_bytes,
                 self.limits.max_bytes_size,
+            )
+            .map(|_| ())
+        } else {
+            let observed_depth = value::validate_value_limits_with_sizes(
+                value,
+                self.limits.max_value_depth,
+                self.limits.max_value_nodes,
+                self.limits.max_string_bytes,
+                self.limits.max_bytes_size,
             )?;
-            return Ok(());
-        }
-        let observed_depth = value::validate_value_limits_with_sizes(
-            value,
-            self.limits.max_value_depth,
-            self.limits.max_value_nodes,
-            self.limits.max_string_bytes,
-            self.limits.max_bytes_size,
-        )?;
-        self.usage.max_value_depth = self.usage.max_value_depth.max(observed_depth);
-        Ok(())
+            self.usage.max_value_depth = self.usage.max_value_depth.max(observed_depth);
+            Ok(())
+        };
+        res.map_err(|e| BudgetError::new(e.to_string()).into())
     }
 
     pub(super) fn eval_stmt(&mut self, stmt: &Stmt) -> Result<ExecFlow, Box<dyn Error>> {
@@ -480,6 +481,11 @@ impl Evaluator<'_> {
         Ok(flow)
     }
 
+    pub(super) fn is_budget_error(err: &(dyn Error + 'static)) -> bool {
+        err.downcast_ref::<BudgetError>().is_some()
+            || err.downcast_ref::<QueryResultLimitExceeded>().is_some()
+    }
+
     pub(super) fn eval_expr_inner(&mut self, expr: &Expr) -> Result<ExecFlow, Box<dyn Error>> {
         match expr {
             Expr::Int(i) => Ok(ExecFlow::Value(Value::Int(*i))),
@@ -491,7 +497,7 @@ impl Evaluator<'_> {
                         StrPiece::Lit(s) => {
                             if let Some(max) = self.limits.max_string_bytes {
                                 if out.len().saturating_add(s.len()) > max {
-                                    return Err(FlareError::runtime(format!(
+                                    return Err(BudgetError::new(format!(
                                         "string size limit exceeded (max {max})"
                                     ))
                                     .into());
@@ -507,7 +513,7 @@ impl Evaluator<'_> {
                             let s = v.to_string();
                             if let Some(max) = self.limits.max_string_bytes {
                                 if out.len().saturating_add(s.len()) > max {
-                                    return Err(FlareError::runtime(format!(
+                                    return Err(BudgetError::new(format!(
                                         "string size limit exceeded (max {max})"
                                     ))
                                     .into());
@@ -557,7 +563,7 @@ impl Evaluator<'_> {
                             if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
                                 if let Some(max) = self.limits.max_string_bytes {
                                     if a.len().saturating_add(b.len()) > max {
-                                        return Err(FlareError::runtime(format!(
+                                        return Err(BudgetError::new(format!(
                                             "string size limit exceeded (max {max})"
                                         ))
                                         .into());
@@ -574,7 +580,7 @@ impl Evaluator<'_> {
                                     while let Some((val, depth)) = stack.pop() {
                                         if let Some(max) = self.limits.max_value_depth {
                                             if depth > max {
-                                                return Err(FlareError::runtime(format!(
+                                                return Err(BudgetError::new(format!(
                                                     "value nesting limit exceeded (max {max})"
                                                 ))
                                                 .into());
@@ -583,7 +589,7 @@ impl Evaluator<'_> {
                                         if let Some(max) = self.limits.max_value_nodes {
                                             count = count.saturating_add(1);
                                             if count > max {
-                                                return Err(FlareError::runtime(format!(
+                                                return Err(BudgetError::new(format!(
                                                     "value node limit exceeded (max {max})"
                                                 ))
                                                 .into());
@@ -703,6 +709,70 @@ impl Evaluator<'_> {
                     }
                 }
                 Ok(ExecFlow::Value(last))
+            }
+            Expr::TryRescue {
+                try_body,
+                err_param,
+                rescue_body,
+            } => {
+                let prev_writes_len = match &self.exec {
+                    ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => {
+                        Some(writes.len())
+                    }
+                    ExecCtx::Normal => None,
+                };
+                let scope = ScopeGuard::block(self);
+                let try_result = scope.runtime.eval_block(try_body);
+                drop(scope);
+
+                match try_result {
+                    Ok(flow) => Ok(flow),
+                    Err(err) => {
+                        if Self::is_budget_error(&*err) {
+                            return Err(err);
+                        }
+                        // Discard any staged Firestore writes buffered during the failed try body,
+                        // preserving writes staged before entering try. Unstaged side effects (e.g. File I/O)
+                        // are outside the transaction buffer and cannot be rolled back.
+                        if let Some(prev_len) = prev_writes_len {
+                            match &mut self.exec {
+                                ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => {
+                                    writes.truncate(prev_len);
+                                }
+                                ExecCtx::Normal => {}
+                            }
+                        }
+
+                        let (kind_str, message_str) =
+                            if let Some(uerr) = err.downcast_ref::<UserRaisedError>() {
+                                ("Runtime", uerr.message.clone())
+                            } else if let Some(ferr) = err.downcast_ref::<FlareError>() {
+                                let k = match ferr.kind {
+                                    ErrorKind::Runtime => "Runtime",
+                                    ErrorKind::Backend => "Backend",
+                                    ErrorKind::Parse => "Parse",
+                                    ErrorKind::Lex => "Lex",
+                                };
+                                (k, ferr.message.clone())
+                            } else if let Some(cap) = err.downcast_ref::<CapabilityError>() {
+                                ("Runtime", cap.to_string())
+                            } else {
+                                ("Runtime", err.to_string())
+                            };
+                        let mut err_map = BTreeMap::new();
+                        err_map.insert("kind".to_string(), Value::Str(kind_str.to_string()));
+                        err_map.insert("message".to_string(), Value::Str(message_str));
+                        let err_val = Value::Map(err_map);
+
+                        let scope = ScopeGuard::block(self);
+                        if let Some(param) = err_param {
+                            scope.runtime.set_var(param, err_val)?;
+                        }
+                        let rescue_flow = scope.runtime.eval_block(rescue_body);
+                        drop(scope);
+                        rescue_flow
+                    }
+                }
             }
         }
     }
@@ -1355,7 +1425,7 @@ impl Evaluator<'_> {
                 if let Some(limit) = e.downcast_ref::<QueryResultLimitExceeded>() {
                     self.usage.max_query_results =
                         self.usage.max_query_results.max(limit.max_results);
-                    return Err(FlareError::runtime(limit.to_string()).into());
+                    return Err(BudgetError::new(limit.to_string()).into());
                 }
                 return Err(backend_err(e));
             }
@@ -1366,10 +1436,9 @@ impl Evaluator<'_> {
         if let Some(max) = max_results {
             if count > max {
                 self.usage.max_query_results = self.usage.max_query_results.max(max);
-                return Err(FlareError::runtime(format!(
-                    "query result limit exceeded (max {max})"
-                ))
-                .into());
+                return Err(
+                    BudgetError::new(format!("query result limit exceeded (max {max})")).into(),
+                );
             }
         }
         self.usage.query_results = self.usage.query_results.saturating_add(count as u64);
@@ -1401,7 +1470,7 @@ impl Evaluator<'_> {
                 if let Some(limit) = e.downcast_ref::<QueryResultLimitExceeded>() {
                     self.usage.max_query_results =
                         self.usage.max_query_results.max(limit.max_results);
-                    return Err(FlareError::runtime(limit.to_string()).into());
+                    return Err(BudgetError::new(limit.to_string()).into());
                 }
                 return Err(backend_err(e));
             }
@@ -1412,10 +1481,9 @@ impl Evaluator<'_> {
         if let Some(max) = max_results {
             if count > max {
                 self.usage.max_query_results = self.usage.max_query_results.max(max);
-                return Err(FlareError::runtime(format!(
-                    "query result limit exceeded (max {max})"
-                ))
-                .into());
+                return Err(
+                    BudgetError::new(format!("query result limit exceeded (max {max})")).into(),
+                );
             }
         }
         self.usage.query_results = self.usage.query_results.saturating_add(count as u64);
@@ -1531,7 +1599,7 @@ fn universal_value_builtin(name: &str) -> Option<Builtin> {
     }
 }
 
-pub(super) const BUILTIN_SPECS: [BuiltinSpec; 44] = {
+pub(super) const BUILTIN_SPECS: [BuiltinSpec; 45] = {
     use BuiltinModule::{Auth, File, Firestore, Storage, CSV, IO, JSON, YAML};
     use ServiceId::{
         Auth as AuthService, Firestore as FirestoreService, Storage as StorageService,
@@ -1546,6 +1614,14 @@ pub(super) const BUILTIN_SPECS: [BuiltinSpec; 44] = {
             CallContract::any(),
             None,
             builtin_puts,
+        ),
+        spec(
+            None,
+            "raise",
+            "raise",
+            CallContract::exact(1),
+            None,
+            builtin_raise,
         ),
         spec(
             None,
@@ -1936,6 +2012,20 @@ fn builtin_puts(
     Ok(ExecFlow::Value(Value::Nil))
 }
 
+fn builtin_raise(
+    _rt: &mut Evaluator<'_>,
+    args: Vec<Value>,
+    _kwargs: BTreeMap<String, Value>,
+    _block: Option<&Block>,
+) -> Result<ExecFlow, Box<dyn Error>> {
+    let val = args.first().ok_or("expected 1 argument")?;
+    let msg = match val {
+        Value::Str(s) => s.clone(),
+        other => other.to_string(),
+    };
+    Err(UserRaisedError::new(msg).into())
+}
+
 fn builtin_to_s(
     rt: &mut Evaluator<'_>,
     args: Vec<Value>,
@@ -2081,7 +2171,9 @@ fn builtin_range(
     let total_nodes = count.saturating_add(1);
     if let Some(limit) = rt.state.limits.max_value_nodes {
         if total_nodes > limit {
-            return Err(format!("value node limit exceeded (max {limit})").into());
+            return Err(
+                BudgetError::new(format!("value node limit exceeded (max {limit})")).into(),
+            );
         }
     }
 
@@ -2146,10 +2238,9 @@ fn builtin_bytes(
         Some(Value::Str(s)) => {
             if let Some(max) = rt.limits.max_bytes_size {
                 if s.len() > max {
-                    return Err(FlareError::runtime(format!(
-                        "bytes size limit exceeded (max {max})"
-                    ))
-                    .into());
+                    return Err(
+                        BudgetError::new(format!("bytes size limit exceeded (max {max})")).into(),
+                    );
                 }
             }
             s.into_bytes()
@@ -2157,10 +2248,9 @@ fn builtin_bytes(
         Some(Value::Array(items)) => {
             if let Some(max) = rt.limits.max_bytes_size {
                 if items.len() > max {
-                    return Err(FlareError::runtime(format!(
-                        "bytes size limit exceeded (max {max})"
-                    ))
-                    .into());
+                    return Err(
+                        BudgetError::new(format!("bytes size limit exceeded (max {max})")).into(),
+                    );
                 }
             }
             items
@@ -2275,9 +2365,7 @@ fn builtin_storage_download(
     let bytes = rt.services.storage.download(path).map_err(backend_err)?;
     if let Some(max) = rt.limits.max_bytes_size {
         if bytes.len() > max {
-            return Err(
-                FlareError::runtime(format!("bytes size limit exceeded (max {max})")).into(),
-            );
+            return Err(BudgetError::new(format!("bytes size limit exceeded (max {max})")).into());
         }
     }
     Ok(ExecFlow::Value(Value::Bytes(bytes)))
@@ -2649,6 +2737,17 @@ fn builtin_io_file(
     Ok(ExecFlow::Value(Value::Module(BuiltinModule::File)))
 }
 
+/// Maps an I/O or codec error that carries Flare's internal `resource limit
+/// exceeded` prefix (set by `io/*` and `BoundedWriter`) to `BudgetError` so
+/// `try/rescue` cannot swallow a budget breach.
+fn promote_resource_limit(e: Box<dyn Error>) -> Box<dyn Error> {
+    if e.to_string().contains("resource limit exceeded") {
+        BudgetError::new(e.to_string()).into()
+    } else {
+        e
+    }
+}
+
 fn builtin_file_read(
     rt: &mut Evaluator<'_>,
     args: Vec<Value>,
@@ -2658,7 +2757,11 @@ fn builtin_file_read(
     let path_str = expect_string(args.first())?;
     let path = std::path::Path::new(path_str);
     let max_bytes = rt.state.limits.max_file_io_bytes;
-    let data = rt.services.io.read(path, max_bytes)?;
+    let data = rt
+        .services
+        .io
+        .read(path, max_bytes)
+        .map_err(promote_resource_limit)?;
     let val = match String::from_utf8(data) {
         Ok(s) => Value::Str(s),
         Err(e) => Value::Bytes(e.into_bytes()),
@@ -2667,7 +2770,8 @@ fn builtin_file_read(
         &val,
         rt.state.limits.max_value_depth,
         rt.state.limits.max_value_nodes,
-    )?;
+    )
+    .map_err(|e| BudgetError::new(e.to_string()))?;
     Ok(ExecFlow::Value(val))
 }
 
@@ -2686,7 +2790,10 @@ fn builtin_file_write(
         _ => return Err("File.write expects str or bytes content".into()),
     };
     let max_bytes = rt.state.limits.max_file_io_bytes;
-    rt.services.io.write(path, bytes, max_bytes)?;
+    rt.services
+        .io
+        .write(path, bytes, max_bytes)
+        .map_err(promote_resource_limit)?;
     Ok(ExecFlow::Value(Value::Int(bytes.len() as i64)))
 }
 
@@ -2729,10 +2836,10 @@ impl<W: std::io::Write> std::io::Write for BoundedWriter<W> {
     }
 }
 
-fn map_csv_error(e: csv::Error) -> String {
+fn map_csv_error(e: csv::Error) -> Box<dyn Error> {
     match e.kind() {
-        csv::ErrorKind::Io(io_err) => io_err.to_string(),
-        _ => format!("CSV.generate error: {e}"),
+        csv::ErrorKind::Io(io_err) => promote_resource_limit(io_err.to_string().into()),
+        _ => format!("CSV.generate error: {e}").into(),
     }
 }
 
@@ -2774,19 +2881,19 @@ fn builtin_json_generate(
     let max_bytes = rt.state.limits.max_file_io_bytes;
     let mut writer = BoundedWriter::new(Vec::new(), max_bytes);
     if pretty {
-        serde_json::to_writer_pretty(&mut writer, &json_val).map_err(|e| {
+        serde_json::to_writer_pretty(&mut writer, &json_val).map_err(|e| -> Box<dyn Error> {
             if e.is_io() {
-                e.to_string()
+                BudgetError::new(e.to_string()).into()
             } else {
-                format!("JSON.generate error: {e}")
+                format!("JSON.generate error: {e}").into()
             }
         })?;
     } else {
-        serde_json::to_writer(&mut writer, &json_val).map_err(|e| {
+        serde_json::to_writer(&mut writer, &json_val).map_err(|e| -> Box<dyn Error> {
             if e.is_io() {
-                e.to_string()
+                BudgetError::new(e.to_string()).into()
             } else {
-                format!("JSON.generate error: {e}")
+                format!("JSON.generate error: {e}").into()
             }
         })?;
     };
@@ -2797,7 +2904,8 @@ fn builtin_json_generate(
         &result,
         rt.state.limits.max_value_depth,
         rt.state.limits.max_value_nodes,
-    )?;
+    )
+    .map_err(|e| BudgetError::new(e.to_string()))?;
     Ok(ExecFlow::Value(result))
 }
 
@@ -2832,9 +2940,10 @@ fn builtin_csv_parse(
             total_nodes = total_nodes.saturating_add(1);
             if let Some(limit) = max_nodes {
                 if total_nodes > limit {
-                    return Err(
-                        format!("resource limit exceeded: max value nodes ({limit})").into(),
-                    );
+                    return Err(BudgetError::new(format!(
+                        "resource limit exceeded: max value nodes ({limit})"
+                    ))
+                    .into());
                 }
             }
             headers.push(h.to_string());
@@ -2849,18 +2958,20 @@ fn builtin_csv_parse(
                 total_nodes = total_nodes.saturating_add(1);
                 if let Some(limit) = max_nodes {
                     if total_nodes > limit {
-                        return Err(
-                            format!("resource limit exceeded: max value nodes ({limit})").into(),
-                        );
+                        return Err(BudgetError::new(format!(
+                            "resource limit exceeded: max value nodes ({limit})"
+                        ))
+                        .into());
                     }
                 }
                 map.insert(header.clone(), Value::Str(field_str.to_string()));
             }
             if let Some(limit) = max_nodes {
                 if total_nodes > limit {
-                    return Err(
-                        format!("resource limit exceeded: max value nodes ({limit})").into(),
-                    );
+                    return Err(BudgetError::new(format!(
+                        "resource limit exceeded: max value nodes ({limit})"
+                    ))
+                    .into());
                 }
             }
             rows.push(Value::Map(map));
@@ -2876,18 +2987,20 @@ fn builtin_csv_parse(
                 total_nodes = total_nodes.saturating_add(1);
                 if let Some(limit) = max_nodes {
                     if total_nodes > limit {
-                        return Err(
-                            format!("resource limit exceeded: max value nodes ({limit})").into(),
-                        );
+                        return Err(BudgetError::new(format!(
+                            "resource limit exceeded: max value nodes ({limit})"
+                        ))
+                        .into());
                     }
                 }
                 row.push(Value::Str(f.to_string()));
             }
             if let Some(limit) = max_nodes {
                 if total_nodes > limit {
-                    return Err(
-                        format!("resource limit exceeded: max value nodes ({limit})").into(),
-                    );
+                    return Err(BudgetError::new(format!(
+                        "resource limit exceeded: max value nodes ({limit})"
+                    ))
+                    .into());
                 }
             }
             rows.push(Value::Array(row));
@@ -2899,7 +3012,8 @@ fn builtin_csv_parse(
         &val,
         rt.state.limits.max_value_depth,
         rt.state.limits.max_value_nodes,
-    )?;
+    )
+    .map_err(|e| BudgetError::new(e.to_string()))?;
     Ok(ExecFlow::Value(val))
 }
 
@@ -3009,8 +3123,14 @@ fn builtin_yaml_generate(
     let yaml_val = value_to_yaml(val)?;
     let max_bytes = rt.state.limits.max_file_io_bytes;
     let mut writer = BoundedWriter::new(Vec::new(), max_bytes);
-    serde_yaml::to_writer(&mut writer, &yaml_val)
-        .map_err(|e| format!("YAML.generate error: {e}"))?;
+    serde_yaml::to_writer(&mut writer, &yaml_val).map_err(|e| -> Box<dyn Error> {
+        let msg = e.to_string();
+        if msg.contains("resource limit exceeded") {
+            BudgetError::new(msg).into()
+        } else {
+            format!("YAML.generate error: {e}").into()
+        }
+    })?;
     let bytes = writer.into_inner();
     let text = String::from_utf8(bytes).map_err(|e| format!("YAML.generate error: {e}"))?;
     let result = Value::Str(text);
@@ -3018,7 +3138,8 @@ fn builtin_yaml_generate(
         &result,
         rt.state.limits.max_value_depth,
         rt.state.limits.max_value_nodes,
-    )?;
+    )
+    .map_err(|e| BudgetError::new(e.to_string()))?;
     Ok(ExecFlow::Value(result))
 }
 
@@ -3031,13 +3152,19 @@ fn json_to_value(
 ) -> Result<Value, Box<dyn Error>> {
     if let Some(limit) = max_depth {
         if depth > limit {
-            return Err(format!("resource limit exceeded: max value depth ({limit})").into());
+            return Err(BudgetError::new(format!(
+                "resource limit exceeded: max value depth ({limit})"
+            ))
+            .into());
         }
     }
     *nodes = nodes.saturating_add(1);
     if let Some(limit) = max_nodes {
         if *nodes > limit {
-            return Err(format!("resource limit exceeded: max value nodes ({limit})").into());
+            return Err(BudgetError::new(format!(
+                "resource limit exceeded: max value nodes ({limit})"
+            ))
+            .into());
         }
     }
     Ok(match val {
@@ -3139,13 +3266,19 @@ fn yaml_to_value(
 ) -> Result<Value, Box<dyn Error>> {
     if let Some(limit) = max_depth {
         if depth > limit {
-            return Err(format!("resource limit exceeded: max value depth ({limit})").into());
+            return Err(BudgetError::new(format!(
+                "resource limit exceeded: max value depth ({limit})"
+            ))
+            .into());
         }
     }
     *nodes = nodes.saturating_add(1);
     if let Some(limit) = max_nodes {
         if *nodes > limit {
-            return Err(format!("resource limit exceeded: max value nodes ({limit})").into());
+            return Err(BudgetError::new(format!(
+                "resource limit exceeded: max value nodes ({limit})"
+            ))
+            .into());
         }
     }
     Ok(match val {

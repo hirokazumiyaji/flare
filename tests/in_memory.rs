@@ -4063,3 +4063,262 @@ fn to_i_methods_and_functions() {
         "{err}"
     );
 }
+
+#[test]
+fn raise_builtin_and_try_rescue_basic() {
+    // Uncaught raise
+    let err = run_script("raise(\"custom error\")").unwrap_err();
+    assert!(format!("{err}").contains("custom error"), "{err}");
+
+    // try { ... } rescue { ... } without error
+    let out = run_script("try { 1 + 2 } rescue { 0 }").unwrap();
+    assert_eq!(out, Value::Int(3));
+
+    // try { ... } rescue { ... } with error
+    let out = run_script("try { raise(\"fail\") } rescue { 42 }").unwrap();
+    assert_eq!(out, Value::Int(42));
+
+    // rescue |err| with err.kind and err.message
+    let src = r#"
+try {
+  raise("something went wrong")
+} rescue |err| {
+  err.message
+}
+"#;
+    assert_eq!(
+        run_script(src).unwrap(),
+        Value::Str("something went wrong".into())
+    );
+
+    let src = r#"
+try {
+  raise("something went wrong")
+} rescue |err| {
+  err.kind
+}
+"#;
+    assert_eq!(run_script(src).unwrap(), Value::Str("Runtime".into()));
+
+    let src = r#"
+try {
+  raise("something went wrong")
+} rescue |err| {
+  err["kind"]
+}
+"#;
+    assert_eq!(run_script(src).unwrap(), Value::Str("Runtime".into()));
+
+    // Catching backend error
+    let src = r#"
+try {
+  update("nonexistent/doc", {a: 1})
+} rescue |err| {
+  err.kind
+}
+"#;
+    assert_eq!(run_script(src).unwrap(), Value::Str("Backend".into()));
+
+    // Catching division by zero runtime error
+    let src = r#"
+try {
+  1 / 0
+} rescue |err| {
+  err.message
+}
+"#;
+    assert_eq!(
+        run_script(src).unwrap(),
+        Value::Str("division by zero".into())
+    );
+
+    // As expression assignment
+    let out = run_script("x = try { raise(\"error\") } rescue { 99 }\nx").unwrap();
+    assert_eq!(out, Value::Int(99));
+
+    // Nested try/rescue
+    let src = r#"
+try {
+  try {
+    raise("inner")
+  } rescue |e1| {
+    raise("outer: " + e1.message)
+  }
+} rescue |e2| {
+  e2.message
+}
+"#;
+    assert_eq!(run_script(src).unwrap(), Value::Str("outer: inner".into()));
+}
+
+#[test]
+fn try_rescue_control_flow_and_returns() {
+    let src = r#"
+fn early_return_in_try() {
+  try {
+    return 10
+  } rescue {
+    return 20
+  }
+  30
+}
+early_return_in_try()
+"#;
+    assert_eq!(run_script(src).unwrap(), Value::Int(10));
+
+    let src = r#"
+fn early_return_in_rescue() {
+  try {
+    raise("fail")
+  } rescue {
+    return 20
+  }
+  30
+}
+early_return_in_rescue()
+"#;
+    assert_eq!(run_script(src).unwrap(), Value::Int(20));
+}
+
+#[test]
+fn try_rescue_cannot_catch_budget_limits() {
+    // Loop iteration limit exceeded
+    let mut rt = Runtime::new(InMemoryFirestore::default());
+    let err = rt
+        .run("try { while true {} } rescue { \"rescued\" }")
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("loop iteration limit exceeded"),
+        "{err}"
+    );
+
+    // Call depth limit exceeded
+    let limits = RuntimeLimits::default().with_max_call_depth(8);
+    let mut rt = Runtime::with_limits(InMemoryFirestore::default(), limits);
+    let src = "fn recurse() { recurse() }\ntry { recurse() } rescue { \"rescued\" }";
+    let err = rt.run(src).unwrap_err();
+    assert!(
+        format!("{err}").contains("call depth limit exceeded"),
+        "{err}"
+    );
+
+    // User-raised errors containing budget limit strings are still catchable
+    let src = r#"
+try {
+  raise("step limit exceeded (fake)")
+} rescue |err| {
+  "caught: " + err.message
+}
+"#;
+    let out = rt.run(src).unwrap();
+    assert_eq!(out, Value::Str("caught: step limit exceeded (fake)".into()));
+}
+
+#[test]
+fn try_rescue_preserves_batch_and_transaction_atomicity() {
+    let mut rt = Runtime::new(InMemoryFirestore::default());
+
+    // Catching an error inside batch rolls back writes staged in `try`, preserving prior and later writes
+    let src = r#"
+batch {
+  set("test/doc1", {val: 10})
+  try {
+    set("test/doc_fail", {val: 99})
+    raise("fail inside try")
+  } rescue |err| {
+    "rescued"
+  }
+  set("test/doc2", {val: 20})
+}
+"#;
+    rt.run(src).unwrap();
+    // doc1 and doc2 were committed; doc_fail was discarded
+    assert_eq!(
+        rt.run("get(\"test/doc1\")[\"val\"]").unwrap(),
+        Value::Int(10)
+    );
+    assert_eq!(
+        rt.run("get(\"test/doc2\")[\"val\"]").unwrap(),
+        Value::Int(20)
+    );
+    assert_eq!(rt.run("get(\"test/doc_fail\")").unwrap(), Value::Nil);
+
+    // Same behavior inside a transaction:
+    let src = r#"
+transaction {
+  set("test/tx1", {val: 100})
+  val = try {
+    set("test/tx_fail", {val: 999})
+    raise("fail inside try")
+  } rescue |err| {
+    42
+  }
+  set("test/tx2", {val: val})
+}
+"#;
+    rt.run(src).unwrap();
+    assert_eq!(
+        rt.run("get(\"test/tx1\")[\"val\"]").unwrap(),
+        Value::Int(100)
+    );
+    assert_eq!(
+        rt.run("get(\"test/tx2\")[\"val\"]").unwrap(),
+        Value::Int(42)
+    );
+    assert_eq!(rt.run("get(\"test/tx_fail\")").unwrap(), Value::Nil);
+}
+
+#[test]
+fn try_rescue_catches_backend_errors_with_budget_phrases() {
+    struct ErroringFirestore {
+        inner: InMemoryFirestore,
+    }
+    impl flare::firestore::Firestore for ErroringFirestore {
+        fn get(&self, _path: &str) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+            Err("resource limit exceeded: firestore quota exhausted".into())
+        }
+        fn apply(
+            &mut self,
+            writes: Vec<flare::firestore::WriteOp>,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            self.inner.apply(writes)
+        }
+        fn run_query(
+            &self,
+            query: &flare::value::QueryRef,
+        ) -> Result<flare::firestore::QueryCandidates, Box<dyn std::error::Error>> {
+            self.inner.run_query(query)
+        }
+        fn begin_transaction(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+            self.inner.begin_transaction()
+        }
+        fn transaction_get(&self, path: &str) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+            self.inner.transaction_get(path)
+        }
+        fn commit_transaction(
+            &mut self,
+            writes: Vec<flare::firestore::WriteOp>,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            self.inner.commit_transaction(writes)
+        }
+        fn abort_transaction(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+            self.inner.abort_transaction()
+        }
+    }
+
+    let mut rt = Runtime::new(ErroringFirestore {
+        inner: InMemoryFirestore::default(),
+    });
+    let src = r#"
+try {
+  get("users/alice")
+} rescue |err| {
+  err.kind + ": " + err.message
+}
+"#;
+    let out = rt.run(src).unwrap();
+    assert_eq!(
+        out,
+        Value::Str("Backend: resource limit exceeded: firestore quota exhausted".into())
+    );
+}

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
 use crate::auth::{Auth, AuthError};
-use crate::error::{CapabilityError, FlareError, ServiceId, Span};
+use crate::error::{BudgetError, CapabilityError, FlareError, ServiceId, Span, UserRaisedError};
 use crate::firestore::{
     normalize_query_field_path, validate_firestore_id, validate_write_data, Firestore,
     QueryCandidates, QueryResultLimitExceeded, WriteOp,
@@ -1106,7 +1106,23 @@ fn attach_span(e: Box<dyn Error>, span: Option<Span>) -> Box<dyn Error> {
                 }
                 ferr as Box<dyn Error>
             }
-            Err(e) => FlareError::runtime(e.to_string()).with_span(span).into(),
+            Err(e) => match e.downcast::<UserRaisedError>() {
+                Ok(mut uerr) => {
+                    if uerr.span.is_none() {
+                        uerr.span = Some(span);
+                    }
+                    FlareError::runtime(uerr.message).with_span(span).into()
+                }
+                Err(e) => match e.downcast::<BudgetError>() {
+                    Ok(mut berr) => {
+                        if berr.span.is_none() {
+                            berr.span = Some(span);
+                        }
+                        FlareError::runtime(berr.message).with_span(span).into()
+                    }
+                    Err(e) => FlareError::runtime(e.to_string()).with_span(span).into(),
+                },
+            },
         },
     }
 }
@@ -1114,6 +1130,14 @@ fn attach_span(e: Box<dyn Error>, span: Option<Span>) -> Box<dyn Error> {
 fn wrap_as_runtime(e: Box<dyn Error>) -> Box<dyn Error> {
     if e.downcast_ref::<FlareError>().is_some() || e.downcast_ref::<CapabilityError>().is_some() {
         e
+    } else if let Some(uerr) = e.downcast_ref::<UserRaisedError>() {
+        let mut ferr = FlareError::runtime(uerr.message.clone());
+        ferr.span = uerr.span;
+        ferr.into()
+    } else if let Some(berr) = e.downcast_ref::<BudgetError>() {
+        let mut ferr = FlareError::runtime(berr.message.clone());
+        ferr.span = berr.span;
+        ferr.into()
     } else {
         FlareError::runtime(e.to_string()).into()
     }

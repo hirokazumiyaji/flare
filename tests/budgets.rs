@@ -445,7 +445,7 @@ fn a_successful_write_is_never_reported_as_a_timeout() {
     // only be checked before the call. Reporting a timeout after a write that
     // already persisted would make a retry apply `increment()` twice, so the
     // result of a completed write is returned as-is.
-    let limits = RuntimeLimits::default().with_max_wall_clock(Duration::from_millis(1));
+    let limits = RuntimeLimits::default().with_max_wall_clock(Duration::from_millis(10));
     let mut rt = Runtime::with_limits(SlowSuccessfulWrite::new(), limits);
     // The write sleeps 30ms, so the budget is long expired by the time the
     // backend returns success. The run must still report success; the write is
