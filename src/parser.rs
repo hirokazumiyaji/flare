@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::error::Error;
 
-use crate::ast::{BinOp, Block, CallArg, Expr, FuncParam, Stmt, StrPiece, UnOp};
+use crate::ast::{BinOp, Block, CallArg, Expr, ExprKind, FuncParam, Stmt, StrPiece, UnOp};
 use crate::error::{FlareError, Span};
 use crate::lexer::{SpannedToken, StrPart, Token};
 use crate::limits::ParserLimits;
@@ -177,6 +177,7 @@ impl Parser {
         }
     }
     fn parse_if_expr(&mut self) -> Result<Expr, Box<dyn Error>> {
+        let span = self.peek_span().unwrap_or(Span::new(1, 1));
         self.expect(Token::If)?;
         self.suppress_block_calls += 1;
         let cond = self.parse_expr();
@@ -197,25 +198,33 @@ impl Parser {
                 else_body = self.parse_brace_block()?;
             }
         }
-        Ok(Expr::If {
-            cond: Box::new(cond),
-            then_body,
-            else_body,
-        })
+        Ok(Expr::new(
+            ExprKind::If {
+                cond: Box::new(cond),
+                then_body,
+                else_body,
+            },
+            span,
+        ))
     }
     fn parse_while_expr(&mut self) -> Result<Expr, Box<dyn Error>> {
+        let span = self.peek_span().unwrap_or(Span::new(1, 1));
         self.expect(Token::While)?;
         self.suppress_block_calls += 1;
         let cond = self.parse_expr();
         self.suppress_block_calls -= 1;
         let cond = cond?;
         let body = self.parse_brace_block()?;
-        Ok(Expr::While {
-            cond: Box::new(cond),
-            body,
-        })
+        Ok(Expr::new(
+            ExprKind::While {
+                cond: Box::new(cond),
+                body,
+            },
+            span,
+        ))
     }
     fn parse_try_rescue(&mut self) -> Result<Expr, Box<dyn Error>> {
+        let span = self.peek_span().unwrap_or(Span::new(1, 1));
         self.expect(Token::Try)?;
         let try_body = self.parse_brace_block()?;
         self.skip_newlines();
@@ -240,11 +249,14 @@ impl Parser {
             None
         };
         let rescue_body = self.parse_brace_block()?;
-        Ok(Expr::TryRescue {
-            try_body,
-            err_param,
-            rescue_body,
-        })
+        Ok(Expr::new(
+            ExprKind::TryRescue {
+                try_body,
+                err_param,
+                rescue_body,
+            },
+            span,
+        ))
     }
     fn parse_expr(&mut self) -> Result<Expr, Box<dyn Error>> {
         self.parse_or()
@@ -253,13 +265,17 @@ impl Parser {
         let mut left = self.parse_and()?;
         self.skip_newlines_inside_delimiter();
         while self.at(&Token::OrOr) {
+            let span = left.span;
             self.bump();
             let right = self.parse_and()?;
-            left = Expr::Binary {
-                left: Box::new(left),
-                op: BinOp::Or,
-                right: Box::new(right),
-            };
+            left = Expr::new(
+                ExprKind::Binary {
+                    left: Box::new(left),
+                    op: BinOp::Or,
+                    right: Box::new(right),
+                },
+                span,
+            );
             self.skip_newlines_inside_delimiter();
         }
         Ok(left)
@@ -268,13 +284,17 @@ impl Parser {
         let mut left = self.parse_comparison()?;
         self.skip_newlines_inside_delimiter();
         while self.at(&Token::AndAnd) {
+            let span = left.span;
             self.bump();
             let right = self.parse_comparison()?;
-            left = Expr::Binary {
-                left: Box::new(left),
-                op: BinOp::And,
-                right: Box::new(right),
-            };
+            left = Expr::new(
+                ExprKind::Binary {
+                    left: Box::new(left),
+                    op: BinOp::And,
+                    right: Box::new(right),
+                },
+                span,
+            );
             self.skip_newlines_inside_delimiter();
         }
         Ok(left)
@@ -296,17 +316,21 @@ impl Parser {
             .find(|(t, _)| self.at(t))
             .map(|(_, op)| *op)
         {
+            let span = left.span;
             self.bump();
             let right = if level + 1 < BINARY_LEVELS.len() {
                 self.parse_binary_level(level + 1)?
             } else {
                 self.parse_unary()?
             };
-            left = Expr::Binary {
-                left: Box::new(left),
-                op,
-                right: Box::new(right),
-            };
+            left = Expr::new(
+                ExprKind::Binary {
+                    left: Box::new(left),
+                    op,
+                    right: Box::new(right),
+                },
+                span,
+            );
             self.skip_newlines_inside_delimiter();
         }
         Ok(left)
@@ -314,20 +338,28 @@ impl Parser {
     fn parse_unary(&mut self) -> Result<Expr, Box<dyn Error>> {
         self.skip_newlines_inside_delimiter();
         if self.at(&Token::Bang) {
+            let span = self.peek_span().unwrap_or(Span::new(1, 1));
             self.bump();
             let expr = self.with_nesting(|parser| parser.parse_unary())?;
-            return Ok(Expr::Unary {
-                op: UnOp::Not,
-                expr: Box::new(expr),
-            });
+            return Ok(Expr::new(
+                ExprKind::Unary {
+                    op: UnOp::Not,
+                    expr: Box::new(expr),
+                },
+                span,
+            ));
         }
         if self.at(&Token::Minus) {
+            let span = self.peek_span().unwrap_or(Span::new(1, 1));
             self.bump();
             let expr = self.with_nesting(|parser| parser.parse_unary())?;
-            return Ok(Expr::Unary {
-                op: UnOp::Neg,
-                expr: Box::new(expr),
-            });
+            return Ok(Expr::new(
+                ExprKind::Unary {
+                    op: UnOp::Neg,
+                    expr: Box::new(expr),
+                },
+                span,
+            ));
         }
         self.parse_call()
     }
@@ -336,6 +368,7 @@ impl Parser {
         loop {
             self.skip_newlines_inside_delimiter();
             if self.at(&Token::Dot) {
+                let span = expr.span;
                 self.bump();
                 self.skip_newlines_inside_delimiter();
                 let name = self.expect_ident()?;
@@ -343,19 +376,26 @@ impl Parser {
                     || (self.at(&Token::LBrace) && self.suppress_block_calls == 0)
                 {
                     let args = self.parse_args()?;
-                    expr = Expr::Call {
-                        receiver: Some(Box::new(expr)),
-                        name,
-                        args,
-                        block: self.parse_optional_brace_block()?,
-                    };
+                    expr = Expr::new(
+                        ExprKind::Call {
+                            receiver: Some(Box::new(expr)),
+                            name,
+                            args,
+                            block: self.parse_optional_brace_block()?,
+                        },
+                        span,
+                    );
                 } else {
-                    expr = Expr::FieldAccess {
-                        receiver: Box::new(expr),
-                        name,
-                    };
+                    expr = Expr::new(
+                        ExprKind::FieldAccess {
+                            receiver: Box::new(expr),
+                            name,
+                        },
+                        span,
+                    );
                 }
             } else if self.at(&Token::LBracket) {
+                let span = expr.span;
                 self.bump();
                 self.enter_nesting()?;
                 self.depth += 1;
@@ -366,22 +406,29 @@ impl Parser {
                 self.leave_nesting();
                 let index = index?;
                 self.expect(Token::RBracket)?;
-                expr = Expr::Index {
-                    base: Box::new(expr),
-                    index: Box::new(index),
-                };
+                expr = Expr::new(
+                    ExprKind::Index {
+                        base: Box::new(expr),
+                        index: Box::new(index),
+                    },
+                    span,
+                );
             } else if self.at(&Token::LParen) {
+                let span = expr.span;
                 let args = self.parse_args()?;
                 let block = if self.suppress_block_calls == 0 {
                     self.parse_optional_brace_block()?
                 } else {
                     None
                 };
-                expr = Expr::Invoke {
-                    callee: Box::new(expr),
-                    args,
-                    block,
-                };
+                expr = Expr::new(
+                    ExprKind::Invoke {
+                        callee: Box::new(expr),
+                        args,
+                        block,
+                    },
+                    span,
+                );
             } else {
                 break;
             }
@@ -389,26 +436,27 @@ impl Parser {
         Ok(expr)
     }
     fn parse_primary(&mut self) -> Result<Expr, Box<dyn Error>> {
+        let span = self.peek_span().unwrap_or(Span::new(1, 1));
         match self.peek().clone() {
             Token::Int(v) => {
                 self.bump();
-                Ok(Expr::Int(v))
+                Ok(Expr::new(ExprKind::Int(v), span))
             }
             Token::Str(parts) => {
                 self.bump();
-                self.expr_from_string_parts(parts)
+                self.expr_from_string_parts(parts, span)
             }
             Token::True => {
                 self.bump();
-                Ok(Expr::Bool(true))
+                Ok(Expr::new(ExprKind::Bool(true), span))
             }
             Token::False => {
                 self.bump();
-                Ok(Expr::Bool(false))
+                Ok(Expr::new(ExprKind::Bool(false), span))
             }
             Token::Nil => {
                 self.bump();
-                Ok(Expr::Nil)
+                Ok(Expr::new(ExprKind::Nil, span))
             }
             Token::Fn => {
                 self.bump();
@@ -419,7 +467,7 @@ impl Parser {
                 }
                 let params = self.parse_fn_params()?;
                 let body = self.parse_brace_block()?;
-                Ok(Expr::Fn { params, body })
+                Ok(Expr::new(ExprKind::Fn { params, body }, span))
             }
             Token::Ident(name) => {
                 self.bump();
@@ -431,14 +479,17 @@ impl Parser {
                     || (self.at(&Token::LBrace) && self.suppress_block_calls == 0)
                 {
                     let args = self.parse_args()?;
-                    Ok(Expr::Call {
-                        receiver: None,
-                        name,
-                        args,
-                        block: self.parse_optional_brace_block()?,
-                    })
+                    Ok(Expr::new(
+                        ExprKind::Call {
+                            receiver: None,
+                            name,
+                            args,
+                            block: self.parse_optional_brace_block()?,
+                        },
+                        span,
+                    ))
                 } else {
-                    Ok(Expr::Var(name))
+                    Ok(Expr::new(ExprKind::Var(name), span))
                 }
             }
             Token::LParen => {
@@ -450,12 +501,13 @@ impl Parser {
                 self.skip_newlines();
                 self.depth -= 1;
                 self.leave_nesting();
-                let out = out?;
+                let mut out = out?;
                 self.expect(Token::RParen)?;
+                out.span = span;
                 Ok(out)
             }
-            Token::LBrace => self.parse_map_literal(),
-            Token::LBracket => self.parse_array_literal(),
+            Token::LBrace => self.parse_map_literal(span),
+            Token::LBracket => self.parse_array_literal(span),
             Token::If => self.parse_if_expr(),
             Token::While => self.parse_while_expr(),
             Token::Try => self.parse_try_rescue(),
@@ -467,7 +519,7 @@ impl Parser {
             t => Err(self.parse_err(format!("unexpected token: {t:?}"))),
         }
     }
-    fn parse_map_literal(&mut self) -> Result<Expr, Box<dyn Error>> {
+    fn parse_map_literal(&mut self, span: Span) -> Result<Expr, Box<dyn Error>> {
         self.expect(Token::LBrace)?;
         self.enter_nesting()?;
         self.depth += 1;
@@ -476,7 +528,7 @@ impl Parser {
         self.leave_nesting();
         let entries = entries?;
         self.expect(Token::RBrace)?;
-        Ok(Expr::Map(entries))
+        Ok(Expr::new(ExprKind::Map(entries), span))
     }
     fn parse_map_entries(&mut self) -> Result<Vec<(String, Expr)>, Box<dyn Error>> {
         self.parse_comma_separated(Token::RBrace, |p| {
@@ -510,7 +562,7 @@ impl Parser {
             Ok((key, value))
         })
     }
-    fn parse_array_literal(&mut self) -> Result<Expr, Box<dyn Error>> {
+    fn parse_array_literal(&mut self, span: Span) -> Result<Expr, Box<dyn Error>> {
         self.expect(Token::LBracket)?;
         self.enter_nesting()?;
         self.depth += 1;
@@ -519,7 +571,7 @@ impl Parser {
         self.leave_nesting();
         let items = items?;
         self.expect(Token::RBracket)?;
-        Ok(Expr::Array(items))
+        Ok(Expr::new(ExprKind::Array(items), span))
     }
     /// delimiter 内のカンマ区切り列を読む。要素前後の改行を無視し、
     /// 末尾カンマを許す。`end` 自体の消費は呼び出し側が行う。
@@ -587,9 +639,13 @@ impl Parser {
         }
         Ok(vec![])
     }
-    fn expr_from_string_parts(&self, parts: Vec<StrPart>) -> Result<Expr, Box<dyn Error>> {
+    fn expr_from_string_parts(
+        &self,
+        parts: Vec<StrPart>,
+        span: Span,
+    ) -> Result<Expr, Box<dyn Error>> {
         if let [StrPart::Lit(s)] = parts.as_slice() {
-            return Ok(Expr::Str(s.clone()));
+            return Ok(Expr::new(ExprKind::Str(s.clone()), span));
         }
         let mut pieces = vec![];
         for part in parts {
@@ -600,7 +656,7 @@ impl Parser {
                 )),
             }
         }
-        Ok(Expr::StrInterp(pieces))
+        Ok(Expr::new(ExprKind::StrInterp(pieces), span))
     }
 
     /// 補間の中身(トークン列、末尾 Eof 付き)を単一の式として読む。
@@ -898,26 +954,26 @@ impl Parser {
                 )));
             }
             let child_depth = depth.saturating_add(1);
-            match expr {
-                Expr::StrInterp(pieces) => {
+            match &expr.kind {
+                ExprKind::StrInterp(pieces) => {
                     for piece in pieces {
                         if let StrPiece::Expr(child) = piece {
                             stack.push((child, child_depth));
                         }
                     }
                 }
-                Expr::Binary { left, right, .. }
-                | Expr::Index {
+                ExprKind::Binary { left, right, .. }
+                | ExprKind::Index {
                     base: left,
                     index: right,
                 } => {
                     stack.push((left, child_depth));
                     stack.push((right, child_depth));
                 }
-                Expr::Unary { expr, .. } | Expr::FieldAccess { receiver: expr, .. } => {
+                ExprKind::Unary { expr, .. } | ExprKind::FieldAccess { receiver: expr, .. } => {
                     stack.push((expr, child_depth))
                 }
-                Expr::Call {
+                ExprKind::Call {
                     receiver,
                     args,
                     block,
@@ -941,17 +997,17 @@ impl Parser {
                         }
                     }
                 }
-                Expr::Map(entries) => {
+                ExprKind::Map(entries) => {
                     for (_, value) in entries {
                         stack.push((value, child_depth));
                     }
                 }
-                Expr::Array(items) => {
+                ExprKind::Array(items) => {
                     for item in items {
                         stack.push((item, child_depth));
                     }
                 }
-                Expr::If {
+                ExprKind::If {
                     cond,
                     then_body,
                     else_body,
@@ -961,13 +1017,13 @@ impl Parser {
                         self.validate_stmt_depth_iterative(child, child_depth, max)?;
                     }
                 }
-                Expr::While { cond, body } => {
+                ExprKind::While { cond, body } => {
                     stack.push((cond, child_depth));
                     for child in body {
                         self.validate_stmt_depth_iterative(child, child_depth, max)?;
                     }
                 }
-                Expr::TryRescue {
+                ExprKind::TryRescue {
                     try_body,
                     rescue_body,
                     ..
@@ -976,7 +1032,7 @@ impl Parser {
                         self.validate_stmt_depth_iterative(child, child_depth, max)?;
                     }
                 }
-                Expr::Fn { params, body } => {
+                ExprKind::Fn { params, body } => {
                     for param in params {
                         if let Some(default) = &param.default {
                             stack.push((default, child_depth));
@@ -986,7 +1042,7 @@ impl Parser {
                         self.validate_stmt_depth_iterative(child, child_depth, max)?;
                     }
                 }
-                Expr::Invoke {
+                ExprKind::Invoke {
                     callee,
                     args,
                     block,
@@ -1005,7 +1061,11 @@ impl Parser {
                         }
                     }
                 }
-                Expr::Int(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Nil | Expr::Var(_) => {}
+                ExprKind::Int(_)
+                | ExprKind::Str(_)
+                | ExprKind::Bool(_)
+                | ExprKind::Nil
+                | ExprKind::Var(_) => {}
             }
         }
         Ok(())
@@ -1152,7 +1212,13 @@ mod tests {
         let program = parse_with_depth(&source, 8).unwrap();
         // 入れ子の `if` は外側の 1 つの Stmt::Expr(Expr::If) になり、本体は内側に畳まれる。
         assert_eq!(program.len(), 1);
-        assert!(matches!(program[0], Stmt::Expr(Expr::If { .. })));
+        assert!(matches!(
+            program[0],
+            Stmt::Expr(Expr {
+                kind: ExprKind::If { .. },
+                ..
+            })
+        ));
     }
 
     #[test]

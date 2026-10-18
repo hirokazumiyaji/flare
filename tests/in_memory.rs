@@ -362,7 +362,7 @@ true.add_seconds(argument())
 "#;
     let err = run_in(&mut runtime, source).unwrap_err();
     assert!(
-        format!("{err}").contains("unsupported method receiver"),
+        format!("{err}").contains("cannot call method 'add_seconds' on Bool"),
         "{err}"
     );
     assert_eq!(
@@ -2260,7 +2260,7 @@ fn errors_carry_kind_and_line_col() {
         .downcast_ref::<FlareError>()
         .expect("runtime error should be FlareError");
     assert_eq!(ferr.kind, ErrorKind::Runtime);
-    assert_eq!(ferr.span, Some(Span::new(3, 1)));
+    assert_eq!(ferr.span, Some(Span::new(3, 5)));
     assert!(format!("{ferr}").contains("undefined variable"), "{ferr}");
 
     // backend エラー(in-memory の document not found)は Backend 種別。
@@ -2562,9 +2562,15 @@ fn timestamp_comparison_diff_and_rfc3339() {
     assert_eq!(out, Value::Array(vec![Value::Int(100), Value::Int(-100)]));
     // 異型との比較・減算は従来どおりエラー。
     let err = run_script("timestamp(1) > 2").unwrap_err();
-    assert!(format!("{err}").contains("unsupported > operands"), "{err}");
+    assert!(
+        format!("{err}").contains("unsupported operands for >: Timestamp and Int"),
+        "{err}"
+    );
     let err = run_script("timestamp(1) - 2").unwrap_err();
-    assert!(format!("{err}").contains("unsupported - operands"), "{err}");
+    assert!(
+        format!("{err}").contains("unsupported operands for -: Timestamp and Int"),
+        "{err}"
+    );
     // RFC3339 出力(UTC)。
     let out = run_script("timestamp(0).to_rfc3339()").unwrap();
     assert_eq!(out, Value::Str("1970-01-01T00:00:00+00:00".to_string()));
@@ -2607,17 +2613,23 @@ fn string_comparison_operators_support_utf8_lexicographical_order() {
     assert_eq!(out, Value::Bool(true));
     // Cross-type errors
     let err = run_script("\"a\" < 1").unwrap_err();
-    assert!(format!("{err}").contains("unsupported < operands"), "{err}");
+    assert!(
+        format!("{err}").contains("unsupported operands for <: Str and Int"),
+        "{err}"
+    );
     let err = run_script("\"a\" > 1").unwrap_err();
-    assert!(format!("{err}").contains("unsupported > operands"), "{err}");
+    assert!(
+        format!("{err}").contains("unsupported operands for >: Str and Int"),
+        "{err}"
+    );
     let err = run_script("\"a\" <= 1").unwrap_err();
     assert!(
-        format!("{err}").contains("unsupported <= operands"),
+        format!("{err}").contains("unsupported operands for <=: Str and Int"),
         "{err}"
     );
     let err = run_script("\"a\" >= 1").unwrap_err();
     assert!(
-        format!("{err}").contains("unsupported >= operands"),
+        format!("{err}").contains("unsupported operands for >=: Str and Int"),
         "{err}"
     );
     // Conditional
@@ -3837,7 +3849,10 @@ fn modulo_operator_and_array_concatenation_work() {
     assert!(format!("{err}").contains("integer overflow"), "{err}");
 
     let err = run_script("\"a\" % 2").unwrap_err();
-    assert!(format!("{err}").contains("unsupported % operands"), "{err}");
+    assert!(
+        format!("{err}").contains("unsupported operands for %: Str and Int"),
+        "{err}"
+    );
 
     let out = run_script("[1, 2] + [3]").unwrap();
     assert_eq!(
@@ -3859,10 +3874,16 @@ fn modulo_operator_and_array_concatenation_work() {
     );
 
     let err = run_script("[1] + 2").unwrap_err();
-    assert!(format!("{err}").contains("unsupported + operands"), "{err}");
+    assert!(
+        format!("{err}").contains("unsupported operands for +: Array and Int"),
+        "{err}"
+    );
 
     let err = run_script("1 + [2]").unwrap_err();
-    assert!(format!("{err}").contains("unsupported + operands"), "{err}");
+    assert!(
+        format!("{err}").contains("unsupported operands for +: Int and Array"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -4037,7 +4058,7 @@ fn to_i_methods_and_functions() {
     // receiver / argument type errors
     let err = run_script("true.to_i()").unwrap_err();
     assert!(
-        format!("{err}").contains("unsupported method receiver"),
+        format!("{err}").contains("cannot call method 'to_i' on Bool"),
         "{err}"
     );
     let err = run_script("[1].to_i()").unwrap_err();
@@ -5043,4 +5064,58 @@ fn issue_184_map_dot_access_does_not_shadow_methods_and_distinguishes_syntax() {
             Value::Array(vec![Value::Str("keys".to_string())])
         ])
     );
+}
+
+#[test]
+fn runtime_error_diagnostics_precise_span_type_names_and_stack_trace() {
+    use flare::{FlareError, Span};
+
+    // 1. Binary operator operand type names
+    let err = run_script("\"foo\" + 1").unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported operands for +: Str and Int"),
+        "{err}"
+    );
+
+    // 2. Method receiver type names
+    let err = run_script("true.keys()").unwrap_err();
+    assert!(
+        format!("{err}").contains("cannot call method 'keys' on Bool"),
+        "{err}"
+    );
+
+    let err = run_script("123.keys()").unwrap_err();
+    assert!(
+        format!("{err}").contains("unknown int method: keys"),
+        "{err}"
+    );
+
+    let err = run_script("nil.foo()").unwrap_err();
+    assert!(
+        format!("{err}").contains("cannot call method 'foo' on nil"),
+        "{err}"
+    );
+
+    // 3. Precise span on sub-expression
+    let err = run_script("x = 1 + (2 + undefined_var)").unwrap_err();
+    let ferr = err.downcast_ref::<FlareError>().unwrap();
+    assert_eq!(ferr.span, Some(Span::new(1, 14)));
+
+    // 4. Call stack trace across functions
+    let script = "fn b() {\n  1 + \"x\"\n}\nfn a() {\n  b()\n}\na()";
+    let err = run_script(script).unwrap_err();
+    let ferr = err.downcast_ref::<FlareError>().unwrap();
+    assert_eq!(ferr.span, Some(Span::new(2, 3)));
+    let err_str = format!("{ferr}");
+    assert!(
+        err_str.contains("2:3: unsupported operands for +: Int and Str"),
+        "{err_str}"
+    );
+    assert!(err_str.contains("in b at 5:3"), "{err_str}");
+    assert!(err_str.contains("in a at 7:1"), "{err_str}");
+    assert_eq!(ferr.frames.len(), 2);
+    assert_eq!(ferr.frames[0].name, "b");
+    assert_eq!(ferr.frames[0].span, Span::new(5, 3));
+    assert_eq!(ferr.frames[1].name, "a");
+    assert_eq!(ferr.frames[1].span, Span::new(7, 1));
 }

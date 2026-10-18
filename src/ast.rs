@@ -1,7 +1,21 @@
 use std::fmt;
 
+use crate::error::Span;
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
+pub struct Expr {
+    pub kind: ExprKind,
+    pub span: Span,
+}
+
+impl Expr {
+    pub fn new(kind: ExprKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExprKind {
     Int(i64),
     Str(String),
     StrInterp(Vec<StrPiece>),
