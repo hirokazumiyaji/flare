@@ -8,13 +8,13 @@ use std::time::Duration;
 
 #[cfg(feature = "emulator")]
 use flare::AuthEmulatorOptions;
-use flare::{
-    Auth, Firestore, InMemoryAuth, InMemoryFirestore, InMemoryStorage, ProjectConfig,
-    RuntimeLimits, Services, Storage, StorageEmulator,
-};
 #[cfg(feature = "emulator")]
 use flare::{
-    AuthEmulator, EmulatorConfig, FirestoreEmulator, parse_timeout_ms as parse_library_timeout_ms,
+    parse_timeout_ms as parse_library_timeout_ms, AuthEmulator, EmulatorConfig, FirestoreEmulator,
+};
+use flare::{
+    validate_emulator_host, Auth, Firestore, InMemoryAuth, InMemoryFirestore, InMemoryStorage,
+    ProjectConfig, RuntimeLimits, Services, Storage, StorageEmulator,
 };
 
 #[cfg(not(feature = "emulator"))]
@@ -42,6 +42,8 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut inline: Vec<String> = vec![];
     let mut use_stdin = false;
     let mut repl = false;
+    let mut no_history = false;
+    let mut history_file: Option<PathBuf> = None;
     // Every budget is finite by default: `fl` accepts arbitrary scripts, so an
     // unbounded recursion, loop, or nested value must be a reported error
     // rather than a hang or a stack overflow.
@@ -56,6 +58,18 @@ fn run() -> Result<(), Box<dyn Error>> {
             Some("--repl" | "-i") => {
                 repl = true;
                 i += 1;
+            }
+            Some("--no-history") => {
+                no_history = true;
+                i += 1;
+            }
+            Some("--history-file") => {
+                let b = args.get(i + 1).ok_or("--history-file requires a path")?;
+                let path = b
+                    .to_str()
+                    .ok_or("--history-file value must be valid UTF-8")?;
+                history_file = Some(PathBuf::from(path));
+                i += 2;
             }
             Some("--backend") => {
                 let b = args
@@ -210,6 +224,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "emulator" => {
             let host = env::var("FIRESTORE_EMULATOR_HOST")
                 .map_err(|_| "FIRESTORE_EMULATOR_HOST must be set when using --backend emulator")?;
+            validate_emulator_host(&host)?;
             Some(EmulatorConfig {
                 host,
                 project_id: project.project_id.clone().unwrap(),
@@ -242,11 +257,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         // a non-UTF-8 value) must not make Firestore-only scripts fail before
         // they ever use Storage.
         "auto" => match env::var("FIREBASE_STORAGE_EMULATOR_HOST") {
-            Ok(host) => Some((
-                host,
-                project.project_id.clone().unwrap(),
-                project.storage_bucket.clone(),
-            )),
+            Ok(host) => {
+                if validate_emulator_host(&host).is_ok() {
+                    Some((
+                        host,
+                        project.project_id.clone().unwrap(),
+                        project.storage_bucket.clone(),
+                    ))
+                } else {
+                    None
+                }
+            }
             Err(_) => None,
         },
         "in-memory" => None,
@@ -263,6 +284,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     return Err("FIREBASE_STORAGE_EMULATOR_HOST must be valid UTF-8".into());
                 }
             };
+            validate_emulator_host(&host)?;
             Some((
                 host,
                 project.project_id.clone().unwrap(),
@@ -324,7 +346,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     let selected_auth = select_auth(&auth_backend, project.project_id.as_deref().unwrap())?;
     let storage: Box<dyn Storage> = match selected_storage {
         SelectedStorage::Memory => Box::new(InMemoryStorage::default()),
-        SelectedStorage::Emulator(storage) => Box::new(storage),
+        SelectedStorage::Emulator(mut storage) => {
+            storage.set_max_bytes_size(limits.max_bytes_size);
+            Box::new(storage)
+        }
     };
     #[cfg(feature = "emulator")]
     let mut firestore: Box<dyn Firestore> = Box::new(InMemoryFirestore::default());
@@ -347,8 +372,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut rt = flare::Runtime::from_services_with_limits(services, limits);
 
     if is_repl {
+        let mut repl_options = flare::repl::ReplOptions::resolve();
+        if no_history {
+            repl_options = repl_options.with_no_history(true);
+        } else if let Some(hf) = history_file {
+            repl_options = repl_options.with_history_file(Some(hf));
+        }
+
         if std::io::stdin().is_terminal() {
-            flare::repl::run_interactive(&mut rt)?;
+            flare::repl::run_interactive_with_options(&mut rt, repl_options)?;
         } else {
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
@@ -447,6 +479,7 @@ fn select_auth(mode: &str, _project_id: &str) -> Result<Box<dyn Auth>, Box<dyn E
                     return Err("FIREBASE_AUTH_EMULATOR_HOST must be valid UTF-8".into());
                 }
             };
+            validate_emulator_host(&host)?;
             #[cfg(feature = "emulator")]
             {
                 Ok(Box::new(AuthEmulator::new_with_options(
@@ -518,7 +551,7 @@ fn resolve_project_config(
 
 fn print_usage() {
     eprintln!(
-        "usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] [budget options] [--repl|-i] [<script-file> | - | -e <script>]"
+        "usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] [budget options] [--repl|-i] [--no-history] [--history-file <path>] [<script-file> | - | -e <script>]"
     );
     eprintln!();
     eprintln!("  Script source:");
@@ -611,6 +644,12 @@ fn print_usage() {
     eprintln!(
         "    emulator    use FIREBASE_AUTH_EMULATOR_HOST and shared Firebase project settings"
     );
+    eprintln!();
+    eprintln!("  REPL options:");
+    eprintln!("    --no-history                disable persistent REPL history");
+    eprintln!("    --history-file <path>       custom path for REPL history file");
+    eprintln!("    FL_HISTORY_FILE             environment override for history file");
+    eprintln!("    FL_NO_HISTORY               set to 1 to disable history persistence");
 }
 
 fn read_stdin() -> Result<String, Box<dyn Error>> {
@@ -642,14 +681,12 @@ mod project_config_tests {
         })
         .unwrap();
         assert_eq!(same.project_id.as_deref(), Some("demo"));
-        assert!(
-            resolve_project_config(|key| match key {
-                "FIREBASE_PROJECT_ID" => Some("one".into()),
-                "FIRESTORE_PROJECT_ID" => Some("two".into()),
-                _ => None,
-            })
-            .is_err()
-        );
+        assert!(resolve_project_config(|key| match key {
+            "FIREBASE_PROJECT_ID" => Some("one".into()),
+            "FIRESTORE_PROJECT_ID" => Some("two".into()),
+            _ => None,
+        })
+        .is_err());
     }
 
     #[test]

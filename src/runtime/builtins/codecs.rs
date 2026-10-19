@@ -2,16 +2,17 @@ use std::collections::BTreeMap;
 use std::error::Error;
 
 use crate::ast::Block;
+use crate::error::BudgetError;
 use crate::runtime::evaluator::{Evaluator, ExecFlow};
 use crate::runtime::expect_string;
 use crate::value::{validate_value_limits, Value};
 
-use super::io::BoundedWriter;
+use super::io::{promote_resource_limit, BoundedWriter};
 
-fn map_csv_error(e: csv::Error) -> String {
+fn map_csv_error(e: csv::Error) -> Box<dyn Error> {
     match e.kind() {
-        csv::ErrorKind::Io(io_err) => io_err.to_string(),
-        _ => format!("CSV.generate error: {e}"),
+        csv::ErrorKind::Io(io_err) => promote_resource_limit(io_err.to_string().into()),
+        _ => format!("CSV.generate error: {e}").into(),
     }
 }
 
@@ -53,19 +54,19 @@ pub fn builtin_json_generate(
     let max_bytes = rt.state.limits.max_file_io_bytes;
     let mut writer = BoundedWriter::new(Vec::new(), max_bytes);
     if pretty {
-        serde_json::to_writer_pretty(&mut writer, &json_val).map_err(|e| {
+        serde_json::to_writer_pretty(&mut writer, &json_val).map_err(|e| -> Box<dyn Error> {
             if e.is_io() {
-                e.to_string()
+                BudgetError::new(e.to_string()).into()
             } else {
-                format!("JSON.generate error: {e}")
+                format!("JSON.generate error: {e}").into()
             }
         })?;
     } else {
-        serde_json::to_writer(&mut writer, &json_val).map_err(|e| {
+        serde_json::to_writer(&mut writer, &json_val).map_err(|e| -> Box<dyn Error> {
             if e.is_io() {
-                e.to_string()
+                BudgetError::new(e.to_string()).into()
             } else {
-                format!("JSON.generate error: {e}")
+                format!("JSON.generate error: {e}").into()
             }
         })?;
     };
@@ -76,7 +77,8 @@ pub fn builtin_json_generate(
         &result,
         rt.state.limits.max_value_depth,
         rt.state.limits.max_value_nodes,
-    )?;
+    )
+    .map_err(|e| BudgetError::new(e.to_string()))?;
     Ok(ExecFlow::Value(result))
 }
 
@@ -111,9 +113,10 @@ pub fn builtin_csv_parse(
             total_nodes = total_nodes.saturating_add(1);
             if let Some(limit) = max_nodes {
                 if total_nodes > limit {
-                    return Err(
-                        format!("resource limit exceeded: max value nodes ({limit})").into(),
-                    );
+                    return Err(BudgetError::new(format!(
+                        "resource limit exceeded: max value nodes ({limit})"
+                    ))
+                    .into());
                 }
             }
             headers.push(h.to_string());
@@ -128,18 +131,20 @@ pub fn builtin_csv_parse(
                 total_nodes = total_nodes.saturating_add(1);
                 if let Some(limit) = max_nodes {
                     if total_nodes > limit {
-                        return Err(
-                            format!("resource limit exceeded: max value nodes ({limit})").into(),
-                        );
+                        return Err(BudgetError::new(format!(
+                            "resource limit exceeded: max value nodes ({limit})"
+                        ))
+                        .into());
                     }
                 }
                 map.insert(header.clone(), Value::Str(field_str.to_string()));
             }
             if let Some(limit) = max_nodes {
                 if total_nodes > limit {
-                    return Err(
-                        format!("resource limit exceeded: max value nodes ({limit})").into(),
-                    );
+                    return Err(BudgetError::new(format!(
+                        "resource limit exceeded: max value nodes ({limit})"
+                    ))
+                    .into());
                 }
             }
             rows.push(Value::Map(map));
@@ -155,18 +160,20 @@ pub fn builtin_csv_parse(
                 total_nodes = total_nodes.saturating_add(1);
                 if let Some(limit) = max_nodes {
                     if total_nodes > limit {
-                        return Err(
-                            format!("resource limit exceeded: max value nodes ({limit})").into(),
-                        );
+                        return Err(BudgetError::new(format!(
+                            "resource limit exceeded: max value nodes ({limit})"
+                        ))
+                        .into());
                     }
                 }
                 row.push(Value::Str(f.to_string()));
             }
             if let Some(limit) = max_nodes {
                 if total_nodes > limit {
-                    return Err(
-                        format!("resource limit exceeded: max value nodes ({limit})").into(),
-                    );
+                    return Err(BudgetError::new(format!(
+                        "resource limit exceeded: max value nodes ({limit})"
+                    ))
+                    .into());
                 }
             }
             rows.push(Value::Array(row));
@@ -178,7 +185,8 @@ pub fn builtin_csv_parse(
         &val,
         rt.state.limits.max_value_depth,
         rt.state.limits.max_value_nodes,
-    )?;
+    )
+    .map_err(|e| BudgetError::new(e.to_string()))?;
     Ok(ExecFlow::Value(val))
 }
 
@@ -288,8 +296,14 @@ pub fn builtin_yaml_generate(
     let yaml_val = value_to_yaml(val)?;
     let max_bytes = rt.state.limits.max_file_io_bytes;
     let mut writer = BoundedWriter::new(Vec::new(), max_bytes);
-    serde_yaml::to_writer(&mut writer, &yaml_val)
-        .map_err(|e| format!("YAML.generate error: {e}"))?;
+    serde_yaml::to_writer(&mut writer, &yaml_val).map_err(|e| -> Box<dyn Error> {
+        let msg = e.to_string();
+        if msg.contains("resource limit exceeded") {
+            BudgetError::new(msg).into()
+        } else {
+            format!("YAML.generate error: {e}").into()
+        }
+    })?;
     let bytes = writer.into_inner();
     let text = String::from_utf8(bytes).map_err(|e| format!("YAML.generate error: {e}"))?;
     let result = Value::Str(text);
@@ -297,7 +311,8 @@ pub fn builtin_yaml_generate(
         &result,
         rt.state.limits.max_value_depth,
         rt.state.limits.max_value_nodes,
-    )?;
+    )
+    .map_err(|e| BudgetError::new(e.to_string()))?;
     Ok(ExecFlow::Value(result))
 }
 
@@ -310,13 +325,19 @@ fn json_to_value(
 ) -> Result<Value, Box<dyn Error>> {
     if let Some(limit) = max_depth {
         if depth > limit {
-            return Err(format!("resource limit exceeded: max value depth ({limit})").into());
+            return Err(BudgetError::new(format!(
+                "resource limit exceeded: max value depth ({limit})"
+            ))
+            .into());
         }
     }
     *nodes = nodes.saturating_add(1);
     if let Some(limit) = max_nodes {
         if *nodes > limit {
-            return Err(format!("resource limit exceeded: max value nodes ({limit})").into());
+            return Err(BudgetError::new(format!(
+                "resource limit exceeded: max value nodes ({limit})"
+            ))
+            .into());
         }
     }
     Ok(match val {
@@ -418,13 +439,19 @@ fn yaml_to_value(
 ) -> Result<Value, Box<dyn Error>> {
     if let Some(limit) = max_depth {
         if depth > limit {
-            return Err(format!("resource limit exceeded: max value depth ({limit})").into());
+            return Err(BudgetError::new(format!(
+                "resource limit exceeded: max value depth ({limit})"
+            ))
+            .into());
         }
     }
     *nodes = nodes.saturating_add(1);
     if let Some(limit) = max_nodes {
         if *nodes > limit {
-            return Err(format!("resource limit exceeded: max value nodes ({limit})").into());
+            return Err(BudgetError::new(format!(
+                "resource limit exceeded: max value nodes ({limit})"
+            ))
+            .into());
         }
     }
     Ok(match val {

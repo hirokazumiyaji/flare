@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 
 use crate::ast::Block;
+use crate::error::BudgetError;
 use crate::runtime::evaluator::{Evaluator, ExecFlow};
 use crate::runtime::expect_string;
 use crate::value::{validate_value_limits, BuiltinModule, Value};
@@ -15,6 +16,17 @@ pub fn builtin_io_file(
     Ok(ExecFlow::Value(Value::Module(BuiltinModule::File)))
 }
 
+/// Maps an I/O or codec error that carries Flare's internal `resource limit
+/// exceeded` prefix (set by `io/*` and `BoundedWriter`) to `BudgetError` so
+/// `try/rescue` cannot swallow a budget breach.
+pub(super) fn promote_resource_limit(e: Box<dyn Error>) -> Box<dyn Error> {
+    if e.to_string().contains("resource limit exceeded") {
+        BudgetError::new(e.to_string()).into()
+    } else {
+        e
+    }
+}
+
 pub fn builtin_file_read(
     rt: &mut Evaluator<'_>,
     args: Vec<Value>,
@@ -24,7 +36,11 @@ pub fn builtin_file_read(
     let path_str = expect_string(args.first())?;
     let path = std::path::Path::new(path_str);
     let max_bytes = rt.state.limits.max_file_io_bytes;
-    let data = rt.services.io.read(path, max_bytes)?;
+    let data = rt
+        .services
+        .io
+        .read(path, max_bytes)
+        .map_err(promote_resource_limit)?;
     let val = match String::from_utf8(data) {
         Ok(s) => Value::Str(s),
         Err(e) => Value::Bytes(e.into_bytes()),
@@ -33,7 +49,8 @@ pub fn builtin_file_read(
         &val,
         rt.state.limits.max_value_depth,
         rt.state.limits.max_value_nodes,
-    )?;
+    )
+    .map_err(|e| BudgetError::new(e.to_string()))?;
     Ok(ExecFlow::Value(val))
 }
 
@@ -52,7 +69,10 @@ pub fn builtin_file_write(
         _ => return Err("File.write expects str or bytes content".into()),
     };
     let max_bytes = rt.state.limits.max_file_io_bytes;
-    rt.services.io.write(path, bytes, max_bytes)?;
+    rt.services
+        .io
+        .write(path, bytes, max_bytes)
+        .map_err(promote_resource_limit)?;
     Ok(ExecFlow::Value(Value::Int(bytes.len() as i64)))
 }
 

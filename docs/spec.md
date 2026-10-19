@@ -154,7 +154,9 @@ rows[0]["__name__"]  # => "users/1" (query-result Map indexing; __name__ is acce
 - Map indices must be **Str**; Array and Str indices must be **Int**. A type mismatch is an error.
 - Missing keys and out-of-range indices return **nil**, as in Ruby. Negative indices also return nil.
 - Indexing a receiver other than Map, Array, or Str is an error (`unsupported index receiver`).
-- The `m.key` form is limited to Map receivers to avoid conflicts with methods such as `.doc(..)` / `.where(..)` on Ref / Query values. A missing key returns nil. Calling it with arguments (`m.key(...)`) is an error (unless calling a map method such as `.has_key(k)`).
+- The `m.key` form without parentheses is field access on Maps (and AuthSession). It accesses the map key directly, even when the key matches a Map method name (`keys`, `values`, `len`, `has_key`, `entries`, `delete`, `merge`). A missing key returns **nil**.
+- Calling `m.method(...)` with parentheses or a block is a method call. Map methods are `.keys()`, `.values()`, `.len()`, `.has_key(k)`, `.entries()`, `.delete(k)`, and `.merge(other)`. Calling an unknown method with parentheses on a Map reports an error (`unknown map method: ...`).
+- Receivers other than Map (such as Array, Str, Bytes) do not support field access; unparenthesized `a.len` is an error (`field access is only supported on map`). Use `a.len()` or `len(a)` instead.
 
 ### Operators and Precedence (Low to High)
 
@@ -164,8 +166,8 @@ rows[0]["__name__"]  # => "users/1" (query-result Map indexing; __name__ is acce
 | 2 | `&&` | Any value (short-circuits and returns the operand itself) |
 | 3 | `==` `!=` | Any values (structural equality) |
 | 3 | `>` `<` `>=` `<=` | Int / Timestamp / Bytes / Str pairs (Bytes use unsigned-byte lexicographic order, Str use UTF-8 lexicographic order); other types are errors |
-| 4 | `+` `-` | `+`: Int pairs / Str pairs (concatenation). `-`: Int pairs / Timestamp − Timestamp → Int (difference in seconds). Other types are errors |
-| 5 | `*` `/` | Int only. `/ 0` reports `division by zero`. |
+| 4 | `+` `-` | `+`: Int pairs / Str pairs (concatenation) / Array pairs (concatenation). `-`: Int pairs / Timestamp − Timestamp → Int (difference in seconds). Other types are errors |
+| 5 | `*` `/` `%` | Int only. `/ 0` and `% 0` report `division by zero`. |
 | 6 | `!` `-` (unary) | `!v` accepts any value and returns `Bool(!truthy(v))`. `-v` accepts Int only (`integer overflow` on overflow). |
 | 7 (highest) | `.method(...)` / `expr[expr]` | Method calls and indexing (see §4, Indexing) |
 
@@ -175,7 +177,7 @@ rows[0]["__name__"]  # => "users/1" (query-result Map indexing; __name__ is acce
 - Truthiness follows §3: only `false` and `nil` are false.
 - Unary minus cannot be used as the first argument of a call without parentheses. `puts -1` is parsed as `puts - 1` (subtraction), so use parentheses to pass a negative value (`puts(-1)`). `!` is allowed (`puts !x` means `puts(!x)`).
 
-If an arithmetic operation (`+`, `-`, `*`, `/`) on Int values exceeds the i64 range, it reports `integer overflow` (it does not panic in debug builds). `/ 0` reports `division by zero`.
+If an arithmetic operation (`+`, `-`, `*`, `/`, `%`) on Int values exceeds the i64 range, it reports `integer overflow` (it does not panic in debug builds). `/ 0` and `% 0` report `division by zero`.
 
 ### Expression Evaluation Order for Calls
 
@@ -194,7 +196,7 @@ a = 2   # Error: reassignment is not allowed: a
 ```
 
 - Variables cannot be reassigned. Function names share the same namespace and cannot be redefined.
-- Defining a function with a built-in name (`puts`, `get`, `set`, `update`, `delete`, `batch`, `transaction`, `doc`, `col`, `col_group`, `array`, `len`, `now`, `timestamp`, `bytes`, `server_timestamp`, `array_union`, `array_remove`, `delete_field`, `increment`, `storage_upload`, `storage_download`, `storage_metadata`, `storage_delete`, `auth_sign_up`, `auth_sign_in`, `auth_current_user`, `auth_sign_out`) errors with `cannot redefine builtin: <name>`. Built-in calls always take precedence.
+- Defining a function with a built-in name (`puts`, `raise`, `get`, `set`, `update`, `delete`, `batch`, `transaction`, `doc`, `col`, `col_group`, `array`, `range`, `len`, `now`, `timestamp`, `bytes`, `server_timestamp`, `array_union`, `array_remove`, `delete_field`, `increment`, `storage_upload`, `storage_download`, `storage_metadata`, `storage_delete`, `auth_sign_up`, `auth_sign_in`, `auth_current_user`, `auth_sign_out`, `to_s`, `inspect`, `type_of`, `to_i`) errors with `cannot redefine builtin: <name>`. Built-in calls always take precedence.
 - Assigning to a name visible from an outer scope inside a function errors; shadowing is not allowed. **Function parameters** may have the same names as outer variables.
 - Parameter names cannot repeat within a function or block definition. Duplicate parameters cause a parse or definition error.
 
@@ -213,16 +215,24 @@ g()      # Error: undefined variable: x
 - Assigning to an already visible name (global, parameter, or function local) inside a function errors. A name that exists only in the caller can be defined as a function local.
 - Block parameters (`each`, `map`, etc.) follow the same rule and may reuse outer names. Block bodies can read outer-scope variables because they are evaluated in the caller’s environment.
 
-### Function Definitions and Calls
+### Function Definitions, Anonymous Functions, and Calls
 
 ```ruby
-fn add(a, b) { return a + b }   # return is optional (the last expression is the result)
+fn add(a, b = 0) { return a + b }   # default argument b = 0; return is optional
 add(2, 3)
-add(a: 2, b: 3)                 # Ruby-style keyword arguments
-puts "x"                        # Parentheses may be omitted
+add(a: 2, b: 3)                    # Ruby-style keyword arguments
+add(5)                             # Uses default value for b (returns 5)
+puts "x"                           # Parentheses may be omitted
+
+# Anonymous functions (first-class values)
+f = fn(x, step = 1) { x + step }
+f(10)                              # 11
+(fn(x) { x * 2 })(3)               # 6
 ```
 
 - Positional and keyword arguments can be mixed. Positional values bind first, then keywords bind by name. Missing, extra, or unknown arguments error.
+- **Default arguments**: Parameters can define defaults using `param = expr` (e.g. `fn f(a, b = 2)`). Default expressions are evaluated at call time only when the argument is omitted. They are evaluated in the function scope where only globals are visible (they cannot access other parameters or caller locals). Parameters without defaults cannot follow parameters with defaults.
+- **Anonymous functions**: `fn(params) { body }` expressions create anonymous functions as first-class `Func` values. They follow Flare's static scope rules (only global variables and function parameters are accessible; caller locals are not captured).
 - Built-in module calls accept the same keyword arguments as their global aliases. Other receiver methods keep their documented contracts; query and collection methods do not accept keywords.
 - The parameter list may be omitted, as in `fn name { ... }`.
 - An array literal cannot be the **first argument of a call without parentheses**. `puts [1, 2]` is parsed as indexing `puts[1, 2]`; pass arrays with parentheses, as `puts([1, 2])`.
@@ -247,24 +257,52 @@ total = len(rows)                                            # Number of items
 | `array.contains(val)` | Returns Bool indicating whether the array contains `val` |
 | `array.join(sep = "")` | Joins array elements as a string using the separator |
 | `array.len()` / `len(array)` | Number of items (Int) |
+| `array.sort()` | Returns a new Array with elements sorted using the total ordering (same order as `order_by`) |
+| `array.sort_by { \|item\| expr }` | Returns a new Array stably sorted by the keys evaluated by the block |
+| `array.reverse()` | Returns a new Array with elements in reverse order |
+| `array.first()` | Returns the first item in the Array, or nil if empty |
+| `array.last()` | Returns the last item in the Array, or nil if empty |
+| `array.slice(start, len)` | Returns a subarray of up to `len` elements starting at index `start`; truncated to the available range when `start` or `start + len` is past the end |
+| `array.uniq()` | Returns a new Array with duplicate elements removed, preserving first-seen order |
+| `array.flatten()` | Returns a new Array with one level of nested arrays flattened |
+| `array.any { \|item\| expr }` | Returns Bool indicating whether the block evaluates to truthy for any item |
+| `array.all { \|item\| expr }` | Returns Bool indicating whether the block evaluates to truthy for all items |
 | `map.keys()` | Returns an Array of all keys in the Map |
 | `map.values()` | Returns an Array of all values in the Map |
 | `map.has_key(key)` | Returns Bool indicating whether the Map contains the string key |
+| `map.entries()` | Returns an Array of `[key, value]` pairs, sorted by key |
+| `map.delete(key)` | Returns a copy of the Map with `key` removed |
+| `map.merge(other)` | Returns a new Map with entries from `other` merged into a copy of `self`; on key collision, the value in `other` wins |
 | `map.len()` / `len(map)` | Number of Map entries (Int) |
 | `str.split(sep)` | Splits the string into an Array of substrings |
 | `str.starts_with(prefix)` | Returns Bool indicating whether the string begins with prefix |
 | `str.ends_with(suffix)` | Returns Bool indicating whether the string ends with suffix |
 | `str.contains(substr)` | Returns Bool indicating whether the string contains substr |
+| `str.upcase()` | Returns a copy of the string converted to uppercase |
+| `str.downcase()` | Returns a copy of the string converted to lowercase |
+| `str.replace(from, to)` | Returns a copy of the string with all occurrences of `from` replaced by `to` |
+| `str.slice(start, len)` | Returns a substring of up to `len` Unicode characters starting at `start`; truncated to the available range when `start` or `start + len` is past the end |
 | `str.trim()` | Returns a copy of the string with leading and trailing whitespace removed |
 | `str.len()` / `len(str)` | Number of Unicode characters in the string (Int) |
 | `len(bytes)` | Number of Bytes bytes |
+| `val.to_s()` / `to_s(val)` | String representation of the value (matching string interpolation) |
+| `val.inspect()` / `inspect(val)` | Developer-oriented inspect string representation |
+| `val.type_of()` / `type_of(val)` | Type name as string (`"Int"`, `"Str"`, `"Bool"`, `"Nil"`, `"Array"`, `"Map"`, `"Timestamp"`, `"Bytes"`, etc.) |
+| `str.to_i()` / `to_i(val)` | Parses base-10 integer from string or returns integer as-is |
 
-- A block is required for `each`, `map`, `filter`, and `find`. The number of block parameters must match the number supplied by the caller (`[1].each { \|a, b\| ... }` errors; **this is checked even for empty arrays**).
-- `each`, `map`, `filter`, `find`, `array.len()`, `map.keys()`, `map.values()`, `map.len()`, `str.trim()`, `str.len()` take no positional arguments.
-- `contains`, `has_key`, `split`, `starts_with`, `ends_with`, `str.contains` take exactly 1 argument. `array.join` takes 0 or 1 argument.
+| `range(end)` / `range(start, end[, step])` | Returns an Array of Int from start to end (exclusive), bounded by `max_value_nodes` |
+| `n.times { \|i\| ... }` | Evaluates the block `n` times with index `0..n-1` (or 0 block parameters); returns `n` |
+| `array.reduce(init) { \|acc, item\| expr }` | Accumulates elements with initial accumulator `init` (or first item if omitted). Alias: `inject`. |
+| `array.each_with_index { \|item, i\| ... }` | Evaluates the block with each item and its 0-based index (Int); returns nil |
+| `array.map_with_index { \|item, i\| expr }` | Returns a new Array of block results for each item and its 0-based index (Int) |
+| `array.select { \|item\| expr }` | Alias for `filter` |
+| `array.reject { \|item\| expr }` | Returns a new Array of items for which the block evaluates to a falsey value |
+- `contains`, `has_key`, `split`, `starts_with`, `ends_with`, `str.contains`, `map.delete`, `map.merge`, `to_s(val)`, `inspect(val)`, `type_of(val)`, `to_i(val)` take exactly 1 argument. `array.slice`, `str.slice`, `str.replace` take exactly 2 arguments. `array.join` and `array.reduce` take 0 or 1 argument. `range` takes 1 to 3 arguments.
+- A block is required for `each`, `map`, `filter`, `select`, `reject`, `find`, `each_with_index`, `map_with_index`, `reduce`, `inject`, `sort_by`, `any`, `all`, and `int.times`. The number of block parameters must match the number supplied by the caller (`[1].each { \|a, b\| ... }` errors; **this is checked even for empty arrays**).
+- `each`, `map`, `filter`, `select`, `reject`, `find`, `each_with_index`, `map_with_index`, `int.times`, `sort_by`, `any`, `all`, `array.len()`, `array.sort()`, `array.reverse()`, `array.first()`, `array.last()`, `array.uniq()`, `array.flatten()`, `map.keys()`, `map.values()`, `map.len()`, `map.entries()`, `str.trim()`, `str.len()`, `str.upcase()`, `str.downcase()`, `val.to_s()`, `val.inspect()`, `val.type_of()`, `str.to_i()` take no positional arguments.
 - Assigning to an outer-scope name inside a block errors, consistent with variable immutability.
-- A `return` inside a block exits the block and becomes the return value of the **enclosing function**. Iteration in `each` / `map` stops there, so later items are not processed. This propagation applies only when returning from a block to an outer function. A `Return` within the function itself (the body or a block in that body) is consumed as that function’s result. A nested block’s `return` belongs to the innermost **function**.
-- There is no `for` statement; use `each` / `map` to iterate. `while` remains, but immutable variables make it unsuitable for iteration (it is intended for special cases such as waiting on side effects).
+- A `return` inside a block exits the block and becomes the return value of the **enclosing function**. Iteration in `each` / `map` / `reduce` / `times` / `find` / `filter` / `sort_by` / `any` / `all` stops there, so later items are not processed. This propagation applies only when returning from a block to an outer function. A `Return` within the function itself (the body or a block in that body) is consumed as that function’s result. A nested block’s `return` belongs to the innermost **function**.
+- There is no `for` statement. For bounded loops and iteration without reassignment, use `range(...)`, `n.times { ... }`, `each`, `each_with_index`, `map`, `map_with_index`, `reduce`, and `select`. `while` remains for special cases such as waiting on external side effects.
 
 ### Methods and Immutability
 
@@ -280,15 +318,22 @@ t2 = t1.add_seconds(10)   # t1 remains 100
 ```ruby
 if cond { ... } else if cond { ... } else { ... }   # else / else if are optional; else if may be repeated
 while cond { ... }
+try { ... } rescue |err| { ... }                    # err binding is optional; returns last evaluated value
 ```
 
-Blocks always use `{ ... }`. `if` and `while` are expressions that return the last evaluated value (`while` returns nil if it never runs).
+Blocks always use `{ ... }`. `if`, `while`, and `try / rescue` are expressions that return the last evaluated value (`while` returns nil if it never runs).
 
 A method call inside an `if` / `while` **condition cannot have a block**, to distinguish it from the body `{ ... }`. Conditions such as `if m.active { ... }` and `if f() { ... }` are valid, but calls with blocks such as `rows.each { ... }` must be written as statements.
 
-### Built-in Output
+`try { ... } rescue |err| { ... }` evaluates the `try` body. If an error occurs (such as from `raise(message)` or a backend failure like updating a missing document), the error is caught and `err` is bound to a Map `{kind: "...", message: "..."}` (with `err.kind` and `err.message` accessible via dot syntax or map index).
+Budget exceeded errors (step, wall-clock, call depth, memory limits) are uncatchable to prevent scripts from bypassing resource controls.
+When an error is rescued inside a `batch` or `transaction`, Firestore writes staged within the failing `try` block are discarded (rolled back from the batch/transaction's pending write buffer) while preserving any writes staged prior to entering `try`, allowing the enclosing batch or transaction to continue. Unstaged external side effects (such as `File.write`) are not rolled back.
+
+### Built-in Output and Error Handling
 
 `puts(v, ...)` prints each value on its own line using `to_s` and returns nil. `to_s` prints Str without quotes and all other values in `inspect` form. `inspect` is Ruby-like: `[1, "x"]`, `{"a" => 1}`, `nil`, and `"str"` (Str is double-quoted; Map keys are sorted). Bytes are shown as hex, up to the first 32 bytes, as `Bytes(00ff)`. Longer values use `Bytes(<first 32 bytes>, <omitted byte count> more bytes)`; Bytes are not decoded as Unicode. The final `fl` result prints as `=> <inspect>` (top-level Str values are quoted too). Interpolation (`#{expression}`) embeds `to_s` output, so Bytes use the same bounded `Bytes(...)` representation.
+
+`raise(message)` raises a runtime error with the given message string (or value converted to string) causing `fl` to exit with status 1 when uncaught.
 
 ## 6. Firestore API
 
@@ -360,7 +405,7 @@ col("users").doc("1")       # Equivalent to doc("users/1")
   - A `DocRef` such as `doc("users/1")` may be used as a `where` value for queries on reference fields in the same database, including `==`, `in`, and `array_contains`. The emulator backend encodes it as a full resource name in the same project and database; nested Array / Map values are encoded recursively by the same rule. A `DocRef` is allowed as a query filter value, but the emulator write codec rejects it with `unsupported value in emulator write`. The shared matcher makes the final decision on server-filtered candidates after normalizing references to relative paths.
   - The emulator may use Firestore server filters only to narrow the candidate set. The final `where` decision is always made client-side by the same implementation used in-memory. Firestore type ordering for comparisons between different types therefore does not affect flare results; in-memory and emulator return the same results.
   - Documents without the field do not match, including for `!=` / `not-in`.
-- `order_by(field, dir)` — `dir` must be `"asc"` or `"desc"`; other values error when called. Multiple clauses are applied in order. Documents missing the field are excluded (`__name__` exists on every document). Ties are broken by lexicographic order of the flare-relative document path. Values of the same type use the `where` ordering (Int numeric, Str lexicographic, Bool `false < true`, Timestamp by seconds, Bytes by unsigned-byte lexicographic order). Different types sort as Nil < Bool < Int < Timestamp < Str < Bytes < Array < Map < other, identically for both backends. Ordering uses the shared comparator after retrieval, so server composite-index constraints do not apply.
+- `order_by(field, dir = "asc")` — `dir` is optional and defaults to `"asc"`. When provided, `dir` must be `"asc"` or `"desc"`; other values error when called. Multiple clauses are applied in order. Documents missing the field are excluded (`__name__` exists on every document). Ties are broken by lexicographic order of the flare-relative document path. Values of the same type use the `where` ordering (Int numeric, Str lexicographic, Bool `false < true`, Timestamp by seconds, Bytes by unsigned-byte lexicographic order). Different types sort as Nil < Bool < Int < Timestamp < Str < Bytes < Array < Map < other, identically for both backends. Ordering uses the shared comparator after retrieval, so server composite-index constraints do not apply.
 
 - `limit(n)` — Maximum result count. The last value wins if specified more than once. `n` must be non-negative; a negative value errors (`limit must be >= 0`).
 - `offset(n)` — Skips the first `n` results; the last value wins if specified more than once. `n` must be non-negative; a negative value errors (`offset must be >= 0`). An offset larger than the result count returns an empty result.
@@ -414,7 +459,7 @@ transaction {
 ## 10. CLI (`fl`)
 
 ```
-usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] [budget options] [--repl|-i] [<script-file> | - | -e <script>]
+usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emulator] [--auth-backend in-memory|emulator] [--emulator-timeout-ms <ms>] [budget options] [--repl|-i] [--no-history] [--history-file <path>] [<script-file> | - | -e <script>]
 ```
 
 - Specify a script source: a file path, `-` (stdin), `-e <script>` (inline script; repeated values are joined with newlines), or `--repl` / `-i` (interactive REPL). When run without arguments, `fl` launches the REPL if connected to an interactive terminal (TTY), or reads from stdin if piped. Combining `--repl` / `-i` with a file, stdin, or `-e` is an error. `--help` / `-h` prints usage. Unknown options and unknown backends for either `--backend` or `--auth-backend` exit with an error.
@@ -432,6 +477,8 @@ usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emula
   - Maintains variables, functions, and service sessions (Firestore, Auth, Storage) across statements.
   - Allows top-level variable re-assignment and function re-definition within the interactive session.
   - Line editing and persistent history via `rustyline` with Tab-completion for keywords, modules, builtins, and in-scope variables.
+  - Command history is saved to `~/.fl_history` with `0600` permissions on Unix. The path can be configured with `--history-file <path>` or `FL_HISTORY_FILE`, and disabled with `--no-history` or `FL_NO_HISTORY=1`.
+  - Sensitive credential-bearing calls (`auth_sign_up`, `auth_sign_in`, `Auth.sign_*`) are automatically excluded from command history to prevent saving passwords in plain text.
   - Safe exit with `exit`, `quit`, or `Ctrl+D`. `Ctrl+C` cancels the current multiline input.
 - Binaries using `--backend emulator` must be built with the `emulator` feature.
   If specified without the feature, the following message is printed and the program exits:

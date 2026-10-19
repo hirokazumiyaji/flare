@@ -5,8 +5,9 @@ pub mod firestore;
 pub mod io;
 pub mod storage;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
+use std::sync::OnceLock;
 
 use crate::ast::Block;
 use crate::error::ServiceId;
@@ -49,11 +50,23 @@ const fn spec(
     }
 }
 
-pub const BUILTIN_SPECS: [BuiltinSpec; 39] = {
-    use BuiltinModule::{Auth, CSV, File, Firestore, IO, JSON, Storage, YAML};
+/// Methods applicable to any value, dispatched through the matching global
+/// builtin so both call forms share one implementation.
+pub fn universal_value_builtin(name: &str) -> Option<Builtin> {
+    match name {
+        "to_s" => Some(core::builtin_to_s),
+        "inspect" => Some(core::builtin_inspect),
+        "type_of" => Some(core::builtin_type_of),
+        "to_i" => Some(core::builtin_to_i),
+        _ => None,
+    }
+}
+
+pub const BUILTIN_SPECS: [BuiltinSpec; 45] = {
+    use BuiltinModule::{Auth, File, Firestore, Storage, CSV, IO, JSON, YAML};
     use ServiceId::{
-        Auth as AuthService, Firestore as FirestoreService, IO as IOService,
-        Storage as StorageService,
+        Auth as AuthService, Firestore as FirestoreService, Storage as StorageService,
+        IO as IOService,
     };
 
     [
@@ -64,6 +77,46 @@ pub const BUILTIN_SPECS: [BuiltinSpec; 39] = {
             CallContract::any(),
             None,
             core::builtin_puts,
+        ),
+        spec(
+            None,
+            "raise",
+            "raise",
+            CallContract::exact(1),
+            None,
+            core::builtin_raise,
+        ),
+        spec(
+            None,
+            "to_s",
+            "to_s",
+            CallContract::exact(1),
+            None,
+            core::builtin_to_s,
+        ),
+        spec(
+            None,
+            "inspect",
+            "inspect",
+            CallContract::exact(1),
+            None,
+            core::builtin_inspect,
+        ),
+        spec(
+            None,
+            "type_of",
+            "type_of",
+            CallContract::exact(1),
+            None,
+            core::builtin_type_of,
+        ),
+        spec(
+            None,
+            "to_i",
+            "to_i",
+            CallContract::exact(1),
+            None,
+            core::builtin_to_i,
         ),
         spec(
             Some(Firestore),
@@ -96,6 +149,14 @@ pub const BUILTIN_SPECS: [BuiltinSpec; 39] = {
             CallContract::any(),
             None,
             core::builtin_array,
+        ),
+        spec(
+            None,
+            "range",
+            "range",
+            CallContract::range(1, 3),
+            None,
+            core::builtin_range,
         ),
         spec(
             None,
@@ -380,22 +441,38 @@ pub const BUILTIN_SPECS: [BuiltinSpec; 39] = {
     ]
 };
 
+static GLOBAL_BUILTINS: OnceLock<HashMap<&'static str, BuiltinSpec>> = OnceLock::new();
+static MODULE_BUILTINS: OnceLock<HashMap<(BuiltinModule, &'static str), BuiltinSpec>> =
+    OnceLock::new();
+
 pub fn builtin_specs() -> &'static [BuiltinSpec] {
     &BUILTIN_SPECS
 }
 
 pub fn lookup_global_builtin(name: &str) -> Option<BuiltinSpec> {
-    builtin_specs()
-        .iter()
-        .copied()
-        .find(|spec| spec.global_name == name)
+    let map = GLOBAL_BUILTINS.get_or_init(|| {
+        let specs = builtin_specs();
+        let mut m = HashMap::with_capacity(specs.len());
+        for &spec in specs {
+            m.insert(spec.global_name, spec);
+        }
+        m
+    });
+    map.get(name).copied()
 }
 
 pub fn lookup_module_builtin(module: BuiltinModule, method: &str) -> Option<BuiltinSpec> {
-    builtin_specs()
-        .iter()
-        .copied()
-        .find(|spec| spec.module == Some(module) && spec.method == method)
+    let map = MODULE_BUILTINS.get_or_init(|| {
+        let specs = builtin_specs();
+        let mut m = HashMap::with_capacity(specs.len());
+        for &spec in specs {
+            if let Some(mod_) = spec.module {
+                m.insert((mod_, spec.method), spec);
+            }
+        }
+        m
+    });
+    map.get(&(module, method)).copied()
 }
 
 pub fn is_builtin_name(name: &str) -> bool {

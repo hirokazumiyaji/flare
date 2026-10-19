@@ -358,11 +358,11 @@ fn argument() {
   set("effects/argument", {ran: true})
   1
 }
-1.add_seconds(argument())
+true.add_seconds(argument())
 "#;
     let err = run_in(&mut runtime, source).unwrap_err();
     assert!(
-        format!("{err}").contains("unsupported method receiver"),
+        format!("{err}").contains("cannot call method 'add_seconds' on Bool"),
         "{err}"
     );
     assert_eq!(
@@ -1192,7 +1192,7 @@ fn builtin_call_contracts_reject_excess_arguments_and_keywords() {
             "too many positional arguments",
         ),
         ("[1].len(2)", "too many positional arguments"),
-        ("{a: 1}.a(2)", "too many positional arguments"),
+        ("{a: 1}.len(2)", "too many positional arguments"),
         (
             "set(\"users/1\", {}, mearge: true)",
             "unknown keyword arguments: mearge",
@@ -1213,7 +1213,7 @@ fn builtin_call_contracts_reject_excess_arguments_and_keywords() {
             "timestamp(1).to_unix(nope: true)",
             "unknown keyword arguments: nope",
         ),
-        ("{a: 1}.a(nope: true)", "unknown keyword arguments: nope"),
+        ("{a: 1}.len(nope: true)", "unknown keyword arguments: nope"),
     ] {
         let err = run_script(source).unwrap_err();
         assert!(format!("{err}").contains(expected), "{source}: {err}");
@@ -1324,7 +1324,7 @@ fn builtin_and_method_call_contracts_validate_block_policies() {
         ("get(\"users/1\") {}", "does not take a block"),
         ("set(\"users/1\", {}) {}", "does not take a block"),
         ("[1].len() {}", "does not take a block"),
-        ("{a: 1}.a {}", "does not take a block"),
+        ("{a: 1}.len {}", "does not take a block"),
     ] {
         let err = run_script(source).unwrap_err();
         assert!(format!("{err}").contains(expected), "{source}: {err}");
@@ -2260,7 +2260,7 @@ fn errors_carry_kind_and_line_col() {
         .downcast_ref::<FlareError>()
         .expect("runtime error should be FlareError");
     assert_eq!(ferr.kind, ErrorKind::Runtime);
-    assert_eq!(ferr.span, Some(Span::new(3, 1)));
+    assert_eq!(ferr.span, Some(Span::new(3, 5)));
     assert!(format!("{ferr}").contains("undefined variable"), "{ferr}");
 
     // backend エラー(in-memory の document not found)は Backend 種別。
@@ -2562,9 +2562,15 @@ fn timestamp_comparison_diff_and_rfc3339() {
     assert_eq!(out, Value::Array(vec![Value::Int(100), Value::Int(-100)]));
     // 異型との比較・減算は従来どおりエラー。
     let err = run_script("timestamp(1) > 2").unwrap_err();
-    assert!(format!("{err}").contains("unsupported > operands"), "{err}");
+    assert!(
+        format!("{err}").contains("unsupported operands for >: Timestamp and Int"),
+        "{err}"
+    );
     let err = run_script("timestamp(1) - 2").unwrap_err();
-    assert!(format!("{err}").contains("unsupported - operands"), "{err}");
+    assert!(
+        format!("{err}").contains("unsupported operands for -: Timestamp and Int"),
+        "{err}"
+    );
     // RFC3339 出力(UTC)。
     let out = run_script("timestamp(0).to_rfc3339()").unwrap();
     assert_eq!(out, Value::Str("1970-01-01T00:00:00+00:00".to_string()));
@@ -2607,13 +2613,25 @@ fn string_comparison_operators_support_utf8_lexicographical_order() {
     assert_eq!(out, Value::Bool(true));
     // Cross-type errors
     let err = run_script("\"a\" < 1").unwrap_err();
-    assert!(format!("{err}").contains("unsupported < operands"), "{err}");
+    assert!(
+        format!("{err}").contains("unsupported operands for <: Str and Int"),
+        "{err}"
+    );
     let err = run_script("\"a\" > 1").unwrap_err();
-    assert!(format!("{err}").contains("unsupported > operands"), "{err}");
+    assert!(
+        format!("{err}").contains("unsupported operands for >: Str and Int"),
+        "{err}"
+    );
     let err = run_script("\"a\" <= 1").unwrap_err();
-    assert!(format!("{err}").contains("unsupported <= operands"), "{err}");
+    assert!(
+        format!("{err}").contains("unsupported operands for <=: Str and Int"),
+        "{err}"
+    );
     let err = run_script("\"a\" >= 1").unwrap_err();
-    assert!(format!("{err}").contains("unsupported >= operands"), "{err}");
+    assert!(
+        format!("{err}").contains("unsupported operands for >=: Str and Int"),
+        "{err}"
+    );
     // Conditional
     let out = run_script("if \"alice\" < \"bob\" { 1 } else { 2 }").unwrap();
     assert_eq!(out, Value::Int(1));
@@ -2705,10 +2723,29 @@ fn order_by_sorts_and_excludes_docs_missing_the_field() {
     ))
     .unwrap();
     assert_eq!(out, Value::Array(vec![Value::Str("nested/n1".to_string())]));
+    // dir を省略するとデフォルトで "asc" になる。
+    let out_default = run_script(&format!(
+        "{setup}\ncol(\"users\").order_by(\"age\").get().map {{ |r| r[\"__name__\"] }}"
+    ))
+    .unwrap();
+    assert_eq!(
+        out_default,
+        Value::Array(vec![
+            Value::Str("users/ob2".to_string()),
+            Value::Str("users/ob3".to_string()),
+            Value::Str("users/ob1".to_string()),
+        ])
+    );
     // 不正な向きは呼び出し時にエラー。
     let err = run_script("col(\"users\").order_by(\"age\", \"up\")").unwrap_err();
     assert!(
         format!("{err}").contains("order_by direction must be \"asc\" or \"desc\""),
+        "{err}"
+    );
+    // 引数 0 個はエラー
+    let err = run_script("col(\"users\").order_by()").unwrap_err();
+    assert!(
+        format!("{err}").contains("expects at least 1 positional arguments, got 0"),
         "{err}"
     );
 }
@@ -3229,9 +3266,15 @@ test_find_return()
     let err = run_script("[1, 2].find()").unwrap_err();
     assert!(format!("{err}").contains("requires { ... } block"), "{err}");
     let err = run_script("[1, 2].contains()").unwrap_err();
-    assert!(format!("{err}").contains("missing positional arguments"), "{err}");
+    assert!(
+        format!("{err}").contains("missing positional arguments"),
+        "{err}"
+    );
     let err = run_script("[1, 2].join(123)").unwrap_err();
-    assert!(format!("{err}").contains("join separator must be a string"), "{err}");
+    assert!(
+        format!("{err}").contains("join separator must be a string"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -3271,7 +3314,8 @@ fn string_extended_methods_and_indexing_work() {
     );
 
     // contains
-    let out = run_script("[\"hello world\".contains(\"world\"), \"hello\".contains(\"abc\")]").unwrap();
+    let out =
+        run_script("[\"hello world\".contains(\"world\"), \"hello\".contains(\"abc\")]").unwrap();
     assert_eq!(
         out,
         Value::Array(vec![Value::Bool(true), Value::Bool(false)])
@@ -3304,21 +3348,42 @@ fn string_extended_methods_and_indexing_work() {
 
     // invalid index type
     let err = run_script("\"hello\"[\"foo\"]").unwrap_err();
-    assert!(format!("{err}").contains("string index must be an int"), "{err}");
+    assert!(
+        format!("{err}").contains("string index must be an int"),
+        "{err}"
+    );
 
     // invalid arguments
     let err = run_script("\"hello\".split(123)").unwrap_err();
-    assert!(format!("{err}").contains("split separator must be a string"), "{err}");
+    assert!(
+        format!("{err}").contains("split separator must be a string"),
+        "{err}"
+    );
     let err = run_script("\"hello\".starts_with(123)").unwrap_err();
-    assert!(format!("{err}").contains("starts_with prefix must be a string"), "{err}");
+    assert!(
+        format!("{err}").contains("starts_with prefix must be a string"),
+        "{err}"
+    );
     let err = run_script("\"hello\".ends_with(123)").unwrap_err();
-    assert!(format!("{err}").contains("ends_with suffix must be a string"), "{err}");
+    assert!(
+        format!("{err}").contains("ends_with suffix must be a string"),
+        "{err}"
+    );
     let err = run_script("\"hello\".contains(123)").unwrap_err();
-    assert!(format!("{err}").contains("contains substring must be a string"), "{err}");
+    assert!(
+        format!("{err}").contains("contains substring must be a string"),
+        "{err}"
+    );
     let err = run_script("\"hello\".trim(1)").unwrap_err();
-    assert!(format!("{err}").contains("too many positional arguments"), "{err}");
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
     let err = run_script("\"hello\".unknown()").unwrap_err();
-    assert!(format!("{err}").contains("unknown string method: unknown"), "{err}");
+    assert!(
+        format!("{err}").contains("unknown string method: unknown"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -3333,7 +3398,10 @@ m = {name: "alice", age: 30}
     assert_eq!(
         out,
         Value::Array(vec![
-            Value::Array(vec![Value::Str("age".to_string()), Value::Str("name".to_string())]),
+            Value::Array(vec![
+                Value::Str("age".to_string()),
+                Value::Str("name".to_string())
+            ]),
             Value::Array(vec![Value::Int(30), Value::Str("alice".to_string())]),
             Value::Bool(true),
             Value::Bool(false),
@@ -3365,12 +3433,1708 @@ m = {}
 
     // argument errors
     let err = run_script("{a: 1}.keys(1)").unwrap_err();
-    assert!(format!("{err}").contains("too many positional arguments"), "{err}");
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
     let err = run_script("{a: 1}.values(1)").unwrap_err();
-    assert!(format!("{err}").contains("too many positional arguments"), "{err}");
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
     let err = run_script("{a: 1}.has_key()").unwrap_err();
-    assert!(format!("{err}").contains("missing positional arguments"), "{err}");
+    assert!(
+        format!("{err}").contains("missing positional arguments"),
+        "{err}"
+    );
     let err = run_script("{a: 1}.has_key(123)").unwrap_err();
-    assert!(format!("{err}").contains("has_key key must be a string"), "{err}");
+    assert!(
+        format!("{err}").contains("has_key key must be a string"),
+        "{err}"
+    );
 }
 
+#[test]
+fn range_builtin_generates_bounded_int_arrays() {
+    let out = run_script("range(3)").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(0), Value::Int(1), Value::Int(2)])
+    );
+
+    let out = run_script("range(1, 4)").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
+
+    let out = run_script("range(0, 6, 2)").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(0), Value::Int(2), Value::Int(4)])
+    );
+
+    let out = run_script("range(5, 0, -1)").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(5),
+            Value::Int(4),
+            Value::Int(3),
+            Value::Int(2),
+            Value::Int(1),
+        ])
+    );
+
+    let out = run_script("range(3, 3)").unwrap();
+    assert_eq!(out, Value::Array(vec![]));
+
+    let out = run_script("range(5, 2)").unwrap();
+    assert_eq!(out, Value::Array(vec![]));
+
+    let out = run_script("range(2, 5, -1)").unwrap();
+    assert_eq!(out, Value::Array(vec![]));
+
+    // Range near boundary
+    let out = run_script("range(9223372036854775805, 9223372036854775807)").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(9223372036854775805),
+            Value::Int(9223372036854775806),
+        ])
+    );
+
+    // Zero step error
+    let err = run_script("range(0, 3, 0)").unwrap_err();
+    assert!(
+        format!("{err}").contains("range step cannot be zero"),
+        "{err}"
+    );
+
+    // Type error
+    let err = run_script("range(\"0\", 3)").unwrap_err();
+    assert!(format!("{err}").contains("expected int argument"), "{err}");
+
+    // Value node limits enforcement
+    let limits = RuntimeLimits::default().with_max_value_nodes(10);
+    let err = run_script_with_limits("range(0, 20)", limits).unwrap_err();
+    assert!(
+        format!("{err}").contains("value node limit exceeded (max 10)"),
+        "{err}"
+    );
+
+    // Iterating over range results
+    let out = run_script("range(1, 4).map { |x| x * 10 }").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(10), Value::Int(20), Value::Int(30)])
+    );
+}
+
+#[test]
+fn int_times_method_executes_iteration_and_enforces_limits() {
+    let out = run_script(
+        r#"
+fn test_times_collect() {
+    range(3).map { |i| i + 1 }
+}
+test_times_collect()
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
+
+    // times returns the integer receiver
+    let out = run_script(
+        r#"
+3.times { |i|
+    i
+}
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(3));
+
+    // 0 params block is allowed
+    let out = run_script(
+        r#"
+2.times {
+    1
+}
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(2));
+
+    // <= 0 times
+    let out = run_script("0.times { |i| i }").unwrap();
+    assert_eq!(out, Value::Int(0));
+    let out = run_script("(-5).times { |i| i }").unwrap();
+    assert_eq!(out, Value::Int(-5));
+
+    // block arity check (> 1 params rejected)
+    let err = run_script("3.times { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 0 or 1 argument(s), got 2"),
+        "{err}"
+    );
+    let err = run_script("0.times { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 0 or 1 argument(s), got 2"),
+        "{err}"
+    );
+
+    // early return from block
+    let out = run_script(
+        r#"
+fn test_times_return() {
+    5.times { |i|
+        if i == 2 {
+            return 777
+        }
+    }
+    100
+}
+test_times_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(777));
+
+    // loop iteration budget
+    let limits = RuntimeLimits::default().with_max_loop_iterations(5);
+    let err = run_script_with_limits("10.times { |i| i }", limits).unwrap_err();
+    assert!(
+        format!("{err}").contains("loop iteration limit exceeded (max 5)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn array_reduce_and_inject_accumulate_elements() {
+    // With initial accumulator
+    let out = run_script("[1, 2, 3, 4].reduce(0) { |acc, x| acc + x }").unwrap();
+    assert_eq!(out, Value::Int(10));
+
+    // Without initial accumulator
+    let out = run_script("[1, 2, 3, 4].reduce { |acc, x| acc * x }").unwrap();
+    assert_eq!(out, Value::Int(24));
+
+    // Empty array with init returns init
+    let out = run_script("[].reduce(42) { |acc, x| acc + x }").unwrap();
+    assert_eq!(out, Value::Int(42));
+
+    // Empty array without init returns nil
+    let out = run_script("[].reduce { |acc, x| acc + x }").unwrap();
+    assert_eq!(out, Value::Nil);
+
+    // Single item without init returns item
+    let out = run_script("[99].reduce { |acc, x| acc + x }").unwrap();
+    assert_eq!(out, Value::Int(99));
+
+    // inject alias
+    let out = run_script("[1, 2, 3].inject(10) { |acc, x| acc + x }").unwrap();
+    assert_eq!(out, Value::Int(16));
+
+    // Block arity check (must have 2 params)
+    let err = run_script("[1, 2].reduce(0) { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 1 argument(s), got 2"),
+        "{err}"
+    );
+    let err = run_script("[].reduce(0) { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 1 argument(s), got 2"),
+        "{err}"
+    );
+
+    // Early return from block
+    let out = run_script(
+        r#"
+fn test_reduce_return() {
+    [1, 2, 3, 4].reduce(0) { |acc, x|
+        if x == 3 {
+            return 555
+        }
+        acc + x
+    }
+    100
+}
+test_reduce_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(555));
+
+    // Loop iteration limit
+    let limits = RuntimeLimits::default().with_max_loop_iterations(2);
+    let err =
+        run_script_with_limits("[1, 2, 3, 4].reduce(0) { |acc, x| acc + x }", limits).unwrap_err();
+    assert!(
+        format!("{err}").contains("loop iteration limit exceeded (max 2)"),
+        "{err}"
+    );
+}
+
+#[test]
+fn array_each_with_index_and_map_with_index_work() {
+    // each_with_index returns nil
+    let out = run_script("[10, 20, 30].each_with_index { |x, i| x + i }").unwrap();
+    assert_eq!(out, Value::Nil);
+
+    // map_with_index returns transformed array
+    let out = run_script("[10, 20, 30].map_with_index { |x, i| [x, i] }").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Array(vec![Value::Int(10), Value::Int(0)]),
+            Value::Array(vec![Value::Int(20), Value::Int(1)]),
+            Value::Array(vec![Value::Int(30), Value::Int(2)]),
+        ])
+    );
+
+    // Block arity check (expects 2)
+    let err = run_script("[1].each_with_index { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 1 argument(s), got 2"),
+        "{err}"
+    );
+    let err = run_script("[].each_with_index { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 1 argument(s), got 2"),
+        "{err}"
+    );
+
+    let err = run_script("[1].map_with_index { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 1 argument(s), got 2"),
+        "{err}"
+    );
+    let err = run_script("[].map_with_index { |x| x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 1 argument(s), got 2"),
+        "{err}"
+    );
+
+    // Early return from block
+    let out = run_script(
+        r#"
+fn test_ewi_return() {
+    [10, 20, 30].each_with_index { |x, i|
+        if i == 1 {
+            return 333
+        }
+    }
+    100
+}
+test_ewi_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(333));
+}
+
+#[test]
+fn array_select_and_reject_methods_work() {
+    let out = run_script("[1, 2, 3, 4, 5].select { |x| x > 2 }").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(3), Value::Int(4), Value::Int(5)])
+    );
+
+    let out = run_script("[1, 2, 3, 4, 5].reject { |x| x > 2 }").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1), Value::Int(2)]));
+
+    // Block arity check (expects 1)
+    let err = run_script("[1].select { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+    let err = run_script("[].select { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+
+    let err = run_script("[1].reject { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+    let err = run_script("[].reject { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+}
+
+#[test]
+fn if_and_while_expressions_work() {
+    // if as expression in variable binding
+    let out = run_script("x = if true { 10 } else { 20 }\nx").unwrap();
+    assert_eq!(out, Value::Int(10));
+
+    let out = run_script("x = if false { 10 } else { 20 }\nx").unwrap();
+    assert_eq!(out, Value::Int(20));
+
+    // if without else returns nil when falsy
+    let out = run_script("x = if false { 10 }\nx").unwrap();
+    assert_eq!(out, Value::Nil);
+
+    // else if chain as expression
+    let out = run_script("x = if false { 1 } else if true { 2 } else { 3 }\nx").unwrap();
+    assert_eq!(out, Value::Int(2));
+
+    let out = run_script("x = if false { 1 } else if false { 2 }\nx").unwrap();
+    assert_eq!(out, Value::Nil);
+
+    // if expression in arithmetic and data structures
+    let out = run_script("1 + if true { 5 } else { 0 }").unwrap();
+    assert_eq!(out, Value::Int(6));
+
+    let out = run_script("[if true { 1 } else { 2 }, if false { 3 } else { 4 }]").unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(1), Value::Int(4)]));
+
+    let out = run_script("m = {val: if true { \"yes\" } else { \"no\" }}\nm[\"val\"]").unwrap();
+    assert_eq!(out, Value::Str("yes".to_string()));
+
+    // while as expression returns nil when not executed
+    let out = run_script("x = while false { 1 }\nx").unwrap();
+    assert_eq!(out, Value::Nil);
+
+    // return from inside if expression propagates through enclosing function
+    let out = run_script(
+        r#"
+fn test_if_return() {
+    x = if true {
+        return 99
+    } else {
+        1
+    }
+    x
+}
+test_if_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(99));
+
+    // return from inside while expression propagates through enclosing function
+    let out = run_script(
+        r#"
+fn test_while_return() {
+    x = while true {
+        return 42
+    }
+    x
+}
+test_while_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(42));
+
+    // method call with block in condition is still forbidden
+    let err = run_script("if [1].each { |x| x } { 1 }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block parameters are not allowed here"),
+        "{err}"
+    );
+}
+
+#[test]
+fn modulo_operator_and_array_concatenation_work() {
+    let out = run_script("10 % 3").unwrap();
+    assert_eq!(out, Value::Int(1));
+
+    let out = run_script("10 % 5").unwrap();
+    assert_eq!(out, Value::Int(0));
+
+    let out = run_script("0 - 10 % 3").unwrap();
+    assert_eq!(out, Value::Int(-1));
+
+    let out = run_script("(0 - 10) % 3").unwrap();
+    assert_eq!(out, Value::Int(-1));
+
+    let err = run_script("10 % 0").unwrap_err();
+    assert!(format!("{err}").contains("division by zero"), "{err}");
+
+    let err = run_script("(0 - 9223372036854775807 - 1) % (0 - 1)").unwrap_err();
+    assert!(format!("{err}").contains("integer overflow"), "{err}");
+
+    let err = run_script("\"a\" % 2").unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported operands for %: Str and Int"),
+        "{err}"
+    );
+
+    let out = run_script("[1, 2] + [3]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(1), Value::Int(2), Value::Int(3)])
+    );
+
+    let out = run_script("[] + []").unwrap();
+    assert_eq!(out, Value::Array(vec![]));
+
+    let out = run_script("[1] + [\"a\", true]").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Str("a".to_string()),
+            Value::Bool(true)
+        ])
+    );
+
+    let err = run_script("[1] + 2").unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported operands for +: Array and Int"),
+        "{err}"
+    );
+
+    let err = run_script("1 + [2]").unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported operands for +: Int and Array"),
+        "{err}"
+    );
+}
+
+#[test]
+fn to_s_and_inspect_methods_and_functions() {
+    // to_s
+    assert_eq!(run_script("1.to_s()").unwrap(), Value::Str("1".into()));
+    assert_eq!(run_script("to_s(1)").unwrap(), Value::Str("1".into()));
+    assert_eq!(
+        run_script("true.to_s()").unwrap(),
+        Value::Str("true".into())
+    );
+    assert_eq!(
+        run_script("false.to_s()").unwrap(),
+        Value::Str("false".into())
+    );
+    assert_eq!(run_script("nil.to_s()").unwrap(), Value::Str("nil".into()));
+    assert_eq!(run_script("to_s(nil)").unwrap(), Value::Str("nil".into()));
+    assert_eq!(
+        run_script("\"hello\".to_s()").unwrap(),
+        Value::Str("hello".into())
+    );
+    assert_eq!(
+        run_script("[1, 2].to_s()").unwrap(),
+        Value::Str("[1, 2]".into())
+    );
+    assert_eq!(
+        run_script("{a: 1}.to_s()").unwrap(),
+        Value::Str("{\"a\" => 1}".into())
+    );
+
+    // inspect
+    assert_eq!(run_script("1.inspect()").unwrap(), Value::Str("1".into()));
+    assert_eq!(run_script("inspect(1)").unwrap(), Value::Str("1".into()));
+    assert_eq!(
+        run_script("\"hello\".inspect()").unwrap(),
+        Value::Str("\"hello\"".into())
+    );
+    assert_eq!(
+        run_script("inspect(\"hello\")").unwrap(),
+        Value::Str("\"hello\"".into())
+    );
+    assert_eq!(
+        run_script("nil.inspect()").unwrap(),
+        Value::Str("nil".into())
+    );
+    assert_eq!(
+        run_script("inspect(nil)").unwrap(),
+        Value::Str("nil".into())
+    );
+    assert_eq!(
+        run_script("[1, \"a\"].inspect()").unwrap(),
+        Value::Str("[1, \"a\"]".into())
+    );
+    assert_eq!(
+        run_script("inspect([1, \"a\"])").unwrap(),
+        Value::Str("[1, \"a\"]".into())
+    );
+
+    // argument errors
+    let err = run_script("1.to_s(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("to_s()").unwrap_err();
+    assert!(
+        format!("{err}").contains("missing positional arguments"),
+        "{err}"
+    );
+    let err = run_script("inspect()").unwrap_err();
+    assert!(
+        format!("{err}").contains("missing positional arguments"),
+        "{err}"
+    );
+}
+
+#[test]
+fn type_of_methods_and_functions() {
+    assert_eq!(run_script("1.type_of()").unwrap(), Value::Str("Int".into()));
+    assert_eq!(run_script("type_of(1)").unwrap(), Value::Str("Int".into()));
+    assert_eq!(
+        run_script("\"str\".type_of()").unwrap(),
+        Value::Str("Str".into())
+    );
+    assert_eq!(
+        run_script("true.type_of()").unwrap(),
+        Value::Str("Bool".into())
+    );
+    assert_eq!(
+        run_script("false.type_of()").unwrap(),
+        Value::Str("Bool".into())
+    );
+    assert_eq!(
+        run_script("nil.type_of()").unwrap(),
+        Value::Str("Nil".into())
+    );
+    assert_eq!(
+        run_script("[1].type_of()").unwrap(),
+        Value::Str("Array".into())
+    );
+    assert_eq!(
+        run_script("{a: 1}.type_of()").unwrap(),
+        Value::Str("Map".into())
+    );
+    assert_eq!(
+        run_script("now().type_of()").unwrap(),
+        Value::Str("Timestamp".into())
+    );
+    assert_eq!(
+        run_script("doc(\"users/alice\").type_of()").unwrap(),
+        Value::Str("DocRef".into())
+    );
+    assert_eq!(
+        run_script("col(\"users\").type_of()").unwrap(),
+        Value::Str("CollectionRef".into())
+    );
+    assert_eq!(
+        run_script("col_group(\"posts\").type_of()").unwrap(),
+        Value::Str("CollectionGroupRef".into())
+    );
+    assert_eq!(
+        run_script("col(\"users\").where(\"a\", \"==\", 1).type_of()").unwrap(),
+        Value::Str("QueryRef".into())
+    );
+    assert_eq!(
+        run_script("bytes([1, 2]).type_of()").unwrap(),
+        Value::Str("Bytes".into())
+    );
+
+    // type_of in branching
+    let src = r#"
+x = 10
+if x.type_of() == "Int" {
+  "number"
+} else {
+  "other"
+}
+"#;
+    assert_eq!(run_script(src).unwrap(), Value::Str("number".into()));
+
+    // argument errors
+    let err = run_script("1.type_of(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("type_of()").unwrap_err();
+    assert!(
+        format!("{err}").contains("missing positional arguments"),
+        "{err}"
+    );
+}
+
+#[test]
+fn to_i_methods_and_functions() {
+    assert_eq!(run_script("\"123\".to_i()").unwrap(), Value::Int(123));
+    assert_eq!(run_script("to_i(\"123\")").unwrap(), Value::Int(123));
+    assert_eq!(run_script("\"-456\".to_i()").unwrap(), Value::Int(-456));
+    assert_eq!(run_script("\"+789\".to_i()").unwrap(), Value::Int(789));
+    assert_eq!(run_script("\"  42  \".to_i()").unwrap(), Value::Int(42));
+    assert_eq!(run_script("123.to_i()").unwrap(), Value::Int(123));
+    assert_eq!(run_script("to_i(123)").unwrap(), Value::Int(123));
+
+    // parse errors
+    let err = run_script("\"abc\".to_i()").unwrap_err();
+    assert!(format!("{err}").contains("invalid integer: abc"), "{err}");
+    let err = run_script("to_i(\"abc\")").unwrap_err();
+    assert!(format!("{err}").contains("invalid integer: abc"), "{err}");
+    let err = run_script("\"12.34\".to_i()").unwrap_err();
+    assert!(format!("{err}").contains("invalid integer: 12.34"), "{err}");
+
+    // receiver / argument type errors
+    let err = run_script("true.to_i()").unwrap_err();
+    assert!(
+        format!("{err}").contains("cannot call method 'to_i' on Bool"),
+        "{err}"
+    );
+    let err = run_script("[1].to_i()").unwrap_err();
+    assert!(
+        format!("{err}").contains("unknown array method: to_i"),
+        "{err}"
+    );
+    let err = run_script("to_i(true)").unwrap_err();
+    assert!(
+        format!("{err}").contains("to_i expects string or int argument"),
+        "{err}"
+    );
+
+    // argument count errors
+    let err = run_script("\"12\".to_i(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("to_i()").unwrap_err();
+    assert!(
+        format!("{err}").contains("missing positional arguments"),
+        "{err}"
+    );
+}
+
+#[test]
+fn raise_builtin_and_try_rescue_basic() {
+    // Uncaught raise
+    let err = run_script("raise(\"custom error\")").unwrap_err();
+    assert!(format!("{err}").contains("custom error"), "{err}");
+
+    // try { ... } rescue { ... } without error
+    let out = run_script("try { 1 + 2 } rescue { 0 }").unwrap();
+    assert_eq!(out, Value::Int(3));
+
+    // try { ... } rescue { ... } with error
+    let out = run_script("try { raise(\"fail\") } rescue { 42 }").unwrap();
+    assert_eq!(out, Value::Int(42));
+
+    // rescue |err| with err.kind and err.message
+    let src = r#"
+try {
+  raise("something went wrong")
+} rescue |err| {
+  err.message
+}
+"#;
+    assert_eq!(
+        run_script(src).unwrap(),
+        Value::Str("something went wrong".into())
+    );
+
+    let src = r#"
+try {
+  raise("something went wrong")
+} rescue |err| {
+  err.kind
+}
+"#;
+    assert_eq!(run_script(src).unwrap(), Value::Str("Runtime".into()));
+
+    let src = r#"
+try {
+  raise("something went wrong")
+} rescue |err| {
+  err["kind"]
+}
+"#;
+    assert_eq!(run_script(src).unwrap(), Value::Str("Runtime".into()));
+
+    // Catching backend error
+    let src = r#"
+try {
+  update("nonexistent/doc", {a: 1})
+} rescue |err| {
+  err.kind
+}
+"#;
+    assert_eq!(run_script(src).unwrap(), Value::Str("Backend".into()));
+
+    // Catching division by zero runtime error
+    let src = r#"
+try {
+  1 / 0
+} rescue |err| {
+  err.message
+}
+"#;
+    assert_eq!(
+        run_script(src).unwrap(),
+        Value::Str("division by zero".into())
+    );
+
+    // As expression assignment
+    let out = run_script("x = try { raise(\"error\") } rescue { 99 }\nx").unwrap();
+    assert_eq!(out, Value::Int(99));
+
+    // Nested try/rescue
+    let src = r#"
+try {
+  try {
+    raise("inner")
+  } rescue |e1| {
+    raise("outer: " + e1.message)
+  }
+} rescue |e2| {
+  e2.message
+}
+"#;
+    assert_eq!(run_script(src).unwrap(), Value::Str("outer: inner".into()));
+}
+
+#[test]
+fn try_rescue_control_flow_and_returns() {
+    let src = r#"
+fn early_return_in_try() {
+  try {
+    return 10
+  } rescue {
+    return 20
+  }
+  30
+}
+early_return_in_try()
+"#;
+    assert_eq!(run_script(src).unwrap(), Value::Int(10));
+
+    let src = r#"
+fn early_return_in_rescue() {
+  try {
+    raise("fail")
+  } rescue {
+    return 20
+  }
+  30
+}
+early_return_in_rescue()
+"#;
+    assert_eq!(run_script(src).unwrap(), Value::Int(20));
+}
+
+#[test]
+fn try_rescue_cannot_catch_budget_limits() {
+    // Loop iteration limit exceeded
+    let mut rt = Runtime::new(InMemoryFirestore::default());
+    let err = rt
+        .run("try { while true {} } rescue { \"rescued\" }")
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("loop iteration limit exceeded"),
+        "{err}"
+    );
+
+    // Call depth limit exceeded
+    let limits = RuntimeLimits::default().with_max_call_depth(8);
+    let mut rt = Runtime::with_limits(InMemoryFirestore::default(), limits);
+    let src = "fn recurse() { recurse() }\ntry { recurse() } rescue { \"rescued\" }";
+    let err = rt.run(src).unwrap_err();
+    assert!(
+        format!("{err}").contains("call depth limit exceeded"),
+        "{err}"
+    );
+
+    // User-raised errors containing budget limit strings are still catchable
+    let src = r#"
+try {
+  raise("step limit exceeded (fake)")
+} rescue |err| {
+  "caught: " + err.message
+}
+"#;
+    let out = rt.run(src).unwrap();
+    assert_eq!(out, Value::Str("caught: step limit exceeded (fake)".into()));
+}
+
+#[test]
+fn try_rescue_preserves_batch_and_transaction_atomicity() {
+    let mut rt = Runtime::new(InMemoryFirestore::default());
+
+    // Catching an error inside batch rolls back writes staged in `try`, preserving prior and later writes
+    let src = r#"
+batch {
+  set("test/doc1", {val: 10})
+  try {
+    set("test/doc_fail", {val: 99})
+    raise("fail inside try")
+  } rescue |err| {
+    "rescued"
+  }
+  set("test/doc2", {val: 20})
+}
+"#;
+    rt.run(src).unwrap();
+    // doc1 and doc2 were committed; doc_fail was discarded
+    assert_eq!(
+        rt.run("get(\"test/doc1\")[\"val\"]").unwrap(),
+        Value::Int(10)
+    );
+    assert_eq!(
+        rt.run("get(\"test/doc2\")[\"val\"]").unwrap(),
+        Value::Int(20)
+    );
+    assert_eq!(rt.run("get(\"test/doc_fail\")").unwrap(), Value::Nil);
+
+    // Same behavior inside a transaction:
+    let src = r#"
+transaction {
+  set("test/tx1", {val: 100})
+  val = try {
+    set("test/tx_fail", {val: 999})
+    raise("fail inside try")
+  } rescue |err| {
+    42
+  }
+  set("test/tx2", {val: val})
+}
+"#;
+    rt.run(src).unwrap();
+    assert_eq!(
+        rt.run("get(\"test/tx1\")[\"val\"]").unwrap(),
+        Value::Int(100)
+    );
+    assert_eq!(
+        rt.run("get(\"test/tx2\")[\"val\"]").unwrap(),
+        Value::Int(42)
+    );
+    assert_eq!(rt.run("get(\"test/tx_fail\")").unwrap(), Value::Nil);
+}
+
+#[test]
+fn try_rescue_catches_backend_errors_with_budget_phrases() {
+    struct ErroringFirestore {
+        inner: InMemoryFirestore,
+    }
+    impl flare::firestore::Firestore for ErroringFirestore {
+        fn get(&self, _path: &str) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+            Err("resource limit exceeded: firestore quota exhausted".into())
+        }
+        fn apply(
+            &mut self,
+            writes: Vec<flare::firestore::WriteOp>,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            self.inner.apply(writes)
+        }
+        fn run_query(
+            &self,
+            query: &flare::value::QueryRef,
+        ) -> Result<flare::firestore::QueryCandidates, Box<dyn std::error::Error>> {
+            self.inner.run_query(query)
+        }
+        fn begin_transaction(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+            self.inner.begin_transaction()
+        }
+        fn transaction_get(&self, path: &str) -> Result<Option<Value>, Box<dyn std::error::Error>> {
+            self.inner.transaction_get(path)
+        }
+        fn commit_transaction(
+            &mut self,
+            writes: Vec<flare::firestore::WriteOp>,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            self.inner.commit_transaction(writes)
+        }
+        fn abort_transaction(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+            self.inner.abort_transaction()
+        }
+    }
+
+    let mut rt = Runtime::new(ErroringFirestore {
+        inner: InMemoryFirestore::default(),
+    });
+    let src = r#"
+try {
+  get("users/alice")
+} rescue |err| {
+  err.kind + ": " + err.message
+}
+"#;
+    let out = rt.run(src).unwrap();
+    assert_eq!(
+        out,
+        Value::Str("Backend: resource limit exceeded: firestore quota exhausted".into())
+    );
+}
+
+#[test]
+fn array_extended_methods_issue_182() {
+    // sort() and sort_by()
+    let out = run_script("[3, 1, 4, 1, 5, 9, 2, 6].sort()").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4),
+            Value::Int(5),
+            Value::Int(6),
+            Value::Int(9),
+        ])
+    );
+
+    // sort() with mixed types follows cmp_for_order (Nil < Bool < Int < Str < Array)
+    let out = run_script(r#"[ [1], "b", 2, nil, true, 1, "a", false ].sort()"#).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Nil,
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Int(1),
+            Value::Int(2),
+            Value::Str("a".to_string()),
+            Value::Str("b".to_string()),
+            Value::Array(vec![Value::Int(1)]),
+        ])
+    );
+
+    // sort() on nested arrays orders elements lexicographically
+    let out = run_script("[ [2, 1], [1, 2], [1, 1], [2] ].sort()").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Array(vec![Value::Int(1), Value::Int(1)]),
+            Value::Array(vec![Value::Int(1), Value::Int(2)]),
+            Value::Array(vec![Value::Int(2)]),
+            Value::Array(vec![Value::Int(2), Value::Int(1)]),
+        ])
+    );
+
+    // sort_by
+    let out = run_script(
+        r#"
+items = [{name: "banana", score: 2}, {name: "apple", score: 5}, {name: "cherry", score: 1}]
+items.sort_by { |item| item.score }.map { |item| item.name }
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Str("cherry".to_string()),
+            Value::Str("banana".to_string()),
+            Value::Str("apple".to_string()),
+        ])
+    );
+
+    // sort_by early return
+    let out = run_script(
+        r#"
+fn test_sort_by_return() {
+  [1, 2, 3].sort_by { |x|
+    if x == 2 {
+      return "early"
+    }
+    x
+  }
+  "after"
+}
+test_sort_by_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Str("early".to_string()));
+
+    // reverse()
+    let out = run_script("[1, 2, 3].reverse()").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(3), Value::Int(2), Value::Int(1)])
+    );
+    assert_eq!(run_script("[].reverse()").unwrap(), Value::Array(vec![]));
+
+    // first() and last()
+    assert_eq!(run_script("[10, 20, 30].first()").unwrap(), Value::Int(10));
+    assert_eq!(run_script("[10, 20, 30].last()").unwrap(), Value::Int(30));
+    assert_eq!(run_script("[].first()").unwrap(), Value::Nil);
+    assert_eq!(run_script("[].last()").unwrap(), Value::Nil);
+
+    // slice(start, len)
+    assert_eq!(
+        run_script("[10, 20, 30, 40, 50].slice(1, 3)").unwrap(),
+        Value::Array(vec![Value::Int(20), Value::Int(30), Value::Int(40)])
+    );
+    assert_eq!(
+        run_script("[10, 20, 30].slice(0, 10)").unwrap(),
+        Value::Array(vec![Value::Int(10), Value::Int(20), Value::Int(30)])
+    );
+    assert_eq!(
+        run_script("[10, 20, 30].slice(5, 2)").unwrap(),
+        Value::Array(vec![])
+    );
+    assert_eq!(
+        run_script("[10, 20, 30].slice(1, 0)").unwrap(),
+        Value::Array(vec![])
+    );
+
+    // slice validations
+    let err = run_script("[1].slice(-1, 2)").unwrap_err();
+    assert!(
+        format!("{err}").contains("slice start must be >= 0"),
+        "{err}"
+    );
+    let err = run_script("[1].slice(0, -2)").unwrap_err();
+    assert!(format!("{err}").contains("slice len must be >= 0"), "{err}");
+    let err = run_script("[1].slice(\"a\", 2)").unwrap_err();
+    assert!(
+        format!("{err}").contains("slice start must be an int"),
+        "{err}"
+    );
+    let err = run_script("[1].slice(0, \"b\")").unwrap_err();
+    assert!(
+        format!("{err}").contains("slice len must be an int"),
+        "{err}"
+    );
+
+    // uniq()
+    let out = run_script("[1, 2, 2, 3, 1, 4, 3].uniq()").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4)
+        ])
+    );
+    assert_eq!(run_script("[].uniq()").unwrap(), Value::Array(vec![]));
+
+    // flatten()
+    let out = run_script("[[1, 2], [3], 4, [[5]]].flatten()").unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(3),
+            Value::Int(4),
+            Value::Array(vec![Value::Int(5)]),
+        ])
+    );
+    assert_eq!(run_script("[].flatten()").unwrap(), Value::Array(vec![]));
+
+    // any { |x| ... } and all { |x| ... }
+    assert_eq!(
+        run_script("[1, 2, 3].any { |x| x == 2 }").unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        run_script("[1, 2, 3].any { |x| x == 5 }").unwrap(),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        run_script("[].any { |x| x == 1 }").unwrap(),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        run_script("[1, 2, 3].all { |x| x > 0 }").unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        run_script("[1, 2, 3].all { |x| x > 1 }").unwrap(),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        run_script("[].all { |x| x > 0 }").unwrap(),
+        Value::Bool(true)
+    );
+
+    // block arity check on empty array
+    let err = run_script("[].any { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+    let err = run_script("[].all { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+    let err = run_script("[].sort_by { |a, b| a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("block expects 2 argument(s), got 1"),
+        "{err}"
+    );
+
+    // call contract checks
+    let err = run_script("[1].sort(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("[1].reverse(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("[1].first(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("[1].last(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("[1].uniq(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+    let err = run_script("[1].flatten(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+}
+
+#[test]
+fn str_extended_methods_issue_182() {
+    // upcase and downcase
+    assert_eq!(
+        run_script(r#""hello World!".upcase()"#).unwrap(),
+        Value::Str("HELLO WORLD!".to_string())
+    );
+    assert_eq!(
+        run_script(r#""HELLO World!".downcase()"#).unwrap(),
+        Value::Str("hello world!".to_string())
+    );
+
+    // replace
+    assert_eq!(
+        run_script(r#""banana".replace("a", "o")"#).unwrap(),
+        Value::Str("bonono".to_string())
+    );
+    assert_eq!(
+        run_script(r#""hello".replace("xyz", "abc")"#).unwrap(),
+        Value::Str("hello".to_string())
+    );
+
+    // slice
+    assert_eq!(
+        run_script(r#""hello world".slice(6, 5)"#).unwrap(),
+        Value::Str("world".to_string())
+    );
+    assert_eq!(
+        run_script(r#""hello world".slice(0, 5)"#).unwrap(),
+        Value::Str("hello".to_string())
+    );
+    assert_eq!(
+        run_script(r#""hello".slice(10, 2)"#).unwrap(),
+        Value::Str("".to_string())
+    );
+    assert_eq!(
+        run_script(r#""こんにちは".slice(1, 3)"#).unwrap(),
+        Value::Str("んにち".to_string())
+    );
+
+    // slice validations
+    let err = run_script(r#""abc".slice(-1, 2)"#).unwrap_err();
+    assert!(
+        format!("{err}").contains("slice start must be >= 0"),
+        "{err}"
+    );
+    let err = run_script(r#""abc".slice(0, -2)"#).unwrap_err();
+    assert!(format!("{err}").contains("slice len must be >= 0"), "{err}");
+    let err = run_script(r#""abc".slice("a", 2)"#).unwrap_err();
+    assert!(
+        format!("{err}").contains("slice start must be an int"),
+        "{err}"
+    );
+    let err = run_script(r#""abc".slice(0, "b")"#).unwrap_err();
+    assert!(
+        format!("{err}").contains("slice len must be an int"),
+        "{err}"
+    );
+
+    // replace validations
+    let err = run_script(r#""abc".replace(1, "x")"#).unwrap_err();
+    assert!(
+        format!("{err}").contains("replace pattern must be a string"),
+        "{err}"
+    );
+    let err = run_script(r#""abc".replace("a", 2)"#).unwrap_err();
+    assert!(
+        format!("{err}").contains("replace replacement must be a string"),
+        "{err}"
+    );
+}
+
+#[test]
+fn map_extended_methods_issue_182() {
+    // merge
+    let out = run_script(
+        r#"
+m1 = {a: 1, b: 2}
+m2 = {b: 20, c: 30}
+merged = m1.merge(m2)
+[m1, m2, merged]
+"#,
+    )
+    .unwrap();
+    let mut expected_m1 = std::collections::BTreeMap::new();
+    expected_m1.insert("a".to_string(), Value::Int(1));
+    expected_m1.insert("b".to_string(), Value::Int(2));
+
+    let mut expected_m2 = std::collections::BTreeMap::new();
+    expected_m2.insert("b".to_string(), Value::Int(20));
+    expected_m2.insert("c".to_string(), Value::Int(30));
+
+    let mut expected_merged = std::collections::BTreeMap::new();
+    expected_merged.insert("a".to_string(), Value::Int(1));
+    expected_merged.insert("b".to_string(), Value::Int(20));
+    expected_merged.insert("c".to_string(), Value::Int(30));
+
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Map(expected_m1),
+            Value::Map(expected_m2),
+            Value::Map(expected_merged),
+        ])
+    );
+
+    // delete
+    let out = run_script(
+        r#"
+orig = {a: 1, b: 2, c: 3}
+deleted = orig.delete("b")
+no_op = orig.delete("non_existent")
+[orig, deleted, no_op]
+"#,
+    )
+    .unwrap();
+    let mut expected_orig = std::collections::BTreeMap::new();
+    expected_orig.insert("a".to_string(), Value::Int(1));
+    expected_orig.insert("b".to_string(), Value::Int(2));
+    expected_orig.insert("c".to_string(), Value::Int(3));
+
+    let mut expected_deleted = std::collections::BTreeMap::new();
+    expected_deleted.insert("a".to_string(), Value::Int(1));
+    expected_deleted.insert("c".to_string(), Value::Int(3));
+
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Map(expected_orig.clone()),
+            Value::Map(expected_deleted),
+            Value::Map(expected_orig),
+        ])
+    );
+
+    // entries
+    let out = run_script(
+        r#"
+m = {b: 2, a: 1}
+m.entries()
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Array(vec![Value::Str("a".to_string()), Value::Int(1)]),
+            Value::Array(vec![Value::Str("b".to_string()), Value::Int(2)]),
+        ])
+    );
+    assert_eq!(run_script("{}.entries()").unwrap(), Value::Array(vec![]));
+
+    // type & contract errors
+    let err = run_script("{a: 1}.merge(123)").unwrap_err();
+    assert!(
+        format!("{err}").contains("merge argument must be a map"),
+        "{err}"
+    );
+    let err = run_script("{a: 1}.delete(123)").unwrap_err();
+    assert!(
+        format!("{err}").contains("delete key must be a string"),
+        "{err}"
+    );
+    let err = run_script("{a: 1}.entries(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional arguments"),
+        "{err}"
+    );
+}
+
+#[test]
+fn anonymous_functions_and_invocations() {
+    let out = run_script("f = fn(x) { x + 1 }\nf(2)").unwrap();
+    assert_eq!(out, Value::Int(3));
+
+    let out = run_script("(fn(x) { x * 2 })(3)").unwrap();
+    assert_eq!(out, Value::Int(6));
+
+    let out = run_script("fn(x) { x * 3 }(4)").unwrap();
+    assert_eq!(out, Value::Int(12));
+
+    let out = run_script(
+        r#"
+fn apply(g, x) { g(x) }
+apply(fn(x) { x + 5 }, 10)
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(15));
+
+    let out = run_script(
+        r#"
+funcs = [fn(x) { x + 1 }, fn(x) { x + 2 }]
+funcs[0](10) + funcs[1](20)
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(33));
+
+    let out = run_script(
+        r#"
+fn factory() { fn(x) { x + 10 } }
+f = factory()
+f(5)
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(15));
+
+    // Return inside an anonymous function does not return from caller
+    let out = run_script(
+        r#"
+fn test_anon_return() {
+  f = fn() { return 1 }
+  f()
+  2
+}
+test_anon_return()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(2));
+
+    let out = run_script("(fn() { return 42 })()").unwrap();
+    assert_eq!(out, Value::Int(42));
+
+    // Global variable is visible to anonymous function
+    let out = run_script(
+        r#"
+global_val = 100
+fn run() {
+  f = fn(x) { global_val + x }
+  f(5)
+}
+run()
+"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(105));
+
+    // Caller local variable is NOT visible to anonymous function
+    let err = run_script(
+        r#"
+fn run() {
+  local_val = 20
+  f = fn() { local_val }
+  f()
+}
+run()
+"#,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err}").contains("undefined variable: local_val"),
+        "{err}"
+    );
+
+    // Invoking a non-function value returns error
+    let err = run_script("x = 42\nx(1)").unwrap_err();
+    assert!(
+        format!("{err}").contains("cannot call non-function value of type Int"),
+        "{err}"
+    );
+
+    // Named fn definition cannot be used as expression
+    let err = run_script("f = fn named(x) { x }").unwrap_err();
+    assert!(
+        format!("{err}").contains("named function definition cannot be used as an expression"),
+        "{err}"
+    );
+}
+
+#[test]
+fn default_function_arguments() {
+    let script = r#"
+fn f(a, b = 2) { a + b }
+[f(1), f(1, 10), f(a: 5), f(a: 5, b: 3), f(5, b: 4)]
+"#;
+    let out = run_script(script).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(3),
+            Value::Int(11),
+            Value::Int(7),
+            Value::Int(8),
+            Value::Int(9),
+        ])
+    );
+
+    let script = r#"
+f = fn(a, b = 10) { a * b }
+[f(3), f(3, 4), (fn(x = 42) { x })()]
+"#;
+    let out = run_script(script).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![Value::Int(30), Value::Int(12), Value::Int(42),])
+    );
+
+    let script = r#"
+fn multi(a, b = 2, c = 3) { a + b + c }
+[multi(1), multi(1, 5), multi(1, 5, 10), multi(1, c: 20)]
+"#;
+    let out = run_script(script).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(6),
+            Value::Int(9),
+            Value::Int(16),
+            Value::Int(23),
+        ])
+    );
+
+    // Default arguments are evaluated at call time
+    let script = r#"
+set("counter/doc", {n: 0})
+fn tick() {
+  doc = get("counter/doc")
+  next_n = doc["n"] + 1
+  set("counter/doc", {n: next_n})
+  next_n
+}
+fn f(x = tick()) { x }
+[f(), f(), f(100), f()]
+"#;
+    let out = run_script(script).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(1),
+            Value::Int(2),
+            Value::Int(100),
+            Value::Int(3),
+        ])
+    );
+
+    // Default arguments cannot reference other parameters
+    let err = run_script("fn f(a, b = a) { b }\nf(1)").unwrap_err();
+    assert!(format!("{err}").contains("undefined variable: a"), "{err}");
+
+    // Required parameter after default is rejected at parse time
+    let err = run_script("fn f(a = 1, b) { a + b }").unwrap_err();
+    assert!(
+        format!("{err}").contains("parameter without default cannot follow parameter with default"),
+        "{err}"
+    );
+
+    let err = run_script("f = fn(a = 1, b) { a + b }").unwrap_err();
+    assert!(
+        format!("{err}").contains("parameter without default cannot follow parameter with default"),
+        "{err}"
+    );
+
+    // Duplicate parameter is rejected at parse time
+    let err = run_script("fn f(a, a = 1) { a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("duplicate function parameter: a"),
+        "{err}"
+    );
+
+    let err = run_script("f = fn(a, a = 1) { a }").unwrap_err();
+    assert!(
+        format!("{err}").contains("duplicate function parameter: a"),
+        "{err}"
+    );
+
+    // Missing required argument error
+    let err = run_script("fn f(a, b = 2) { a + b }\nf()").unwrap_err();
+    assert!(format!("{err}").contains("missing argument: a"), "{err}");
+
+    // Too many positional args
+    let err = run_script("fn f(a = 1) { a }\nf(1, 2)").unwrap_err();
+    assert!(
+        format!("{err}").contains("too many positional args"),
+        "{err}"
+    );
+
+    // Duplicate positional and keyword
+    let err = run_script("fn f(a = 1) { a }\nf(2, a: 3)").unwrap_err();
+    assert!(format!("{err}").contains("duplicate argument a"), "{err}");
+
+    // Unknown keyword
+    let err = run_script("fn f(a = 1) { a }\nf(b: 2)").unwrap_err();
+    assert!(
+        format!("{err}").contains("unknown keyword arguments: b"),
+        "{err}"
+    );
+
+    // Default arguments must not evaluate if the call has a contract error
+    let setup = r#"
+set("effects/default_eval", {hit: false})
+fn side_effect() {
+  set("effects/default_eval", {hit: true})
+  1
+}
+fn f(a, b = side_effect()) { a + b }
+"#;
+    let mut runtime = Runtime::new(InMemoryFirestore::default());
+    run_in(&mut runtime, setup).unwrap();
+    let err = run_in(&mut runtime, "f()").unwrap_err();
+    assert!(format!("{err}").contains("missing argument: a"), "{err}");
+    let hit = run_in(&mut runtime, "get(\"effects/default_eval\")[\"hit\"]").unwrap();
+    assert_eq!(hit, Value::Bool(false));
+
+    let err = run_in(&mut runtime, "f(1, extra: 2)").unwrap_err();
+    assert!(
+        format!("{err}").contains("unknown keyword arguments: extra"),
+        "{err}"
+    );
+    let hit = run_in(&mut runtime, "get(\"effects/default_eval\")[\"hit\"]").unwrap();
+    assert_eq!(hit, Value::Bool(false));
+}
+
+#[test]
+fn issue_184_map_dot_access_does_not_shadow_methods_and_distinguishes_syntax() {
+    // 1. Unparenthesized access accesses keys directly, even if matching method names
+    assert_eq!(run_script("{keys: 1}.keys").unwrap(), Value::Int(1));
+    assert_eq!(run_script("{values: 1}.values").unwrap(), Value::Int(1));
+    assert_eq!(run_script("{has_key: 1}.has_key").unwrap(), Value::Int(1));
+    assert_eq!(run_script("{len: 1, a: 2}.len").unwrap(), Value::Int(1));
+
+    // 2. Parenthesized access calls the method
+    assert_eq!(
+        run_script("{keys: 1}.keys()").unwrap(),
+        Value::Array(vec![Value::Str("keys".to_string())])
+    );
+    assert_eq!(
+        run_script("{values: 1}.values()").unwrap(),
+        Value::Array(vec![Value::Int(1)])
+    );
+    assert_eq!(
+        run_script("{has_key: 1}.has_key(\"has_key\")").unwrap(),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        run_script("{has_key: 1}.has_key(\"other\")").unwrap(),
+        Value::Bool(false)
+    );
+    assert_eq!(run_script("{len: 1, a: 2}.len()").unwrap(), Value::Int(2));
+
+    // 3. Missing keys return nil
+    assert_eq!(run_script("{a: 1}.keys").unwrap(), Value::Nil);
+    assert_eq!(run_script("{a: 1}.values").unwrap(), Value::Nil);
+    assert_eq!(run_script("{a: 1}.len").unwrap(), Value::Nil);
+    assert_eq!(run_script("{a: 1}.has_key").unwrap(), Value::Nil);
+    assert_eq!(run_script("{a: 1}.missing").unwrap(), Value::Nil);
+
+    // 4. Calling non-existent method with parens is an error
+    let err = run_script("{a: 1}.missing()").unwrap_err();
+    assert!(
+        format!("{err}").contains("unknown map method: missing"),
+        "{err}"
+    );
+
+    // 5. Unparenthesized field access on non-map types is an error
+    let err = run_script("[1, 2].len").unwrap_err();
+    assert!(
+        format!("{err}").contains("field access is only supported on map"),
+        "{err}"
+    );
+    let err = run_script("\"hello\".len").unwrap_err();
+    assert!(
+        format!("{err}").contains("field access is only supported on map"),
+        "{err}"
+    );
+    let err = run_script("bytes([1, 2]).len").unwrap_err();
+    assert!(
+        format!("{err}").contains("field access is only supported on map"),
+        "{err}"
+    );
+
+    // 6. Parenthesized method calls on array, string, bytes work as expected
+    assert_eq!(run_script("[1, 2].len()").unwrap(), Value::Int(2));
+    assert_eq!(run_script("\"hello\".len()").unwrap(), Value::Int(5));
+    assert_eq!(run_script("bytes([1, 2]).len()").unwrap(), Value::Int(2));
+
+    // 7. Chained field access and method calls
+    assert_eq!(
+        run_script("m = {a: {keys: 42}}\n[m.a.keys, m.a.keys()]").unwrap(),
+        Value::Array(vec![
+            Value::Int(42),
+            Value::Array(vec![Value::Str("keys".to_string())])
+        ])
+    );
+}
+
+#[test]
+fn runtime_error_diagnostics_precise_span_type_names_and_stack_trace() {
+    use flare::{FlareError, Span};
+
+    // 1. Binary operator operand type names
+    let err = run_script("\"foo\" + 1").unwrap_err();
+    assert!(
+        format!("{err}").contains("unsupported operands for +: Str and Int"),
+        "{err}"
+    );
+
+    // 2. Method receiver type names
+    let err = run_script("true.keys()").unwrap_err();
+    assert!(
+        format!("{err}").contains("cannot call method 'keys' on Bool"),
+        "{err}"
+    );
+
+    let err = run_script("123.keys()").unwrap_err();
+    assert!(
+        format!("{err}").contains("unknown int method: keys"),
+        "{err}"
+    );
+
+    let err = run_script("nil.foo()").unwrap_err();
+    assert!(
+        format!("{err}").contains("cannot call method 'foo' on nil"),
+        "{err}"
+    );
+
+    // 3. Precise span on sub-expression
+    let err = run_script("x = 1 + (2 + undefined_var)").unwrap_err();
+    let ferr = err.downcast_ref::<FlareError>().unwrap();
+    assert_eq!(ferr.span, Some(Span::new(1, 14)));
+
+    // 4. Call stack trace across functions
+    let script = "fn b() {\n  1 + \"x\"\n}\nfn a() {\n  b()\n}\na()";
+    let err = run_script(script).unwrap_err();
+    let ferr = err.downcast_ref::<FlareError>().unwrap();
+    assert_eq!(ferr.span, Some(Span::new(2, 3)));
+    let err_str = format!("{ferr}");
+    assert!(
+        err_str.contains("2:3: unsupported operands for +: Int and Str"),
+        "{err_str}"
+    );
+    assert!(err_str.contains("in b at 5:3"), "{err_str}");
+    assert!(err_str.contains("in a at 7:1"), "{err_str}");
+    assert_eq!(ferr.frames.len(), 2);
+    assert_eq!(ferr.frames[0].name, "b");
+    assert_eq!(ferr.frames[0].span, Span::new(5, 3));
+    assert_eq!(ferr.frames[1].name, "a");
+    assert_eq!(ferr.frames[1].span, Span::new(7, 1));
+}

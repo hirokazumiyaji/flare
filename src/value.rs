@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ast::Stmt;
@@ -40,7 +41,7 @@ pub enum Value {
     Func(UserFunc),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BuiltinModule {
     Firestore,
     Auth,
@@ -178,8 +179,20 @@ pub struct QueryFilter {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserFunc {
-    pub params: Vec<String>,
-    pub body: Vec<Stmt>,
+    pub params: Rc<[crate::ast::FuncParam]>,
+    pub body: Rc<[Stmt]>,
+}
+
+impl UserFunc {
+    pub fn new(
+        params: impl Into<Rc<[crate::ast::FuncParam]>>,
+        body: impl Into<Rc<[Stmt]>>,
+    ) -> Self {
+        Self {
+            params: params.into(),
+            body: body.into(),
+        }
+    }
 }
 
 /// Validate a runtime value without recursively walking its Rust data
@@ -266,6 +279,16 @@ pub fn validate_value_limits_with_sizes(
     max_string_bytes: Option<usize>,
     max_bytes_size: Option<usize>,
 ) -> Result<usize, Box<dyn Error>> {
+    if !matches!(
+        value,
+        Value::Array(_) | Value::ArrayUnion(_) | Value::ArrayRemove(_) | Value::Map(_)
+    ) {
+        let mut nodes = 0usize;
+        check_value_node_budget(&mut nodes, max_nodes)?;
+        check_value_size_leaf(value, max_string_bytes, max_bytes_size)?;
+        return Ok(0);
+    }
+
     let mut stack = vec![(value, 0usize)];
     let mut nodes = 0usize;
     let mut observed_depth = 0usize;
@@ -340,6 +363,12 @@ impl Value {
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
             (Value::Timestamp(x), Value::Timestamp(y)) => x.seconds.cmp(&y.seconds),
             (Value::Bytes(x), Value::Bytes(y)) => x.cmp(y),
+            (Value::Array(x), Value::Array(y)) => x
+                .iter()
+                .zip(y.iter())
+                .map(|(a, b)| a.cmp_for_order(b))
+                .find(|o| o.is_ne())
+                .unwrap_or_else(|| x.len().cmp(&y.len())),
             _ => type_rank(self).cmp(&type_rank(other)),
         }
     }
@@ -399,54 +428,358 @@ impl CollectionGroupRef {
     }
 }
 
+/// Default nesting depth ceiling for [`Value::inspect`].
+///
+/// Compound values deeper than this limit are truncated with `[...]` or `{...}`
+/// to prevent unbounded memory growth and stack exhaustion during formatting.
+pub const DEFAULT_MAX_INSPECT_DEPTH: usize = 64;
+
+enum InspectAction<'a> {
+    Value(&'a Value, usize),
+    OwnedValue(Box<Value>, usize),
+    Str(&'static str),
+    String(String),
+}
+
+fn format_leaf_value(val: &Value, out: &mut String) -> bool {
+    use std::fmt::Write;
+    match val {
+        Value::Int(i) => {
+            let _ = write!(out, "{i}");
+            true
+        }
+        Value::Str(s) => {
+            out.push_str(&inspect_str(s));
+            true
+        }
+        Value::Bool(b) => {
+            out.push_str(if *b { "true" } else { "false" });
+            true
+        }
+        Value::Nil => {
+            out.push_str("nil");
+            true
+        }
+        Value::Timestamp(ts) => {
+            let _ = write!(out, "Timestamp({})", ts.seconds);
+            true
+        }
+        Value::Bytes(b) => {
+            out.push_str(&inspect_bytes(b));
+            true
+        }
+        Value::ServerTimestamp => {
+            out.push_str("ServerTimestamp");
+            true
+        }
+        Value::DeleteField => {
+            out.push_str("DeleteField");
+            true
+        }
+        Value::Increment(n) => {
+            let _ = write!(out, "Increment({n})");
+            true
+        }
+        Value::Opaque(s) => {
+            out.push_str(s);
+            true
+        }
+        Value::RedactedToken(name) => {
+            let _ = write!(out, "<redacted:{name}>");
+            true
+        }
+        Value::Module(module) => {
+            out.push_str(module.name());
+            true
+        }
+        Value::DocRef(d) => {
+            let _ = write!(out, "#<DocRef path={}>", inspect_str(&d.path));
+            true
+        }
+        Value::CollectionRef(c) => {
+            let _ = write!(out, "#<CollectionRef path={}>", inspect_str(&c.path));
+            true
+        }
+        Value::CollectionGroupRef(cg) => {
+            let _ = write!(out, "#<CollectionGroupRef id={}>", inspect_str(&cg.id));
+            true
+        }
+        Value::QueryRef(_) => {
+            out.push_str("#<QueryRef>");
+            true
+        }
+        Value::Func(_) => {
+            out.push_str("<func>");
+            true
+        }
+        _ => false,
+    }
+}
+
 impl Value {
+    /// Flare の型名を返す。`type_of(v)` および `v.type_of()` に使う。
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::Int(_) => "Int",
+            Self::Str(_) => "Str",
+            Self::Bytes(_) => "Bytes",
+            Self::Bool(_) => "Bool",
+            Self::Nil => "Nil",
+            Self::Array(_) => "Array",
+            Self::Map(_) => "Map",
+            Self::Timestamp(_) => "Timestamp",
+            Self::ServerTimestamp => "ServerTimestamp",
+            Self::ArrayUnion(_) => "ArrayUnion",
+            Self::ArrayRemove(_) => "ArrayRemove",
+            Self::DeleteField => "DeleteField",
+            Self::Increment(_) => "Increment",
+            Self::Opaque(_) => "Opaque",
+            Self::AuthSession(_) => "AuthSession",
+            Self::RedactedToken(_) => "RedactedToken",
+            Self::Module(_) => "Module",
+            Self::DocRef(_) => "DocRef",
+            Self::CollectionRef(_) => "CollectionRef",
+            Self::CollectionGroupRef(_) => "CollectionGroupRef",
+            Self::QueryRef(_) => "QueryRef",
+            Self::Func(_) => "Function",
+        }
+    }
+
     /// Ruby の `inspect` 風の開発者向け表現。`fl` の最終結果・複合値の
     /// `to_s` に使う。Str はダブルクォート付き、それ以外は素直な文字列表現。
+    ///
+    /// 再帰呼び出しではなく明示的なヒープスタックで走査するため、
+    /// ネイティブスタックを消費せず、実行時設定された深いネスト値も切り捨てずに
+    /// 安全にフォーマットできます。深さ制限を設けて省略表示したい場合は
+    /// [`Value::inspect_with_depth`] を使用してください。
     pub fn inspect(&self) -> String {
-        match self {
-            Value::Int(i) => i.to_string(),
-            Value::Str(s) => inspect_str(s),
-            Value::Bool(b) => b.to_string(),
-            Value::Nil => "nil".to_string(),
-            Value::Array(items) => {
-                let inner: Vec<String> = items.iter().map(|v| v.inspect()).collect();
-                format!("[{}]", inner.join(", "))
+        self.inspect_with_depth(usize::MAX)
+    }
+
+    /// `inspect` with a configurable nesting depth limit.
+    ///
+    /// Compound values (Array, Map, ArrayUnion, ArrayRemove) that reach `max_depth`
+    /// truncate their contents to `[...]` or `{...}`. The traversal is iterative
+    /// on the heap to prevent stack overflow even on deeply nested values.
+    pub fn inspect_with_depth(&self, max_depth: usize) -> String {
+        let mut out = String::new();
+        let mut stack = vec![InspectAction::Value(self, 0)];
+
+        while let Some(action) = stack.pop() {
+            match action {
+                InspectAction::Str(s) => out.push_str(s),
+                InspectAction::String(s) => out.push_str(&s),
+                InspectAction::Value(val, depth) => {
+                    if format_leaf_value(val, &mut out) {
+                        continue;
+                    }
+                    match val {
+                        Value::Array(items) => {
+                            if items.is_empty() {
+                                out.push_str("[]");
+                            } else if depth >= max_depth {
+                                out.push_str("[...]");
+                            } else {
+                                out.push('[');
+                                stack.push(InspectAction::Str("]"));
+                                for (i, item) in items.iter().enumerate().rev() {
+                                    if i + 1 < items.len() {
+                                        stack.push(InspectAction::Str(", "));
+                                    }
+                                    stack.push(InspectAction::Value(item, depth + 1));
+                                }
+                            }
+                        }
+                        Value::Map(m) => {
+                            if m.is_empty() {
+                                out.push_str("{}");
+                            } else if depth >= max_depth {
+                                out.push_str("{...}");
+                            } else {
+                                out.push('{');
+                                stack.push(InspectAction::Str("}"));
+                                for (i, (k, v)) in m.iter().enumerate().rev() {
+                                    if i + 1 < m.len() {
+                                        stack.push(InspectAction::Str(", "));
+                                    }
+                                    stack.push(InspectAction::Value(v, depth + 1));
+                                    stack.push(InspectAction::Str(" => "));
+                                    stack.push(InspectAction::String(inspect_str(k)));
+                                }
+                            }
+                        }
+                        Value::ArrayUnion(items) => {
+                            if items.is_empty() {
+                                out.push_str("ArrayUnion([])");
+                            } else if depth >= max_depth {
+                                out.push_str("ArrayUnion([...])");
+                            } else {
+                                out.push_str("ArrayUnion([");
+                                stack.push(InspectAction::Str("])"));
+                                for (i, item) in items.iter().enumerate().rev() {
+                                    if i + 1 < items.len() {
+                                        stack.push(InspectAction::Str(", "));
+                                    }
+                                    stack.push(InspectAction::Value(item, depth + 1));
+                                }
+                            }
+                        }
+                        Value::ArrayRemove(items) => {
+                            if items.is_empty() {
+                                out.push_str("ArrayRemove([])");
+                            } else if depth >= max_depth {
+                                out.push_str("ArrayRemove([...])");
+                            } else {
+                                out.push_str("ArrayRemove([");
+                                stack.push(InspectAction::Str("])"));
+                                for (i, item) in items.iter().enumerate().rev() {
+                                    if i + 1 < items.len() {
+                                        stack.push(InspectAction::Str(", "));
+                                    }
+                                    stack.push(InspectAction::Value(item, depth + 1));
+                                }
+                            }
+                        }
+                        Value::AuthSession(session) => {
+                            out.push_str("AuthSession(user=");
+                            stack.push(InspectAction::String(format!(
+                                ", id_token=<redacted>, refresh_token=<redacted>, expires_at={})",
+                                session.expires_at
+                            )));
+                            stack.push(InspectAction::OwnedValue(
+                                Box::new(session.user.to_value()),
+                                depth + 1,
+                            ));
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                InspectAction::OwnedValue(val, depth) => {
+                    if format_leaf_value(&val, &mut out) {
+                        continue;
+                    }
+                    match *val {
+                        Value::Array(items) => {
+                            if items.is_empty() {
+                                out.push_str("[]");
+                            } else if depth >= max_depth {
+                                out.push_str("[...]");
+                            } else {
+                                out.push('[');
+                                stack.push(InspectAction::Str("]"));
+                                let len = items.len();
+                                for (i, item) in items.into_iter().enumerate().rev() {
+                                    if i + 1 < len {
+                                        stack.push(InspectAction::Str(", "));
+                                    }
+                                    stack
+                                        .push(InspectAction::OwnedValue(Box::new(item), depth + 1));
+                                }
+                            }
+                        }
+                        Value::Map(m) => {
+                            if m.is_empty() {
+                                out.push_str("{}");
+                            } else if depth >= max_depth {
+                                out.push_str("{...}");
+                            } else {
+                                out.push('{');
+                                stack.push(InspectAction::Str("}"));
+                                let len = m.len();
+                                for (i, (k, v)) in m.into_iter().enumerate().rev() {
+                                    if i + 1 < len {
+                                        stack.push(InspectAction::Str(", "));
+                                    }
+                                    stack.push(InspectAction::OwnedValue(Box::new(v), depth + 1));
+                                    stack.push(InspectAction::Str(" => "));
+                                    stack.push(InspectAction::String(inspect_str(&k)));
+                                }
+                            }
+                        }
+                        Value::ArrayUnion(items) => {
+                            if items.is_empty() {
+                                out.push_str("ArrayUnion([])");
+                            } else if depth >= max_depth {
+                                out.push_str("ArrayUnion([...])");
+                            } else {
+                                out.push_str("ArrayUnion([");
+                                stack.push(InspectAction::Str("])"));
+                                let len = items.len();
+                                for (i, item) in items.into_iter().enumerate().rev() {
+                                    if i + 1 < len {
+                                        stack.push(InspectAction::Str(", "));
+                                    }
+                                    stack
+                                        .push(InspectAction::OwnedValue(Box::new(item), depth + 1));
+                                }
+                            }
+                        }
+                        Value::ArrayRemove(items) => {
+                            if items.is_empty() {
+                                out.push_str("ArrayRemove([])");
+                            } else if depth >= max_depth {
+                                out.push_str("ArrayRemove([...])");
+                            } else {
+                                out.push_str("ArrayRemove([");
+                                stack.push(InspectAction::Str("])"));
+                                let len = items.len();
+                                for (i, item) in items.into_iter().enumerate().rev() {
+                                    if i + 1 < len {
+                                        stack.push(InspectAction::Str(", "));
+                                    }
+                                    stack
+                                        .push(InspectAction::OwnedValue(Box::new(item), depth + 1));
+                                }
+                            }
+                        }
+                        Value::AuthSession(session) => {
+                            out.push_str("AuthSession(user=");
+                            stack.push(InspectAction::String(format!(
+                                ", id_token=<redacted>, refresh_token=<redacted>, expires_at={})",
+                                session.expires_at
+                            )));
+                            stack.push(InspectAction::OwnedValue(
+                                Box::new(session.user.to_value()),
+                                depth + 1,
+                            ));
+                        }
+                        _ => unreachable!(),
+                    }
+                }
             }
-            Value::Map(m) => {
-                let inner: Vec<String> = m
-                    .iter()
-                    .map(|(k, v)| format!("{} => {}", inspect_str(k), v.inspect()))
-                    .collect();
-                format!("{{{}}}", inner.join(", "))
+        }
+
+        out
+    }
+}
+
+/// Drop a `Value` iteratively using an explicit heap stack, avoiding native stack
+/// overflow when dropping deeply nested structures.
+pub fn drop_value_iteratively(value: Value) {
+    let mut stack = vec![value];
+    while let Some(val) = stack.pop() {
+        match val {
+            Value::Array(mut items) => {
+                while let Some(child) = items.pop() {
+                    stack.push(child);
+                }
             }
-            Value::Timestamp(ts) => format!("Timestamp({})", ts.seconds),
-            Value::Bytes(bytes) => inspect_bytes(bytes),
-            Value::ServerTimestamp => "ServerTimestamp".to_string(),
-            Value::ArrayUnion(v) => {
-                let inner: Vec<String> = v.iter().map(|x| x.inspect()).collect();
-                format!("ArrayUnion([{}])", inner.join(", "))
+            Value::Map(mut m) => {
+                while let Some((_, child)) = m.pop_first() {
+                    stack.push(child);
+                }
             }
-            Value::ArrayRemove(v) => {
-                let inner: Vec<String> = v.iter().map(|x| x.inspect()).collect();
-                format!("ArrayRemove([{}])", inner.join(", "))
+            Value::ArrayUnion(mut items) | Value::ArrayRemove(mut items) => {
+                while let Some(child) = items.pop() {
+                    stack.push(child);
+                }
             }
-            Value::DeleteField => "DeleteField".to_string(),
-            Value::Increment(n) => format!("Increment({n})"),
-            Value::Opaque(s) => s.clone(),
-            Value::AuthSession(session) => format!(
-                "AuthSession(user={}, id_token=<redacted>, refresh_token=<redacted>, expires_at={})",
-                session.user.to_value().inspect(),
-                session.expires_at
-            ),
-            Value::RedactedToken(name) => format!("<redacted:{name}>"),
-            Value::Module(module) => module.name().to_string(),
-            Value::DocRef(d) => format!("#<DocRef path={}>", inspect_str(&d.path)),
-            Value::CollectionRef(c) => format!("#<CollectionRef path={}>", inspect_str(&c.path)),
-            Value::CollectionGroupRef(cg) => {
-                format!("#<CollectionGroupRef id={}>", inspect_str(&cg.id))
+            Value::QueryRef(mut q) => {
+                for filter in std::mem::take(&mut q.filters) {
+                    stack.push(filter.value);
+                }
             }
-            Value::QueryRef(_) => "#<QueryRef>".to_string(),
-            Value::Func(_) => "<func>".to_string(),
+            _ => {}
         }
     }
 }
@@ -501,5 +834,119 @@ impl fmt::Display for Value {
             Value::Str(s) => write!(f, "{s}"),
             other => write!(f, "{}", other.inspect()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn inspect_truncates_at_max_depth() {
+        let nested_array =
+            Value::Array(vec![Value::Array(vec![Value::Array(vec![Value::Int(1)])])]);
+        assert_eq!(nested_array.inspect_with_depth(2), "[[[...]]]");
+        assert_eq!(nested_array.inspect_with_depth(1), "[[...]]");
+        assert_eq!(nested_array.inspect_with_depth(0), "[...]");
+        assert_eq!(nested_array.inspect_with_depth(3), "[[[1]]]");
+
+        let mut inner_map = BTreeMap::new();
+        inner_map.insert("b".to_string(), Value::Int(2));
+        let mut outer_map = BTreeMap::new();
+        outer_map.insert("a".to_string(), Value::Map(inner_map));
+        let map_val = Value::Map(outer_map);
+        assert_eq!(map_val.inspect_with_depth(1), "{\"a\" => {...}}");
+        assert_eq!(map_val.inspect_with_depth(2), "{\"a\" => {\"b\" => 2}}");
+
+        let union_val = Value::ArrayUnion(vec![Value::Array(vec![Value::Int(1)])]);
+        assert_eq!(union_val.inspect_with_depth(1), "ArrayUnion([[...]])");
+
+        let remove_val = Value::ArrayRemove(vec![Value::Array(vec![Value::Int(1)])]);
+        assert_eq!(remove_val.inspect_with_depth(1), "ArrayRemove([[...]])");
+    }
+
+    #[test]
+    fn inspect_empty_containers_are_not_truncated() {
+        let empty_arr = Value::Array(vec![Value::Array(vec![])]);
+        assert_eq!(empty_arr.inspect_with_depth(1), "[[]]");
+
+        let mut outer_map = BTreeMap::new();
+        outer_map.insert("a".to_string(), Value::Map(BTreeMap::new()));
+        let empty_map = Value::Map(outer_map);
+        assert_eq!(empty_map.inspect_with_depth(1), "{\"a\" => {}}");
+    }
+
+    #[test]
+    fn inspect_does_not_truncate_accepted_values_beyond_default_depth() {
+        // A value 70 levels deep (allowed when runtime limit is configured higher or unlimited)
+        // should not be truncated by inspect(), keeping full-output behavior.
+        let mut val = Value::Int(1);
+        for _ in 0..70 {
+            val = Value::Array(vec![val]);
+        }
+        let inspected = val.inspect();
+        assert!(!inspected.contains("[...]"));
+        assert!(inspected.contains("1"));
+        assert_eq!(inspected.len(), 141); // 70 * '[' + '1' + 70 * ']'
+
+        // But inspect_with_depth can still truncate when explicitly requested.
+        let truncated = val.inspect_with_depth(DEFAULT_MAX_INSPECT_DEPTH);
+        assert!(truncated.contains("[...]"));
+    }
+
+    #[test]
+    fn deeply_nested_values_inspect_and_drop_without_stack_overflow() {
+        // Construct deeply nested values (10,000 levels deep) which would
+        // overflow the native thread stack if inspect() or drop were recursive.
+        let mut deep_array = Value::Int(42);
+        for _ in 0..10_000 {
+            deep_array = Value::Array(vec![deep_array]);
+        }
+
+        let inspected = deep_array.inspect();
+        assert!(inspected.starts_with("[[[[[[["));
+        assert!(inspected.ends_with("]]]]]]]"));
+        assert!(inspected.contains("42"));
+        assert!(!inspected.contains("[...]"));
+
+        let truncated = deep_array.inspect_with_depth(DEFAULT_MAX_INSPECT_DEPTH);
+        assert!(truncated.contains("[...]"));
+
+        drop_value_iteratively(deep_array);
+
+        let mut deep_map = Value::Int(100);
+        for i in 0..10_000 {
+            let mut m = BTreeMap::new();
+            m.insert(format!("k{i}"), deep_map);
+            deep_map = Value::Map(m);
+        }
+
+        let map_inspected = deep_map.inspect();
+        assert!(map_inspected.contains("100"));
+        assert!(!map_inspected.contains("{...}"));
+
+        let truncated_map = deep_map.inspect_with_depth(DEFAULT_MAX_INSPECT_DEPTH);
+        assert!(truncated_map.contains("{...}"));
+
+        drop_value_iteratively(deep_map);
+
+        let mut deep_in_query = Value::Int(1);
+        for _ in 0..10_000 {
+            deep_in_query = Value::Array(vec![deep_in_query]);
+        }
+        let query_val = Value::QueryRef(QueryRef {
+            source: QuerySource::Collection("users".into()),
+            filters: vec![QueryFilter {
+                field: "tags".into(),
+                op: QueryOp::In,
+                value: deep_in_query,
+            }],
+            order_by: vec![],
+            offset: None,
+            limit: None,
+        });
+        assert_eq!(query_val.inspect(), "#<QueryRef>");
+        drop_value_iteratively(query_val);
     }
 }

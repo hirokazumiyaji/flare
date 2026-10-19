@@ -1,10 +1,23 @@
 use std::error::Error;
 use std::fmt;
 
+/// Typed runtime errors raised by the evaluator, the call contracts and the
+/// method/builtin dispatchers.
+///
+/// These are the errors a script can observe as ordinary runtime failures.
+/// Engine-enforced budget violations (step/loop/call-depth/wall-clock/value and
+/// query limits) are deliberately *not* modelled here: they stay
+/// `crate::error::BudgetError` so that `try / rescue` cannot swallow them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeError {
     UndefinedVariable(String),
     UndefinedFunction(String),
+    CannotCallNonFunction(String),
+    CannotCallMethodOnNil(String),
+    CannotCallMethodOnType {
+        name: String,
+        type_name: String,
+    },
     ReassignmentNotAllowed(String),
     CannotRedefineBuiltin(String),
     TooManyPositionalArgs,
@@ -12,11 +25,17 @@ pub enum RuntimeError {
     DuplicateArgument(String),
     UnknownKeywordArguments(Vec<String>),
     DuplicateKeywordArgument(String),
-    DuplicateParam { kind: String, name: String },
+    DuplicateParam {
+        kind: String,
+        name: String,
+    },
     BlockNotAllowed(String),
     RequiresBlock(String),
     BlockTakesNoParameters(String),
-    WrongBlockArity { expected: usize, got: usize },
+    WrongBlockArity {
+        expected: usize,
+        got: usize,
+    },
     PositionalArityMismatch {
         name: String,
         expected: usize,
@@ -25,7 +44,15 @@ pub enum RuntimeError {
         hint: Option<&'static str>,
     },
     UnsupportedMethodReceiver,
-    UnknownMethod { receiver: String, name: String },
+    UnknownMethod {
+        receiver: String,
+        name: String,
+    },
+    UnknownModuleMethod {
+        module: String,
+        name: String,
+    },
+    UnsupportedFieldAccess,
     NestedStaging(String),
     QueryInBatch,
     QueryInTransaction,
@@ -33,13 +60,6 @@ pub enum RuntimeError {
     GetAfterWriteInTransaction,
     StorageInBatch,
     StorageInTransaction,
-    StepLimitExceeded(u64),
-    LoopIterationLimitExceeded(u64),
-    CallDepthLimitExceeded(usize),
-    WallClockLimitExceeded(String),
-    StringSizeLimitExceeded(usize),
-    BytesSizeLimitExceeded(usize),
-    QueryResultLimitExceeded(usize),
     IntegerOverflow,
 }
 
@@ -48,6 +68,15 @@ impl fmt::Display for RuntimeError {
         match self {
             Self::UndefinedVariable(name) => write!(f, "undefined variable: {name}"),
             Self::UndefinedFunction(name) => write!(f, "undefined function: {name}"),
+            Self::CannotCallNonFunction(type_name) => {
+                write!(f, "cannot call non-function value of type {type_name}")
+            }
+            Self::CannotCallMethodOnNil(name) => {
+                write!(f, "cannot call method '{name}' on nil")
+            }
+            Self::CannotCallMethodOnType { name, type_name } => {
+                write!(f, "cannot call method '{name}' on {type_name}")
+            }
             Self::ReassignmentNotAllowed(name) => write!(f, "reassignment is not allowed: {name}"),
             Self::CannotRedefineBuiltin(name) => write!(f, "cannot redefine builtin: {name}"),
             Self::TooManyPositionalArgs => write!(f, "too many positional args"),
@@ -105,6 +134,10 @@ impl fmt::Display for RuntimeError {
             Self::UnknownMethod { receiver, name } => {
                 write!(f, "unknown {receiver} method: {name}")
             }
+            Self::UnknownModuleMethod { module, name } => {
+                write!(f, "unknown module method: {module}.{name}")
+            }
+            Self::UnsupportedFieldAccess => write!(f, "field access is only supported on map"),
             Self::NestedStaging(name) => write!(f, "nested {name} is not allowed"),
             Self::QueryInBatch => write!(f, "queries are not allowed inside batch"),
             Self::QueryInTransaction => {
@@ -112,30 +145,14 @@ impl fmt::Display for RuntimeError {
             }
             Self::GetInBatch => write!(f, "get is not allowed inside batch"),
             Self::GetAfterWriteInTransaction => {
-                write!(f, "get is not allowed after the first write in a transaction")
+                write!(
+                    f,
+                    "get is not allowed after the first write in a transaction"
+                )
             }
             Self::StorageInBatch => write!(f, "storage APIs are not allowed inside batch"),
             Self::StorageInTransaction => {
                 write!(f, "storage APIs are not allowed inside transaction")
-            }
-            Self::StepLimitExceeded(max) => write!(f, "step limit exceeded (max {max})"),
-            Self::LoopIterationLimitExceeded(max) => {
-                write!(f, "loop iteration limit exceeded (max {max})")
-            }
-            Self::CallDepthLimitExceeded(max) => {
-                write!(f, "call depth limit exceeded (max {max})")
-            }
-            Self::WallClockLimitExceeded(max) => {
-                write!(f, "wall-clock limit exceeded (max {max})")
-            }
-            Self::StringSizeLimitExceeded(max) => {
-                write!(f, "string size limit exceeded (max {max})")
-            }
-            Self::BytesSizeLimitExceeded(max) => {
-                write!(f, "bytes size limit exceeded (max {max})")
-            }
-            Self::QueryResultLimitExceeded(max) => {
-                write!(f, "query result limit exceeded (max {max})")
             }
             Self::IntegerOverflow => write!(f, "integer overflow"),
         }

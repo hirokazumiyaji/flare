@@ -15,35 +15,44 @@ pub mod value;
 use std::error::Error;
 
 pub use runtime::Runtime;
-pub use services::{ProjectConfig, Services};
+pub use services::{
+    is_remote_emulator_allowed, validate_emulator_host, ProjectConfig, Services,
+    ALLOW_REMOTE_EMULATOR_ENV,
+};
 
 pub use auth::{
     Auth, AuthError, AuthErrorKind, AuthSession, AuthToken, AuthUser, InMemoryAuth, UnavailableAuth,
 };
 #[cfg(feature = "emulator")]
 pub use auth::{AuthEmulator, AuthEmulatorOptions, DEFAULT_AUTH_OPERATION_TIMEOUT};
-pub use error::{CapabilityError, ErrorKind, FlareError, ServiceId, Span};
+pub use error::{
+    add_call_frame, BudgetError, CallFrame, CapabilityError, ErrorKind, FlareError, ServiceId,
+    Span, UserRaisedError,
+};
 #[cfg(feature = "emulator")]
 pub use firestore::{
-    DEFAULT_OPERATION_TIMEOUT, EmulatorAuth, EmulatorConfig, EmulatorConnectionError,
-    FirestoreEmulator, FirestoreEmulatorOptions, OPERATION_TIMEOUT_ENV, parse_timeout_ms,
+    parse_timeout_ms, EmulatorAuth, EmulatorConfig, EmulatorConnectionError, FirestoreEmulator,
+    FirestoreEmulatorOptions, DEFAULT_OPERATION_TIMEOUT, OPERATION_TIMEOUT_ENV,
 };
 pub use firestore::{Firestore, InMemoryFirestore, RequestClock, UnavailableFirestore};
 pub use io::{InMemoryIo, Io, StdIo, UnavailableIO, UnavailableIo};
 pub use limits::{
-    DEFAULT_BACKEND_TIMEOUT_MS, DEFAULT_MAX_BYTES_SIZE, DEFAULT_MAX_CALL_DEPTH,
-    DEFAULT_MAX_FILE_IO_BYTES, DEFAULT_MAX_LOOP_ITERATIONS, DEFAULT_MAX_PARSER_DEPTH,
-    DEFAULT_MAX_QUERY_RESULTS, DEFAULT_MAX_STEPS, DEFAULT_MAX_STRING_BYTES,
-    DEFAULT_MAX_VALUE_DEPTH, DEFAULT_MAX_WALL_CLOCK_MS, ParserLimits, RuntimeLimits, RuntimeUsage,
+    ParserLimits, RuntimeLimits, RuntimeUsage, DEFAULT_BACKEND_TIMEOUT_MS, DEFAULT_MAX_BYTES_SIZE,
+    DEFAULT_MAX_CALL_DEPTH, DEFAULT_MAX_FILE_IO_BYTES, DEFAULT_MAX_LOOP_ITERATIONS,
+    DEFAULT_MAX_PARSER_DEPTH, DEFAULT_MAX_QUERY_RESULTS, DEFAULT_MAX_STEPS,
+    DEFAULT_MAX_STRING_BYTES, DEFAULT_MAX_VALUE_DEPTH, DEFAULT_MAX_WALL_CLOCK_MS,
 };
+pub use repl::ReplOptions;
 pub use storage::{
-    HttpStorageTransport, HttpTransport, InMemoryStorage, Storage, StorageEmulator, StorageError,
-    StorageErrorKind, StorageHttpTransport, StorageMetadata, StorageRequest, StorageResponse,
-    StorageTransport, UnavailableStorage,
+    parse_http_response, parse_http_response_with_limit, HttpStorageTransport, HttpTransport,
+    InMemoryStorage, Storage, StorageEmulator, StorageError, StorageErrorKind,
+    StorageHttpTransport, StorageMetadata, StorageRequest, StorageResponse, StorageTransport,
+    UnavailableStorage, DEFAULT_MAX_STORAGE_BODY_BYTES, DEFAULT_MAX_STORAGE_RESPONSE_BYTES,
+    STORAGE_HEADER_ALLOWANCE_BYTES,
 };
 pub use value::{
-    BuiltinModule, Value, validate_value_depth, validate_value_limits,
-    validate_value_limits_with_sizes,
+    drop_value_iteratively, validate_value_depth, validate_value_limits,
+    validate_value_limits_with_sizes, BuiltinModule, Value, DEFAULT_MAX_INSPECT_DEPTH,
 };
 
 pub fn run_script(source: &str) -> Result<Value, Box<dyn Error>> {

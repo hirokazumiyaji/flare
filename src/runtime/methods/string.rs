@@ -7,8 +7,9 @@ use crate::value::Value;
 
 pub fn str_method_contract(name: &str) -> Option<CallContract> {
     match name {
-        "len" | "trim" => Some(CallContract::exact(0)),
+        "len" | "trim" | "to_i" | "upcase" | "downcase" => Some(CallContract::exact(0)),
         "split" | "starts_with" | "ends_with" | "contains" => Some(CallContract::exact(1)),
+        "replace" | "slice" => Some(CallContract::exact(2)),
         _ => None,
     }
 }
@@ -21,6 +22,39 @@ pub fn eval_string_method(
     match name {
         "len" => Ok(ExecFlow::Value(Value::Int(s.chars().count() as i64))),
         "trim" => Ok(ExecFlow::Value(Value::Str(s.trim().to_string()))),
+        "upcase" => Ok(ExecFlow::Value(Value::Str(s.to_uppercase()))),
+        "downcase" => Ok(ExecFlow::Value(Value::Str(s.to_lowercase()))),
+        "replace" => {
+            let from = match args.first() {
+                Some(Value::Str(from)) => from,
+                _ => return Err("replace pattern must be a string".into()),
+            };
+            let to = match args.get(1) {
+                Some(Value::Str(to)) => to,
+                _ => return Err("replace replacement must be a string".into()),
+            };
+            Ok(ExecFlow::Value(Value::Str(s.replace(from, to))))
+        }
+        "slice" => {
+            let start = match args.first() {
+                Some(Value::Int(start)) => *start,
+                _ => return Err("slice start must be an int".into()),
+            };
+            let len = match args.get(1) {
+                Some(Value::Int(len)) => *len,
+                _ => return Err("slice len must be an int".into()),
+            };
+            if start < 0 {
+                return Err("slice start must be >= 0".into());
+            }
+            if len < 0 {
+                return Err("slice len must be >= 0".into());
+            }
+            let start = start as usize;
+            let len = len as usize;
+            let out: String = s.chars().skip(start).take(len).collect();
+            Ok(ExecFlow::Value(Value::Str(out)))
+        }
         "split" => {
             let sep = match args.first() {
                 Some(Value::Str(sep)) => sep,

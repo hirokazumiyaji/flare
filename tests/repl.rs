@@ -142,3 +142,376 @@ fn repl_stream_enforces_source_size_budget_on_pending_buffer() {
     assert!(lines[0].contains("source size limit exceeded"));
     assert_eq!(lines[1], "=> 2");
 }
+
+#[test]
+fn repl_loop_handles_continuation_prompt_and_syntax_error_recovery() {
+    use flare::repl::run_repl_loop;
+    use rustyline::error::ReadlineError;
+
+    let mut rt = Runtime::new(InMemoryFirestore::default());
+
+    let mut prompts = Vec::new();
+    let mut history = Vec::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let lines = vec![
+        Ok("fn broken() {".to_string()),
+        Ok("  let invalid = 1 + ;".to_string()),
+        Ok("}".to_string()),
+        Ok("1 + 1".to_string()),
+        Ok("exit".to_string()),
+    ];
+    let mut line_iter = lines.into_iter();
+
+    run_repl_loop(
+        &mut rt,
+        |_rt, prompt| {
+            prompts.push(prompt.to_string());
+            line_iter.next().unwrap_or(Err(ReadlineError::Eof))
+        },
+        |entry| history.push(entry.to_string()),
+        &mut stdout,
+        &mut stderr,
+    )
+    .unwrap();
+
+    assert_eq!(prompts, vec!["fl> ", "fl* ", "fl* ", "fl> ", "fl> "]);
+    assert_eq!(
+        history,
+        vec!["fn broken() {\n  let invalid = 1 + ;\n}", "1 + 1"]
+    );
+
+    let err_str = String::from_utf8(stderr).unwrap();
+    assert!(err_str.contains("error:"));
+
+    let out_str = String::from_utf8(stdout).unwrap();
+    assert!(out_str.contains("=> 2"));
+}
+
+#[test]
+fn repl_loop_handles_ctrl_c_interrupted_branches() {
+    use flare::repl::run_repl_loop;
+    use rustyline::error::ReadlineError;
+
+    let mut rt = Runtime::new(InMemoryFirestore::default());
+
+    let mut prompts = Vec::new();
+    let mut history = Vec::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let lines = vec![
+        Err(ReadlineError::Interrupted),
+        Ok("fn pending() {".to_string()),
+        Err(ReadlineError::Interrupted),
+        Ok("10 + 20".to_string()),
+        Ok("exit".to_string()),
+    ];
+    let mut line_iter = lines.into_iter();
+
+    run_repl_loop(
+        &mut rt,
+        |_rt, prompt| {
+            prompts.push(prompt.to_string());
+            line_iter.next().unwrap_or(Err(ReadlineError::Eof))
+        },
+        |entry| history.push(entry.to_string()),
+        &mut stdout,
+        &mut stderr,
+    )
+    .unwrap();
+
+    assert_eq!(prompts, vec!["fl> ", "fl> ", "fl* ", "fl> ", "fl> "]);
+    assert_eq!(history, vec!["10 + 20"]);
+
+    let out_str = String::from_utf8(stdout).unwrap();
+    assert!(out_str.contains("^C\n^C\n=> 30"));
+}
+
+#[test]
+fn repl_loop_handles_ctrl_d_eof_branches() {
+    use flare::repl::run_repl_loop;
+    use rustyline::error::ReadlineError;
+
+    let mut rt = Runtime::new(InMemoryFirestore::default());
+
+    let mut prompts = Vec::new();
+    let mut history = Vec::new();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    let lines = vec![
+        Ok("fn pending() {".to_string()),
+        Err(ReadlineError::Eof),
+        Ok("42".to_string()),
+        Err(ReadlineError::Eof),
+    ];
+    let mut line_iter = lines.into_iter();
+
+    run_repl_loop(
+        &mut rt,
+        |_rt, prompt| {
+            prompts.push(prompt.to_string());
+            line_iter.next().unwrap_or(Err(ReadlineError::Eof))
+        },
+        |entry| history.push(entry.to_string()),
+        &mut stdout,
+        &mut stderr,
+    )
+    .unwrap();
+
+    assert_eq!(prompts, vec!["fl> ", "fl* ", "fl> ", "fl> "]);
+    assert_eq!(history, vec!["42"]);
+
+    let out_str = String::from_utf8(stdout).unwrap();
+    assert!(out_str.contains("=> 42"));
+}
+
+#[test]
+fn repl_history_file_save_and_load_round_trip() {
+    use flare::repl::FlareHelper;
+    use rustyline::history::FileHistory;
+    use rustyline::Editor;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let history_path = temp_dir.path().join(".fl_history");
+
+    {
+        let mut rl = Editor::<FlareHelper, FileHistory>::new().unwrap();
+        rl.add_history_entry("a = 100").unwrap();
+        rl.add_history_entry("b = 200").unwrap();
+        rl.save_history(&history_path).unwrap();
+    }
+
+    {
+        let mut rl = Editor::<FlareHelper, FileHistory>::new().unwrap();
+        rl.load_history(&history_path).unwrap();
+        let entries: Vec<&str> = rl.history().iter().map(String::as_str).collect();
+        assert_eq!(entries, vec!["a = 100", "b = 200"]);
+    }
+}
+
+#[test]
+fn sensitive_auth_inputs_are_detected() {
+    use flare::repl::is_sensitive_input;
+
+    // Direct builtin calls
+    assert!(is_sensitive_input(
+        "auth_sign_in(\"a@b.com\", \"password\")"
+    ));
+    assert!(is_sensitive_input(
+        "auth_sign_up(\"a@b.com\", \"password\")"
+    ));
+    assert!(is_sensitive_input("sign_in(\"a@b.com\", \"password\")"));
+    assert!(is_sensitive_input("sign_up(\"a@b.com\", \"password\")"));
+
+    // Module calls
+    assert!(is_sensitive_input(
+        "Auth.sign_in(\"a@b.com\", \"password\")"
+    ));
+    assert!(is_sensitive_input(
+        "Auth.sign_up(\"a@b.com\", \"password\")"
+    ));
+    assert!(is_sensitive_input(
+        "Auth . sign_in(\"a@b.com\", \"password\")"
+    ));
+    assert!(is_sensitive_input(
+        "Auth.auth_sign_in(\"a@b.com\", \"password\")"
+    ));
+
+    // Expressions and variables
+    assert!(is_sensitive_input(
+        "let res = auth_sign_in(\"a@b.com\", \"secret\")"
+    ));
+    assert!(is_sensitive_input(
+        "res = Auth.sign_in(\"a@b.com\", \"secret\")"
+    ));
+    assert!(is_sensitive_input(
+        "if true {\n  auth_sign_up(\"a@b.com\", \"password\")\n}"
+    ));
+
+    // Multi-line
+    assert!(is_sensitive_input(
+        "auth_sign_in(\n  \"a@b.com\",\n  \"secret\"\n)"
+    ));
+
+    // Case insensitivity
+    assert!(is_sensitive_input("AUTH_SIGN_IN(\"a@b.com\", \"secret\")"));
+    assert!(is_sensitive_input("AUTH.SIGN_IN(\"a@b.com\", \"secret\")"));
+
+    // Non-sensitive inputs
+    assert!(!is_sensitive_input("1 + 1"));
+    assert!(!is_sensitive_input("puts(\"hello\")"));
+    assert!(!is_sensitive_input("auth_current_user()"));
+    assert!(!is_sensitive_input("Auth.current_user()"));
+    assert!(!is_sensitive_input("auth_sign_out()"));
+    assert!(!is_sensitive_input("Auth.sign_out()"));
+    assert!(!is_sensitive_input("design_pattern = 1"));
+    assert!(!is_sensitive_input("assignment = 2"));
+    assert!(!is_sensitive_input("doc(\"users/1\").get()"));
+}
+
+#[test]
+fn repl_options_resolution_respects_env_and_flags() {
+    use flare::repl::ReplOptions;
+    use std::path::PathBuf;
+
+    // Default with HOME
+    let opts = ReplOptions::resolve_from(|k| match k {
+        "HOME" => Some("/tmp/test_home".into()),
+        _ => None,
+    });
+    assert!(!opts.no_history);
+    assert_eq!(
+        opts.history_file,
+        Some(PathBuf::from("/tmp/test_home/.fl_history"))
+    );
+
+    // FL_NO_HISTORY=1
+    let opts = ReplOptions::resolve_from(|k| match k {
+        "HOME" => Some("/tmp/test_home".into()),
+        "FL_NO_HISTORY" => Some("1".into()),
+        _ => None,
+    });
+    assert!(opts.no_history);
+    assert_eq!(opts.history_file, None);
+
+    // FL_NO_HISTORY=true
+    let opts = ReplOptions::resolve_from(|k| match k {
+        "FL_NO_HISTORY" => Some("true".into()),
+        _ => None,
+    });
+    assert!(opts.no_history);
+    assert_eq!(opts.history_file, None);
+
+    // FL_HISTORY_FILE
+    let opts = ReplOptions::resolve_from(|k| match k {
+        "HOME" => Some("/tmp/test_home".into()),
+        "FL_HISTORY_FILE" => Some("/custom/history".into()),
+        _ => None,
+    });
+    assert!(!opts.no_history);
+    assert_eq!(opts.history_file, Some(PathBuf::from("/custom/history")));
+
+    // FL_NO_HISTORY takes precedence over FL_HISTORY_FILE
+    let opts = ReplOptions::resolve_from(|k| match k {
+        "FL_HISTORY_FILE" => Some("/custom/history".into()),
+        "FL_NO_HISTORY" => Some("1".into()),
+        _ => None,
+    });
+    assert!(opts.no_history);
+    assert_eq!(opts.history_file, None);
+
+    // with_no_history builder
+    let opts = ReplOptions::resolve_from(|k| match k {
+        "FL_HISTORY_FILE" => Some("/custom/history".into()),
+        _ => None,
+    })
+    .with_no_history(true);
+    assert!(opts.no_history);
+    assert_eq!(opts.history_file, None);
+
+    // with_history_file does not override no_history
+    let opts = ReplOptions::resolve_from(|k| match k {
+        "FL_NO_HISTORY" => Some("1".into()),
+        _ => None,
+    })
+    .with_history_file(Some(PathBuf::from("/custom/history")));
+    assert!(opts.no_history);
+    assert_eq!(opts.history_file, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn history_file_permissions_are_0600() {
+    use flare::repl::{ensure_file_0600, set_file_mode_0600};
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir_in("/tmp").unwrap();
+    let history_path = temp_dir.path().join("sub").join(".fl_history");
+
+    // ensure_file_0600 creates parent dir and file with 0600
+    ensure_file_0600(&history_path).unwrap();
+    let meta = std::fs::metadata(&history_path).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+    // Change permissions to 0644 then set_file_mode_0600 tightens back to 0600
+    std::fs::set_permissions(&history_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let meta = std::fs::metadata(&history_path).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+
+    set_file_mode_0600(&history_path).unwrap();
+    let meta = std::fs::metadata(&history_path).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn repl_history_omits_sensitive_entries() {
+    use flare::repl::{is_sensitive_input, FlareHelper};
+    use rustyline::history::FileHistory;
+    use rustyline::Editor;
+
+    let mut rl = Editor::<FlareHelper, FileHistory>::new().unwrap();
+
+    let inputs = [
+        "x = 10",
+        "auth_sign_in(\"user@example.com\", \"secret\")",
+        "puts(x)",
+        "Auth.sign_up(\"new@example.com\", \"pass\")",
+        "y = 20",
+    ];
+
+    for input in inputs {
+        if !is_sensitive_input(input) {
+            let _ = rl.add_history_entry(input);
+        }
+    }
+
+    let history: Vec<String> = rl.history().iter().map(|s| s.to_string()).collect();
+    assert_eq!(history, vec!["x = 10", "puts(x)", "y = 20"]);
+}
+
+#[test]
+fn repl_history_omits_multiline_sensitive_entries() {
+    use flare::repl::{is_complete_input, is_sensitive_input, FlareHelper};
+    use rustyline::history::FileHistory;
+    use rustyline::Editor;
+
+    let mut rl = Editor::<FlareHelper, FileHistory>::new().unwrap();
+
+    let lines = [
+        "fn add(a, b) {",
+        "  a + b",
+        "}",
+        "auth_sign_in(",
+        "  \"user@example.com\",",
+        "  \"secret_pass\"",
+        ")",
+        "Auth.",
+        "  sign_up(",
+        "    \"other@example.com\",",
+        "    \"secret_pass2\"",
+        "  )",
+        "result = 42",
+    ];
+
+    let mut buffer = String::new();
+    for line in lines {
+        if !buffer.is_empty() {
+            buffer.push('\n');
+        }
+        buffer.push_str(line);
+
+        if is_complete_input(&buffer) {
+            let complete = std::mem::take(&mut buffer);
+            let trimmed = complete.trim();
+            if !is_sensitive_input(trimmed) {
+                let _ = rl.add_history_entry(trimmed);
+            }
+        }
+    }
+
+    let history: Vec<String> = rl.history().iter().map(|s| s.to_string()).collect();
+    assert_eq!(history, vec!["fn add(a, b) {\n  a + b\n}", "result = 42",]);
+}

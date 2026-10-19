@@ -9,7 +9,9 @@ mod memory;
 mod unavailable;
 
 pub use emulator::{
-    HttpStorageTransport, StorageEmulator, StorageRequest, StorageResponse, StorageTransport,
+    parse_http_response, parse_http_response_with_limit, HttpStorageTransport, StorageEmulator,
+    StorageRequest, StorageResponse, StorageTransport, DEFAULT_MAX_STORAGE_BODY_BYTES,
+    DEFAULT_MAX_STORAGE_RESPONSE_BYTES, STORAGE_HEADER_ALLOWANCE_BYTES,
 };
 
 /// Short aliases for callers that name the transport after its role.
@@ -223,6 +225,8 @@ pub trait Storage {
 
     fn set_timeout(&mut self, _timeout: Option<std::time::Duration>) {}
 
+    fn set_max_bytes_size(&mut self, _max_bytes_size: Option<usize>) {}
+
     fn supports_backend_timeout(&self) -> bool {
         false
     }
@@ -251,6 +255,9 @@ impl<T: Storage + ?Sized> Storage for Box<T> {
 
     fn set_timeout(&mut self, timeout: Option<std::time::Duration>) {
         (**self).set_timeout(timeout)
+    }
+    fn set_max_bytes_size(&mut self, max_bytes_size: Option<usize>) {
+        (**self).set_max_bytes_size(max_bytes_size)
     }
     fn supports_backend_timeout(&self) -> bool {
         (**self).supports_backend_timeout()
@@ -285,6 +292,9 @@ impl<T: Storage + ?Sized> Storage for &mut T {
 
     fn set_timeout(&mut self, timeout: Option<std::time::Duration>) {
         (**self).set_timeout(timeout)
+    }
+    fn set_max_bytes_size(&mut self, max_bytes_size: Option<usize>) {
+        (**self).set_max_bytes_size(max_bytes_size)
     }
     fn supports_backend_timeout(&self) -> bool {
         (**self).supports_backend_timeout()

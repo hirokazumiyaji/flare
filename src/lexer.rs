@@ -24,10 +24,13 @@ pub enum Token {
     If,
     Else,
     While,
+    Try,
+    Rescue,
     Plus,
     Minus,
     Star,
     Slash,
+    Percent,
     Eq,
     EqEq,
     Ne,
@@ -208,7 +211,8 @@ impl<'a> Lexer<'a> {
                     let token = self.lex_string_token()?;
                     return Ok(Some(self.spanned(token, span)));
                 }
-                '(' | ')' | ',' | '{' | '}' | '[' | ']' | '.' | ':' | '+' | '-' | '*' | '/' => {
+                '(' | ')' | ',' | '{' | '}' | '[' | ']' | '.' | ':' | '+' | '-' | '*' | '/'
+                | '%' => {
                     let span = self.span();
                     self.bump();
                     // or-pattern が single_char_token の定義域と一致するため、
@@ -281,6 +285,8 @@ impl<'a> Lexer<'a> {
                         "if" => Token::If,
                         "else" => Token::Else,
                         "while" => Token::While,
+                        "try" => Token::Try,
+                        "rescue" => Token::Rescue,
                         "true" => Token::True,
                         "false" => Token::False,
                         "nil" => Token::Nil,
@@ -442,6 +448,7 @@ fn single_char_token(c: char) -> Option<Token> {
         '-' => Token::Minus,
         '*' => Token::Star,
         '/' => Token::Slash,
+        '%' => Token::Percent,
         _ => return None,
     })
 }

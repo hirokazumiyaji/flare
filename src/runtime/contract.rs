@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::error::Error;
 
-use crate::ast::{Block, CallArg};
+use crate::ast::{Block, CallArg, FuncParam};
 use crate::runtime::error::RuntimeError;
 use crate::value::Value;
 
-#[derive(Clone, Copy)]
+/// The positional part of a call contract.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PositionalArity {
     Exact(usize),
     Range(usize, usize),
@@ -18,12 +19,20 @@ pub enum BlockPolicy {
     Required,
 }
 
+/// Runtime validation shared by builtin functions and built-in methods.
+///
+/// `keywords` is intentionally small: the language's builtin API is
+/// positional except for `set(..., merge: true)`.  `array` and `puts` use
+/// `PositionalArity::Any` because their variable-arity behavior is part of
+/// the API.
 #[derive(Clone, Copy)]
 pub struct CallContract {
     pub positional: PositionalArity,
     pub keywords: &'static [&'static str],
     pub block: BlockPolicy,
+    /// Keywords that occupy the same slot as a positional argument.
     pub positional_keyword_conflicts: &'static [(&'static str, usize)],
+    /// Optional compatibility/detail hint for a missing argument.
     pub missing_hint: Option<&'static str>,
 }
 
@@ -114,6 +123,27 @@ pub fn validate_unique_params(params: &[String], kind: &str) -> Result<(), Box<d
     Ok(())
 }
 
+/// Hand-built ASTs can reach `eval_program` without passing the parser.
+pub fn validate_func_params(params: &[FuncParam], kind: &str) -> Result<(), Box<dyn Error>> {
+    let mut seen = HashSet::with_capacity(params.len());
+    let mut seen_default = false;
+    for param in params {
+        if !seen.insert(param.name.as_str()) {
+            return Err(RuntimeError::DuplicateParam {
+                kind: kind.to_string(),
+                name: param.name.clone(),
+            }
+            .into());
+        }
+        if param.default.is_some() {
+            seen_default = true;
+        } else if seen_default {
+            return Err("parameter without default cannot follow parameter with default".into());
+        }
+    }
+    Ok(())
+}
+
 pub fn keyword_names(args: &[CallArg]) -> BTreeMap<String, Value> {
     args.iter()
         .filter_map(|arg| match arg {
@@ -123,6 +153,59 @@ pub fn keyword_names(args: &[CallArg]) -> BTreeMap<String, Value> {
         .collect()
 }
 
+pub fn validate_user_call_contract(
+    name: &str,
+    params: &[FuncParam],
+    args: &[CallArg],
+    block: Option<&Block>,
+) -> Result<(), Box<dyn Error>> {
+    if block.is_some() {
+        return Err(RuntimeError::BlockNotAllowed(name.to_string()).into());
+    }
+    let has_keywords = args
+        .iter()
+        .any(|arg| matches!(arg, CallArg::Keyword { .. }));
+    if !has_keywords {
+        let pos_len = args.len();
+        if pos_len > params.len() {
+            return Err(RuntimeError::TooManyPositionalArgs.into());
+        }
+        for param in &params[pos_len..] {
+            if param.default.is_none() {
+                return Err(RuntimeError::MissingArgument(param.name.clone()).into());
+            }
+        }
+        return Ok(());
+    }
+    let positional_count = positional_arg_count(args);
+    if positional_count > params.len() {
+        return Err(RuntimeError::TooManyPositionalArgs.into());
+    }
+    let mut kwargs = keyword_names(args);
+    let mut idx = 0;
+    for param in params {
+        if idx < positional_count {
+            if kwargs.contains_key(&param.name) {
+                return Err(RuntimeError::DuplicateArgument(param.name.clone()).into());
+            }
+            idx += 1;
+            continue;
+        }
+        if kwargs.remove(&param.name).is_some() {
+            continue;
+        }
+        if param.default.is_some() {
+            continue;
+        }
+        return Err(RuntimeError::MissingArgument(param.name.clone()).into());
+    }
+    if !kwargs.is_empty() {
+        let keys: Vec<String> = kwargs.keys().cloned().collect();
+        return Err(RuntimeError::UnknownKeywordArguments(keys).into());
+    }
+    Ok(())
+}
+
 pub fn validate_call_contract(
     name: &str,
     positional_len: usize,
@@ -130,6 +213,8 @@ pub fn validate_call_contract(
     block: Option<&Block>,
     contract: CallContract,
 ) -> Result<(), Box<dyn Error>> {
+    // Check this before arity/type checks so a call which supplies the same
+    // option in two ways always gets the actionable duplicate-argument error.
     for (keyword, position) in contract.positional_keyword_conflicts {
         if positional_len > *position && kwargs.contains_key(*keyword) {
             return Err(RuntimeError::DuplicateArgument((*keyword).to_string()).into());
@@ -170,13 +255,21 @@ pub fn validate_call_contract(
         }
     }
 
-    let unknown: Vec<String> = kwargs
+    let unknown: Vec<&str> = kwargs
         .keys()
-        .filter(|key| !contract.keywords.contains(&key.as_str()))
-        .cloned()
+        .filter(|key| {
+            !contract
+                .keywords
+                .iter()
+                .any(|allowed| allowed == &key.as_str())
+        })
+        .map(String::as_str)
         .collect();
     if !unknown.is_empty() {
-        return Err(RuntimeError::UnknownKeywordArguments(unknown).into());
+        return Err(RuntimeError::UnknownKeywordArguments(
+            unknown.iter().map(|k| k.to_string()).collect(),
+        )
+        .into());
     }
 
     match (contract.block, block) {
@@ -186,6 +279,11 @@ pub fn validate_call_contract(
         (BlockPolicy::Required, None) => Err(RuntimeError::RequiresBlock(name.to_string()).into()),
         _ => Ok(()),
     }
+}
+
+pub fn unknown_keyword_arguments(kwargs: &BTreeMap<String, Value>) -> Box<dyn Error> {
+    let keys: Vec<String> = kwargs.keys().cloned().collect();
+    RuntimeError::UnknownKeywordArguments(keys).into()
 }
 
 pub fn check_block_arity(block: &Block, yielded: usize) -> Result<(), Box<dyn Error>> {
@@ -198,53 +296,4 @@ pub fn check_block_arity(block: &Block, yielded: usize) -> Result<(), Box<dyn Er
     } else {
         Ok(())
     }
-}
-
-pub fn validate_user_call_contract(
-    name: &str,
-    params: &[String],
-    args: &[CallArg],
-    block: Option<&Block>,
-) -> Result<(), Box<dyn Error>> {
-    if block.is_some() {
-        return Err(RuntimeError::BlockNotAllowed(name.to_string()).into());
-    }
-    bind_function_args(
-        params,
-        vec![Value::Nil; positional_arg_count(args)],
-        keyword_names(args),
-    )
-    .map(|_| ())
-}
-
-pub fn bind_function_args(
-    params: &[String],
-    positional: Vec<Value>,
-    mut kwargs: BTreeMap<String, Value>,
-) -> Result<Vec<(String, Value)>, Box<dyn Error>> {
-    if positional.len() > params.len() {
-        return Err(RuntimeError::TooManyPositionalArgs.into());
-    }
-    let mut out = Vec::with_capacity(params.len());
-    let mut idx = 0;
-    for param in params {
-        if idx < positional.len() {
-            if kwargs.contains_key(param) {
-                return Err(RuntimeError::DuplicateArgument(param.clone()).into());
-            }
-            out.push((param.clone(), positional[idx].clone()));
-            idx += 1;
-            continue;
-        }
-        if let Some(v) = kwargs.remove(param) {
-            out.push((param.clone(), v));
-            continue;
-        }
-        return Err(RuntimeError::MissingArgument(param.clone()).into());
-    }
-    if !kwargs.is_empty() {
-        let keys: Vec<String> = kwargs.keys().cloned().collect();
-        return Err(RuntimeError::UnknownKeywordArguments(keys).into());
-    }
-    Ok(out)
 }

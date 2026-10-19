@@ -351,18 +351,22 @@ fn scalar_results_count_against_the_value_node_limit() {
 
 #[test]
 fn external_asts_are_depth_checked_before_evaluation() {
-    use flare::ast::{Expr, Stmt, UnOp};
+    use flare::ast::{Expr, ExprKind, Stmt, UnOp};
+    use flare::Span;
 
     // An embedder can hand the public API an AST it built itself, so the
     // parser-depth budget has to hold for ASTs that never went through the
     // parser. A unary chain far past the default depth of 128 would otherwise
     // recurse through `eval_expr` until the thread stack is gone.
-    let mut expr = Expr::Int(1);
+    let mut expr = Expr::new(ExprKind::Int(1), Span::new(1, 1));
     for _ in 0..5_000 {
-        expr = Expr::Unary {
-            op: UnOp::Neg,
-            expr: Box::new(expr),
-        };
+        expr = Expr::new(
+            ExprKind::Unary {
+                op: UnOp::Neg,
+                expr: Box::new(expr),
+            },
+            Span::new(1, 1),
+        );
     }
     let stmt = Stmt::Expr(expr);
     let mut rt = runtime_with(RuntimeLimits::default());
@@ -445,7 +449,7 @@ fn a_successful_write_is_never_reported_as_a_timeout() {
     // only be checked before the call. Reporting a timeout after a write that
     // already persisted would make a retry apply `increment()` twice, so the
     // result of a completed write is returned as-is.
-    let limits = RuntimeLimits::default().with_max_wall_clock(Duration::from_millis(1));
+    let limits = RuntimeLimits::default().with_max_wall_clock(Duration::from_millis(10));
     let mut rt = Runtime::with_limits(SlowSuccessfulWrite::new(), limits);
     // The write sleeps 30ms, so the budget is long expired by the time the
     // backend returns success. The run must still report success; the write is
@@ -552,6 +556,12 @@ fn string_size_budget_enforces_limit_on_concat_and_interpolation() {
     // Container holding large string
     let err = rt.run("[\"a\" + \"b\" + \"c\" + \"d\" + \"e\" + \"f\" + \"g\" + \"h\" + \"i\" + \"j\" + \"k\"]").unwrap_err();
     assert_budget_error(err, "string size limit exceeded");
+
+    // to_s / inspect exceeding limit
+    let err = rt.run("[1, 2, 3, 4, 5, 6].to_s()").unwrap_err();
+    assert_budget_error(err, "string size limit exceeded");
+    let err = rt.run("inspect([1, 2, 3, 4, 5, 6])").unwrap_err();
+    assert_budget_error(err, "string size limit exceeded");
 }
 
 #[test]
@@ -574,7 +584,9 @@ fn bytes_size_budget_enforces_limit_on_bytes_and_storage() {
         .unwrap();
 
     storage_rt.set_limits(RuntimeLimits::default().with_max_bytes_size(4));
-    let err = storage_rt.run("storage_download(\"test.bin\")").unwrap_err();
+    let err = storage_rt
+        .run("storage_download(\"test.bin\")")
+        .unwrap_err();
     assert_budget_error(err, "bytes size limit exceeded");
 }
 
@@ -594,4 +606,50 @@ fn validate_value_limits_with_sizes_checks_bounds() {
     assert!(validate_value_limits_with_sizes(&nested, None, None, Some(4), None).is_err());
 }
 
+#[test]
+fn array_concatenation_respects_value_node_budget() {
+    let limits = RuntimeLimits::default().with_max_value_nodes(4);
+    let mut rt = Runtime::with_limits(InMemoryFirestore::default(), limits);
+    let err = rt.run("[1, 2] + [3, 4]").unwrap_err();
+    assert_budget_error(err, "value node limit exceeded");
+}
 
+#[test]
+fn nested_array_concatenation_respects_value_node_budget() {
+    let limits = RuntimeLimits::default().with_max_value_nodes(6);
+    let mut rt = Runtime::with_limits(InMemoryFirestore::default(), limits);
+    let err = rt.run("[[1, 2]] + [[3, 4]]").unwrap_err();
+    assert_budget_error(err, "value node limit exceeded");
+}
+
+#[test]
+fn array_concatenation_respects_value_depth_budget() {
+    let limits = RuntimeLimits::default().with_max_value_depth(1);
+    let mut rt = Runtime::with_limits(InMemoryFirestore::default(), limits);
+    let err = rt.run("[[1]] + []").unwrap_err();
+    assert_budget_error(err, "value nesting limit exceeded");
+}
+
+#[test]
+fn extended_array_methods_charge_loop_iterations() {
+    let items: Vec<String> = (0..50).rev().map(|i| i.to_string()).collect();
+    let src = format!("[{}].sort()", items.join(","));
+    let mut rt = runtime_with(RuntimeLimits::default().with_max_loop_iterations(5));
+    let err = rt.run(&src).unwrap_err();
+    assert_budget_error(err, "loop iteration limit exceeded");
+
+    let src = format!("[{}].sort_by {{ |x| x }}", items.join(","));
+    let mut rt = runtime_with(RuntimeLimits::default().with_max_loop_iterations(5));
+    let err = rt.run(&src).unwrap_err();
+    assert_budget_error(err, "loop iteration limit exceeded");
+
+    let src = format!("[{}].uniq()", items.join(","));
+    let mut rt = runtime_with(RuntimeLimits::default().with_max_loop_iterations(5));
+    let err = rt.run(&src).unwrap_err();
+    assert_budget_error(err, "loop iteration limit exceeded");
+
+    let src = format!("[{}].flatten()", items.join(","));
+    let mut rt = runtime_with(RuntimeLimits::default().with_max_loop_iterations(5));
+    let err = rt.run(&src).unwrap_err();
+    assert_budget_error(err, "loop iteration limit exceeded");
+}

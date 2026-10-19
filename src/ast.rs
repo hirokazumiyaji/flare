@@ -1,7 +1,21 @@
 use std::fmt;
 
+use crate::error::Span;
+
 #[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
+pub struct Expr {
+    pub kind: ExprKind,
+    pub span: Span,
+}
+
+impl Expr {
+    pub fn new(kind: ExprKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExprKind {
     Int(i64),
     Str(String),
     StrInterp(Vec<StrPiece>),
@@ -25,12 +39,45 @@ pub enum Expr {
         args: Vec<CallArg>,
         block: Option<Block>,
     },
+    FieldAccess {
+        receiver: Box<Expr>,
+        name: String,
+    },
     Map(Vec<(String, Expr)>),
     Array(Vec<Expr>),
     Index {
         base: Box<Expr>,
         index: Box<Expr>,
     },
+    If {
+        cond: Box<Expr>,
+        then_body: Vec<Stmt>,
+        else_body: Vec<Stmt>,
+    },
+    While {
+        cond: Box<Expr>,
+        body: Vec<Stmt>,
+    },
+    TryRescue {
+        try_body: Vec<Stmt>,
+        err_param: Option<String>,
+        rescue_body: Vec<Stmt>,
+    },
+    Fn {
+        params: Vec<FuncParam>,
+        body: Vec<Stmt>,
+    },
+    Invoke {
+        callee: Box<Expr>,
+        args: Vec<CallArg>,
+        block: Option<Block>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuncParam {
+    pub name: String,
+    pub default: Option<Expr>,
 }
 
 /// An argument to a call, retaining its position in the source.
@@ -50,6 +97,7 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    Rem,
     Eq,
     Ne,
     Gt,
@@ -75,19 +123,10 @@ pub enum Stmt {
     },
     Def {
         name: String,
-        params: Vec<String>,
+        params: Vec<FuncParam>,
         body: Vec<Stmt>,
     },
     Return(Option<Expr>),
-    If {
-        cond: Expr,
-        then_body: Vec<Stmt>,
-        else_body: Vec<Stmt>,
-    },
-    While {
-        cond: Expr,
-        body: Vec<Stmt>,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +142,7 @@ impl fmt::Display for BinOp {
             Self::Sub => "-",
             Self::Mul => "*",
             Self::Div => "/",
+            Self::Rem => "%",
             Self::Eq => "==",
             Self::Ne => "!=",
             Self::Gt => ">",

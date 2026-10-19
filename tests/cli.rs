@@ -510,8 +510,9 @@ fn fl_default_budgets_stop_infinite_recursion() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("call depth limit exceeded"), "{stderr:?}");
-    // The position of the failing top-level statement (`f()`), not of the fn.
-    assert!(stderr.starts_with("error: 1:16: "), "{stderr:?}");
+    // The position of the failing call inside f(), and stack trace contains top-level call.
+    assert!(stderr.starts_with("error: 1:10: "), "{stderr:?}");
+    assert!(stderr.contains("in f at 1:16"), "{stderr:?}");
 }
 
 #[test]
@@ -872,4 +873,69 @@ fn fl_json_and_file_io_execution() {
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "=> 42\n");
     let _ = std::fs::remove_file(temp_file);
+}
+
+#[test]
+fn fl_help_includes_history_options() {
+    let out = Command::new(FL_EXE)
+        .arg("--help")
+        .output()
+        .expect("spawn fl");
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--no-history"), "{stderr}");
+    assert!(stderr.contains("--history-file"), "{stderr}");
+    assert!(stderr.contains("FL_HISTORY_FILE"), "{stderr}");
+    assert!(stderr.contains("FL_NO_HISTORY"), "{stderr}");
+}
+
+#[test]
+fn fl_no_history_flag_is_accepted_with_repl() {
+    let mut child = Command::new(FL_EXE)
+        .args(["--repl", "--no-history"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fl with --no-history");
+
+    use std::io::Write;
+    let mut stdin = child.stdin.take().expect("open stdin");
+    stdin.write_all(b"1 + 2\nexit\n").expect("write stdin");
+    drop(stdin);
+
+    let out = child.wait_with_output().expect("wait fl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("=> 3"));
+}
+
+#[test]
+fn fl_history_file_flag_is_accepted() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let temp_file = temp_dir.path().join("fl_custom_history");
+
+    let mut child = Command::new(FL_EXE)
+        .args(["--repl", "--history-file", temp_file.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn fl with --history-file");
+
+    use std::io::Write;
+    let mut stdin = child.stdin.take().expect("open stdin");
+    stdin.write_all(b"10 * 20\nexit\n").expect("write stdin");
+    drop(stdin);
+
+    let out = child.wait_with_output().expect("wait fl");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("=> 200"));
 }

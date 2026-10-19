@@ -1,21 +1,21 @@
-use std::collections::{BTreeMap, HashMap};
 #[cfg(test)]
 use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::time::{Duration, Instant};
 
-use crate::ast::{BinOp, Block, CallArg, Expr, Stmt, StrPiece, UnOp};
+use crate::ast::{BinOp, Block, Expr, Stmt};
 use crate::auth::Auth;
-use crate::error::{CapabilityError, FlareError, ServiceId, Span};
+use crate::error::{BudgetError, CapabilityError, FlareError, ServiceId, Span, UserRaisedError};
 use crate::firestore::{validate_firestore_id, Firestore, WriteOp};
 use crate::limits::{RuntimeLimits, RuntimeUsage};
 use crate::parser::Parser;
 use crate::services::ServiceAccess;
 use crate::services::Services;
 use crate::storage::{InMemoryStorage, Storage};
-use crate::value::{self, UserFunc, Value};
 #[cfg(test)]
 use crate::value::QueryRef;
+use crate::value::Value;
 
 pub(crate) mod builtins;
 pub(crate) mod contract;
@@ -27,12 +27,11 @@ mod state;
 use builtins::auth::auth_session_field;
 #[cfg(test)]
 use builtins::{builtin_specs, is_builtin_name};
-pub(crate) use evaluator::Evaluator;
+use evaluator::Evaluator;
 #[cfg(test)]
 use evaluator::ScopeGuard;
 use state::RuntimeState;
 
-#[derive(Debug)]
 pub(crate) enum ExecCtx {
     Normal,
     Batch { writes: Vec<WriteOp> },
@@ -122,6 +121,7 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         apply_backend_limits(&mut services.firestore, &limits);
         services.auth.set_timeout(limits.backend_timeout);
         services.storage.set_timeout(limits.backend_timeout);
+        services.storage.set_max_bytes_size(limits.max_bytes_size);
         Self {
             services,
             state: RuntimeState::new(limits),
@@ -183,6 +183,9 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
         apply_backend_limits(&mut self.services.firestore, &self.state.limits);
         self.services.auth.set_timeout(limits.backend_timeout);
         self.services.storage.set_timeout(limits.backend_timeout);
+        self.services
+            .storage
+            .set_max_bytes_size(limits.max_bytes_size);
     }
 
     /// Return a snapshot of the counters consumed by the most recent run.
@@ -256,8 +259,8 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
 }
 
 /// `bytes(...)` の引数エラー文言。3 箇所から使うので定数にまとめる。
-pub(crate) const BYTES_USAGE: &str = "bytes expects one string or an array of integers from 0 to 255";
-pub(crate) const BYTES_ELEMENT_ERR: &str = "bytes array elements must be integers from 0 to 255";
+const BYTES_USAGE: &str = "bytes expects one string or an array of integers from 0 to 255";
+const BYTES_ELEMENT_ERR: &str = "bytes array elements must be integers from 0 to 255";
 
 pub(crate) fn parse_timestamp_arg(v: Option<&Value>) -> Result<i64, Box<dyn Error>> {
     match v {
@@ -398,18 +401,6 @@ pub(crate) fn validate_path(path: &str, collection: bool) -> Result<(), Box<dyn 
     Ok(())
 }
 
-pub(crate) fn check_block_arity(block: &Block, yielded: usize) -> Result<(), Box<dyn Error>> {
-    if block.params.len() != yielded {
-        return Err(format!(
-            "block expects {} argument(s), got {}",
-            block.params.len(),
-            yielded
-        )
-        .into());
-    }
-    Ok(())
-}
-
 /// バックエンドが page 処理済みの候補に相対パスの `__name__` を付ける。
 pub(crate) fn wrap_doc(path: &str, doc: &BTreeMap<String, Value>) -> Value {
     let mut out = doc.clone();
@@ -488,18 +479,43 @@ pub(crate) fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dy
         BinOp::Add => match (l, r) {
             (Value::Int(a), Value::Int(b)) => int_binop(a, b, |a, b| a.checked_add(b))?,
             (Value::Str(a), Value::Str(b)) => Value::Str(format!("{a}{b}")),
-            _ => return Err("unsupported + operands".into()),
+            (Value::Array(mut a), Value::Array(b)) => {
+                a.extend(b);
+                Value::Array(a)
+            }
+            (l, r) => {
+                return Err(format!(
+                    "unsupported operands for +: {} and {}",
+                    l.type_name(),
+                    r.type_name()
+                )
+                .into())
+            }
         },
         BinOp::Sub => match (l, r) {
             (Value::Int(a), Value::Int(b)) => int_binop(a, b, |a, b| a.checked_sub(b))?,
             (Value::Timestamp(a), Value::Timestamp(b)) => {
                 int_binop(a.seconds, b.seconds, |a, b| a.checked_sub(b))?
             }
-            _ => return Err("unsupported - operands".into()),
+            (l, r) => {
+                return Err(format!(
+                    "unsupported operands for -: {} and {}",
+                    l.type_name(),
+                    r.type_name()
+                )
+                .into())
+            }
         },
         BinOp::Mul => match (l, r) {
             (Value::Int(a), Value::Int(b)) => int_binop(a, b, |a, b| a.checked_mul(b))?,
-            _ => return Err("unsupported * operands".into()),
+            (l, r) => {
+                return Err(format!(
+                    "unsupported operands for *: {} and {}",
+                    l.type_name(),
+                    r.type_name()
+                )
+                .into())
+            }
         },
         BinOp::Div => match (l, r) {
             (Value::Int(a), Value::Int(b)) => {
@@ -508,7 +524,30 @@ pub(crate) fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dy
                 }
                 int_binop(a, b, |a, b| a.checked_div(b))?
             }
-            _ => return Err("unsupported / operands".into()),
+            (l, r) => {
+                return Err(format!(
+                    "unsupported operands for /: {} and {}",
+                    l.type_name(),
+                    r.type_name()
+                )
+                .into())
+            }
+        },
+        BinOp::Rem => match (l, r) {
+            (Value::Int(a), Value::Int(b)) => {
+                if b == 0 {
+                    return Err("division by zero".into());
+                }
+                int_binop(a, b, |a, b| a.checked_rem(b))?
+            }
+            (l, r) => {
+                return Err(format!(
+                    "unsupported operands for %: {} and {}",
+                    l.type_name(),
+                    r.type_name()
+                )
+                .into())
+            }
         },
         BinOp::Eq => Value::Bool(l == r),
         BinOp::Ne => Value::Bool(l != r),
@@ -517,35 +556,67 @@ pub(crate) fn eval_binary(l: Value, op: BinOp, r: Value) -> Result<Value, Box<dy
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds > b.seconds),
             (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a > b),
             (Value::Str(a), Value::Str(b)) => Value::Bool(a > b),
-            _ => return Err("unsupported > operands".into()),
+            (l, r) => {
+                return Err(format!(
+                    "unsupported operands for >: {} and {}",
+                    l.type_name(),
+                    r.type_name()
+                )
+                .into())
+            }
         },
         BinOp::Lt => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a < b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds < b.seconds),
             (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a < b),
             (Value::Str(a), Value::Str(b)) => Value::Bool(a < b),
-            _ => return Err("unsupported < operands".into()),
+            (l, r) => {
+                return Err(format!(
+                    "unsupported operands for <: {} and {}",
+                    l.type_name(),
+                    r.type_name()
+                )
+                .into())
+            }
         },
         BinOp::Ge => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a >= b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds >= b.seconds),
             (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a >= b),
             (Value::Str(a), Value::Str(b)) => Value::Bool(a >= b),
-            _ => return Err("unsupported >= operands".into()),
+            (l, r) => {
+                return Err(format!(
+                    "unsupported operands for >=: {} and {}",
+                    l.type_name(),
+                    r.type_name()
+                )
+                .into())
+            }
         },
         BinOp::Le => match (l, r) {
             (Value::Int(a), Value::Int(b)) => Value::Bool(a <= b),
             (Value::Timestamp(a), Value::Timestamp(b)) => Value::Bool(a.seconds <= b.seconds),
             (Value::Bytes(a), Value::Bytes(b)) => Value::Bool(a <= b),
             (Value::Str(a), Value::Str(b)) => Value::Bool(a <= b),
-            _ => return Err("unsupported <= operands".into()),
+            (l, r) => {
+                return Err(format!(
+                    "unsupported operands for <=: {} and {}",
+                    l.type_name(),
+                    r.type_name()
+                )
+                .into())
+            }
         },
         // `eval_expr` が `And` / `Or` を短絡評価して返すため、ここには到達しない。
         BinOp::And | BinOp::Or => unreachable!("And/Or are short-circuited in eval_expr"),
     })
 }
 
-pub(crate) fn int_binop(a: i64, b: i64, f: impl Fn(i64, i64) -> Option<i64>) -> Result<Value, Box<dyn Error>> {
+pub(crate) fn int_binop(
+    a: i64,
+    b: i64,
+    f: impl Fn(i64, i64) -> Option<i64>,
+) -> Result<Value, Box<dyn Error>> {
     f(a, b)
         .map(Value::Int)
         .ok_or_else(|| "integer overflow".into())
@@ -570,6 +641,8 @@ pub(crate) fn backend_err(e: Box<dyn Error>) -> Box<dyn Error> {
 
 /// eval 失敗時にトップレベル文の位置を付与する。既に span を持つ
 /// FlareError (lex/parse/backendで付与済み)はそのまま通し、
+/// eval 失敗時にトップレベル文の位置を付与する。既に span を持つ
+/// FlareError (lex/parse/backendで付与済み)はそのまま通し、
 /// span なしの FlareError と String 系エラーは Runtime として包む。
 pub(crate) fn attach_span(e: Box<dyn Error>, span: Option<Span>) -> Box<dyn Error> {
     let Some(span) = span else {
@@ -589,7 +662,60 @@ pub(crate) fn attach_span(e: Box<dyn Error>, span: Option<Span>) -> Box<dyn Erro
                 }
                 ferr as Box<dyn Error>
             }
-            Err(e) => FlareError::runtime(e.to_string()).with_span(span).into(),
+            Err(e) => match e.downcast::<UserRaisedError>() {
+                Ok(uerr) => {
+                    let err_span = uerr.span.or(Some(span));
+                    FlareError::runtime(uerr.message)
+                        .with_span(err_span.unwrap())
+                        .into()
+                }
+                Err(e) => match e.downcast::<BudgetError>() {
+                    Ok(berr) => {
+                        let err_span = berr.span.or(Some(span));
+                        let mut ferr = FlareError::runtime(berr.message);
+                        ferr.span = err_span;
+                        ferr.frames = berr.frames;
+                        ferr.into()
+                    }
+                    Err(e) => FlareError::runtime(e.to_string()).with_span(span).into(),
+                },
+            },
+        },
+    }
+}
+
+pub(crate) fn attach_expr_span(e: Box<dyn Error>, span: Span) -> Box<dyn Error> {
+    match e.downcast::<CapabilityError>() {
+        Ok(mut capability) => {
+            if capability.span.is_none() {
+                capability.span = Some(span);
+            }
+            capability as Box<dyn Error>
+        }
+        Err(e) => match e.downcast::<FlareError>() {
+            Ok(mut ferr) => {
+                if ferr.span.is_none() {
+                    ferr.span = Some(span);
+                }
+                ferr as Box<dyn Error>
+            }
+            Err(e) => match e.downcast::<BudgetError>() {
+                Ok(mut berr) => {
+                    if berr.span.is_none() {
+                        berr.span = Some(span);
+                    }
+                    berr as Box<dyn Error>
+                }
+                Err(e) => match e.downcast::<UserRaisedError>() {
+                    Ok(mut uerr) => {
+                        if uerr.span.is_none() {
+                            uerr.span = Some(span);
+                        }
+                        uerr as Box<dyn Error>
+                    }
+                    Err(e) => FlareError::runtime(e.to_string()).with_span(span).into(),
+                },
+            },
         },
     }
 }
@@ -597,6 +723,15 @@ pub(crate) fn attach_span(e: Box<dyn Error>, span: Option<Span>) -> Box<dyn Erro
 pub(crate) fn wrap_as_runtime(e: Box<dyn Error>) -> Box<dyn Error> {
     if e.downcast_ref::<FlareError>().is_some() || e.downcast_ref::<CapabilityError>().is_some() {
         e
+    } else if let Some(uerr) = e.downcast_ref::<UserRaisedError>() {
+        let mut ferr = FlareError::runtime(uerr.message.clone());
+        ferr.span = uerr.span;
+        ferr.into()
+    } else if let Some(berr) = e.downcast_ref::<BudgetError>() {
+        let mut ferr = FlareError::runtime(berr.message.clone());
+        ferr.span = berr.span;
+        ferr.frames = berr.frames.clone();
+        ferr.into()
     } else {
         FlareError::runtime(e.to_string()).into()
     }
@@ -618,6 +753,7 @@ impl ExecFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::ExprKind;
     use crate::firestore::InMemoryFirestore;
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -701,15 +837,18 @@ mod tests {
     }
 
     fn empty_transaction_stmt() -> Stmt {
-        Stmt::Expr(Expr::Call {
-            receiver: None,
-            name: "transaction".into(),
-            args: vec![],
-            block: Some(Block {
-                params: vec![],
-                body: vec![],
-            }),
-        })
+        Stmt::Expr(Expr::new(
+            ExprKind::Call {
+                receiver: None,
+                name: "transaction".into(),
+                args: vec![],
+                block: Some(Block {
+                    params: vec![],
+                    body: vec![],
+                }),
+            },
+            Span::new(1, 1),
+        ))
     }
 
     fn failing_commit_runtime(abort_failures_remaining: usize) -> Runtime<FailingCommitFirestore> {
@@ -737,7 +876,7 @@ mod tests {
         let err = runtime
             .eval_program(&[empty_transaction_stmt()])
             .unwrap_err();
-        assert_eq!(err.to_string(), "commit failed");
+        assert!(err.to_string().contains("commit failed"));
         assert_eq!(runtime.services.firestore.abort_calls, 1);
         // A failed rollback leaves the transaction available for retry.
         assert!(runtime.services.firestore.in_tx);
@@ -770,7 +909,7 @@ mod tests {
         let err = runtime
             .eval_program(&[empty_transaction_stmt()])
             .unwrap_err();
-        assert_eq!(err.to_string(), "commit failed");
+        assert!(err.to_string().contains("commit failed"));
         // Abort calls: the failed transaction's rollback, the retry before the
         // new begin, and the rollback after this commit failed too.
         assert_eq!(runtime.services.firestore.abort_calls, 3);

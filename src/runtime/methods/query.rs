@@ -1,21 +1,17 @@
 use std::error::Error;
 
-use crate::error::FlareError;
-use crate::firestore::{
-    normalize_query_field_path, QueryCandidates, QueryResultLimitExceeded,
-};
+use crate::error::BudgetError;
+use crate::firestore::{normalize_query_field_path, QueryCandidates, QueryResultLimitExceeded};
 use crate::runtime::contract::CallContract;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::evaluator::Evaluator;
-use crate::runtime::{
-    backend_err, expect_int, expect_string, reject_non_document_value, wrap_doc,
-};
+use crate::runtime::{backend_err, expect_int, expect_string, reject_non_document_value, wrap_doc};
 use crate::value::{Direction, QueryFilter, QueryOp, QueryRef, Value};
 
 pub fn query_method_contract(name: &str) -> Option<CallContract> {
     match name {
         "where" => Some(CallContract::exact(3)),
-        "order_by" => Some(CallContract::exact(2)),
+        "order_by" => Some(CallContract::range(1, 2)),
         "limit" | "offset" => Some(CallContract::exact(1)),
         "count" | "get" => Some(CallContract::exact(0)),
         _ => None,
@@ -30,6 +26,8 @@ pub fn eval_query_method(
 ) -> Result<Value, Box<dyn Error>> {
     match name {
         "where" => {
+            // Field path は正規化してから保存する。in-memory の lookup と
+            // emulator の wire 表現が同じ spelling を共有する。
             let field = normalize_query_field_path(expect_string(args.first())?)?;
             let op = QueryOp::parse(expect_string(args.get(1))?)?;
             let value = args.get(2).ok_or("where requires value")?;
@@ -55,16 +53,22 @@ pub fn eval_query_method(
         }
         "order_by" => {
             let field = normalize_query_field_path(expect_string(args.first())?)?;
-            let dir = Direction::parse(expect_string(args.get(1))?)?;
+            let dir = match args.get(1) {
+                Some(val) => Direction::parse(expect_string(Some(val))?)?,
+                None => Direction::Asc,
+            };
             query.order_by.push((field, dir));
             Ok(Value::QueryRef(query))
         }
         "count" => {
             rt.forbid_query_in_batch_or_transaction()?;
+            // 集計はフィルタ一致件数を数える。順序・offset・limit は無視する。
             let mut unpaged = query.clone();
             unpaged.order_by.clear();
             unpaged.offset = None;
             unpaged.limit = None;
+            // `count` returns a number, not rows. Counting still walks
+            // every match, so it must respect the candidate budget too.
             Ok(Value::Int(count_query_with_budget(rt, &unpaged)?))
         }
         "get" => {
@@ -75,6 +79,9 @@ pub fn eval_query_method(
                     .map(|(path, doc)| wrap_doc(&path, &doc))
                     .collect(),
             );
+            // `run_query_with_budget` checks each document field, but the
+            // value handed to the script also contains the row maps, their
+            // `__name__` entries, and the enclosing array.
             rt.check_value(&result)?;
             Ok(result)
         }
@@ -86,6 +93,10 @@ pub fn eval_query_method(
     }
 }
 
+/// Count query matches under the result budget.
+///
+/// `count_query` returns a number, so nothing is materialized; the budget
+/// still applies because counting walks every match.
 pub fn count_query_with_budget(
     rt: &mut Evaluator<'_>,
     query: &QueryRef,
@@ -96,9 +107,8 @@ pub fn count_query_with_budget(
         Ok(count) => count,
         Err(e) => {
             if let Some(limit) = e.downcast_ref::<QueryResultLimitExceeded>() {
-                rt.usage.max_query_results =
-                    rt.usage.max_query_results.max(limit.max_results);
-                return Err(FlareError::runtime(limit.to_string()).into());
+                rt.usage.max_query_results = rt.usage.max_query_results.max(limit.max_results);
+                return Err(BudgetError::new(limit.to_string()).into());
             }
             return Err(backend_err(e));
         }
@@ -109,7 +119,9 @@ pub fn count_query_with_budget(
     if let Some(max) = max_results {
         if count > max {
             rt.usage.max_query_results = rt.usage.max_query_results.max(max);
-            return Err(RuntimeError::QueryResultLimitExceeded(max).into());
+            return Err(
+                BudgetError::new(format!("query result limit exceeded (max {max})")).into(),
+            );
         }
     }
     rt.usage.query_results = rt.usage.query_results.saturating_add(count as u64);
@@ -117,12 +129,17 @@ pub fn count_query_with_budget(
     Ok(count as i64)
 }
 
+/// Run a query page under the result budget.
 pub fn run_query_with_budget(
     rt: &mut Evaluator<'_>,
     query: &QueryRef,
 ) -> Result<QueryCandidates, Box<dyn Error>> {
     rt.check_wall_clock()?;
     let max_results = rt.limits.max_query_results;
+    // The bounded hook is the resource boundary: a backend that refuses to
+    // materialize more than `max` rows errors instead of returning a
+    // partial vector. The length check below stays as a defense for legacy
+    // backends that keep the trait's compatibility fallback.
     let result = match max_results {
         Some(max) => rt.services.firestore.run_query_bounded(query, max),
         None => rt.services.firestore.run_query_page(query),
@@ -130,10 +147,12 @@ pub fn run_query_with_budget(
     let rows = match result {
         Ok(rows) => rows,
         Err(e) => {
+            // Budget consumption stays observable on the failure path, but
+            // only for the dedicated marker: a genuine backend error must
+            // not be recorded as a budget failure.
             if let Some(limit) = e.downcast_ref::<QueryResultLimitExceeded>() {
-                rt.usage.max_query_results =
-                    rt.usage.max_query_results.max(limit.max_results);
-                return Err(FlareError::runtime(limit.to_string()).into());
+                rt.usage.max_query_results = rt.usage.max_query_results.max(limit.max_results);
+                return Err(BudgetError::new(limit.to_string()).into());
             }
             return Err(backend_err(e));
         }
@@ -144,7 +163,9 @@ pub fn run_query_with_budget(
     if let Some(max) = max_results {
         if count > max {
             rt.usage.max_query_results = rt.usage.max_query_results.max(max);
-            return Err(RuntimeError::QueryResultLimitExceeded(max).into());
+            return Err(
+                BudgetError::new(format!("query result limit exceeded (max {max})")).into(),
+            );
         }
     }
     rt.usage.query_results = rt.usage.query_results.saturating_add(count as u64);

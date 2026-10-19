@@ -57,6 +57,8 @@ pub(super) fn connect(
         )
         .into());
     }
+    crate::services::validate_emulator_host(host)
+        .map_err(|e| format!("FIRESTORE_EMULATOR_HOST is invalid: {e}"))?;
     let runtime = RuntimeBuilder::new_current_thread()
         .enable_all()
         .build()
@@ -82,11 +84,7 @@ pub(super) fn connect(
         &runtime,
         Some(connect_timeout),
         "connect",
-        FirestoreDb::with_options_token_source(
-            options,
-            gcloud_sdk::GCP_DEFAULT_SCOPES.clone(),
-            emulator_token_source(auth),
-        ),
+        FirestoreDb::with_options_auth(options, emulator_auth_headers(auth)),
     )?;
     let probe_timeout = remaining_budget(connect_timeout, sequence_started.elapsed());
 
@@ -250,34 +248,60 @@ fn ensure_url_scheme(host: &str) -> String {
 /// emulator 側で「有効な JWT 形式だが admin ではない」資格として扱われ、
 /// security rules を評価させる。`owner` は admin で rules をバイパスし、
 /// `unauthenticated` のような素の文字列は `invalid jwt` で 400 になるため、
-/// rules 検証にはこの形式が必要になる(実測で 403 PERMISSION_DENIED を確認)。
-const NON_ADMIN_JWT: &str = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1bmF1dGhvcmljYXRlZCJ9.";
+const NON_ADMIN_AUTH_HEADER: &str = "Bearer eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1bmF1dGhvcmljYXRlZCJ9.";
 
-/// 静的 emulator token の有効期限(2100-01-01T00:00:00Z の POSIX 秒)。
-/// emulator はこの token の有効期限を検証しないが、SDK は `Token` に期限を
-/// 必須とするため、十分先の日付を固定値で持つ。
-const EMULATOR_TOKEN_EXPIRY_SECONDS: i64 = 4_102_444_800;
+#[derive(Debug)]
+struct FlareEmulatorCredentials {
+    auth_header: http::HeaderValue,
+    entity_tag: gcloud_sdk::google_cloud_auth::credentials::EntityTag,
+}
 
-fn emulator_token_source(auth: EmulatorAuth) -> gcloud_sdk::TokenSourceType {
-    // `owner` は admin 資格で rules をバイパスする。rules を検証したい
-    // ときは admin でない token を送る必要がある。
-    let token = match auth {
-        EmulatorAuth::Owner => "owner",
-        EmulatorAuth::EnforceRules => NON_ADMIN_JWT,
-    };
-    gcloud_sdk::TokenSourceType::ExternalSource(Box::new(
-        gcloud_sdk::ExternalJwtFunctionSource::new(move || {
-            std::future::ready(Ok(gcloud_sdk::Token::new(
-                "Bearer".to_string(),
-                token.into(),
-                // 2100-01-01 の POSIX 秒。gcloud-sdk 0.32 は token の期限を
-                // `jiff::Timestamp` で持つ。`firestore::FirestoreInstant` は
-                // その型の別名なので、jiff を直接依存せずに同じ値を作れる。
-                firestore::FirestoreInstant::new(EMULATOR_TOKEN_EXPIRY_SECONDS, 0)
-                    .expect("valid token expiry"),
-            )))
-        }),
-    ))
+impl FlareEmulatorCredentials {
+    fn new(auth: EmulatorAuth) -> Self {
+        let header_str = match auth {
+            EmulatorAuth::Owner => "Bearer owner",
+            EmulatorAuth::EnforceRules => NON_ADMIN_AUTH_HEADER,
+        };
+        Self {
+            auth_header: http::HeaderValue::from_static(header_str),
+            entity_tag: gcloud_sdk::google_cloud_auth::credentials::EntityTag::new(),
+        }
+    }
+}
+
+impl gcloud_sdk::google_cloud_auth::credentials::CredentialsProvider for FlareEmulatorCredentials {
+    async fn headers(
+        &self,
+        extensions: http::Extensions,
+    ) -> Result<
+        gcloud_sdk::google_cloud_auth::credentials::CacheableResource<http::HeaderMap>,
+        gcloud_sdk::google_cloud_auth::errors::CredentialsError,
+    > {
+        if extensions.get::<gcloud_sdk::google_cloud_auth::credentials::EntityTag>()
+            == Some(&self.entity_tag)
+        {
+            return Ok(gcloud_sdk::google_cloud_auth::credentials::CacheableResource::NotModified);
+        }
+        let mut headers = http::HeaderMap::new();
+        headers.insert(http::header::AUTHORIZATION, self.auth_header.clone());
+        Ok(
+            gcloud_sdk::google_cloud_auth::credentials::CacheableResource::New {
+                entity_tag: self.entity_tag.clone(),
+                data: headers,
+            },
+        )
+    }
+
+    async fn universe_domain(&self) -> Option<String> {
+        None
+    }
+}
+
+pub(crate) fn emulator_auth_headers(auth: EmulatorAuth) -> gcloud_sdk::GoogleAuthHeaders {
+    let credentials = FlareEmulatorCredentials::new(auth);
+    gcloud_sdk::GoogleAuthHeaders::from(
+        gcloud_sdk::google_cloud_auth::credentials::Credentials::from(credentials),
+    )
 }
 
 #[cfg(test)]

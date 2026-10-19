@@ -24,6 +24,7 @@ use crate::value::{DocRef, QueryFilter, QueryOp, QueryRef, QuerySource, Value};
 const COUNT_ALIAS: &str = "all";
 
 pub use client::EmulatorAuth;
+pub use codec::{decode_field_value_bounded, encode_field_value_bounded};
 
 /// Default application-level deadline for one emulator RPC.
 ///
@@ -318,6 +319,10 @@ pub fn parse_timeout_ms(value: &str) -> Result<Duration, Box<dyn Error>> {
 fn validate_config(name: &str, value: &str) -> Result<(), Box<dyn Error>> {
     if value.trim().is_empty() {
         return Err(format!("{name} must not be empty").into());
+    }
+    if name == "FIRESTORE_EMULATOR_HOST" {
+        crate::services::validate_emulator_host(value)
+            .map_err(|e| format!("{name} is invalid: {e}"))?;
     }
     Ok(())
 }

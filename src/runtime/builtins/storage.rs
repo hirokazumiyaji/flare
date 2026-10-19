@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 
 use crate::ast::Block;
-use crate::error::FlareError;
+use crate::error::BudgetError;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::evaluator::{Evaluator, ExecFlow};
 use crate::runtime::{backend_err, ExecCtx};
@@ -57,9 +57,7 @@ pub fn builtin_storage_download(
     let bytes = rt.services.storage.download(path).map_err(backend_err)?;
     if let Some(max) = rt.limits.max_bytes_size {
         if bytes.len() > max {
-            return Err(
-                FlareError::runtime(RuntimeError::BytesSizeLimitExceeded(max).to_string()).into(),
-            );
+            return Err(BudgetError::new(format!("bytes size limit exceeded (max {max})")).into());
         }
     }
     Ok(ExecFlow::Value(Value::Bytes(bytes)))

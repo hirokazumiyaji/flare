@@ -1,7 +1,6 @@
 use std::error::Error;
 
 use crate::auth::AuthSession;
-use crate::runtime::builtins::auth::auth_session_field;
 use crate::runtime::contract::CallContract;
 use crate::runtime::error::RuntimeError;
 use crate::runtime::evaluator::ExecFlow;
@@ -24,7 +23,7 @@ pub fn bytes_method_contract(name: &str) -> Option<CallContract> {
 }
 
 pub fn auth_session_method_contract(_name: &str) -> Option<CallContract> {
-    Some(CallContract::exact(0))
+    None
 }
 
 pub fn eval_timestamp_method(
@@ -66,16 +65,13 @@ pub fn eval_bytes_method(
 }
 
 pub fn eval_auth_session_method(
-    session: &AuthSession,
+    _session: &AuthSession,
     name: &str,
-    args: Vec<Value>,
+    _args: Vec<Value>,
 ) -> Result<ExecFlow, Box<dyn Error>> {
-    if !args.is_empty() {
-        return Err(RuntimeError::UnknownMethod {
-            receiver: "auth session".to_string(),
-            name: name.to_string(),
-        }
-        .into());
+    Err(RuntimeError::UnknownMethod {
+        receiver: "auth session".to_string(),
+        name: name.to_string(),
     }
-    Ok(ExecFlow::Value(auth_session_field(session, name)))
+    .into())
 }

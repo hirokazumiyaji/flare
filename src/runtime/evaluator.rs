@@ -1,23 +1,34 @@
-use std::ops::{Deref, DerefMut};
+use std::ops::{ControlFlow, Deref, DerefMut};
 
-use crate::error::{CapabilityError, ServiceId};
-use crate::services::ServiceAccess;
-use crate::value::BuiltinModule;
-
-use super::builtins::storage::forbid_storage_in_batch_or_transaction;
-use super::builtins::{
+use crate::ast::{CallArg, ExprKind, StrPiece, UnOp};
+use crate::error::{
+    add_call_frame, BudgetError, CapabilityError, ErrorKind, ServiceId, Span, UserRaisedError,
+};
+use crate::firestore::QueryResultLimitExceeded;
+use crate::runtime::builtins::auth::auth_session_field;
+use crate::runtime::builtins::storage::forbid_storage_in_batch_or_transaction;
+use crate::runtime::builtins::{
     is_builtin_name, lookup_global_builtin, lookup_module_builtin, BuiltinSpec,
 };
-use super::contract::{
-    bind_function_args, keyword_names, positional_arg_count, validate_call_contract,
-    validate_unique_keywords, validate_unique_params, validate_user_call_contract,
+use crate::runtime::contract::{
+    check_block_arity, keyword_names, positional_arg_count, validate_call_contract,
+    validate_func_params, validate_unique_keywords, validate_unique_params,
+    validate_user_call_contract, BlockPolicy, PositionalArity,
 };
-use super::error::RuntimeError;
-use super::methods::{eval_method_call, required_service_for_method, validate_method_call};
+use crate::runtime::error::RuntimeError;
+use crate::runtime::methods::{
+    check_method_receiver, eval_method_call, module_builtin_spec, required_service_for_method,
+    validate_method_call,
+};
+use crate::services::ServiceAccess;
+use crate::value::{self, BuiltinModule, UserFunc};
+
 use super::state::RuntimeState;
 use super::*;
 
 pub(crate) use super::ExecFlow;
+
+type CallArgValues = (Vec<Value>, BTreeMap<String, Value>);
 
 pub(crate) struct Evaluator<'a> {
     pub(crate) services: ServiceAccess<'a>,
@@ -50,39 +61,41 @@ impl DerefMut for Evaluator<'_> {
 /// global scope visible. A block only adds one frame. In both cases the
 /// original scope stack is restored on every exit path, including `?` returns
 /// and panic unwinding.
-pub(crate) struct ScopeGuard<'guard, 'runtime> {
-    pub(crate) runtime: &'guard mut Evaluator<'runtime>,
-    // `Some` is a function frame and contains the caller-local suffix. `None`
+pub(super) struct ScopeGuard<'guard, 'runtime> {
+    pub(super) runtime: &'guard mut Evaluator<'runtime>,
+    // `Some` is a function frame and contains the previous frame base. `None`
     // is a block frame, which is removed from the end on drop.
-    saved: Option<Vec<HashMap<String, Value>>>,
+    saved_base: Option<usize>,
 }
 
 impl<'guard, 'runtime> ScopeGuard<'guard, 'runtime> {
-    pub(crate) fn function(runtime: &'guard mut Evaluator<'runtime>) -> Self {
-        let saved = runtime.scopes.split_off(1);
+    pub(super) fn function(runtime: &'guard mut Evaluator<'runtime>) -> Self {
+        let saved_base = runtime.current_frame_base;
+        runtime.current_frame_base = runtime.scopes.len();
         runtime.scopes.push(HashMap::new());
         Self {
             runtime,
-            saved: Some(saved),
+            saved_base: Some(saved_base),
         }
     }
 
-    pub(crate) fn block(runtime: &'guard mut Evaluator<'runtime>) -> Self {
+    pub(super) fn block(runtime: &'guard mut Evaluator<'runtime>) -> Self {
         runtime.scopes.push(HashMap::new());
         Self {
             runtime,
-            saved: None,
+            saved_base: None,
         }
     }
 }
 
 impl Drop for ScopeGuard<'_, '_> {
     fn drop(&mut self) {
-        if let Some(mut saved) = self.saved.take() {
-            // Keep the global frame and discard every frame created while the
-            // function was running before restoring the caller-local suffix.
-            self.runtime.scopes.truncate(1);
-            self.runtime.scopes.append(&mut saved);
+        if let Some(saved_base) = self.saved_base {
+            // Keep the caller frames and discard every frame created while the
+            // function was running before restoring the caller frame base.
+            let base = self.runtime.current_frame_base;
+            self.runtime.scopes.truncate(base);
+            self.runtime.current_frame_base = saved_base;
         } else {
             self.runtime.scopes.pop();
         }
@@ -173,6 +186,7 @@ impl Evaluator<'_> {
             self.usage.elapsed = started_at.elapsed();
         }
         self.call_depth = 0;
+        self.current_frame_base = 0;
         self.execution_active = false;
     }
 
@@ -229,22 +243,22 @@ impl Evaluator<'_> {
         };
         let elapsed = started_at.elapsed();
         if elapsed >= limit {
-            return Err(FlareError::runtime(
-                RuntimeError::WallClockLimitExceeded(format_duration(limit)).to_string(),
-            )
+            return Err(BudgetError::new(format!(
+                "wall-clock limit exceeded (max {})",
+                format_duration(limit)
+            ))
             .into());
         }
         Ok(())
     }
 
     pub(super) fn consume_step(&mut self) -> Result<(), Box<dyn Error>> {
-        self.check_wall_clock()?;
+        if self.usage.steps & 1023 == 0 {
+            self.check_wall_clock()?;
+        }
         if let Some(max) = self.limits.max_steps {
             if self.usage.steps >= max {
-                return Err(FlareError::runtime(
-                    RuntimeError::StepLimitExceeded(max).to_string(),
-                )
-                .into());
+                return Err(BudgetError::new(format!("step limit exceeded (max {max})")).into());
             }
         }
         self.usage.steps = self.usage.steps.saturating_add(1);
@@ -252,13 +266,14 @@ impl Evaluator<'_> {
     }
 
     pub(super) fn consume_loop_iteration(&mut self) -> Result<(), Box<dyn Error>> {
-        self.check_wall_clock()?;
+        if self.usage.loop_iterations & 1023 == 0 {
+            self.check_wall_clock()?;
+        }
         if let Some(max) = self.limits.max_loop_iterations {
             if self.usage.loop_iterations >= max {
-                return Err(FlareError::runtime(
-                    RuntimeError::LoopIterationLimitExceeded(max).to_string(),
-                )
-                .into());
+                return Err(
+                    BudgetError::new(format!("loop iteration limit exceeded (max {max})")).into(),
+                );
             }
         }
         self.usage.loop_iterations = self.usage.loop_iterations.saturating_add(1);
@@ -266,13 +281,14 @@ impl Evaluator<'_> {
     }
 
     pub(super) fn enter_call(&mut self) -> Result<(), Box<dyn Error>> {
-        self.check_wall_clock()?;
+        if self.call_depth & 127 == 0 {
+            self.check_wall_clock()?;
+        }
         if let Some(max) = self.limits.max_call_depth {
             if self.call_depth >= max {
-                return Err(FlareError::runtime(
-                    RuntimeError::CallDepthLimitExceeded(max).to_string(),
-                )
-                .into());
+                return Err(
+                    BudgetError::new(format!("call depth limit exceeded (max {max})")).into(),
+                );
             }
         }
         self.call_depth = self.call_depth.saturating_add(1);
@@ -297,13 +313,32 @@ impl Evaluator<'_> {
         ) {
             // スカラー値は子が無いので depth 0 相当。ただし root 1 ノードと
             // して数え、ノード予算が 0 のときはここで弾く。
-            value::validate_value_limits_with_sizes(
-                value,
-                self.limits.max_value_depth,
-                self.limits.max_value_nodes.map(|budget| budget.min(1)),
-                self.limits.max_string_bytes,
-                self.limits.max_bytes_size,
-            )?;
+            if let Some(0) = self.limits.max_value_nodes {
+                return Err(BudgetError::new("value node limit exceeded (max 0)").into());
+            }
+            match value {
+                Value::Str(s) => {
+                    if let Some(max) = self.limits.max_string_bytes {
+                        if s.len() > max {
+                            return Err(BudgetError::new(format!(
+                                "string size limit exceeded (max {max})"
+                            ))
+                            .into());
+                        }
+                    }
+                }
+                Value::Bytes(b) => {
+                    if let Some(max) = self.limits.max_bytes_size {
+                        if b.len() > max {
+                            return Err(BudgetError::new(format!(
+                                "bytes size limit exceeded (max {max})"
+                            ))
+                            .into());
+                        }
+                    }
+                }
+                _ => {}
+            }
             return Ok(());
         }
         let observed_depth = value::validate_value_limits_with_sizes(
@@ -312,7 +347,8 @@ impl Evaluator<'_> {
             self.limits.max_value_nodes,
             self.limits.max_string_bytes,
             self.limits.max_bytes_size,
-        )?;
+        )
+        .map_err(|e| BudgetError::new(e.to_string()))?;
         self.usage.max_value_depth = self.usage.max_value_depth.max(observed_depth);
         Ok(())
     }
@@ -327,7 +363,9 @@ impl Evaluator<'_> {
                 // 変数参照時(Expr::Var)は変数テーブルから読み出されるため構文上区別できる。
                 // 一方で fn 定義(Stmt::Def)は定義してもビルトインに隠されて呼び出せないため
                 // 禁止している。
-                if self.var_exists(name) && !(self.repl_mode && self.scopes.len() == 1) {
+                if self.var_exists(name)
+                    && !(self.repl_mode && self.current_frame_base == 0 && self.scopes.len() == 1)
+                {
                     return Err(RuntimeError::ReassignmentNotAllowed(name.to_string()).into());
                 }
                 let flow = self.eval_expr(value)?;
@@ -339,19 +377,18 @@ impl Evaluator<'_> {
                 Ok(ExecFlow::Value(v))
             }
             Stmt::Def { name, params, body } => {
-                validate_unique_params(params, "function")?;
+                validate_func_params(params, "function")?;
                 if is_builtin_name(name) {
                     return Err(RuntimeError::CannotRedefineBuiltin(name.to_string()).into());
                 }
-                if self.var_exists(name) && !(self.repl_mode && self.scopes.len() == 1) {
+                if self.var_exists(name)
+                    && !(self.repl_mode && self.current_frame_base == 0 && self.scopes.len() == 1)
+                {
                     return Err(RuntimeError::ReassignmentNotAllowed(name.to_string()).into());
                 }
                 self.set_var(
                     name,
-                    Value::Func(UserFunc {
-                        params: params.clone(),
-                        body: body.clone(),
-                    }),
+                    Value::Func(UserFunc::new(params.clone(), body.clone())),
                 )?;
                 Ok(ExecFlow::Value(Value::Nil))
             }
@@ -364,39 +401,6 @@ impl Evaluator<'_> {
                     None => Value::Nil,
                 };
                 Ok(ExecFlow::Return(value))
-            }
-            Stmt::If {
-                cond,
-                then_body,
-                else_body,
-            } => {
-                let cond = match self.eval_expr(cond)? {
-                    ExecFlow::Value(v) => v,
-                    flow @ ExecFlow::Return(_) => return Ok(flow),
-                };
-                let body = if cond.truthy() { then_body } else { else_body };
-                self.eval_block(body)
-            }
-            Stmt::While { cond, body } => {
-                let mut last = Value::Nil;
-                loop {
-                    // The condition evaluation itself is a checkpoint: a long
-                    // body must not be able to hide past the wall-clock budget.
-                    self.check_wall_clock()?;
-                    let cond = match self.eval_expr(cond)? {
-                        ExecFlow::Value(v) => v,
-                        flow @ ExecFlow::Return(_) => return Ok(flow),
-                    };
-                    if !cond.truthy() {
-                        break;
-                    }
-                    self.consume_loop_iteration()?;
-                    match self.eval_block(body)? {
-                        ExecFlow::Value(v) => last = v,
-                        ExecFlow::Return(v) => return Ok(ExecFlow::Return(v)),
-                    }
-                }
-                Ok(ExecFlow::Value(last))
             }
         }
     }
@@ -446,7 +450,7 @@ impl Evaluator<'_> {
         (flow, writes)
     }
 
-    pub(crate) fn forbid_query_in_batch_or_transaction(&self) -> Result<(), Box<dyn Error>> {
+    pub(super) fn forbid_query_in_batch_or_transaction(&self) -> Result<(), Box<dyn Error>> {
         match self.exec {
             ExecCtx::Batch { .. } => Err(RuntimeError::QueryInBatch.into()),
             ExecCtx::Transaction { .. } => Err(RuntimeError::QueryInTransaction.into()),
@@ -521,27 +525,35 @@ impl Evaluator<'_> {
     /// result cannot be materialized and handed to the script before the
     /// budget rejects it.
     pub(super) fn eval_expr(&mut self, expr: &Expr) -> Result<ExecFlow, Box<dyn Error>> {
-        let flow = self.eval_expr_inner(expr)?;
+        let flow = self
+            .eval_expr_inner(expr)
+            .map_err(|e| attach_expr_span(e, expr.span))?;
         if let ExecFlow::Value(value) = &flow {
-            self.check_value(value)?;
+            self.check_value(value)
+                .map_err(|e| attach_expr_span(e, expr.span))?;
         }
         Ok(flow)
     }
 
+    pub(super) fn is_budget_error(err: &(dyn Error + 'static)) -> bool {
+        err.downcast_ref::<BudgetError>().is_some()
+            || err.downcast_ref::<QueryResultLimitExceeded>().is_some()
+    }
+
     pub(super) fn eval_expr_inner(&mut self, expr: &Expr) -> Result<ExecFlow, Box<dyn Error>> {
-        match expr {
-            Expr::Int(i) => Ok(ExecFlow::Value(Value::Int(*i))),
-            Expr::Str(s) => Ok(ExecFlow::Value(Value::Str(s.clone()))),
-            Expr::StrInterp(pieces) => {
+        match &expr.kind {
+            ExprKind::Int(i) => Ok(ExecFlow::Value(Value::Int(*i))),
+            ExprKind::Str(s) => Ok(ExecFlow::Value(Value::Str(s.clone()))),
+            ExprKind::StrInterp(pieces) => {
                 let mut out = String::new();
                 for piece in pieces {
                     match piece {
                         StrPiece::Lit(s) => {
                             if let Some(max) = self.limits.max_string_bytes {
                                 if out.len().saturating_add(s.len()) > max {
-                                    return Err(FlareError::runtime(
-                                        RuntimeError::StringSizeLimitExceeded(max).to_string(),
-                                    )
+                                    return Err(BudgetError::new(format!(
+                                        "string size limit exceeded (max {max})"
+                                    ))
                                     .into());
                                 }
                             }
@@ -555,9 +567,9 @@ impl Evaluator<'_> {
                             let s = v.to_string();
                             if let Some(max) = self.limits.max_string_bytes {
                                 if out.len().saturating_add(s.len()) > max {
-                                    return Err(FlareError::runtime(
-                                        RuntimeError::StringSizeLimitExceeded(max).to_string(),
-                                    )
+                                    return Err(BudgetError::new(format!(
+                                        "string size limit exceeded (max {max})"
+                                    ))
                                     .into());
                                 }
                             }
@@ -567,15 +579,15 @@ impl Evaluator<'_> {
                 }
                 Ok(ExecFlow::Value(Value::Str(out)))
             }
-            Expr::Bool(b) => Ok(ExecFlow::Value(Value::Bool(*b))),
-            Expr::Nil => Ok(ExecFlow::Value(Value::Nil)),
-            Expr::Var(name) => match self.get_var(name).cloned() {
+            ExprKind::Bool(b) => Ok(ExecFlow::Value(Value::Bool(*b))),
+            ExprKind::Nil => Ok(ExecFlow::Value(Value::Nil)),
+            ExprKind::Var(name) => match self.get_var(name).cloned() {
                 Some(value) => Ok(ExecFlow::Value(value)),
                 None => BuiltinModule::from_name(name)
                     .map(|module| ExecFlow::Value(Value::Module(module)))
                     .ok_or_else(|| RuntimeError::UndefinedVariable(name.clone()).into()),
             },
-            Expr::Binary { left, op, right } => {
+            ExprKind::Binary { left, op, right } => {
                 let l = match self.eval_expr(left)? {
                     ExecFlow::Value(v) => v,
                     flow @ ExecFlow::Return(_) => return Ok(flow),
@@ -605,10 +617,52 @@ impl Evaluator<'_> {
                             if let (Value::Str(a), Value::Str(b)) = (&l, &r) {
                                 if let Some(max) = self.limits.max_string_bytes {
                                     if a.len().saturating_add(b.len()) > max {
-                                        return Err(FlareError::runtime(format!(
+                                        return Err(BudgetError::new(format!(
                                             "string size limit exceeded (max {max})"
                                         ))
                                         .into());
+                                    }
+                                }
+                            }
+                            if let (Value::Array(a), Value::Array(b)) = (&l, &r) {
+                                if self.limits.max_value_nodes.is_some()
+                                    || self.limits.max_value_depth.is_some()
+                                {
+                                    let mut count = 1usize;
+                                    let mut stack: Vec<(&Value, usize)> =
+                                        a.iter().chain(b.iter()).map(|v| (v, 1usize)).collect();
+                                    while let Some((val, depth)) = stack.pop() {
+                                        if let Some(max) = self.limits.max_value_depth {
+                                            if depth > max {
+                                                return Err(BudgetError::new(format!(
+                                                    "value nesting limit exceeded (max {max})"
+                                                ))
+                                                .into());
+                                            }
+                                        }
+                                        if let Some(max) = self.limits.max_value_nodes {
+                                            count = count.saturating_add(1);
+                                            if count > max {
+                                                return Err(BudgetError::new(format!(
+                                                    "value node limit exceeded (max {max})"
+                                                ))
+                                                .into());
+                                            }
+                                        }
+                                        let child_depth = depth.saturating_add(1);
+                                        match val {
+                                            Value::Array(items)
+                                            | Value::ArrayUnion(items)
+                                            | Value::ArrayRemove(items) => {
+                                                stack
+                                                    .extend(items.iter().map(|v| (v, child_depth)));
+                                            }
+                                            Value::Map(map) => {
+                                                stack
+                                                    .extend(map.values().map(|v| (v, child_depth)));
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                 }
                             }
@@ -617,7 +671,7 @@ impl Evaluator<'_> {
                     }
                 }
             }
-            Expr::Unary { op, expr } => {
+            ExprKind::Unary { op, expr } => {
                 let v = match self.eval_expr(expr)? {
                     ExecFlow::Value(v) => v,
                     flow @ ExecFlow::Return(_) => return Ok(flow),
@@ -626,11 +680,15 @@ impl Evaluator<'_> {
                     UnOp::Not => Value::Bool(!v.truthy()),
                     UnOp::Neg => match v {
                         Value::Int(i) => Value::Int(i.checked_neg().ok_or("integer overflow")?),
-                        _ => return Err("unsupported unary - operand".into()),
+                        _ => {
+                            return Err(
+                                format!("unsupported unary - operand: {}", v.type_name()).into()
+                            )
+                        }
                     },
                 }))
             }
-            Expr::Map(entries) => {
+            ExprKind::Map(entries) => {
                 let mut out = BTreeMap::new();
                 for (k, expr) in entries {
                     match self.eval_expr(expr)? {
@@ -642,7 +700,7 @@ impl Evaluator<'_> {
                 }
                 Ok(ExecFlow::Value(Value::Map(out)))
             }
-            Expr::Array(items) => {
+            ExprKind::Array(items) => {
                 let mut out = vec![];
                 for item in items {
                     match self.eval_expr(item)? {
@@ -652,7 +710,7 @@ impl Evaluator<'_> {
                 }
                 Ok(ExecFlow::Value(Value::Array(out)))
             }
-            Expr::Index { base, index } => {
+            ExprKind::Index { base, index } => {
                 let base = match self.eval_expr(base)? {
                     ExecFlow::Value(v) => v,
                     flow @ ExecFlow::Return(_) => return Ok(flow),
@@ -663,7 +721,14 @@ impl Evaluator<'_> {
                 };
                 eval_index(base, index).map(ExecFlow::Value)
             }
-            Expr::Call {
+            ExprKind::FieldAccess { receiver, name } => {
+                let base = match self.eval_expr(receiver)? {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                };
+                self.eval_field_access(base, name).map(ExecFlow::Value)
+            }
+            ExprKind::Call {
                 receiver,
                 name,
                 args,
@@ -673,10 +738,151 @@ impl Evaluator<'_> {
                 // nested call expression must consume depth as well, so the
                 // guard is entered before the receiver runs.
                 self.enter_call()?;
-                let outcome = self.eval_call_body(receiver.as_deref(), name, args, block.as_ref());
+                let outcome =
+                    self.eval_call_body(receiver.as_deref(), name, args, block.as_ref(), expr.span);
                 self.leave_call();
                 outcome
             }
+            ExprKind::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                let cond = match self.eval_expr(cond)? {
+                    ExecFlow::Value(v) => v,
+                    flow @ ExecFlow::Return(_) => return Ok(flow),
+                };
+                let body = if cond.truthy() { then_body } else { else_body };
+                self.eval_block(body)
+            }
+            ExprKind::While { cond, body } => {
+                let mut last = Value::Nil;
+                loop {
+                    // The condition evaluation itself is a checkpoint: a long
+                    // body must not be able to hide past the wall-clock budget.
+                    self.check_wall_clock()?;
+                    let cond = match self.eval_expr(cond)? {
+                        ExecFlow::Value(v) => v,
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    };
+                    if !cond.truthy() {
+                        break;
+                    }
+                    self.consume_loop_iteration()?;
+                    match self.eval_block(body)? {
+                        ExecFlow::Value(v) => last = v,
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    }
+                }
+                Ok(ExecFlow::Value(last))
+            }
+            ExprKind::TryRescue {
+                try_body,
+                err_param,
+                rescue_body,
+            } => {
+                let prev_writes_len = match &self.exec {
+                    ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => {
+                        Some(writes.len())
+                    }
+                    ExecCtx::Normal => None,
+                };
+                let scope = ScopeGuard::block(self);
+                let try_result = scope.runtime.eval_block(try_body);
+                drop(scope);
+
+                match try_result {
+                    Ok(flow) => Ok(flow),
+                    Err(err) => {
+                        if Self::is_budget_error(&*err) {
+                            return Err(err);
+                        }
+                        // Discard any staged Firestore writes buffered during the failed try body,
+                        // preserving writes staged before entering try. Unstaged side effects (e.g. File I/O)
+                        // are outside the transaction buffer and cannot be rolled back.
+                        if let Some(prev_len) = prev_writes_len {
+                            match &mut self.exec {
+                                ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => {
+                                    writes.truncate(prev_len);
+                                }
+                                ExecCtx::Normal => {}
+                            }
+                        }
+
+                        let (kind_str, message_str) =
+                            if let Some(uerr) = err.downcast_ref::<UserRaisedError>() {
+                                ("Runtime", uerr.message.clone())
+                            } else if let Some(ferr) = err.downcast_ref::<FlareError>() {
+                                let k = match ferr.kind {
+                                    ErrorKind::Runtime => "Runtime",
+                                    ErrorKind::Backend => "Backend",
+                                    ErrorKind::Parse => "Parse",
+                                    ErrorKind::Lex => "Lex",
+                                };
+                                (k, ferr.message.clone())
+                            } else if let Some(cap) = err.downcast_ref::<CapabilityError>() {
+                                ("Runtime", cap.to_string())
+                            } else {
+                                ("Runtime", err.to_string())
+                            };
+                        let mut err_map = BTreeMap::new();
+                        err_map.insert("kind".to_string(), Value::Str(kind_str.to_string()));
+                        err_map.insert("message".to_string(), Value::Str(message_str));
+                        let err_val = Value::Map(err_map);
+
+                        let scope = ScopeGuard::block(self);
+                        if let Some(param) = err_param {
+                            scope.runtime.set_var(param, err_val)?;
+                        }
+                        let rescue_flow = scope.runtime.eval_block(rescue_body);
+                        drop(scope);
+                        rescue_flow
+                    }
+                }
+            }
+            ExprKind::Fn { params, body } => {
+                validate_func_params(params, "function")?;
+                Ok(ExecFlow::Value(Value::Func(UserFunc::new(
+                    params.clone(),
+                    body.clone(),
+                ))))
+            }
+            ExprKind::Invoke {
+                callee,
+                args,
+                block,
+            } => {
+                self.enter_call()?;
+                let outcome = self.eval_invoke_body(callee, args, block.as_ref(), expr.span);
+                self.leave_call();
+                outcome
+            }
+        }
+    }
+
+    fn eval_field_access(&mut self, base: Value, name: &str) -> Result<Value, Box<dyn Error>> {
+        match base {
+            Value::Map(map) => Ok(map.get(name).cloned().unwrap_or(Value::Nil)),
+            Value::AuthSession(session) => Ok(auth_session_field(&session, name)),
+            Value::Module(module) => {
+                if let Some(spec) = lookup_module_builtin(module, name) {
+                    if spec.contract.positional == PositionalArity::Exact(0)
+                        && spec.contract.block == BlockPolicy::Forbidden
+                    {
+                        if let Some(service) = spec.required_service {
+                            self.require_service(service)?;
+                        }
+                        let flow = (spec.handler)(self, vec![], BTreeMap::new(), None)?;
+                        return Ok(flow.into_value());
+                    }
+                }
+                Err(RuntimeError::UnknownModuleMethod {
+                    module: module.name().to_string(),
+                    name: name.to_string(),
+                }
+                .into())
+            }
+            _ => Err(RuntimeError::UnsupportedFieldAccess.into()),
         }
     }
 
@@ -688,6 +894,7 @@ impl Evaluator<'_> {
         name: &str,
         args: &[CallArg],
         block: Option<&Block>,
+        call_span: Span,
     ) -> Result<ExecFlow, Box<dyn Error>> {
         {
             // Validate the call shape before evaluating argument
@@ -701,30 +908,37 @@ impl Evaluator<'_> {
             // can run.
             validate_unique_keywords(args)?;
             let receiver_value = match receiver {
-                Some(expr) => match self.eval_expr(expr)? {
-                    ExecFlow::Value(v) => Some(v),
-                    flow @ ExecFlow::Return(_) => return Ok(flow),
-                },
+                Some(expr) => {
+                    let value = match self.eval_expr(expr)? {
+                        ExecFlow::Value(v) => v,
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    };
+                    check_method_receiver(&value, name)?;
+                    Some(value)
+                }
                 None => None,
             };
+            let has_keywords = args.iter().any(|a| matches!(a, CallArg::Keyword { .. }));
+            let keyword_names = if has_keywords {
+                keyword_names(args)
+            } else {
+                BTreeMap::new()
+            };
             let spec = if let Some(Value::Module(module)) = receiver_value.as_ref() {
-                let spec = lookup_module_builtin(*module, name)
-                    .ok_or_else(|| format!("unknown module method: {}.{name}", module.name()))?;
+                let spec = module_builtin_spec(*module, name)?;
                 let label = format!("{}.{name}", module.name());
                 validate_call_contract(
                     &label,
                     positional_arg_count(args),
-                    &keyword_names(args),
+                    &keyword_names,
                     block,
                     spec.contract,
                 )?;
                 Some(spec)
             } else if let Some(rec) = receiver_value.as_ref() {
-                let keyword_names = keyword_names(args);
                 validate_method_call(rec, name, positional_arg_count(args), &keyword_names, block)?;
                 None
             } else if let Some(spec) = lookup_global_builtin(name) {
-                let keyword_names = keyword_names(args);
                 validate_call_contract(
                     name,
                     positional_arg_count(args),
@@ -734,8 +948,13 @@ impl Evaluator<'_> {
                 )?;
                 Some(spec)
             } else {
-                let Some(Value::Func(func)) = self.get_var(name).cloned() else {
+                let Some(var) = self.get_var(name) else {
                     return Err(RuntimeError::UndefinedFunction(name.to_string()).into());
+                };
+                let Value::Func(func) = var else {
+                    return Err(
+                        RuntimeError::CannotCallNonFunction(var.type_name().to_string()).into(),
+                    );
                 };
                 validate_user_call_contract(name, &func.params, args, block)?;
                 None
@@ -754,24 +973,67 @@ impl Evaluator<'_> {
             // `args` is one ordered sequence; splitting it into
             // positional/keyword collections for binding must not change
             // the order in which the expressions above are evaluated.
-            let mut argv = vec![];
-            let mut kw = BTreeMap::new();
-            for arg in args {
-                match arg {
-                    CallArg::Positional(expr) => match self.eval_expr(expr)? {
-                        ExecFlow::Value(v) => argv.push(v),
-                        flow @ ExecFlow::Return(_) => return Ok(flow),
-                    },
-                    CallArg::Keyword { name, value } => match self.eval_expr(value)? {
-                        ExecFlow::Value(v) => {
-                            kw.insert(name.clone(), v);
-                        }
-                        flow @ ExecFlow::Return(_) => return Ok(flow),
-                    },
-                }
-            }
-            self.eval_call(receiver_value, name, argv, kw, block)
+            let call_args = match self.eval_call_args(args)? {
+                ControlFlow::Continue(pair) => pair,
+                ControlFlow::Break(flow) => return Ok(flow),
+            };
+            self.eval_call(receiver_value, name, spec, call_args, block, call_span)
         }
+    }
+
+    pub(super) fn eval_invoke_body(
+        &mut self,
+        callee: &Expr,
+        args: &[CallArg],
+        block: Option<&Block>,
+        call_span: Span,
+    ) -> Result<ExecFlow, Box<dyn Error>> {
+        validate_unique_keywords(args)?;
+        let callee_val = match self.eval_expr(callee)? {
+            ExecFlow::Value(v) => v,
+            flow @ ExecFlow::Return(_) => return Ok(flow),
+        };
+        let func = match callee_val {
+            Value::Func(f) => f,
+            other => {
+                return Err(
+                    RuntimeError::CannotCallNonFunction(other.type_name().to_string()).into(),
+                );
+            }
+        };
+        validate_user_call_contract("anonymous function", &func.params, args, block)?;
+
+        let (argv, kw) = match self.eval_call_args(args)? {
+            ControlFlow::Continue(pair) => pair,
+            ControlFlow::Break(flow) => return Ok(flow),
+        };
+        self.call_user_func(&func, argv, kw)
+            .map_err(|e| add_call_frame(e, "<anonymous>", call_span))
+    }
+
+    /// Evaluate a call argument list into positional and keyword value
+    /// collections, short-circuiting on `Return` from any argument expression.
+    fn eval_call_args(
+        &mut self,
+        args: &[CallArg],
+    ) -> Result<ControlFlow<ExecFlow, CallArgValues>, Box<dyn Error>> {
+        let mut argv = vec![];
+        let mut kw = BTreeMap::new();
+        for arg in args {
+            match arg {
+                CallArg::Positional(expr) => match self.eval_expr(expr)? {
+                    ExecFlow::Value(v) => argv.push(v),
+                    flow @ ExecFlow::Return(_) => return Ok(ControlFlow::Break(flow)),
+                },
+                CallArg::Keyword { name, value } => match self.eval_expr(value)? {
+                    ExecFlow::Value(v) => {
+                        kw.insert(name.clone(), v);
+                    }
+                    flow @ ExecFlow::Return(_) => return Ok(ControlFlow::Break(flow)),
+                },
+            }
+        }
+        Ok(ControlFlow::Continue((argv, kw)))
     }
 
     fn validate_call_context(
@@ -796,11 +1058,7 @@ impl Evaluator<'_> {
         if matches!(name, "get" | "count")
             && matches!(
                 receiver,
-                Some(
-                    Value::CollectionRef(_)
-                        | Value::CollectionGroupRef(_)
-                        | Value::QueryRef(_)
-                )
+                Some(Value::CollectionRef(_) | Value::CollectionGroupRef(_) | Value::QueryRef(_))
             )
         {
             return self.forbid_query_in_batch_or_transaction();
@@ -820,44 +1078,85 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    pub(crate) fn eval_call(
+    pub(super) fn eval_call(
         &mut self,
         receiver: Option<Value>,
         name: &str,
-        args: Vec<Value>,
-        kwargs: BTreeMap<String, Value>,
+        spec: Option<BuiltinSpec>,
+        (args, kwargs): CallArgValues,
         block: Option<&Block>,
+        call_span: Span,
     ) -> Result<ExecFlow, Box<dyn Error>> {
         if let Some(rec) = receiver {
             if let Value::Module(module) = rec {
-                let spec = lookup_module_builtin(module, name)
-                    .ok_or_else(|| format!("unknown module method: {}.{name}", module.name()))?;
+                let spec = match spec {
+                    Some(spec) => spec,
+                    None => module_builtin_spec(module, name)?,
+                };
                 return (spec.handler)(self, args, kwargs, block);
             }
             if !kwargs.is_empty() {
                 return Err("keyword args are not supported for method calls yet".into());
             }
-            return eval_method_call(self, rec, name, args, block);
+            return eval_method_call(self, rec, name, args, kwargs, block);
         }
 
         // ビルトインはテーブル駆動で引く。ユーザー定義より優先されるため、
         // 同名の fn 定義は `Stmt::Def` 側でエラーにする(is_builtin_name)。
-        if let Some(spec) = lookup_global_builtin(name) {
+        if let Some(spec) = spec.or_else(|| lookup_global_builtin(name)) {
             return (spec.handler)(self, args, kwargs, block);
         }
 
-        let Some(Value::Func(func)) = self.get_var(name).cloned() else {
+        let Some(var) = self.get_var(name).cloned() else {
             return Err(RuntimeError::UndefinedFunction(name.to_string()).into());
         };
-        let bound = bind_function_args(&func.params, args, kwargs)?;
-        // 呼び出し元のローカル変数・呼び出された関数自身のローカルは隠す。
-        //
-        // caller scope の保存と frame の破棄を guard に任せる。引数の
-        // binding、本体の runtime error、panic unwind のいずれでも同じ復元が
-        // 進み、手動の cleanup 処理に依存しない。
+        let Value::Func(func) = var else {
+            return Err(RuntimeError::CannotCallNonFunction(var.type_name().to_string()).into());
+        };
+        self.call_user_func(&func, args, kwargs)
+            .map_err(|e| add_call_frame(e, name, call_span))
+    }
+
+    pub(super) fn call_user_func(
+        &mut self,
+        func: &UserFunc,
+        args: Vec<Value>,
+        mut kwargs: BTreeMap<String, Value>,
+    ) -> Result<ExecFlow, Box<dyn Error>> {
         let scope = ScopeGuard::function(self);
-        for (param, value) in bound {
-            scope.runtime.set_var(&param, value)?;
+        if kwargs.is_empty() && args.len() == func.params.len() {
+            for (param, value) in func.params.iter().zip(args) {
+                scope.runtime.set_var(&param.name, value)?;
+            }
+        } else {
+            // Callers must pre-validate via `validate_user_call_contract` so default
+            // expressions do not run on invalid calls and side effects stay off.
+            let mut bound = Vec::with_capacity(func.params.len());
+            let mut idx = 0;
+            for param in &*func.params {
+                if idx < args.len() {
+                    bound.push((param.name.clone(), args[idx].clone()));
+                    idx += 1;
+                    continue;
+                }
+                if let Some(v) = kwargs.remove(&param.name) {
+                    bound.push((param.name.clone(), v));
+                    continue;
+                }
+                if let Some(default_expr) = &param.default {
+                    let flow = scope.runtime.eval_expr(default_expr)?;
+                    let v = match flow {
+                        ExecFlow::Value(v) => v,
+                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                    };
+                    bound.push((param.name.clone(), v));
+                    continue;
+                }
+                unreachable!("missing argument caught by pre-validation");
+            }
+            for (name, val) in bound {
+                scope.runtime.set_var(&name, val)?;
+            }
         }
         let result = scope.runtime.eval_block(&func.body);
         drop(scope);
@@ -866,8 +1165,7 @@ impl Evaluator<'_> {
         // call_block や batch/transaction のブロックから直接来た Return だけ。
         result.map(|flow| ExecFlow::Value(flow.into_value()))
     }
-
-    pub(crate) fn call_block(
+    pub(super) fn call_block(
         &mut self,
         block: &Block,
         args: Vec<Value>,
@@ -888,19 +1186,25 @@ impl Evaluator<'_> {
         drop(scope);
         result
     }
-
-    pub(crate) fn get_var(&self, name: &str) -> Option<&Value> {
-        for scope in self.scopes.iter().rev() {
+    pub(super) fn get_var(&self, name: &str) -> Option<&Value> {
+        for scope in self.scopes[self.current_frame_base..].iter().rev() {
             if let Some(v) = scope.get(name) {
+                return Some(v);
+            }
+        }
+        if self.current_frame_base > 0 {
+            if let Some(v) = self.scopes[0].get(name) {
                 return Some(v);
             }
         }
         None
     }
 
-    pub(crate) fn set_var(&mut self, name: &str, value: Value) -> Result<(), Box<dyn Error>> {
+    pub(super) fn set_var(&mut self, name: &str, value: Value) -> Result<(), Box<dyn Error>> {
         let is_reassign = self.scopes.last().expect("scope").contains_key(name);
-        if is_reassign && !(self.repl_mode && self.scopes.len() == 1) {
+        if is_reassign
+            && !(self.repl_mode && self.current_frame_base == 0 && self.scopes.len() == 1)
+        {
             return Err(RuntimeError::ReassignmentNotAllowed(name.to_string()).into());
         }
         self.scopes
@@ -910,11 +1214,15 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    pub(crate) fn var_exists(&self, name: &str) -> bool {
-        self.scopes.iter().rev().any(|s| s.contains_key(name))
+    pub(super) fn var_exists(&self, name: &str) -> bool {
+        self.scopes[self.current_frame_base..]
+            .iter()
+            .rev()
+            .any(|s| s.contains_key(name))
+            || (self.current_frame_base > 0 && self.scopes[0].contains_key(name))
     }
 
-    pub(crate) fn require_service(&self, service: ServiceId) -> Result<(), Box<dyn Error>> {
+    fn require_service(&self, service: ServiceId) -> Result<(), Box<dyn Error>> {
         let available = match service {
             ServiceId::Firestore => self.services.firestore.is_available(),
             ServiceId::Auth => self.services.auth.is_available(),

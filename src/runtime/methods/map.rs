@@ -8,9 +8,9 @@ use crate::value::Value;
 
 pub fn map_method_contract(name: &str) -> Option<CallContract> {
     match name {
-        "keys" | "values" | "len" => Some(CallContract::exact(0)),
-        "has_key" => Some(CallContract::exact(1)),
-        _ => Some(CallContract::exact(0)),
+        "keys" | "values" | "len" | "entries" => Some(CallContract::exact(0)),
+        "has_key" | "delete" | "merge" => Some(CallContract::exact(1)),
+        _ => None,
     }
 }
 
@@ -34,17 +34,35 @@ pub fn eval_map_method(
             };
             Ok(ExecFlow::Value(Value::Bool(map.contains_key(key))))
         }
-        _ => {
-            if !args.is_empty() {
-                return Err(RuntimeError::UnknownMethod {
-                    receiver: "map".to_string(),
-                    name: name.to_string(),
-                }
-                .into());
-            }
-            Ok(ExecFlow::Value(
-                map.get(name).cloned().unwrap_or(Value::Nil),
-            ))
+        "entries" => {
+            let entries = map
+                .iter()
+                .map(|(k, v)| Value::Array(vec![Value::Str(k.clone()), v.clone()]))
+                .collect();
+            Ok(ExecFlow::Value(Value::Array(entries)))
         }
+        "delete" => {
+            let key = match args.first() {
+                Some(Value::Str(k)) => k,
+                _ => return Err("delete key must be a string".into()),
+            };
+            let mut new_map = map.clone();
+            new_map.remove(key);
+            Ok(ExecFlow::Value(Value::Map(new_map)))
+        }
+        "merge" => {
+            let other = match args.first() {
+                Some(Value::Map(m)) => m,
+                _ => return Err("merge argument must be a map".into()),
+            };
+            let mut new_map = map.clone();
+            new_map.extend(other.clone());
+            Ok(ExecFlow::Value(Value::Map(new_map)))
+        }
+        _ => Err(RuntimeError::UnknownMethod {
+            receiver: "map".to_string(),
+            name: name.to_string(),
+        }
+        .into()),
     }
 }

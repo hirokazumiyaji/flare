@@ -6,32 +6,16 @@ mod unix {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    struct TestDir(PathBuf);
+    struct TestDir(tempfile::TempDir);
 
     impl TestDir {
         fn new() -> Self {
-            let unique = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock should be after the Unix epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "flare-release-test-{}-{unique}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&path).expect("create test directory");
-            Self(path)
+            Self(tempfile::tempdir().expect("create test directory"))
         }
 
         fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            self.0.path()
         }
     }
 
@@ -207,5 +191,34 @@ mod unix {
                 .and_then(|name| name.to_str())
                 .expect("checksum path should be UTF-8"),
         ));
+    }
+
+    #[test]
+    fn release_archive_supports_custom_platform_naming() {
+        let temp = TestDir::new();
+        let tag = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let output_dir = temp.path().join("dist");
+        let binary = PathBuf::from(env!("CARGO_BIN_EXE_fl"));
+        let platform = "aarch64-apple-darwin";
+        let output = run_script(
+            "package-release.sh",
+            &[
+                &tag,
+                binary.to_str().expect("binary path should be UTF-8"),
+                output_dir.to_str().expect("output path should be UTF-8"),
+                platform,
+            ],
+        );
+        assert_success(&output);
+
+        let version = env!("CARGO_PKG_VERSION");
+        let package_name = format!("flare-{version}-{platform}");
+        let archive = output_dir.join(format!("{package_name}.tar.gz"));
+        let archive_checksum = output_dir.join(format!("{package_name}.tar.gz.sha256"));
+        assert!(archive.is_file(), "custom platform archive was not created");
+        assert!(
+            archive_checksum.is_file(),
+            "custom platform checksum was not created"
+        );
     }
 }
