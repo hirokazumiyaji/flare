@@ -1525,6 +1525,44 @@ mod tests {
     }
 
     #[test]
+    fn attach_span_prefers_the_error_span_over_the_statement_span() {
+        let error_span = Span::new(2, 3);
+        let statement_span = Span::new(9, 1);
+
+        let raised: Box<dyn Error> = UserRaisedError::new("raised").with_span(error_span).into();
+        let raised = attach_span(raised, Some(statement_span));
+        let raised = raised
+            .downcast_ref::<FlareError>()
+            .expect("user-raised errors become FlareError");
+        assert_eq!(raised.span, Some(error_span));
+        assert_eq!(raised.message, "raised");
+
+        let budget: Box<dyn Error> = BudgetError::new("budget").with_span(error_span).into();
+        let budget = attach_span(budget, Some(statement_span));
+        let budget = budget
+            .downcast_ref::<FlareError>()
+            .expect("budget errors become FlareError");
+        assert_eq!(budget.span, Some(error_span));
+        assert_eq!(budget.message, "budget");
+
+        // Without an inner span the statement span is still used.
+        let raised: Box<dyn Error> = UserRaisedError::new("fallback").into();
+        let raised = attach_span(raised, Some(statement_span));
+        let raised = raised
+            .downcast_ref::<FlareError>()
+            .expect("user-raised errors become FlareError");
+        assert_eq!(raised.span, Some(statement_span));
+
+        let budget: Box<dyn Error> = BudgetError::new("fallback budget").into();
+        let budget = attach_span(budget, Some(statement_span));
+        let budget = budget
+            .downcast_ref::<FlareError>()
+            .expect("budget errors become FlareError");
+        assert_eq!(budget.span, Some(statement_span));
+        assert_eq!(budget.message, "fallback budget");
+    }
+
+    #[test]
     fn scope_guards_restore_after_binding_error() {
         let mut runtime = Runtime::new(InMemoryFirestore::default());
         runtime.state.scopes.push(std::collections::HashMap::from([(

@@ -4242,7 +4242,41 @@ fn try_rescue_cannot_catch_budget_limits() {
         "{err}"
     );
 
+    // Value nesting limit exceeded while constructing a composite value.
+    // The validator reports it as a string, so `check_value` must wrap it in
+    // `BudgetError`; otherwise `rescue` would swallow an engine budget breach.
+    let limits = RuntimeLimits::default().with_max_value_depth(0);
+    let mut rt = Runtime::with_limits(InMemoryFirestore::default(), limits);
+    let err = rt.run("try { [1] } rescue { \"rescued\" }").unwrap_err();
+    assert!(
+        format!("{err}").contains("value nesting limit exceeded"),
+        "{err}"
+    );
+
+    // Same for the node budget, which composite values can exceed as well.
+    let limits = RuntimeLimits::default().with_max_value_nodes(2);
+    let mut rt = Runtime::with_limits(InMemoryFirestore::default(), limits);
+    let err = rt.run("try { [1, 2] } rescue { \"rescued\" }").unwrap_err();
+    assert!(
+        format!("{err}").contains("value node limit exceeded"),
+        "{err}"
+    );
+
+    // Builtins validate their own result too. CSV.parse checks node counts
+    // while decoding but leaves the depth check to the shared validator, so
+    // that call site must promote the validator error the same way.
+    let limits = RuntimeLimits::default().with_max_value_depth(0);
+    let mut rt = Runtime::with_limits(InMemoryFirestore::default(), limits);
+    let err = rt
+        .run("try { CSV.parse(\"a,b\n1,2\", headers: true) } rescue { \"rescued\" }")
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("value nesting limit exceeded"),
+        "{err}"
+    );
+
     // User-raised errors containing budget limit strings are still catchable
+    let mut rt = Runtime::new(InMemoryFirestore::default());
     let src = r#"
 try {
   raise("step limit exceeded (fake)")

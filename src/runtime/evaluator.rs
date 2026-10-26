@@ -289,38 +289,17 @@ impl Evaluator<'_> {
     /// すでに 1 ノードである」ことで拒否する。Composite 値のときは子を展開
     /// しながら数えるので、巨大な配列を 1 ノードとして誤認しない。
     pub(super) fn check_value(&mut self, value: &Value) -> Result<(), Box<dyn Error>> {
-        if !matches!(
-            value,
-            Value::Array(_) | Value::ArrayUnion(_) | Value::ArrayRemove(_) | Value::Map(_)
-        ) {
+        if !value.is_composite() {
             // スカラー値は子が無いので depth 0 相当。ただし root 1 ノードと
-            // して数え、ノード予算が 0 のときはここで弾く。
-            if let Some(0) = self.limits.max_value_nodes {
-                return Err(BudgetError::new("value node limit exceeded (max 0)").into());
-            }
-            match value {
-                Value::Str(s) => {
-                    if let Some(max) = self.limits.max_string_bytes {
-                        if s.len() > max {
-                            return Err(BudgetError::new(format!(
-                                "string size limit exceeded (max {max})"
-                            ))
-                            .into());
-                        }
-                    }
-                }
-                Value::Bytes(b) => {
-                    if let Some(max) = self.limits.max_bytes_size {
-                        if b.len() > max {
-                            return Err(BudgetError::new(format!(
-                                "bytes size limit exceeded (max {max})"
-                            ))
-                            .into());
-                        }
-                    }
-                }
-                _ => {}
-            }
+            // して数え、ノード予算が 0 のときはここで弾く。葉の判定は
+            // validator と共有し、走査スタックを確保しない高速経路を保つ。
+            value::check_leaf_value_limits(
+                value,
+                self.limits.max_value_nodes,
+                self.limits.max_string_bytes,
+                self.limits.max_bytes_size,
+            )
+            .map_err(|e| BudgetError::new(e.to_string()))?;
             return Ok(());
         }
         let observed_depth = value::validate_value_limits_with_sizes(
@@ -632,18 +611,8 @@ impl Evaluator<'_> {
                                             }
                                         }
                                         let child_depth = depth.saturating_add(1);
-                                        match val {
-                                            Value::Array(items)
-                                            | Value::ArrayUnion(items)
-                                            | Value::ArrayRemove(items) => {
-                                                stack
-                                                    .extend(items.iter().map(|v| (v, child_depth)));
-                                            }
-                                            Value::Map(map) => {
-                                                stack
-                                                    .extend(map.values().map(|v| (v, child_depth)));
-                                            }
-                                            _ => {}
+                                        if let Some(children) = val.children() {
+                                            stack.extend(children.map(|v| (v, child_depth)));
                                         }
                                     }
                                 }
@@ -3150,6 +3119,19 @@ fn promote_resource_limit(e: Box<dyn Error>) -> Box<dyn Error> {
     }
 }
 
+/// Validate a builtin's result against the value budgets and promote the
+/// validator's plain-string errors to `BudgetError`, so `try/rescue` cannot
+/// swallow an engine budget breach.
+fn validate_value_budget(rt: &Evaluator<'_>, value: &Value) -> Result<(), Box<dyn Error>> {
+    validate_value_limits(
+        value,
+        rt.state.limits.max_value_depth,
+        rt.state.limits.max_value_nodes,
+    )
+    .map_err(|e| BudgetError::new(e.to_string()))?;
+    Ok(())
+}
+
 fn builtin_file_read(
     rt: &mut Evaluator<'_>,
     args: Vec<Value>,
@@ -3168,12 +3150,7 @@ fn builtin_file_read(
         Ok(s) => Value::Str(s),
         Err(e) => Value::Bytes(e.into_bytes()),
     };
-    validate_value_limits(
-        &val,
-        rt.state.limits.max_value_depth,
-        rt.state.limits.max_value_nodes,
-    )
-    .map_err(|e| BudgetError::new(e.to_string()))?;
+    validate_value_budget(rt, &val)?;
     Ok(ExecFlow::Value(val))
 }
 
@@ -3302,12 +3279,7 @@ fn builtin_json_generate(
     let bytes = writer.into_inner();
     let text = String::from_utf8(bytes).map_err(|e| format!("JSON.generate error: {e}"))?;
     let result = Value::Str(text);
-    validate_value_limits(
-        &result,
-        rt.state.limits.max_value_depth,
-        rt.state.limits.max_value_nodes,
-    )
-    .map_err(|e| BudgetError::new(e.to_string()))?;
+    validate_value_budget(rt, &result)?;
     Ok(ExecFlow::Value(result))
 }
 
@@ -3410,12 +3382,7 @@ fn builtin_csv_parse(
         Value::Array(rows)
     };
 
-    validate_value_limits(
-        &val,
-        rt.state.limits.max_value_depth,
-        rt.state.limits.max_value_nodes,
-    )
-    .map_err(|e| BudgetError::new(e.to_string()))?;
+    validate_value_budget(rt, &val)?;
     Ok(ExecFlow::Value(val))
 }
 
@@ -3487,11 +3454,7 @@ fn builtin_csv_generate(
     let bytes = bounded.into_inner();
     let text = String::from_utf8(bytes).map_err(|e| format!("CSV.generate error: {e}"))?;
     let result = Value::Str(text);
-    validate_value_limits(
-        &result,
-        rt.state.limits.max_value_depth,
-        rt.state.limits.max_value_nodes,
-    )?;
+    validate_value_budget(rt, &result)?;
     Ok(ExecFlow::Value(result))
 }
 
@@ -3536,12 +3499,7 @@ fn builtin_yaml_generate(
     let bytes = writer.into_inner();
     let text = String::from_utf8(bytes).map_err(|e| format!("YAML.generate error: {e}"))?;
     let result = Value::Str(text);
-    validate_value_limits(
-        &result,
-        rt.state.limits.max_value_depth,
-        rt.state.limits.max_value_nodes,
-    )
-    .map_err(|e| BudgetError::new(e.to_string()))?;
+    validate_value_budget(rt, &result)?;
     Ok(ExecFlow::Value(result))
 }
 
