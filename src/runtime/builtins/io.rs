@@ -27,6 +27,22 @@ pub(super) fn promote_resource_limit(e: Box<dyn Error>) -> Box<dyn Error> {
     }
 }
 
+/// Validate a builtin's result against the value budgets and promote the
+/// validator's plain-string errors to `BudgetError`, so `try/rescue` cannot
+/// swallow an engine budget breach.
+pub(super) fn validate_value_budget(
+    rt: &Evaluator<'_>,
+    value: &Value,
+) -> Result<(), Box<dyn Error>> {
+    validate_value_limits(
+        value,
+        rt.state.limits.max_value_depth,
+        rt.state.limits.max_value_nodes,
+    )
+    .map_err(|e| BudgetError::new(e.to_string()))?;
+    Ok(())
+}
+
 pub fn builtin_file_read(
     rt: &mut Evaluator<'_>,
     args: Vec<Value>,
@@ -45,12 +61,7 @@ pub fn builtin_file_read(
         Ok(s) => Value::Str(s),
         Err(e) => Value::Bytes(e.into_bytes()),
     };
-    validate_value_limits(
-        &val,
-        rt.state.limits.max_value_depth,
-        rt.state.limits.max_value_nodes,
-    )
-    .map_err(|e| BudgetError::new(e.to_string()))?;
+    validate_value_budget(rt, &val)?;
     Ok(ExecFlow::Value(val))
 }
 

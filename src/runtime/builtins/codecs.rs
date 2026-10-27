@@ -5,9 +5,9 @@ use crate::ast::Block;
 use crate::error::BudgetError;
 use crate::runtime::evaluator::{Evaluator, ExecFlow};
 use crate::runtime::expect_string;
-use crate::value::{validate_value_limits, Value};
+use crate::value::Value;
 
-use super::io::{promote_resource_limit, BoundedWriter};
+use super::io::{promote_resource_limit, validate_value_budget, BoundedWriter};
 
 fn map_csv_error(e: csv::Error) -> Box<dyn Error> {
     match e.kind() {
@@ -73,12 +73,7 @@ pub fn builtin_json_generate(
     let bytes = writer.into_inner();
     let text = String::from_utf8(bytes).map_err(|e| format!("JSON.generate error: {e}"))?;
     let result = Value::Str(text);
-    validate_value_limits(
-        &result,
-        rt.state.limits.max_value_depth,
-        rt.state.limits.max_value_nodes,
-    )
-    .map_err(|e| BudgetError::new(e.to_string()))?;
+    validate_value_budget(rt, &result)?;
     Ok(ExecFlow::Value(result))
 }
 
@@ -181,12 +176,7 @@ pub fn builtin_csv_parse(
         Value::Array(rows)
     };
 
-    validate_value_limits(
-        &val,
-        rt.state.limits.max_value_depth,
-        rt.state.limits.max_value_nodes,
-    )
-    .map_err(|e| BudgetError::new(e.to_string()))?;
+    validate_value_budget(rt, &val)?;
     Ok(ExecFlow::Value(val))
 }
 
@@ -258,11 +248,7 @@ pub fn builtin_csv_generate(
     let bytes = bounded.into_inner();
     let text = String::from_utf8(bytes).map_err(|e| format!("CSV.generate error: {e}"))?;
     let result = Value::Str(text);
-    validate_value_limits(
-        &result,
-        rt.state.limits.max_value_depth,
-        rt.state.limits.max_value_nodes,
-    )?;
+    validate_value_budget(rt, &result)?;
     Ok(ExecFlow::Value(result))
 }
 
@@ -307,12 +293,7 @@ pub fn builtin_yaml_generate(
     let bytes = writer.into_inner();
     let text = String::from_utf8(bytes).map_err(|e| format!("YAML.generate error: {e}"))?;
     let result = Value::Str(text);
-    validate_value_limits(
-        &result,
-        rt.state.limits.max_value_depth,
-        rt.state.limits.max_value_nodes,
-    )
-    .map_err(|e| BudgetError::new(e.to_string()))?;
+    validate_value_budget(rt, &result)?;
     Ok(ExecFlow::Value(result))
 }
 

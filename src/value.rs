@@ -270,6 +270,19 @@ fn check_value_size_leaf(
     Ok(())
 }
 
+/// Validate a leaf value: it counts as the one root node and may carry a
+/// size-limited `Str`/`Bytes` payload.
+pub(crate) fn check_leaf_value_limits(
+    value: &Value,
+    max_nodes: Option<usize>,
+    max_string_bytes: Option<usize>,
+    max_bytes_size: Option<usize>,
+) -> Result<(), Box<dyn Error>> {
+    let mut nodes = 0usize;
+    check_value_node_budget(&mut nodes, max_nodes)?;
+    check_value_size_leaf(value, max_string_bytes, max_bytes_size)
+}
+
 /// Validate nesting, total node count, and individual string/bytes sizes of a runtime
 /// value in a single bounded pass.
 pub fn validate_value_limits_with_sizes(
@@ -279,13 +292,8 @@ pub fn validate_value_limits_with_sizes(
     max_string_bytes: Option<usize>,
     max_bytes_size: Option<usize>,
 ) -> Result<usize, Box<dyn Error>> {
-    if !matches!(
-        value,
-        Value::Array(_) | Value::ArrayUnion(_) | Value::ArrayRemove(_) | Value::Map(_)
-    ) {
-        let mut nodes = 0usize;
-        check_value_node_budget(&mut nodes, max_nodes)?;
-        check_value_size_leaf(value, max_string_bytes, max_bytes_size)?;
+    if !value.is_composite() {
+        check_leaf_value_limits(value, max_nodes, max_string_bytes, max_bytes_size)?;
         return Ok(0);
     }
 
@@ -298,32 +306,21 @@ pub fn validate_value_limits_with_sizes(
     while let Some((value, depth)) = stack.pop() {
         check_value_depth_budget(depth, max_depth)?;
         observed_depth = observed_depth.max(depth);
+        // Function bodies are ASTs and are checked by the parser. Other
+        // scalar/reference values are leaves from the data-value point of
+        // view, so they add no children to walk.
+        let Some(children) = value.children() else {
+            continue;
+        };
         let child_depth = depth.saturating_add(1);
-
-        match value {
-            Value::Array(items) | Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
-                for item in items {
-                    // Bound each real child as it is enqueued: an empty
-                    // container at the limit is valid, so the depth check must
-                    // not run for children that do not exist.
-                    check_value_depth_budget(child_depth, max_depth)?;
-                    check_value_node_budget(&mut nodes, max_nodes)?;
-                    check_value_size_leaf(item, max_string_bytes, max_bytes_size)?;
-                    stack.push((item, child_depth));
-                }
-            }
-            Value::Map(map) => {
-                for item in map.values() {
-                    check_value_depth_budget(child_depth, max_depth)?;
-                    check_value_node_budget(&mut nodes, max_nodes)?;
-                    check_value_size_leaf(item, max_string_bytes, max_bytes_size)?;
-                    stack.push((item, child_depth));
-                }
-            }
-            // Function bodies are ASTs and are checked by the parser.  Other
-            // scalar/reference values are leaves from the data-value point of
-            // view.
-            _ => {}
+        for item in children {
+            // Bound each real child as it is enqueued: an empty container at
+            // the limit is valid, so the depth check must not run for children
+            // that do not exist.
+            check_value_depth_budget(child_depth, max_depth)?;
+            check_value_node_budget(&mut nodes, max_nodes)?;
+            check_value_size_leaf(item, max_string_bytes, max_bytes_size)?;
+            stack.push((item, child_depth));
         }
     }
     Ok(observed_depth)
@@ -346,9 +343,49 @@ impl Timestamp {
     }
 }
 
+/// Iterator over the direct children of a composite [`Value`].
+///
+/// A concrete enum keeps the hot budget walks allocation-free.
+pub(crate) enum ValueChildren<'a> {
+    Array(std::slice::Iter<'a, Value>),
+    Map(std::collections::btree_map::Values<'a, String, Value>),
+}
+
+impl<'a> Iterator for ValueChildren<'a> {
+    type Item = &'a Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Array(iter) => iter.next(),
+            Self::Map(iter) => iter.next(),
+        }
+    }
+}
+
 impl Value {
     pub fn truthy(&self) -> bool {
         !matches!(self, Value::Bool(false) | Value::Nil)
+    }
+
+    /// Direct children of a composite value, or `None` for a leaf.
+    ///
+    /// This is the single source of truth for the container variants: the
+    /// budget validator and every budget walk descend through this iterator,
+    /// so a new container variant only has to be added here.
+    pub(crate) fn children(&self) -> Option<ValueChildren<'_>> {
+        match self {
+            Value::Array(items) | Value::ArrayUnion(items) | Value::ArrayRemove(items) => {
+                Some(ValueChildren::Array(items.iter()))
+            }
+            Value::Map(map) => Some(ValueChildren::Map(map.values())),
+            _ => None,
+        }
+    }
+
+    /// Whether this value is a container whose children count against the
+    /// value budgets.
+    pub fn is_composite(&self) -> bool {
+        self.children().is_some()
     }
 
     /// クエリ `order_by` 用の全順序。同型は自然順(Int 数値順 / Str 辞書順 /
