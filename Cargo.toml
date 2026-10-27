@@ -63,6 +63,11 @@ path = "tests/repl.rs"
 required-features = ["cli"]
 
 [[test]]
+name = "release"
+path = "tests/release.rs"
+required-features = ["cli"]
+
+[[test]]
 name = "firestore_emulator"
 path = "tests/firestore_emulator.rs"
 required-features = ["emulator"]
