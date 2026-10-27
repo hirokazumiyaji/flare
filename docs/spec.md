@@ -62,15 +62,14 @@ puts "found #{rows}"
 |----|----|------|
 | Int | `42` | 64-bit signed integer. **Numbers are integers only** (Float is unsupported). |
 | Str | `"hello"` | UTF-8 string |
-| Bytes | `bytes([0, 255])` | Arbitrary byte sequence independent of UTF-8 strings; Storage content round-trips losslessly. |
+| Bytes | `bytes("fire")` / `bytes([0, 255])` | Arbitrary immutable byte sequence independent of UTF-8 strings; Storage content round-trips losslessly. Strings become UTF-8 bytes; every integer array element must be in `0..=255`. |
 | Bool | `true` / `false` | Boolean |
 | Nil | `nil` | No value. `get` for a missing document also returns nil. |
 | Array | `[1, 2, "a"]` | Sequence of arbitrary values |
 | Map | `{name: "a", age: 1}` | Dictionary with string keys, stored in key order |
 | Timestamp | `timestamp(100)` / `now()` | Unix seconds (integer); no nanosecond precision |
-| Bytes | `bytes("fire")` / `bytes([102, 105, 114, 101])` | Immutable byte sequence. Strings become UTF-8 bytes; every integer array element must be in `0..=255`. |
 | Func | `fn f(a) { a }` | User-defined function |
-| BuiltinModule | `Firestore`, `Auth`, `Storage` | Immutable namespace value whose methods use the current Runtime's configured service |
+| BuiltinModule | `Firestore`, `Auth`, `Storage`, `IO`, `File`, `JSON`, `CSV`, `YAML` | Immutable namespace value whose methods use the current Runtime's configured service |
 
 Special values for Firestore operations:
 
@@ -89,8 +88,6 @@ Special values for Firestore operations:
 | RedactedToken | (Cannot be created; access `session.id_token`) | Redacted token projection (`<redacted:id_token>`). The raw token is never exposed to scripts (§11). |
 
 The five sentinels (ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment) are valid only as **direct field values** in the `data_map` of `set` / `update`. They are invalid inside nested Maps / Arrays (both backends return an error). Before staging a write, `set` / `update` recursively validate the data map and reject values Firestore cannot store, such as `Func`, queries, or `Opaque`, without sending them to the backend (`unsupported value in write`).
-
-The five sentinels (ServerTimestamp / ArrayUnion / ArrayRemove / DeleteField / Increment) are valid only as **direct field values** in the `data_map` of `set` / `update`. They are invalid inside nested Maps / Arrays (both backends return an error).
 
 When the emulator backend reads a document containing field types flare does not support, it converts them instead of rejecting the entire document: `bytes` becomes a lossless first-class `Bytes` value; `double` / `geo_point` become display-only `Opaque` values (for example, `Double(1.5)` or `GeoPoint(35.7, 139.7)`); and a `reference` in the same database becomes a relative-path `DocRef` (references to another project or database become an `Opaque` `Reference(...)` value). `Opaque` values cannot be matched by query operators such as `==` (scripts cannot create them), and writing them back fails with `unsupported value in emulator write`. Storage `bytes([...])` is `Value::Bytes`; downloaded bytes retain their individual values.
 
@@ -130,7 +127,7 @@ Map keys must be identifiers or string literals. Values may be any expression.
 
 ### Byte Sequences
 
-`bytes([0, 255, 128])` creates `Bytes` from an array of Int values in `0..=255`. There is no implicit conversion from string literals to UTF-8 byte sequences.
+`bytes([0, 255, 128])` creates `Bytes` from an array of Int values in `0..=255`, and `bytes("fire")` creates `Bytes` by explicitly converting a UTF-8 string. There is no implicit conversion from string literals to UTF-8 byte sequences; use explicit `bytes(str)` or `bytes(array)`.
 
 ### Indexing (`expr[expr]` and `m.key`)
 
@@ -337,7 +334,7 @@ When an error is rescued inside a `batch` or `transaction`, Firestore writes sta
 
 ## 6. Firestore API
 
-There is no `firestore` object. All operations are provided as **global functions**.
+There is no lowercase `firestore` object instance to instantiate. All operations are provided as **global functions** and as methods on the `Firestore` module (`Firestore.get(...)`, etc.).
 
 Arguments that accept a document path (the `target` argument below) accept either a path string (`"users/1"`) or the result of `doc(...)`.
 
@@ -483,7 +480,6 @@ usage: fl [--backend in-memory|emulator] [--storage-backend auto|in-memory|emula
 - Binaries using `--backend emulator` must be built with the `emulator` feature.
   If specified without the feature, the following message is printed and the program exits:
   `emulator backend requires the \`emulator\` Cargo feature; rebuild with --features emulator`
-  is printed, then the program exits.
 - With `--backend emulator` (when the `emulator` feature is enabled):
   - `FIRESTORE_EMULATOR_HOST` is **required**; missing values error immediately.
 - `--storage-backend` selects Storage: `auto` (default), `in-memory`, or `emulator`. `auto` uses the Storage emulator when `FIREBASE_STORAGE_EMULATOR_HOST` is set, otherwise in-memory. Explicit `emulator` requires `FIREBASE_STORAGE_EMULATOR_HOST`.
@@ -522,7 +518,7 @@ auth_current_user()      # => nil
 
 ### AuthSession and Token Redaction
 
-``auth_sign_up` / `auth_sign_in` return an AuthSession, a dedicated value that explicitly owns the user record and **ID / refresh tokens**. It is not a Map.
+`auth_sign_up` / `auth_sign_in` return an AuthSession, a dedicated value that explicitly owns the user record and **ID / refresh tokens**. It is not a Map.
 
 - Raw token strings are **never exposed to scripts**. They do not appear in `inspect`, `puts`, the final `fl` result, or `Debug` output. The display always has this form:
   ```
@@ -678,6 +674,12 @@ The following are explicitly **unsupported**. Do not implement them or imply sup
 
 ## 15. Known Limitations and Implementation Notes
 
+There are currently no unresolved limitations in §7 `where` comparisons across types (including the handling of Nil, Array, Map, and missing fields). Even when the emulator uses Firestore server filters to narrow candidates, the shared client-side matcher in §7 makes the final decision.
+
+| Item | Current behavior | Planned |
+|------|-----------|------|
+| Auth session persistence | Sessions are held only in process memory and are not persisted between script runs. | backlog |
+
 ## 16. Cloud Storage API
 
 The Cloud Storage MVP CRUD API is provided as global functions and uses object paths separate from Firestore `doc()` / `col()` paths.
@@ -709,16 +711,11 @@ Metadata Map keys use snake_case (`name`, `bucket`, `content_type`, `size`, `gen
 
 ```bash
 export FIREBASE_PROJECT_ID=demo-flare
-firebase emulators:exec --only storage --project demo-flare \
+firebase emulators:exec --config firebase.emulators.json --only storage --project demo-flare \
   'cargo test --test storage_emulator -- --nocapture'
 ```
 
-`storage.rules` in `firebase.json` allows all objects as a local CRUD fixture. Production rules, listing, resumable uploads, public URLs, object generation operations, and authenticated production access are separate concerns.
-
-There are currently no unresolved limitations in §7 `where` comparisons across types (including the handling of Nil, Array, Map, and missing fields). Even when the emulator uses Firestore server filters to narrow candidates, the shared client-side matcher in §7 makes the final decision.
-| Item | Current behavior | Planned |
-|------|-----------|------|
-| Auth session persistence | Sessions are held only in process memory and are not persisted between script runs. | backlog |
+`storage.emulator.rules`, referenced by `firebase.emulators.json`, allows all objects as a local CRUD fixture, while `storage.rules` in `firebase.json` denies access. Production rules, listing, resumable uploads, public URLs, object generation operations, and authenticated production access are separate concerns.
 
 ## 17. IO and Data Format APIs
 
