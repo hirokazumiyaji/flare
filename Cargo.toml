@@ -2,7 +2,13 @@
 name = "flare"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.98"
+description = "An mruby-inspired scripting language runtime for Firestore, Cloud Storage, and Authentication"
 license = "MIT"
+repository = "https://github.com/hirokazumiyaji/flare"
+readme = "README.md"
+keywords = ["firebase", "firestore", "scripting", "language", "repl"]
+categories = ["command-line-utilities", "development-tools"]
 autobins = false
 
 [features]
