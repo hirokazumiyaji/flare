@@ -6,6 +6,7 @@ pub mod io;
 pub mod lexer;
 pub mod limits;
 pub mod parser;
+#[cfg(feature = "cli")]
 pub mod repl;
 pub mod runtime;
 pub mod services;
@@ -42,6 +43,7 @@ pub use limits::{
     DEFAULT_MAX_PARSER_DEPTH, DEFAULT_MAX_QUERY_RESULTS, DEFAULT_MAX_STEPS,
     DEFAULT_MAX_STRING_BYTES, DEFAULT_MAX_VALUE_DEPTH, DEFAULT_MAX_WALL_CLOCK_MS,
 };
+#[cfg(feature = "cli")]
 pub use repl::ReplOptions;
 pub use storage::{
     parse_http_response, parse_http_response_with_limit, HttpStorageTransport, HttpTransport,

@@ -71,7 +71,7 @@ firebase emulators:exec --config firebase.emulators.json --only firestore --proj
 
 `firebase.json` is for deployment and denies Firestore and Storage reads and writes. Do not run `firebase deploy --config firebase.emulators.json`. See [Firebase rules separation and deployment safeguards](docs/firebase-security.md) for details.
 
-When run without the feature, `fl --backend emulator` exits without loading the SDK and explains how to enable the `emulator` feature. Consumers that only need in-memory support can use the same API with `cargo build --no-default-features`.
+When run without the feature, `fl --backend emulator` exits without loading the SDK and explains how to enable the `emulator` feature. Consumers that only need in-memory support can use the same API with `cargo build --no-default-features`, which also builds the library without the `cli` feature (and therefore without the `fl` binary or `repl` module).
 
 You can also start the emulator in another terminal (for example, with `firebase emulators:start --only firestore`) and run a one-shot test using the repository's `firebase.json`:
 
@@ -181,7 +181,7 @@ cargo test --locked --test release           # release tag/package validation
 cargo test --locked --test auth              # in-memory Auth contract tests
 cargo test --locked --test firebase_config   # Firebase deployment guard
 
-# Default features: in-memory only
+# Minimal build (in-memory only, no CLI/REPL)
 cargo check --locked --no-default-features --all-targets
 cargo test --locked --no-default-features --all-targets
 

@@ -119,19 +119,25 @@ jobs:
         if: matrix.os == 'ubuntu-24.04'
         run: cargo check --manifest-path fuzz/Cargo.toml --locked
 
-      - name: Verify default feature set is in-memory-only
+      - name: Verify feature boundaries
         if: matrix.os == 'ubuntu-24.04'
         run: |
           set -euo pipefail
-          test "$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["features"].get("default", []))')" = "[]"
-          # The main acceptance criterion is that an in-memory-only build does
-          # not link the emulator SDK. Assert the resolved dependency graph, not
-          # just the declared feature list: re-declaring firestore / gcloud-sdk
-          # / prost-types as non-optional would leave the line above green while
-          # restoring the resolution, compile-time and binary-size costs.
+          test "$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["features"].get("default", []))')" = "['cli']"
+          # The main acceptance criterion is that a minimal build does not link
+          # the emulator SDK or terminal control. Assert the resolved dependency
+          # graph, not just the declared feature list: re-declaring firestore /
+          # gcloud-sdk / prost-types / rustyline as non-optional would leave the
+          # line above green while restoring resolution, compile-time and
+          # binary-size costs.
           if cargo tree --prefix none --edges normal --no-default-features \
             | grep -E '^(firestore|gcloud-sdk|prost-types) v'; then
             echo "emulator SDK must not be in the default dependency graph" >&2
+            exit 1
+          fi
+          if cargo tree --prefix none --edges normal --no-default-features \
+            | grep -E '^rustyline v'; then
+            echo "rustyline must not be in the minimal dependency graph" >&2
             exit 1
           fi
 
@@ -151,9 +157,9 @@ jobs:
         include:
           - name: default
             cargo_args: ""
-          # Issue #99 asks for this leg explicitly. Today `default = []`, so it
-          # is a no-op -- but the moment a default feature appears, the default
-          # leg keeps passing while minimal consumers hit an unverified build.
+          # Issue #99 asks for this leg explicitly. `default` now enables the
+          # `cli` feature, so only this leg proves that the library still
+          # compiles when embedders opt out of terminal control.
           - name: no-default-features
             cargo_args: "--no-default-features"
           - name: emulator
