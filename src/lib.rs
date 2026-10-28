@@ -15,7 +15,7 @@ pub mod value;
 
 use std::error::Error;
 
-pub use runtime::Runtime;
+pub use runtime::{builtin_names, Runtime};
 pub use services::{
     is_remote_emulator_allowed, validate_emulator_host, ProjectConfig, Services,
     ALLOW_REMOTE_EMULATOR_ENV,
