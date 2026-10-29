@@ -54,7 +54,7 @@ jobs:
           toolchain: 1.98.1
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Build documentation
         run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
@@ -82,7 +82,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Record Rust toolchain
         run: |
@@ -177,7 +177,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Test ${{ matrix.name }} build
         run: cargo test --all-targets --locked ${{ matrix.cargo_args }}
@@ -245,7 +245,7 @@ jobs:
           echo "cargo_lock_sha256=$(sha256sum Cargo.lock | awk '{print $1}')"
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Run integration tests with allow-all emulator rules, twice
         # Two passes in the same emulator session: fixtures from the first run
