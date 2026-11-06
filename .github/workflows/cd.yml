@@ -67,7 +67,9 @@ jobs:
           - os: ubuntu-24.04
             platform: linux-x86_64
             target: x86_64-unknown-linux-gnu
-          - os: macos-14
+          # macos-14 was retired on 2026-11-02; macOS releases build on the
+          # current arm64 runner image.
+          - os: macos-26
             platform: aarch64-apple-darwin
             target: aarch64-apple-darwin
     steps:

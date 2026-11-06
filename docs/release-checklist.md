@@ -5,7 +5,7 @@ Use before tagging a release or publishing binaries.
 ## 0. Pinned tools
 
 - `rust-toolchain.toml` pins Rust to **1.98.1** and installs `rustfmt` and `clippy`. Check the active toolchain with `rustup show active-toolchain` and `rustc --version --verbose` before building.
-- CI and CD use the same `rust-toolchain.toml`, the checked-in `Cargo.lock`, and the `ubuntu-24.04` runner image. Dependency-resolving Cargo commands must include `--locked`.
+- CI and CD use the same `rust-toolchain.toml`, the checked-in `Cargo.lock`, and pinned runner images: `ubuntu-24.04` for Linux and `macos-26` (arm64) for macOS. Dependency-resolving Cargo commands must include `--locked`.
 - The emulator jobs use Node **24.11.0**, Temurin Java **21.0.8**, and Firebase CLI **15.31.0**. For a local emulator run, install the same CLI explicitly and verify it:
 
   ```bash
