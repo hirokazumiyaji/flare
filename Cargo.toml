@@ -32,7 +32,7 @@ emulator = [
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 csv = "1"
 firestore = { version = "0.61", optional = true }
-gcloud-sdk = { version = "0.33", optional = true }
+gcloud-sdk = { version = "0.34", optional = true }
 http = { version = "1", optional = true }
 prost-types = { version = "0.14", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json"], optional = true }

@@ -598,10 +598,10 @@ dependencies = [
  "async-trait",
  "backoff",
  "futures",
- "gcloud-sdk",
+ "gcloud-sdk 0.33.3",
  "hex",
  "hyper",
- "jiff",
+ "jiff 0.2.37",
  "rand 0.10.1",
  "regex",
  "rsb_derive",
@@ -621,7 +621,7 @@ dependencies = [
  "chrono",
  "csv",
  "firestore",
- "gcloud-sdk",
+ "gcloud-sdk 0.34.0",
  "http",
  "proptest",
  "prost-types",
@@ -775,16 +775,44 @@ dependencies = [
 
 [[package]]
 name = "gcloud-sdk"
-version = "0.33.2"
+version = "0.33.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6715afe64d16504b42487d2271e2a865c864699c4b562a541e696dabb28802f9"
+checksum = "bfbb81834c9b141d0e2f1f16178e265a90479544175b3a850bad424a449a570a"
 dependencies = [
  "async-trait",
  "bytes",
  "futures",
  "google-cloud-auth",
  "hyper",
- "jiff",
+ "jiff 0.2.37",
+ "once_cell",
+ "prost",
+ "prost-types",
+ "reqwest",
+ "rustls",
+ "secret-vault-value",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tonic-prost",
+ "tower",
+ "tower-layer",
+ "tracing",
+]
+
+[[package]]
+name = "gcloud-sdk"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06aad80db2c4c2a5d192f07ac0dca3235afd34fc4fc4babaccf07b50f80a23c6"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "google-cloud-auth",
+ "hyper",
+ "jiff 1.0.1",
  "jsonwebtoken",
  "once_cell",
  "prost",
@@ -845,7 +873,7 @@ dependencies = [
  "hex",
  "hmac",
  "http",
- "jiff",
+ "jiff 0.2.37",
  "jsonwebtoken",
  "reqwest",
  "rustc_version",
@@ -1321,14 +1349,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ab1baf72f08796de0260609515130699b890ac25f30e610ad894bc5856cafdb"
 dependencies = [
  "defmt",
- "jiff-core",
- "jiff-static",
+ "jiff-core 0.1.1",
+ "jiff-static 0.2.37",
  "jiff-tzdb-platform",
  "log",
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
  "windows-link",
+]
+
+[[package]]
+name = "jiff"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed5d126d72eb017f10b302e73bdeca446bea405ee449af4d9e7866d6b082d83e"
+dependencies = [
+ "jiff-core 1.0.1",
+ "jiff-static 1.0.1",
+ "log",
+ "portable-atomic",
+ "portable-atomic-util",
+ "serde_core",
 ]
 
 [[package]]
@@ -1342,15 +1384,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "jiff-core"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6b46a105a9874634dd96231021526bf24ca04955a5998c59a9c7666e634b7b8"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "jiff-static"
 version = "0.2.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "378268a1116ad67ae6228701118ac9f491d78fda38a40a1f1a9e1348de6f7212"
 dependencies = [
- "jiff-core",
+ "jiff-core 0.1.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "jiff-static"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0127e9bde3c6130d6169e7d8d68676e4be69c4bf7573c308b6f960a5089c428"
+dependencies = [
+ "jiff-core 1.0.1",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -2406,7 +2469,7 @@ dependencies = [
  "hex",
  "indexmap 1.9.3",
  "indexmap 2.14.0",
- "jiff",
+ "jiff 0.2.37",
  "schemars 0.9.0",
  "schemars 1.2.3",
  "serde_core",
