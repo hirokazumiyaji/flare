@@ -594,7 +594,7 @@ dependencies = [
  "async-trait",
  "backon",
  "futures",
- "gcloud-sdk 0.34.0",
+ "gcloud-sdk",
  "hex",
  "hyper",
  "jiff 1.0.1",
@@ -617,7 +617,7 @@ dependencies = [
  "chrono",
  "csv",
  "firestore",
- "gcloud-sdk 0.33.2",
+ "gcloud-sdk",
  "http",
  "proptest",
  "prost-types",
@@ -771,35 +771,6 @@ dependencies = [
 
 [[package]]
 name = "gcloud-sdk"
-version = "0.33.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6715afe64d16504b42487d2271e2a865c864699c4b562a541e696dabb28802f9"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "google-cloud-auth",
- "hyper",
- "jiff 0.2.37",
- "jsonwebtoken",
- "once_cell",
- "prost",
- "prost-types",
- "reqwest",
- "rustls",
- "secret-vault-value",
- "serde",
- "serde_json",
- "tokio",
- "tonic",
- "tonic-prost",
- "tower",
- "tower-layer",
- "tracing",
-]
-
-[[package]]
-name = "gcloud-sdk"
 version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06aad80db2c4c2a5d192f07ac0dca3235afd34fc4fc4babaccf07b50f80a23c6"
@@ -810,6 +781,7 @@ dependencies = [
  "google-cloud-auth",
  "hyper",
  "jiff 1.0.1",
+ "jsonwebtoken",
  "once_cell",
  "prost",
  "prost-types",
