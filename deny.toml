@@ -67,6 +67,10 @@ feature-depth = 1
 # output a note when they are encountered.
 ignore = [
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained, used transitively by serde_yaml" },
+    # Issued 2026-11-17, after chrono's last release. There is no patched
+    # version; chrono is used directly for RFC3339 parsing/formatting. Replace
+    # it with jiff or time before removing this ignore.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; no patched version exists and the direct uses are limited to RFC3339 parsing/formatting" },
 ]
 
 [licenses]
