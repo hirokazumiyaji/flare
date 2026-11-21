@@ -31,8 +31,12 @@ emulator = [
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 csv = "1"
-firestore = { version = "0.61", optional = true }
-gcloud-sdk = { version = "0.33", optional = true }
+firestore = { version = "0.66", optional = true }
+# `google-firestore-v1` must be requested here, not inherited from `firestore`.
+# Both crates have to resolve to the same gcloud-sdk version for the generated
+# Firestore types to unify, and the feature is what generates the
+# `google::firestore::v1` and `google::r#type` modules this crate uses.
+gcloud-sdk = { version = "0.34", optional = true, features = ["google-firestore-v1"] }
 http = { version = "1", optional = true }
 prost-types = { version = "0.14", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json"], optional = true }
