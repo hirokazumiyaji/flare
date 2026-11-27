@@ -31,7 +31,7 @@ emulator = [
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 csv = "1"
-firestore = { version = "0.66", optional = true }
+firestore = { version = "0.67", optional = true }
 # `google-firestore-v1` must be requested here, not inherited from `firestore`.
 # Both crates have to resolve to the same gcloud-sdk version for the generated
 # Firestore types to unify, and the feature is what generates the
