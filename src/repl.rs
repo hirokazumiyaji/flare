@@ -691,5 +691,9 @@ pub fn run_stream<F: Firestore, S: Storage, R: BufRead, W: Write>(
         }
     }
 
+    if !buffer.is_empty() {
+        return Err("incomplete input at end of stream".into());
+    }
+
     Ok(())
 }
