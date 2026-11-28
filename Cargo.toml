@@ -59,6 +59,10 @@ name = "query_payload"
 harness = false
 
 [[bench]]
+name = "memory_apply"
+harness = false
+
+[[bench]]
 name = "interpreter"
 harness = false
 
