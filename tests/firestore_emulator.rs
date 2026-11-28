@@ -12,7 +12,8 @@ use firestore::{FirestoreDb, FirestoreDbOptions};
 use flare::run_script_with_firestore;
 use flare::run_script_with_firestore_and_limits;
 use flare::runtime::Runtime;
-use flare::{EmulatorAuth, FirestoreEmulator, RuntimeLimits, Value};
+use flare::value::{QueryFilter, QueryOp, QueryRef, QuerySource};
+use flare::{EmulatorAuth, Firestore, FirestoreEmulator, RuntimeLimits, Value};
 use gcloud_sdk::google::firestore::v1::{
     value, write, ArrayValue, CommitRequest, Document, MapValue, Value as SdkValue, Write,
 };
@@ -336,6 +337,96 @@ col("users/{run}/rows").where("kind", "==", "match").get()"#
         format!("{err}").contains("query result limit exceeded (max 1)"),
         "{err}"
     );
+}
+
+#[test]
+fn emulator_applies_limit_after_local_only_filters() {
+    // Non-matching docs sort first (`a`) and in the middle (`m`) under
+    // `__name__` order. Local-only `array_contains` must still see `z` when
+    // `limit(1)` is set, whether the page comes from `run_query_page`, the
+    // bounded budget path, or `--unlimited`.
+    let Some(fs) = emulator() else {
+        eprintln!("skip: no emulator");
+        return;
+    };
+    let collection = test_collection("page_after_local_filters");
+    let seed = format!(
+        r#"set("{collection}/a", {{tags: ["a"], kind: "other"}})
+set("{collection}/m", {{tags: ["m"], kind: "other"}})
+set("{collection}/z", {{tags: ["z"], kind: "match"}})"#
+    );
+    run_script_with_firestore(&seed, fs).unwrap();
+
+    let expected_name = format!("{collection}/z");
+    let local_only = QueryRef {
+        source: QuerySource::Collection(collection.clone()),
+        filters: vec![QueryFilter {
+            field: "tags".to_string(),
+            op: QueryOp::ArrayContains,
+            value: Value::Str("z".to_string()),
+        }],
+        order_by: vec![],
+        offset: None,
+        limit: Some(1),
+    };
+    let page = emulator().unwrap().run_query_page(&local_only).unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].0, expected_name);
+
+    let local_script = format!(
+        r#"col("{collection}").where("tags", "array_contains", "z").limit(1).get().map {{ |r| r["__name__"] }}"#
+    );
+    let bounded = run_script_with_firestore_and_limits(
+        &local_script,
+        emulator().unwrap(),
+        RuntimeLimits::default(),
+    )
+    .unwrap();
+    let unlimited = run_script_with_firestore_and_limits(
+        &local_script,
+        emulator().unwrap(),
+        RuntimeLimits::unlimited(),
+    )
+    .unwrap();
+    let expected = Value::Array(vec![Value::Str(expected_name.clone())]);
+    assert_eq!(bounded, expected);
+    assert_eq!(unlimited, expected);
+
+    let server_filterable = QueryRef {
+        source: QuerySource::Collection(collection.clone()),
+        filters: vec![QueryFilter {
+            field: "kind".to_string(),
+            op: QueryOp::Eq,
+            value: Value::Str("match".to_string()),
+        }],
+        order_by: vec![],
+        offset: None,
+        limit: Some(1),
+    };
+    let server_page = emulator()
+        .unwrap()
+        .run_query_page(&server_filterable)
+        .unwrap();
+    assert_eq!(server_page.len(), 1);
+    assert_eq!(server_page[0].0, expected_name);
+
+    let server_script = format!(
+        r#"col("{collection}").where("kind", "==", "match").limit(1).get().map {{ |r| r["__name__"] }}"#
+    );
+    let server_bounded = run_script_with_firestore_and_limits(
+        &server_script,
+        emulator().unwrap(),
+        RuntimeLimits::default(),
+    )
+    .unwrap();
+    let server_unlimited = run_script_with_firestore_and_limits(
+        &server_script,
+        emulator().unwrap(),
+        RuntimeLimits::unlimited(),
+    )
+    .unwrap();
+    assert_eq!(server_bounded, expected);
+    assert_eq!(server_unlimited, expected);
 }
 
 #[test]

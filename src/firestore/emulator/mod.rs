@@ -679,6 +679,10 @@ impl Firestore for FirestoreEmulator {
 /// 範囲比較を含む filter は Firestore が同フィールドの先頭 order_by を
 /// 要求するため、既存の結果順 path へ push しない。値の範囲も proto の
 /// i32 に収まる場合だけ page 全体だけを push する。
+///
+/// `server_prefilters` が全 filter を載せていないときは push しない。
+/// サーバ側の limit / offset は候補生成に効くので、ローカル matcher が
+/// 落とす行があると最終一致集合より前にページが切れてしまう。
 fn can_push_path_page(query: &QueryRef) -> bool {
     let has_page = query.offset.is_some() || query.limit.is_some();
     let has_order_requiring_filter = query.filters.iter().any(|filter| {
@@ -693,6 +697,7 @@ fn can_push_path_page(query: &QueryRef) -> bool {
         && !has_order_requiring_filter
         && query.offset.unwrap_or(0) <= i32::MAX as usize
         && query.limit.is_none_or(|limit| limit <= i32::MAX as usize)
+        && server_prefilters(&query.filters).len() == query.filters.len()
 }
 
 fn push_path_page(
@@ -1249,6 +1254,32 @@ mod tests {
         query
             .order_by
             .push(("ord".to_string(), crate::value::Direction::Asc));
+        assert!(!can_push_path_page(&query));
+    }
+
+    #[test]
+    fn path_page_pushdown_requires_fully_server_covered_filters() {
+        let mut query = query();
+        query.filters.push(QueryFilter {
+            field: "kind".to_string(),
+            op: QueryOp::Eq,
+            value: Value::Str("match".to_string()),
+        });
+        assert!(can_push_path_page(&query));
+
+        query.filters.clear();
+        query.filters.push(QueryFilter {
+            field: "tags".to_string(),
+            op: QueryOp::ArrayContains,
+            value: Value::Str("z".to_string()),
+        });
+        assert!(!can_push_path_page(&query));
+
+        query.filters.push(QueryFilter {
+            field: "kind".to_string(),
+            op: QueryOp::Eq,
+            value: Value::Str("match".to_string()),
+        });
         assert!(!can_push_path_page(&query));
     }
 
