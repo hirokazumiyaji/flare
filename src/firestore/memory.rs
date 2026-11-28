@@ -237,13 +237,7 @@ fn is_direct_child(collection: &str, doc_path: &str) -> bool {
 }
 
 fn path_in_group(id: &str, doc_path: &str) -> bool {
-    let segments: Vec<&str> = doc_path.split('/').collect();
-    if segments.len() < 2 {
-        return false;
-    }
-    (0..segments.len() - 1)
-        .step_by(2)
-        .any(|idx| segments[idx] == id)
+    doc_path.rsplit('/').nth(1) == Some(id)
 }
 
 fn apply_write_to_docs(

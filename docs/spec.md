@@ -410,7 +410,7 @@ col("users").doc("1")       # Equivalent to doc("users/1")
 - `count()` — Returns the number of matching documents as Int. Ignores ordering, offset, and limit. In-memory counts references to stored documents directly; the emulator uses a `COUNT(*)` aggregation query.
 - **Deterministic order:** Without `order_by`, results are sorted lexicographically by flare-relative document path (`users/a` < `users/b`). With `order_by`, the ordering above applies. Apply `offset` before `limit`.
 - **Query execution path:** In-memory `get()` orders references to candidates, then clones only fields included in the page. The emulator sends `__name__` ordering and page bounds to the server only when there is no `order_by`, no range-comparison filter, and offset/limit fit in protobuf i32. Other `get()` calls, and `count()` on emulators without aggregation RPC support, use a safe fallback that returns all candidates and retrieves document payloads outside the page.
-- Queries on `col()` include **direct child documents only**, not documents in subcollections. `col_group(id)` includes every document whose collection name matches `id` at any level of its path.
+- Queries on `col()` include **direct child documents only**. `col_group(id)` selects documents whose immediate parent collection has the given ID, at any depth. For example, `col_group("items")` selects `teams/a/items/b` and excludes `teams/a/items/b/notes/c`.
 - Query **construction** (`.where()` / `.order_by()` / `.offset()` / `.limit()`) is allowed inside `batch` / `transaction`. Query **execution** (`.get()` / `.count()`) is not.
 - Cursors such as `start_after` are unsupported (§12). Use `order_by` + `offset` + `limit` for pagination.
 
