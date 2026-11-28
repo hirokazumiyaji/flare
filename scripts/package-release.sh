@@ -24,12 +24,19 @@ if [[ ! -f "$binary" ]]; then
   echo "release binary is missing: $binary" >&2
   exit 1
 fi
-for required in README.md LICENSE docs/spec.md; do
+for required in README.md LICENSE docs/spec.md docs/firebase-security.md docs/release-checklist.md; do
   if [[ ! -f "$required" ]]; then
     echo "release package is missing required file: $required" >&2
     exit 1
   fi
 done
+shopt -s nullglob
+example_scripts=(examples/scripts/*.fl)
+shopt -u nullglob
+if [[ ${#example_scripts[@]} -eq 0 ]]; then
+  echo "release package is missing required file: examples/scripts/*.fl" >&2
+  exit 1
+fi
 
 mkdir -p "$output_dir"
 package_name="flare-${version}-${platform}"
@@ -39,14 +46,16 @@ checksum_file="$archive.sha256"
 
 rm -rf "$staging_dir"
 rm -f "$archive" "$checksum_file"
-mkdir -p "$staging_dir/docs"
+mkdir -p "$staging_dir/docs" "$staging_dir/examples/scripts"
 
 # Keep the executable bit in the archive even when the build came from a
 # checkout or an artifact transfer that did not preserve modes.
 install -m 0755 "$binary" "$staging_dir/fl"
 chmod 0755 "$staging_dir/fl"
 install -m 0644 README.md LICENSE "$staging_dir/"
-install -m 0644 docs/spec.md "$staging_dir/docs/spec.md"
+install -m 0644 docs/spec.md docs/firebase-security.md docs/release-checklist.md \
+  "$staging_dir/docs/"
+install -m 0644 "${example_scripts[@]}" "$staging_dir/examples/scripts/"
 
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -60,7 +69,11 @@ sha256() {
 # gets a separate sidecar so a downloader can verify it before extraction.
 (
   cd "$staging_dir"
-  sha256 fl README.md LICENSE docs/spec.md > SHA256SUMS
+  paths=()
+  while IFS= read -r path; do
+    paths+=("$path")
+  done < <(find . -type f | sed 's|^\./||' | sort)
+  sha256 "${paths[@]}" > SHA256SUMS
 )
 tar -czf "$archive" -C "$output_dir" "$package_name"
 (

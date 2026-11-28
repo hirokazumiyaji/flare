@@ -61,7 +61,8 @@ Use before tagging a release or publishing binaries.
      and publishes only after all jobs succeed. There is no `continue-on-error`
      or release bypass.
    - The release archive contains the executable `fl` with mode `0755`,
-     `README.md`, `LICENSE`, `docs/spec.md`, and `SHA256SUMS`. CD also
+     `README.md`, `LICENSE`, `docs/spec.md`, `docs/firebase-security.md`,
+     `docs/release-checklist.md`, `examples/scripts/`, and `SHA256SUMS`. CD also
      publishes the archive's `.sha256` sidecar.
 
 6. **Verify a downloaded release**
