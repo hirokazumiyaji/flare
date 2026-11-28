@@ -66,11 +66,23 @@ feature-depth = 1
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
 ignore = [
-    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained, used transitively by serde_yaml" },
-    # Issued 2026-11-17, after chrono's last release. There is no patched
-    # version; chrono is used directly for RFC3339 parsing/formatting. Replace
-    # it with jiff or time before removing this ignore.
-    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; no patched version exists and the direct uses are limited to RFC3339 parsing/formatting" },
+    # Direct dep: serde_yaml 0.9 (YAML.parse / YAML.generate Value DOM).
+    # Transitive only: unsafe-libyaml (no other crate pulls it; not via SDK).
+    # Recheck when Cargo.lock changes serde_yaml or drops unsafe-libyaml.
+    # Remove when `cargo tree -i unsafe-libyaml` is empty and
+    # `cargo deny check advisories` passes without this id.
+    # Behavior gate: yaml_parse_and_generate, yaml_edge_roundtrip_contract
+    # in tests/io_and_formats.rs.
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via direct serde_yaml; remove once serde_yaml is replaced and unsafe-libyaml leaves the lockfile" },
+    # Direct dep: chrono (RFC3339 parse/format only). Not pulled by the SDK.
+    # Issued 2026-11-17 after chrono's last release; no patched version.
+    # Recheck when Cargo.toml/Cargo.lock change chrono, or after switching
+    # parse_rfc3339_to_unix / Timestamp::to_rfc3339 to jiff or time.
+    # Remove when `cargo tree -i chrono` is empty and advisories pass without
+    # this id. Behavior gate: parses_timestamp_from_rfc3339_string,
+    # timestamp_comparison_diff_and_rfc3339, rfc3339_year_bounds_contract
+    # in tests/in_memory.rs.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained, direct RFC3339 only; remove once chrono is replaced and leaves the lockfile" },
 ]
 
 [licenses]

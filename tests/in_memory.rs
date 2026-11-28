@@ -2584,6 +2584,25 @@ fn timestamp_comparison_diff_and_rfc3339() {
     assert_eq!(out, Value::Int(1));
 }
 
+/// Contract for a chrono replacement (jiff/time). Keep these RFC3339 edges.
+#[test]
+fn rfc3339_year_bounds_contract() {
+    // Year 0001 and 9999 inclusive bounds via parse → to_rfc3339 (UTC).
+    let out = run_script(r#"timestamp("0001-01-01T00:00:00Z").to_rfc3339()"#).unwrap();
+    assert_eq!(out, Value::Str("0001-01-01T00:00:00+00:00".into()));
+    let out = run_script(r#"timestamp("9999-12-31T23:59:59Z").to_rfc3339()"#).unwrap();
+    assert_eq!(out, Value::Str("9999-12-31T23:59:59+00:00".into()));
+    // Just past year 9999 fails on format.
+    let err = run_script("timestamp(253402300800).to_rfc3339()").unwrap_err();
+    assert!(format!("{err}").contains("timestamp out of range"), "{err}");
+    // Offset folding and Z remain second-precision only.
+    let out = run_script(
+        r#"[timestamp("1970-01-01T09:00:00+09:00").to_unix(), timestamp("1970-01-01T00:00:00Z").to_unix()]"#,
+    )
+    .unwrap();
+    assert_eq!(out, Value::Array(vec![Value::Int(0), Value::Int(0)]));
+}
+
 #[test]
 fn string_comparison_operators_support_utf8_lexicographical_order() {
     let out = run_script("[\"a\" < \"b\", \"b\" > \"a\", \"a\" <= \"a\", \"a\" >= \"a\", \"abc\" < \"abd\", \"abc\" < \"abcd\"]").unwrap();
