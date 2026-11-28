@@ -1116,7 +1116,7 @@ impl Evaluator<'_> {
                     let flow = scope.runtime.eval_expr(default_expr)?;
                     let v = match flow {
                         ExecFlow::Value(v) => v,
-                        flow @ ExecFlow::Return(_) => return Ok(flow),
+                        ExecFlow::Return(v) => return Ok(ExecFlow::Value(v)),
                     };
                     bound.push((param.name.clone(), v));
                     continue;

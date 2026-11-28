@@ -5047,6 +5047,36 @@ fn f(a, b = side_effect()) { a + b }
 }
 
 #[test]
+fn issue_259_default_arg_return_consumed_by_owning_function() {
+    // Named: return in a default expression exits the callee, not the caller.
+    let out = run_script(
+        "fn inner(a = if true { return 7 }) { 0 }\nfn outer() { inner(); 9 }\nouter()",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(9));
+
+    // Named: default evaluates only when the argument is omitted.
+    let out = run_script(
+        "fn inner(a = if true { return 7 }) { a }\nfn outer() { inner(3); 9 }\nouter()",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(9));
+
+    // Anonymous: same return-boundary and omit-only evaluation.
+    let out = run_script(
+        "inner = fn(a = if true { return 7 }) { 0 }\nfn outer() { inner(); 9 }\nouter()",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(9));
+
+    let out = run_script(
+        "inner = fn(a = if true { return 7 }) { a }\nfn outer() { inner(3); 9 }\nouter()",
+    )
+    .unwrap();
+    assert_eq!(out, Value::Int(9));
+}
+
+#[test]
 fn issue_184_map_dot_access_does_not_shadow_methods_and_distinguishes_syntax() {
     // 1. Unparenthesized access accesses keys directly, even if matching method names
     assert_eq!(run_script("{keys: 1}.keys").unwrap(), Value::Int(1));
