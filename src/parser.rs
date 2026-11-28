@@ -843,9 +843,9 @@ impl Parser {
         let Some(max) = self.limits.max_tokens else {
             return Ok(());
         };
-        // 末尾の EOF は合成トークンなので source budget に計上しない。
-        let eof = if self.at(&Token::Eof) { 1 } else { 0 };
-        let count = count_source_tokens(self.tokens.as_slice()).saturating_sub(eof);
+        // `count_source_tokens` skips synthetic EOF the same way the lexer
+        // omits it from `tokens_emitted`, so exact-at-limit decisions match.
+        let count = count_source_tokens(self.tokens.as_slice());
         if count > max {
             return Err(self.parse_err(format!("token limit exceeded (max {max})")));
         }
@@ -901,34 +901,7 @@ impl Parser {
         let Some(max) = self.limits.max_depth else {
             return Ok(());
         };
-        let mut stack = vec![(stmt, 0usize)];
-        while let Some((stmt, depth)) = stack.pop() {
-            if depth > max {
-                return Err(self.parse_err(format!(
-                    "parser nesting limit exceeded (max {max}, observed {depth})"
-                )));
-            }
-            // 式は guard される nesting の一部ではないので、現在の深さを
-            // そのまま使う(`enter_nesting` と同じ基準: 最外の構築物が 0)。
-            //  Statements の本体だけが一階層深く入る。
-            match stmt {
-                Stmt::Expr(expr) => self.validate_expr_depth(expr, depth, max)?,
-                Stmt::Assign { value, .. } => self.validate_expr_depth(value, depth, max)?,
-                Stmt::Def { params, body, .. } => {
-                    for param in params {
-                        if let Some(default) = &param.default {
-                            self.validate_expr_depth(default, depth + 1, max)?;
-                        }
-                    }
-                    for child in body {
-                        stack.push((child, depth + 1));
-                    }
-                }
-                Stmt::Return(Some(expr)) => self.validate_expr_depth(expr, depth, max)?,
-                Stmt::Return(None) => {}
-            }
-        }
-        Ok(())
+        self.validate_stmt_depth_iterative(stmt, 0, max)
     }
 
     fn validate_expr_limits(&self, expr: &Expr) -> Result<(), Box<dyn Error>> {
@@ -1080,18 +1053,28 @@ impl Parser {
         let mut stack = vec![(stmt, initial_depth)];
         while let Some((stmt, depth)) = stack.pop() {
             if depth > max {
-                return Err(self.parse_err(format!("parser nesting limit exceeded (max {max})")));
+                return Err(self.parse_err(format!(
+                    "parser nesting limit exceeded (max {max}, observed {depth})"
+                )));
             }
-            let child_depth = depth.saturating_add(1);
+            // Expressions ride the statement's depth (`enter_nesting` only
+            // advances for constructs). Def params/body step one level deeper,
+            // whether the Def is top-level or nested inside another block.
             match stmt {
-                Stmt::Expr(expr) => self.validate_expr_depth(expr, child_depth, max)?,
-                Stmt::Assign { value, .. } => self.validate_expr_depth(value, child_depth, max)?,
-                Stmt::Def { body, .. } => {
+                Stmt::Expr(expr) => self.validate_expr_depth(expr, depth, max)?,
+                Stmt::Assign { value, .. } => self.validate_expr_depth(value, depth, max)?,
+                Stmt::Def { params, body, .. } => {
+                    let child_depth = depth.saturating_add(1);
+                    for param in params {
+                        if let Some(default) = &param.default {
+                            self.validate_expr_depth(default, child_depth, max)?;
+                        }
+                    }
                     for child in body {
                         stack.push((child, child_depth));
                     }
                 }
-                Stmt::Return(Some(expr)) => self.validate_expr_depth(expr, child_depth, max)?,
+                Stmt::Return(Some(expr)) => self.validate_expr_depth(expr, depth, max)?,
                 Stmt::Return(None) => {}
             }
         }
@@ -1144,6 +1127,12 @@ impl Parser {
 fn count_source_tokens(tokens: &[Token]) -> usize {
     let mut count = 0usize;
     for token in tokens {
+        // Top-level trailing `Eof` is synthetic (lex pushes it after
+        // `tokens_emitted` stops). Skip every `Token::Eof` here; interpolation
+        // closers live in `SpannedToken` form and are counted below.
+        if matches!(token, Token::Eof) {
+            continue;
+        }
         count = count.saturating_add(1);
         if let Token::Str(parts) = token {
             for part in parts {
@@ -1156,13 +1145,13 @@ fn count_source_tokens(tokens: &[Token]) -> usize {
     count
 }
 
-/// 補間内のトークン列を数える。合成された末尾 `Eof` は数えない。
+/// Count tokens inside an interpolation, matching lexer `tokens_emitted`.
+///
+/// The lexer counts the closing `}` via `next_token`, then stores `Eof` in its
+/// place. Counting that `Eof` keeps the parser budget aligned with the lexer.
 fn count_spanned_source_tokens(tokens: &[SpannedToken]) -> usize {
     let mut count = 0usize;
     for spanned in tokens {
-        if spanned.token == Token::Eof {
-            continue;
-        }
         count = count.saturating_add(1);
         if let Token::Str(parts) = &spanned.token {
             for part in parts {
@@ -1244,5 +1233,79 @@ mod tests {
             counted > interp + 1,
             "counted {counted} should exceed the single outer string token"
         );
+    }
+
+    fn token_budget(max: usize) -> ParserLimits {
+        ParserLimits::unlimited().with_max_tokens(max)
+    }
+
+    fn lex_ok(source: &str, max: usize) -> bool {
+        crate::lexer::lex_with_limits(source, token_budget(max)).is_ok()
+    }
+
+    fn parse_ok_with_tokens(source: &str, max: usize) -> bool {
+        let tokens = crate::lexer::lex_with_limits(source, ParserLimits::unlimited()).unwrap();
+        Parser::new_with_limits(tokens, token_budget(max))
+            .parse_program()
+            .is_ok()
+    }
+
+    #[test]
+    fn token_budget_exact_and_one_over_match_lexer_and_parser() {
+        // Short literal: one real token. Exact limit accepts; one under rejects.
+        assert!(lex_ok("1", 1));
+        assert!(parse_ok_with_tokens("1", 1));
+        assert!(!lex_ok("1", 0));
+        assert!(!parse_ok_with_tokens("1", 0));
+
+        // Interpolation counts the same way on both paths (inner tokens +
+        // the closing `}` the lexer records as interp Eof).
+        let interp = "\"a#{1}b\"";
+        let counted = count_source_tokens(
+            &crate::lexer::lex_with_limits(interp, ParserLimits::unlimited()).unwrap(),
+        );
+        assert_eq!(counted, 3);
+        assert!(lex_ok(interp, counted));
+        assert!(parse_ok_with_tokens(interp, counted));
+        assert!(!lex_ok(interp, counted - 1));
+        assert!(!parse_ok_with_tokens(interp, counted - 1));
+    }
+
+    #[test]
+    fn nested_and_top_level_fn_args_and_bodies_share_depth_rules() {
+        // Arrays create AST depth; parentheses do not.
+        let deep = "[".repeat(4) + "1" + &"]".repeat(4);
+        let top_args = format!("fn f(x = {deep}) {{ 1 }}");
+        let nest_args = format!("if 1 {{ fn f(x = {deep}) {{ 1 }} }}");
+        let top_body = format!("fn f() {{ {deep} }}");
+        let nest_body = format!("if 1 {{ fn f() {{ {deep} }} }}");
+
+        // Source entry: nested Def pays one extra level for the enclosing block.
+        assert!(parse_with_depth(&top_args, 5).is_ok());
+        assert!(parse_with_depth(&top_args, 4).is_err());
+        assert!(parse_with_depth(&nest_args, 6).is_ok());
+        assert!(parse_with_depth(&nest_args, 5).is_err());
+        assert!(parse_with_depth(&top_body, 5).is_ok());
+        assert!(parse_with_depth(&top_body, 4).is_err());
+        assert!(parse_with_depth(&nest_body, 6).is_ok());
+        assert!(parse_with_depth(&nest_body, 5).is_err());
+
+        // Public AST entry applies the same Def args/body walk in both positions.
+        for (src, ok_at, bad_at) in [
+            (&top_args, 5usize, 4usize),
+            (&nest_args, 6, 5),
+            (&top_body, 5, 4),
+            (&nest_body, 6, 5),
+        ] {
+            let program = parse_with_depth(src, 100).unwrap();
+            assert!(
+                Parser::validate_stmt_depth(&program, ok_at).is_ok(),
+                "expected ok at {ok_at} for {src}"
+            );
+            assert!(
+                Parser::validate_stmt_depth(&program, bad_at).is_err(),
+                "expected err at {bad_at} for {src}"
+            );
+        }
     }
 }
