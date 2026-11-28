@@ -1070,12 +1070,13 @@ pub trait Firestore {
     /// Run a query while refusing to return more than `max_results` matching
     /// candidates.
     ///
-    /// The default is a compatibility fallback: it delegates to `run_query`
-    /// and then rejects an oversized result, so existing third-party
-    /// implementations of [`Firestore`] keep compiling. That bounds the value
-    /// handed to the runtime, but *not* peak memory during collection. A
-    /// backend that must bound memory has to override this and stop before the
-    /// first extra candidate is materialized.
+    /// The default is a compatibility fallback: it delegates to `run_query`,
+    /// rejects an oversized candidate set, then applies the same order,
+    /// offset, and limit shaping as [`Firestore::run_query_page`]. Existing
+    /// third-party implementations of [`Firestore`] keep compiling. That
+    /// bounds the value handed to the runtime, but *not* peak memory during
+    /// collection. A backend that must bound memory has to override this and
+    /// stop before the first extra candidate is materialized.
     fn run_query_bounded(
         &self,
         query: &QueryRef,
@@ -1085,7 +1086,8 @@ pub trait Firestore {
         if rows.len() > max_results {
             return Err(query_result_limit_error(max_results));
         }
-        Ok(rows)
+        let order_by = parse_order_by(query)?;
+        Ok(apply_query_shape(rows, query, &order_by))
     }
 
     /// Configure a per-call timeout for backends that support one.
@@ -1520,20 +1522,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn default_page_and_count_methods_preserve_unshaped_query_semantics() {
-        let firestore = FallbackFirestore;
-        let query = QueryRef {
+    fn shaped_page_query() -> QueryRef {
+        QueryRef {
             source: QuerySource::Collection("users".to_string()),
             filters: vec![],
             order_by: vec![("ord".to_string(), Direction::Asc)],
             offset: Some(1),
             limit: Some(1),
-        };
+        }
+    }
+
+    #[test]
+    fn default_page_and_count_methods_preserve_unshaped_query_semantics() {
+        let firestore = FallbackFirestore;
+        let query = shaped_page_query();
         let page = firestore.run_query_page(&query).unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].0, "users/b");
         assert_eq!(firestore.count_query(&query).unwrap(), 3);
+    }
+
+    #[test]
+    fn default_bounded_query_applies_order_offset_and_limit() {
+        let firestore = FallbackFirestore;
+        let query = shaped_page_query();
+        let page = firestore.run_query_bounded(&query, 10).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].0, "users/b");
+    }
+
+    #[test]
+    fn default_bounded_query_rejects_oversized_candidate_sets() {
+        let firestore = FallbackFirestore;
+        let query = shaped_page_query();
+        let err = firestore.run_query_bounded(&query, 2).unwrap_err();
+        let limit = err
+            .downcast_ref::<QueryResultLimitExceeded>()
+            .expect("budget marker");
+        assert_eq!(limit.max_results, 2);
     }
 
     #[test]
