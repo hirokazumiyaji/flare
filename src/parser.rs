@@ -103,7 +103,7 @@ impl Parser {
         while !self.at(&Token::Eof) {
             spans.push(self.peek_span().unwrap_or(Span::new(1, 1)));
             out.push(self.parse_stmt()?);
-            self.skip_separators();
+            self.require_statement_separator(&Token::Eof)?;
         }
         self.validate_program_limits(&out)?;
         Ok((out, spans))
@@ -741,7 +741,7 @@ impl Parser {
         let mut body = vec![];
         while !self.at(&Token::RBrace) {
             body.push(self.parse_stmt()?);
-            self.skip_separators();
+            self.require_statement_separator(&Token::RBrace)?;
         }
         self.expect(Token::RBrace)?;
         Ok((
@@ -818,6 +818,18 @@ impl Parser {
         while self.at(&Token::Newline) || self.at(&Token::Semicolon) {
             self.bump();
         }
+    }
+    /// 文の直後で区切りを要求する。終端(`Eof` / `RBrace`)なら何もしない。
+    /// 隣接した文は位置付きの構文エラーにする。
+    fn require_statement_separator(&mut self, end: &Token) -> Result<(), Box<dyn Error>> {
+        if self.at(end) {
+            return Ok(());
+        }
+        if self.at(&Token::Newline) || self.at(&Token::Semicolon) {
+            self.skip_separators();
+            return Ok(());
+        }
+        Err(self.parse_err("expected newline or `;` between statements"))
     }
     /// delimiter の内側だけで式中の改行を透過的に無視する。delimiter の外側では
     /// 改行を文の区切りとして残す。

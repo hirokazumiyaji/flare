@@ -1604,6 +1604,50 @@ fn semicolons_remain_statement_separators() {
 }
 
 #[test]
+fn adjacent_statements_require_newline_or_semicolon() {
+    // Spec: statements are separated by newline or `;`. Adjacent tokens that
+    // start a new statement must be a positioned parse error, not silent runs.
+    for (source, at) in [
+        ("1 2", "1:3: "),
+        ("if true { 1 2 }", "1:13: "),
+        ("fn f() { 1 2 }\nf()", "1:12: "),
+        ("a = 1 b = 2", "1:7: "),
+    ] {
+        let err = run_script(source).unwrap_err();
+        let message = format!("{err}");
+        assert!(
+            message.starts_with(at),
+            "{source}: expected span prefix {at:?}, got {message}"
+        );
+        assert!(
+            message.contains("expected newline or `;` between statements"),
+            "{source}: {message}"
+        );
+    }
+
+    // Newlines and semicolons still separate statements.
+    assert_eq!(run_script("1\n2").unwrap(), Value::Int(2));
+    assert_eq!(run_script("1; 2").unwrap(), Value::Int(2));
+    assert_eq!(run_script("if true { 1; 2 }").unwrap(), Value::Int(2));
+    assert_eq!(run_script("if true { 1\n2 }").unwrap(), Value::Int(2));
+
+    // Continued expressions inside delimiters stay one expression.
+    assert_eq!(
+        run_script("[1\n+ 2]").unwrap(),
+        Value::Array(vec![Value::Int(3)])
+    );
+
+    // Parentheses-omitted call args remain one statement, not adjacent stmts.
+    assert_eq!(run_script("fn f(a) { a }\nf 3").unwrap(), Value::Int(3));
+    let err = run_script("fn f(a) { a }\nf 3 4").unwrap_err();
+    let message = format!("{err}");
+    assert!(
+        message.contains("expected newline or `;` between statements"),
+        "{message}"
+    );
+}
+
+#[test]
 fn recursive_functions_still_work() {
     let out =
         run_script("fn fact(n) { if n <= 1 { 1 } else { n * fact(n - 1) } }\nfact(5)").unwrap();
