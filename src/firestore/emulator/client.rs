@@ -474,4 +474,53 @@ mod tests {
         .expect("ready operation");
         assert_eq!(value, 7);
     }
+
+    #[test]
+    fn count_timeout_covers_stream_after_rpc() {
+        // count() wraps RunAggregationQuery / RunQuery plus the response
+        // stream in one run_operation. A stall after the RPC phase must
+        // still hit the same deadline.
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+        let error = run_operation(&runtime, Some(Duration::from_millis(20)), "count", async {
+            let _guard = DropSignal(Arc::clone(&dropped));
+            tokio::task::yield_now().await;
+            future::pending::<Result<i64, gcloud_sdk::tonic::Status>>().await
+        })
+        .expect_err("stalled count stream should time out");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "count timeout should fail fast, elapsed {elapsed:?}"
+        );
+        let flare_error = error
+            .downcast_ref::<FlareError>()
+            .expect("timeout should be a typed backend error");
+        assert_eq!(flare_error.kind, ErrorKind::Backend);
+        let message = flare_error.to_string();
+        assert!(message.contains("count"), "{message}");
+        assert!(message.contains("timed out"), "{message}");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "stream future was not cancelled"
+        );
+    }
+
+    #[test]
+    fn count_succeeds_within_operation_timeout() {
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let value = run_operation(&runtime, Some(Duration::from_millis(50)), "count", async {
+            tokio::task::yield_now().await;
+            Ok::<_, gcloud_sdk::tonic::Status>(3_i64)
+        })
+        .expect("ready count");
+        assert_eq!(value, 3);
+    }
 }

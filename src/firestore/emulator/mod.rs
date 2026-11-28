@@ -733,49 +733,48 @@ fn run_count_aggregation(
     parent: Option<&str>,
     query: StructuredAggregationQuery,
 ) -> Result<Option<i64>, Box<dyn Error>> {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return Err(std::io::Error::other(
-            "Firestore emulator calls cannot run inside an active Tokio runtime",
-        )
-        .into());
-    }
     let db = &fs.client.db;
     let parent = path::parent_path(&fs.client.project_id, parent);
-    let values = fs.client.runtime.block_on(async move {
-        let response = match db
-            .client()
-            .get()
-            .run_aggregation_query(Request::new(RunAggregationQueryRequest {
-                parent,
-                explain_options: None,
-                query_type: Some(
-                    run_aggregation_query_request::QueryType::StructuredAggregationQuery(query),
-                ),
-                consistency_selector: None,
-                request_options: None,
-            }))
-            .await
-        {
-            Ok(response) => response,
-            Err(status) if status.code() == Code::Unimplemented => return Ok(vec![]),
-            Err(status) => return Err(status),
-        };
-        let mut stream = response.into_inner();
-        let mut values = vec![];
-        loop {
-            match stream.message().await {
-                Ok(Some(row)) => {
-                    if let Some(result) = row.result {
-                        values.extend(result.aggregate_fields.into_values());
-                    }
-                }
-                Ok(None) => break,
+    let values = client::run_operation(
+        &fs.client.runtime,
+        fs.client.operation_timeout,
+        "count",
+        async move {
+            let response = match db
+                .client()
+                .get()
+                .run_aggregation_query(Request::new(RunAggregationQueryRequest {
+                    parent,
+                    explain_options: None,
+                    query_type: Some(
+                        run_aggregation_query_request::QueryType::StructuredAggregationQuery(query),
+                    ),
+                    consistency_selector: None,
+                    request_options: None,
+                }))
+                .await
+            {
+                Ok(response) => response,
                 Err(status) if status.code() == Code::Unimplemented => return Ok(vec![]),
                 Err(status) => return Err(status),
+            };
+            let mut stream = response.into_inner();
+            let mut values = vec![];
+            loop {
+                match stream.message().await {
+                    Ok(Some(row)) => {
+                        if let Some(result) = row.result {
+                            values.extend(result.aggregate_fields.into_values());
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(status) if status.code() == Code::Unimplemented => return Ok(vec![]),
+                    Err(status) => return Err(status),
+                }
             }
-        }
-        Ok::<_, gcloud_sdk::tonic::Status>(values)
-    })?;
+            Ok::<_, gcloud_sdk::tonic::Status>(values)
+        },
+    )?;
 
     match values.as_slice() {
         [] => Ok(None),
@@ -1031,12 +1030,6 @@ fn is_server_prefilter_safe(filter: &QueryFilter) -> bool {
 }
 
 fn run_count_fallback(fs: &FirestoreEmulator, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return Err(std::io::Error::other(
-            "Firestore emulator calls cannot run inside an active Tokio runtime",
-        )
-        .into());
-    }
     let server_filters = server_prefilters(&query.filters);
     let (parent, mut sq) = match &query.source {
         QuerySource::Collection(path) => {
@@ -1058,30 +1051,34 @@ fn run_count_fallback(fs: &FirestoreEmulator, query: &QueryRef) -> Result<i64, B
     });
     let db = &fs.client.db;
     let parent = path::parent_path(&fs.client.project_id, parent.as_deref());
-    let count = fs.client.runtime.block_on(async move {
-        let response = db
-            .client()
-            .get()
-            .run_query(Request::new(RunQueryRequest {
-                parent,
-                explain_options: None,
-                query_type: Some(run_query_request::QueryType::StructuredQuery(sq)),
-                consistency_selector: None,
-                request_options: None,
-            }))
-            .await?;
-        let mut stream = response.into_inner();
-        let mut count = 0_i64;
-        while let Some(row) = stream.message().await? {
-            if row.document.is_some() {
-                count = count.checked_add(1).ok_or_else(|| {
-                    gcloud_sdk::tonic::Status::resource_exhausted("query count overflow")
-                })?;
+    client::run_operation(
+        &fs.client.runtime,
+        fs.client.operation_timeout,
+        "count",
+        async move {
+            let response = db
+                .client()
+                .get()
+                .run_query(Request::new(RunQueryRequest {
+                    parent,
+                    explain_options: None,
+                    query_type: Some(run_query_request::QueryType::StructuredQuery(sq)),
+                    consistency_selector: None,
+                    request_options: None,
+                }))
+                .await?;
+            let mut stream = response.into_inner();
+            let mut count = 0_i64;
+            while let Some(row) = stream.message().await? {
+                if row.document.is_some() {
+                    count = count.checked_add(1).ok_or_else(|| {
+                        gcloud_sdk::tonic::Status::resource_exhausted("query count overflow")
+                    })?;
+                }
             }
-        }
-        Ok::<_, gcloud_sdk::tonic::Status>(count)
-    })?;
-    Ok(count)
+            Ok::<_, gcloud_sdk::tonic::Status>(count)
+        },
+    )
 }
 
 fn structured_query(
