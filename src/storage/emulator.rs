@@ -292,7 +292,14 @@ impl HttpStorageTransport {
                 }
             }
         }
-        let (response, _) = parse_http_response_with_limit(&raw, self.max_body_bytes)?;
+        let (response, complete) = parse_http_response_with_limit(&raw, self.max_body_bytes)?;
+        // Framed bodies (Content-Length / chunked) require their end marker.
+        // Connection-delimited bodies complete on EOF with complete == false.
+        if !complete && response_body_is_framed(&response.headers) {
+            return Err(StorageError::backend(
+                "storage emulator response body incomplete",
+            ));
+        }
         Ok(response)
     }
 }
@@ -825,6 +832,14 @@ fn percent_encode(value: &str) -> String {
     out
 }
 
+fn response_body_is_framed(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("transfer-encoding") && value.contains("chunked")
+    }) || headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+}
+
 pub fn parse_http_response(raw: &[u8]) -> Result<(StorageResponse, bool), StorageError> {
     parse_http_response_with_limit(raw, Some(DEFAULT_MAX_STORAGE_BODY_BYTES))
 }
@@ -1205,6 +1220,142 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("response body size exceeds limit"), "{err}");
+    }
+
+    fn bind_local_listener() -> Option<std::net::TcpListener> {
+        match std::net::TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => Some(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skip: sandbox does not permit local TCP listeners");
+                None
+            }
+            Err(error) => panic!("could not bind local test server: {error}"),
+        }
+    }
+
+    #[test]
+    fn http_transport_rejects_truncated_content_length_body() {
+        let Some(listener) = bind_local_listener() else {
+            return;
+        };
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhi")
+                .unwrap();
+        });
+        let transport = HttpStorageTransport::new(address.to_string()).unwrap();
+        let err = transport
+            .send(&StorageRequest::new("GET", "/object", vec![]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("response body incomplete"), "{err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_transport_rejects_truncated_chunked_body() {
+        let Some(listener) = bind_local_listener() else {
+            return;
+        };
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n",
+                )
+                .unwrap();
+        });
+        let transport = HttpStorageTransport::new(address.to_string()).unwrap();
+        let err = transport
+            .send(&StorageRequest::new("GET", "/object", vec![]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("response body incomplete"), "{err}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_transport_accepts_connection_delimited_body_across_split_reads() {
+        let Some(listener) = bind_local_listener() else {
+            return;
+        };
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nab")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            stream.write_all(b"cdef").unwrap();
+        });
+        let transport = HttpStorageTransport::new(address.to_string()).unwrap();
+        let response = transport
+            .send(&StorageRequest::new("GET", "/object", vec![]))
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"abcdef");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_transport_reassembles_split_content_length_reads() {
+        let Some(listener) = bind_local_listener() else {
+            return;
+        };
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nab")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            stream.write_all(b"cd").unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            stream.write_all(b"ef").unwrap();
+        });
+        let transport = HttpStorageTransport::new(address.to_string()).unwrap();
+        let response = transport
+            .send(&StorageRequest::new("GET", "/object", vec![]))
+            .unwrap();
+        assert_eq!(response.body, b"abcdef");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_transport_reassembles_split_chunked_reads() {
+        let Some(listener) = bind_local_listener() else {
+            return;
+        };
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n",
+                )
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            stream.write_all(b"3\r\ndef\r\n0\r\n\r\n").unwrap();
+        });
+        let transport = HttpStorageTransport::new(address.to_string()).unwrap();
+        let response = transport
+            .send(&StorageRequest::new("GET", "/object", vec![]))
+            .unwrap();
+        assert_eq!(response.body, b"abcdef");
+        server.join().unwrap();
     }
 
     #[test]
