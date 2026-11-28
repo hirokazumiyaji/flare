@@ -275,6 +275,28 @@ without_headers = CSV.parse(csv_text)
 }
 
 #[test]
+fn csv_parse_rejects_duplicate_headers() {
+    let err = run_script(r#"CSV.parse("name,name\nAda,Bob", headers: true)"#).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("duplicate header key") && msg.contains("name"),
+        "expected duplicate header error, got: {msg}"
+    );
+}
+
+#[test]
+fn csv_parse_headerless_keeps_duplicate_values() {
+    let res = run_script(r#"CSV.parse("Ada,Ada\nBob,Bob")"#).unwrap();
+    assert_eq!(
+        res,
+        Value::Array(vec![
+            Value::Array(vec![Value::Str("Ada".into()), Value::Str("Ada".into())]),
+            Value::Array(vec![Value::Str("Bob".into()), Value::Str("Bob".into())]),
+        ])
+    );
+}
+
+#[test]
 fn csv_generate_from_maps_and_arrays() {
     let script = r#"
 maps = [
@@ -306,6 +328,17 @@ csv_from_arrays = CSV.generate(arrays)
     assert!(maps_csv.contains("Bob"));
 
     assert_eq!(arrays_csv, "x,y\n10,20\n");
+}
+
+#[test]
+fn yaml_parse_rejects_stringified_key_collision() {
+    // Numeric 1 and string "1" are distinct YAML keys but collide after stringification.
+    let err = run_script(r#"YAML.parse("1: a\n\"1\": b\n")"#).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("duplicate map key") && msg.contains('1'),
+        "expected duplicate map key error, got: {msg}"
+    );
 }
 
 #[test]

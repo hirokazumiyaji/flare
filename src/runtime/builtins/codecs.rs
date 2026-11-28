@@ -104,7 +104,8 @@ pub fn builtin_csv_parse(
             .headers()
             .map_err(|e| format!("CSV.parse headers error: {e}"))?;
         let mut headers = Vec::new();
-        for h in raw_headers.iter() {
+        let mut seen_headers = BTreeMap::new();
+        for (col, h) in raw_headers.iter().enumerate() {
             total_nodes = total_nodes.saturating_add(1);
             if let Some(limit) = max_nodes {
                 if total_nodes > limit {
@@ -114,7 +115,15 @@ pub fn builtin_csv_parse(
                     .into());
                 }
             }
-            headers.push(h.to_string());
+            let header = h.to_string();
+            if let Some(first_col) = seen_headers.get(&header) {
+                return Err(format!(
+                    "CSV.parse error: duplicate header key \"{header}\" at columns {first_col} and {col}"
+                )
+                .into());
+            }
+            seen_headers.insert(header.clone(), col);
+            headers.push(header);
         }
         let mut rows = Vec::new();
         for record_res in reader.records() {
@@ -472,6 +481,9 @@ fn yaml_to_value(
                     serde_yaml::Value::Bool(b) => b.to_string(),
                     other => format!("{other:?}"),
                 };
+                if m.contains_key(&key_str) {
+                    return Err(format!("YAML.parse error: duplicate map key \"{key_str}\"").into());
+                }
                 m.insert(
                     key_str,
                     yaml_to_value(v, next_depth, max_depth, nodes, max_nodes)?,
