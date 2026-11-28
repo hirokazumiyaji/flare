@@ -1106,6 +1106,12 @@ fn structured_query(
     })
 }
 
+// Firestore timestamps keep nanoseconds. Flare's `Timestamp` is second-only,
+// so a wire `==` with `nanos = 0` drops same-second rows that still carry
+// nanos (for example `serverTimestamp()`). Expand comparisons to cover the
+// whole Flare second before they leave as server prefilters.
+const MAX_TIMESTAMP_NANOS: i32 = 999_999_999;
+
 // `filters` is the deliberately small, server-safe subset selected by
 // `server_prefilters`; all original filters are checked again locally.
 fn build_where(
@@ -1115,6 +1121,12 @@ fn build_where(
     let mut parts = vec![];
     for f in filters {
         let field_path = parse_query_field_path(&f.field)?;
+        if !field_path.is_document_id() {
+            if let Value::Timestamp(ts) = &f.value {
+                push_timestamp_second_filters(&mut parts, field_path.wire(), f.op, ts.seconds)?;
+                continue;
+            }
+        }
         let op = match f.op {
             QueryOp::Eq => structured_query::field_filter::Operator::Equal,
             QueryOp::Ne => structured_query::field_filter::Operator::NotEqual,
@@ -1132,17 +1144,7 @@ fn build_where(
         } else {
             codec::encode_query_value(project_id, &f.value)?
         };
-        parts.push(structured_query::Filter {
-            filter_type: Some(structured_query::filter::FilterType::FieldFilter(
-                structured_query::FieldFilter {
-                    field: Some(structured_query::FieldReference {
-                        field_path: field_path.wire().to_string(),
-                    }),
-                    op: op.into(),
-                    value: Some(value),
-                },
-            )),
-        });
+        parts.push(field_filter(field_path.wire(), op, value));
     }
     Ok(match parts.len() {
         0 => None,
@@ -1156,6 +1158,92 @@ fn build_where(
             )),
         }),
     })
+}
+
+fn wire_timestamp(seconds: i64, nanos: i32) -> gcloud_sdk::google::firestore::v1::Value {
+    gcloud_sdk::google::firestore::v1::Value {
+        value_type: Some(firestore_value::ValueType::TimestampValue(
+            prost_types::Timestamp { seconds, nanos },
+        )),
+    }
+}
+
+fn field_filter(
+    field_path: &str,
+    op: structured_query::field_filter::Operator,
+    value: gcloud_sdk::google::firestore::v1::Value,
+) -> structured_query::Filter {
+    structured_query::Filter {
+        filter_type: Some(structured_query::filter::FilterType::FieldFilter(
+            structured_query::FieldFilter {
+                field: Some(structured_query::FieldReference {
+                    field_path: field_path.to_string(),
+                }),
+                op: op.into(),
+                value: Some(value),
+            },
+        )),
+    }
+}
+
+fn push_timestamp_second_filters(
+    parts: &mut Vec<structured_query::Filter>,
+    field_path: &str,
+    op: QueryOp,
+    seconds: i64,
+) -> Result<(), Box<dyn Error>> {
+    let start = wire_timestamp(seconds, 0);
+    let end_inclusive = wire_timestamp(seconds, MAX_TIMESTAMP_NANOS);
+    match op {
+        QueryOp::Eq => {
+            parts.push(field_filter(
+                field_path,
+                structured_query::field_filter::Operator::GreaterThanOrEqual,
+                start,
+            ));
+            parts.push(field_filter(
+                field_path,
+                structured_query::field_filter::Operator::LessThanOrEqual,
+                end_inclusive,
+            ));
+        }
+        QueryOp::Gt => {
+            parts.push(field_filter(
+                field_path,
+                structured_query::field_filter::Operator::GreaterThan,
+                end_inclusive,
+            ));
+        }
+        QueryOp::Ge => {
+            parts.push(field_filter(
+                field_path,
+                structured_query::field_filter::Operator::GreaterThanOrEqual,
+                start,
+            ));
+        }
+        QueryOp::Lt => {
+            parts.push(field_filter(
+                field_path,
+                structured_query::field_filter::Operator::LessThan,
+                start,
+            ));
+        }
+        QueryOp::Le => {
+            parts.push(field_filter(
+                field_path,
+                structured_query::field_filter::Operator::LessThanOrEqual,
+                end_inclusive,
+            ));
+        }
+        QueryOp::Ne
+        | QueryOp::In
+        | QueryOp::NotIn
+        | QueryOp::ArrayContains
+        | QueryOp::ArrayContainsAny => {
+            return Err(format!("timestamp query op {op:?} is not a server prefilter").into());
+        }
+    }
+    Ok(())
 }
 
 /// `__name__` is a document reference on the wire, while the public API uses
@@ -1334,5 +1422,137 @@ mod tests {
                 other => panic!("unexpected test case: {other:?}"),
             }
         }
+    }
+
+    fn field_filters(filter: structured_query::Filter) -> Vec<structured_query::FieldFilter> {
+        match filter.filter_type {
+            Some(structured_query::filter::FilterType::FieldFilter(field_filter)) => {
+                vec![field_filter]
+            }
+            Some(structured_query::filter::FilterType::CompositeFilter(composite)) => composite
+                .filters
+                .into_iter()
+                .map(|part| match part.filter_type {
+                    Some(structured_query::filter::FilterType::FieldFilter(field_filter)) => {
+                        field_filter
+                    }
+                    other => panic!("expected field filter part, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected field or composite filter, got {other:?}"),
+        }
+    }
+
+    fn timestamp_parts(value: &gcloud_sdk::google::firestore::v1::Value) -> (i64, i32) {
+        match &value.value_type {
+            Some(firestore_value::ValueType::TimestampValue(ts)) => (ts.seconds, ts.nanos),
+            other => panic!("expected timestamp value, got {other:?}"),
+        }
+    }
+
+    /// Wire bounds for a Flare second: inclusive start/end of that second.
+    fn covers_stored_nanos(seconds: i64, nanos: i32, lower: (i64, i32), upper: (i64, i32)) -> bool {
+        let stored = (seconds, nanos);
+        stored >= lower && stored <= upper
+    }
+
+    #[test]
+    fn build_where_expands_timestamp_equality_to_the_flare_second() {
+        let filter = build_where(
+            "p",
+            &[QueryFilter {
+                field: "ts".to_string(),
+                op: QueryOp::Eq,
+                value: Value::Timestamp(crate::value::Timestamp { seconds: 100 }),
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        let parts = field_filters(filter);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0].op,
+            structured_query::field_filter::Operator::GreaterThanOrEqual as i32
+        );
+        assert_eq!(
+            parts[1].op,
+            structured_query::field_filter::Operator::LessThanOrEqual as i32
+        );
+        let lower = timestamp_parts(parts[0].value.as_ref().unwrap());
+        let upper = timestamp_parts(parts[1].value.as_ref().unwrap());
+        assert_eq!(lower, (100, 0));
+        assert_eq!(upper, (100, MAX_TIMESTAMP_NANOS));
+
+        // Second start, mid-second, and adjacent seconds: only the matching
+        // second stays inside the server prefilter window.
+        let fixtures = [
+            (100, 0, true),
+            (100, 500_000_000, true),
+            (100, MAX_TIMESTAMP_NANOS, true),
+            (99, MAX_TIMESTAMP_NANOS, false),
+            (101, 0, false),
+        ];
+        for (seconds, nanos, keep) in fixtures {
+            assert_eq!(
+                covers_stored_nanos(seconds, nanos, lower, upper),
+                keep,
+                "seconds={seconds} nanos={nanos}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_where_timestamp_ranges_match_flare_second_precision() {
+        let cases = [
+            (
+                QueryOp::Ge,
+                structured_query::field_filter::Operator::GreaterThanOrEqual,
+                (100, 0),
+            ),
+            (
+                QueryOp::Gt,
+                structured_query::field_filter::Operator::GreaterThan,
+                (100, MAX_TIMESTAMP_NANOS),
+            ),
+            (
+                QueryOp::Lt,
+                structured_query::field_filter::Operator::LessThan,
+                (100, 0),
+            ),
+            (
+                QueryOp::Le,
+                structured_query::field_filter::Operator::LessThanOrEqual,
+                (100, MAX_TIMESTAMP_NANOS),
+            ),
+        ];
+        for (op, wire_op, bound) in cases {
+            let filter = build_where(
+                "p",
+                &[QueryFilter {
+                    field: "ts".to_string(),
+                    op,
+                    value: Value::Timestamp(crate::value::Timestamp { seconds: 100 }),
+                }],
+            )
+            .unwrap()
+            .unwrap();
+            let parts = field_filters(filter);
+            assert_eq!(parts.len(), 1, "{op:?}");
+            assert_eq!(parts[0].op, wire_op as i32, "{op:?}");
+            assert_eq!(
+                timestamp_parts(parts[0].value.as_ref().unwrap()),
+                bound,
+                "{op:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_equality_remains_a_server_prefilter() {
+        assert!(is_server_prefilter_safe(&QueryFilter {
+            field: "ts".to_string(),
+            op: QueryOp::Eq,
+            value: Value::Timestamp(crate::value::Timestamp { seconds: 1 }),
+        }));
     }
 }
