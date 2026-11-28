@@ -244,7 +244,9 @@ pub fn builtin_csv_generate(
         }
     }
 
-    let bounded = wtr.into_inner().map_err(|e| e.error().to_string())?;
+    let bounded = wtr
+        .into_inner()
+        .map_err(|e| promote_resource_limit(e.error().to_string().into()))?;
     let bytes = bounded.into_inner();
     let text = String::from_utf8(bytes).map_err(|e| format!("CSV.generate error: {e}"))?;
     let result = Value::Str(text);

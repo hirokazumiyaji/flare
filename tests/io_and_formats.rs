@@ -414,20 +414,54 @@ backup_rows = JSON.parse(backup_content)
     );
 }
 
+fn assert_uncatchable_file_io_budget(err: Box<dyn std::error::Error>, needle: &str) {
+    let text = err.to_string();
+    assert!(text.contains(needle), "expected {needle:?} in {text:?}");
+    assert!(
+        !text.contains("rescued"),
+        "BudgetError must bypass try/rescue: {text:?}"
+    );
+}
+
 #[test]
 fn data_codecs_respect_resource_limits() {
     let limits = RuntimeLimits::default().with_max_file_io_bytes(20);
 
-    // CSV generate exceeding 20 bytes
-    let script = r#"
-data = [
-  {"name": "very long person name exceeding twenty bytes", "age": 30}
-]
-CSV.generate(data)
+    let ok = run_script_with_services_and_limits(
+        r#"CSV.generate([{"a": "1"}])"#,
+        Services::in_memory(),
+        limits,
+    )
+    .unwrap();
+    assert_eq!(ok, Value::Str("a\n1\n".into()));
+
+    // Final-flush oversize: payload fits the csv writer buffer, so the limit
+    // trips in into_inner rather than write_record.
+    let flush_script = r#"
+try {
+  CSV.generate([{"name": "very long person name exceeding twenty bytes", "age": 30}])
+  "ok"
+} rescue { "rescued" }
 "#;
     let err =
-        run_script_with_services_and_limits(script, Services::in_memory(), limits).unwrap_err();
-    assert!(err.to_string().contains("max file io bytes (20)"));
+        run_script_with_services_and_limits(flush_script, Services::in_memory(), limits).unwrap_err();
+    assert_uncatchable_file_io_budget(err, "max file io bytes (20)");
+
+    // Write-time oversize: exceed the csv writer's 8KiB buffer so the flush
+    // happens inside write_record (map_csv_error), not only into_inner.
+    let write_limits = RuntimeLimits::default().with_max_file_io_bytes(100);
+    let big = "x".repeat(9000);
+    let write_script = format!(
+        r#"
+try {{
+  CSV.generate([["{big}"]])
+  "ok"
+}} rescue {{ "rescued" }}
+"#
+    );
+    let err = run_script_with_services_and_limits(&write_script, Services::in_memory(), write_limits)
+        .unwrap_err();
+    assert_uncatchable_file_io_budget(err, "max file io bytes (100)");
 
     // JSON generate exceeding 20 bytes
     let script_json = r#"
