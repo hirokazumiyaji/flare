@@ -345,6 +345,59 @@ re_parsed = YAML.parse(generated)
     );
 }
 
+/// Contract for a serde_yaml replacement that drops unsafe-libyaml.
+/// Keep these observables when swapping the YAML crate.
+#[test]
+fn yaml_edge_roundtrip_contract() {
+    let script = r#"
+src = "
+empty_map: {}
+empty_list: []
+missing: null
+flag: true
+count: 0
+nested:
+  leaf: hi
+"
+data = YAML.parse(src)
+text = YAML.generate(data)
+again = YAML.parse(text)
+ts_text = YAML.generate(timestamp(0))
+[
+  data["empty_map"],
+  data["empty_list"],
+  data["missing"],
+  data["flag"],
+  data["count"],
+  data["nested"]["leaf"],
+  again["empty_map"],
+  again["empty_list"],
+  again["missing"],
+  again["nested"]["leaf"],
+  ts_text,
+  YAML.parse(ts_text)
+]
+"#;
+    let res = run_script(script).unwrap();
+    assert_eq!(
+        res,
+        Value::Array(vec![
+            Value::Map(Default::default()),
+            Value::Array(vec![]),
+            Value::Nil,
+            Value::Bool(true),
+            Value::Int(0),
+            Value::Str("hi".into()),
+            Value::Map(Default::default()),
+            Value::Array(vec![]),
+            Value::Nil,
+            Value::Str("hi".into()),
+            Value::Str("1970-01-01T00:00:00+00:00\n".into()),
+            Value::Str("1970-01-01T00:00:00+00:00".into()),
+        ])
+    );
+}
+
 #[test]
 fn issue_164_usage_scenarios_import_and_export() {
     let temp = TempDirGuard::new("issue_164");
