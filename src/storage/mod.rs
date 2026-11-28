@@ -11,7 +11,8 @@ mod unavailable;
 pub use emulator::{
     parse_http_response, parse_http_response_with_limit, HttpStorageTransport, StorageEmulator,
     StorageRequest, StorageResponse, StorageTransport, DEFAULT_MAX_STORAGE_BODY_BYTES,
-    DEFAULT_MAX_STORAGE_RESPONSE_BYTES, STORAGE_HEADER_ALLOWANCE_BYTES,
+    DEFAULT_MAX_STORAGE_METADATA_BYTES, DEFAULT_MAX_STORAGE_RESPONSE_BYTES,
+    STORAGE_HEADER_ALLOWANCE_BYTES,
 };
 
 /// Short aliases for callers that name the transport after its role.

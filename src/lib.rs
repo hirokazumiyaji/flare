@@ -49,8 +49,8 @@ pub use storage::{
     parse_http_response, parse_http_response_with_limit, HttpStorageTransport, HttpTransport,
     InMemoryStorage, Storage, StorageEmulator, StorageError, StorageErrorKind,
     StorageHttpTransport, StorageMetadata, StorageRequest, StorageResponse, StorageTransport,
-    UnavailableStorage, DEFAULT_MAX_STORAGE_BODY_BYTES, DEFAULT_MAX_STORAGE_RESPONSE_BYTES,
-    STORAGE_HEADER_ALLOWANCE_BYTES,
+    UnavailableStorage, DEFAULT_MAX_STORAGE_BODY_BYTES, DEFAULT_MAX_STORAGE_METADATA_BYTES,
+    DEFAULT_MAX_STORAGE_RESPONSE_BYTES, STORAGE_HEADER_ALLOWANCE_BYTES,
 };
 pub use value::{
     drop_value_iteratively, validate_value_depth, validate_value_limits,
