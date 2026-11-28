@@ -144,6 +144,43 @@ fn repl_stream_enforces_source_size_budget_on_pending_buffer() {
 }
 
 #[test]
+fn repl_stream_diagnoses_incomplete_input_at_eof() {
+    let mut rt = Runtime::new(InMemoryFirestore::default());
+
+    let mut output = Vec::new();
+    run_stream(&mut rt, &b"1 + 1\n"[..], &mut output).unwrap();
+    assert_eq!(String::from_utf8(output).unwrap(), "=> 2\n");
+
+    let mut output = Vec::new();
+    let err = run_stream(&mut rt, &b"1 + 1\nfn unfinished() {\n"[..], &mut output).unwrap_err();
+    assert!(
+        err.to_string().contains("incomplete input at end of stream"),
+        "block EOF error was: {err}"
+    );
+    assert_eq!(String::from_utf8(output).unwrap(), "=> 2\n");
+
+    let mut output = Vec::new();
+    let err = run_stream(&mut rt, &b"[1, 2,\n"[..], &mut output).unwrap_err();
+    assert!(
+        err.to_string().contains("incomplete input at end of stream"),
+        "array EOF error was: {err}"
+    );
+    assert!(output.is_empty());
+
+    let mut output = Vec::new();
+    let err = run_stream(&mut rt, &b"\"unterminated\n"[..], &mut output).unwrap_err();
+    assert!(
+        err.to_string().contains("incomplete input at end of stream"),
+        "string EOF error was: {err}"
+    );
+    assert!(output.is_empty());
+
+    let mut output = Vec::new();
+    run_stream(&mut rt, &b""[..], &mut output).unwrap();
+    assert!(output.is_empty());
+}
+
+#[test]
 fn repl_loop_handles_continuation_prompt_and_syntax_error_recovery() {
     use flare::repl::run_repl_loop;
     use rustyline::error::ReadlineError;
