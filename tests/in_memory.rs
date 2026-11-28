@@ -2838,6 +2838,37 @@ fn where_supports_array_contains_operators() {
 }
 
 #[test]
+fn unpaged_count_matches_get_len_for_local_and_multi_and_filters() {
+    // Contract shared with `emulator_unpaged_count_matches_get_len_for_local_filters`.
+    // Local-only operators and multi-AND must keep get().len() == count(), and
+    // order_by / offset / limit must not change the count.
+    let setup = r#"set("users/a", {v: 1, tags: []})
+set("users/z", {v: 1, tags: ["x"]})
+set("users/m", {v: 2, tags: ["x"], active: true})"#;
+    let out = run_script(&format!(
+        r#"{setup}
+[
+  col("users").where("tags", "array_contains", "x").get().len(),
+  col("users").where("tags", "array_contains", "x").count(),
+  col("users").where("v", "==", 1).where("tags", "array_contains", "x").get().len(),
+  col("users").where("v", "==", 1).where("tags", "array_contains", "x").count(),
+  col("users").where("tags", "array_contains", "x").order_by("v", "desc").offset(1).limit(1).count(),
+]"#
+    ))
+    .unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(2),
+            Value::Int(2),
+            Value::Int(1),
+            Value::Int(1),
+            Value::Int(2),
+        ])
+    );
+}
+
+#[test]
 fn membership_null_and_empty_array_queries_match_emulator_matrix() {
     // Keep this matrix in lockstep with
     // `emulator_membership_null_and_empty_array_queries_match_in_memory`.

@@ -495,30 +495,38 @@ impl Firestore for FirestoreEmulator {
 
     fn count_query(&self, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
         super::validate_query_filters(&query.filters)?;
+        // Match `run_query`: parse filters before any RPC so both backends
+        // reject the same malformed paths / oversized values.
+        super::prepare_query_filters(&query.filters)?;
         let server_filters = server_prefilters(&query.filters);
-        let (parent, aggregation) = match &query.source {
-            QuerySource::Collection(path) => {
-                let (parent, collection_id) = path::split_collection_path(path)?;
-                let sq = structured_query(
-                    &self.client.project_id,
-                    collection_id,
-                    false,
-                    &server_filters,
-                )?;
-                (parent, count_aggregation_query(sq)?)
-            }
-            QuerySource::CollectionGroup(id) => {
-                let sq = structured_query(&self.client.project_id, id, true, &server_filters)?;
-                (None, count_aggregation_query(sq)?)
-            }
-        };
+        // Aggregation only sees the server-safe subset (at most one filter).
+        // When any filter still needs local evaluation, skip aggregation and
+        // count candidates with the shared matcher so `count()` matches
+        // unpaged `get().len()`.
+        if aggregation_covers_filters(&query.filters) {
+            let (parent, aggregation) = match &query.source {
+                QuerySource::Collection(path) => {
+                    let (parent, collection_id) = path::split_collection_path(path)?;
+                    let sq = structured_query(
+                        &self.client.project_id,
+                        collection_id,
+                        false,
+                        &server_filters,
+                    )?;
+                    (parent, count_aggregation_query(sq)?)
+                }
+                QuerySource::CollectionGroup(id) => {
+                    let sq = structured_query(&self.client.project_id, id, true, &server_filters)?;
+                    (None, count_aggregation_query(sq)?)
+                }
+            };
 
-        if let Some(count) = run_count_aggregation(self, parent.as_deref(), aggregation)? {
-            return Ok(count);
+            if let Some(count) = run_count_aggregation(self, parent.as_deref(), aggregation)? {
+                return Ok(count);
+            }
         }
-        // 古い emulator が aggregation RPC を実装しない場合は、__name__ だけを
-        // 返す projection query へフォールバックし、全フィールドを materialize
-        // せずに件数を取得する。
+        // Aggregation unavailable, or filters remain for local evaluation:
+        // fetch candidates and apply the full predicate locally.
         run_count_fallback(self, query)
     }
 
@@ -1003,6 +1011,13 @@ fn server_prefilters(filters: &[QueryFilter]) -> Vec<QueryFilter> {
         .collect()
 }
 
+/// True when every filter is included in the server-safe subset sent to an
+/// aggregation query. False means at least one filter must be evaluated
+/// locally, so a server `COUNT(*)` would over-count.
+fn aggregation_covers_filters(filters: &[QueryFilter]) -> bool {
+    server_prefilters(filters).len() == filters.len()
+}
+
 fn is_server_prefilter_safe(filter: &QueryFilter) -> bool {
     // `__name__` の equality には Firestore の完全リソース名が必要で、
     // relative path を scalar string として送ると server が候補を除外する。
@@ -1031,14 +1046,8 @@ fn is_server_prefilter_safe(filter: &QueryFilter) -> bool {
 }
 
 fn run_count_fallback(fs: &FirestoreEmulator, query: &QueryRef) -> Result<i64, Box<dyn Error>> {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return Err(std::io::Error::other(
-            "Firestore emulator calls cannot run inside an active Tokio runtime",
-        )
-        .into());
-    }
     let server_filters = server_prefilters(&query.filters);
-    let (parent, mut sq) = match &query.source {
+    let (parent, sq) = match &query.source {
         QuerySource::Collection(path) => {
             let (parent, collection_id) = path::split_collection_path(path)?;
             (
@@ -1051,37 +1060,11 @@ fn run_count_fallback(fs: &FirestoreEmulator, query: &QueryRef) -> Result<i64, B
             structured_query(&fs.client.project_id, id, true, &server_filters)?,
         ),
     };
-    sq.select = Some(structured_query::Projection {
-        fields: vec![structured_query::FieldReference {
-            field_path: "__name__".to_string(),
-        }],
-    });
-    let db = &fs.client.db;
-    let parent = path::parent_path(&fs.client.project_id, parent.as_deref());
-    let count = fs.client.runtime.block_on(async move {
-        let response = db
-            .client()
-            .get()
-            .run_query(Request::new(RunQueryRequest {
-                parent,
-                explain_options: None,
-                query_type: Some(run_query_request::QueryType::StructuredQuery(sq)),
-                consistency_selector: None,
-                request_options: None,
-            }))
-            .await?;
-        let mut stream = response.into_inner();
-        let mut count = 0_i64;
-        while let Some(row) = stream.message().await? {
-            if row.document.is_some() {
-                count = count.checked_add(1).ok_or_else(|| {
-                    gcloud_sdk::tonic::Status::resource_exhausted("query count overflow")
-                })?;
-            }
-        }
-        Ok::<_, gcloud_sdk::tonic::Status>(count)
-    })?;
-    Ok(count)
+    // Same candidate path as `get()`: server prefilters narrow, then the
+    // shared matcher decides. Needed so locally-evaluated operators
+    // (`array_contains`, multi-AND leftovers, …) affect the count.
+    let rows = run_query_candidates(fs, parent.as_deref(), sq, &query.filters)?;
+    i64::try_from(rows.len()).map_err(|_| "query count overflow".into())
 }
 
 fn structured_query(
@@ -1250,6 +1233,33 @@ mod tests {
             .order_by
             .push(("ord".to_string(), crate::value::Direction::Asc));
         assert!(!can_push_path_page(&query));
+    }
+
+    #[test]
+    fn aggregation_covers_filters_only_when_server_subset_is_complete() {
+        assert!(aggregation_covers_filters(&[]));
+        assert!(aggregation_covers_filters(&[QueryFilter {
+            field: "age".to_string(),
+            op: QueryOp::Ge,
+            value: Value::Int(20),
+        }]));
+        assert!(!aggregation_covers_filters(&[QueryFilter {
+            field: "tags".to_string(),
+            op: QueryOp::ArrayContains,
+            value: Value::Str("x".to_string()),
+        }]));
+        assert!(!aggregation_covers_filters(&[
+            QueryFilter {
+                field: "age".to_string(),
+                op: QueryOp::Ge,
+                value: Value::Int(20),
+            },
+            QueryFilter {
+                field: "active".to_string(),
+                op: QueryOp::Eq,
+                value: Value::Bool(true),
+            },
+        ]));
     }
 
     #[test]
