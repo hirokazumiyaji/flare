@@ -17,8 +17,7 @@ use crate::runtime::contract::{
 };
 use crate::runtime::error::RuntimeError;
 use crate::runtime::methods::{
-    check_method_receiver, eval_method_call, module_builtin_spec, required_service_for_method,
-    validate_method_call,
+    check_method_receiver, eval_method_call, required_service_for_method, validate_method_call,
 };
 use crate::services::ServiceAccess;
 use crate::value::{self, BuiltinModule, UserFunc};
@@ -893,17 +892,30 @@ impl Evaluator<'_> {
             } else {
                 BTreeMap::new()
             };
-            let spec = if let Some(Value::Module(module)) = receiver_value.as_ref() {
-                let spec = module_builtin_spec(*module, name)?;
-                let label = format!("{}.{name}", module.name());
-                validate_call_contract(
-                    &label,
-                    positional_arg_count(args),
-                    &keyword_names,
-                    block,
-                    spec.contract,
-                )?;
-                Some(spec)
+            let spec = if let Some(rec @ Value::Module(module)) = receiver_value.as_ref() {
+                match lookup_module_builtin(*module, name) {
+                    Some(spec) => {
+                        let label = format!("{}.{name}", module.name());
+                        validate_call_contract(
+                            &label,
+                            positional_arg_count(args),
+                            &keyword_names,
+                            block,
+                            spec.contract,
+                        )?;
+                        Some(spec)
+                    }
+                    None => {
+                        validate_method_call(
+                            rec,
+                            name,
+                            positional_arg_count(args),
+                            &keyword_names,
+                            block,
+                        )?;
+                        None
+                    }
+                }
             } else if let Some(rec) = receiver_value.as_ref() {
                 validate_method_call(rec, name, positional_arg_count(args), &keyword_names, block)?;
                 None
@@ -1057,11 +1069,7 @@ impl Evaluator<'_> {
         call_span: Span,
     ) -> Result<ExecFlow, Box<dyn Error>> {
         if let Some(rec) = receiver {
-            if let Value::Module(module) = rec {
-                let spec = match spec {
-                    Some(spec) => spec,
-                    None => module_builtin_spec(module, name)?,
-                };
+            if let (Value::Module(_), Some(spec)) = (&rec, spec) {
                 return (spec.handler)(self, args, kwargs, block);
             }
             if !kwargs.is_empty() {
