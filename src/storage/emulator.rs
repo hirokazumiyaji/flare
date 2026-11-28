@@ -18,8 +18,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 use crate::limits::DEFAULT_MAX_BYTES_SIZE;
 
-/// Default maximum allowed body size for storage emulator responses (50 MiB).
+/// Default maximum allowed object-body size for storage emulator responses (50 MiB).
 pub const DEFAULT_MAX_STORAGE_BODY_BYTES: usize = DEFAULT_MAX_BYTES_SIZE;
+
+/// Maximum allowed JSON metadata response size. Kept separate from the object
+/// body budget so a tight `--max-bytes-size` does not reject a normal upload
+/// or metadata reply.
+pub const DEFAULT_MAX_STORAGE_METADATA_BYTES: usize = 1024 * 1024;
 
 /// Additional byte allowance for HTTP status line and response headers (64 KiB).
 pub const STORAGE_HEADER_ALLOWANCE_BYTES: usize = 64 * 1024;
@@ -27,6 +32,10 @@ pub const STORAGE_HEADER_ALLOWANCE_BYTES: usize = 64 * 1024;
 /// Default maximum allowed total raw response size (headers + body).
 pub const DEFAULT_MAX_STORAGE_RESPONSE_BYTES: usize =
     DEFAULT_MAX_STORAGE_BODY_BYTES + STORAGE_HEADER_ALLOWANCE_BYTES;
+
+fn transport_body_limit(max_object_bytes: Option<usize>) -> Option<usize> {
+    max_object_bytes.map(|max| max.max(DEFAULT_MAX_STORAGE_METADATA_BYTES))
+}
 
 use serde_json::Value as JsonValue;
 
@@ -422,7 +431,7 @@ impl<T: StorageTransport> StorageEmulator<T> {
             )));
         }
         transport.set_limits(
-            Some(DEFAULT_MAX_STORAGE_BODY_BYTES),
+            transport_body_limit(Some(DEFAULT_MAX_STORAGE_BODY_BYTES)),
             STORAGE_HEADER_ALLOWANCE_BYTES,
         );
         let bucket = format!("{project_id}.appspot.com");
@@ -458,11 +467,16 @@ impl<T: StorageTransport> StorageEmulator<T> {
         let max = max.into();
         self.max_bytes_size = max;
         self.transport
-            .set_limits(max, STORAGE_HEADER_ALLOWANCE_BYTES);
+            .set_limits(transport_body_limit(max), STORAGE_HEADER_ALLOWANCE_BYTES);
     }
 
     pub fn max_bytes_size(&self) -> Option<usize> {
         self.max_bytes_size
+    }
+
+    fn metadata_response_limit(&self) -> Option<usize> {
+        self.max_bytes_size
+            .map(|_| DEFAULT_MAX_STORAGE_METADATA_BYTES)
     }
 
     /// Override the emulator bucket. Normally it is `{project_id}.appspot.com`.
@@ -554,9 +568,10 @@ impl<T: StorageTransport> StorageEmulator<T> {
         &self,
         request: &StorageRequest,
         path: &str,
+        max_response_body: Option<usize>,
     ) -> Result<StorageResponse, Box<dyn Error>> {
         let response = self.transport.send(request)?;
-        if let Some(max) = self.max_bytes_size {
+        if let Some(max) = max_response_body {
             if response.body.len() > max {
                 return Err(StorageError::backend(format!(
                     "storage emulator response body size exceeds limit: {} (max {max})",
@@ -617,7 +632,7 @@ impl<T: StorageTransport> Storage for StorageEmulator<T> {
             headers: self.request_headers(Some(content_type)),
             body: data.to_vec(),
         };
-        let response = self.send_checked(&request, path)?;
+        let response = self.send_checked(&request, path, self.metadata_response_limit())?;
         parse_metadata(
             &response.body,
             path,
@@ -635,7 +650,9 @@ impl<T: StorageTransport> Storage for StorageEmulator<T> {
             headers: self.request_headers(None),
             body: vec![],
         };
-        Ok(self.send_checked(&request, path)?.body)
+        Ok(self
+            .send_checked(&request, path, self.max_bytes_size)?
+            .body)
     }
 
     fn metadata(&self, path: &str) -> Result<StorageMetadata, Box<dyn Error>> {
@@ -646,7 +663,7 @@ impl<T: StorageTransport> Storage for StorageEmulator<T> {
             headers: self.request_headers(None),
             body: vec![],
         };
-        let response = self.send_checked(&request, path)?;
+        let response = self.send_checked(&request, path, self.metadata_response_limit())?;
         parse_metadata(&response.body, path, &self.bucket, None, None)
     }
 
@@ -658,7 +675,7 @@ impl<T: StorageTransport> Storage for StorageEmulator<T> {
             headers: self.request_headers(None),
             body: vec![],
         };
-        self.send_checked(&request, path)?;
+        self.send_checked(&request, path, self.metadata_response_limit())?;
         Ok(())
     }
 }
@@ -1282,16 +1299,70 @@ mod tests {
             .unwrap()
             .with_max_bytes_size(4096);
         assert_eq!(emulator.max_bytes_size(), Some(4096));
-        assert_eq!(emulator.transport().max_body_bytes(), Some(4096));
+        // Transport must allow metadata replies even when the object budget is tight.
+        assert_eq!(
+            emulator.transport().max_body_bytes(),
+            Some(DEFAULT_MAX_STORAGE_METADATA_BYTES)
+        );
         assert_eq!(
             emulator.transport().max_response_bytes(),
-            Some(4096 + STORAGE_HEADER_ALLOWANCE_BYTES)
+            Some(DEFAULT_MAX_STORAGE_METADATA_BYTES + STORAGE_HEADER_ALLOWANCE_BYTES)
         );
 
         emulator.set_max_bytes_size(None);
         assert_eq!(emulator.max_bytes_size(), None);
         assert_eq!(emulator.transport().max_body_bytes(), None);
         assert_eq!(emulator.transport().max_response_bytes(), None);
+    }
+
+    #[test]
+    fn upload_within_object_budget_allows_normal_metadata_response() {
+        let meta = br#"{"name":"tiny.bin","bucket":"p.appspot.com","contentType":"application/octet-stream","size":1,"generation":"1","metageneration":"1"}"#;
+        assert!(meta.len() > 1, "fixture must exceed a 1-byte object budget");
+        let transport = FakeTransport::new(vec![StorageResponse::new(200, meta.to_vec())]);
+        let mut emulator = StorageEmulator::with_transport("p", transport)
+            .unwrap()
+            .with_max_bytes_size(1);
+        let metadata = emulator
+            .upload("tiny.bin", b"x", "application/octet-stream")
+            .unwrap();
+        assert_eq!(metadata.size, 1);
+        assert_eq!(metadata.name, "tiny.bin");
+    }
+
+    #[test]
+    fn upload_rejects_oversized_metadata_response_under_separate_cap() {
+        let prefix = concat!(
+            r#"{"name":"tiny.bin","bucket":"p.appspot.com","contentType":"application/octet-stream","#,
+            r#""size":1,"generation":"1","metageneration":"1","metadata":{"pad":""#
+        );
+        let mut huge = prefix.as_bytes().to_vec();
+        huge.extend(std::iter::repeat_n(b'a', DEFAULT_MAX_STORAGE_METADATA_BYTES));
+        huge.extend_from_slice(b"\"}}");
+        let transport = FakeTransport::new(vec![StorageResponse::new(200, huge)]);
+        let mut emulator = StorageEmulator::with_transport("p", transport)
+            .unwrap()
+            .with_max_bytes_size(1);
+        let err = emulator
+            .upload("tiny.bin", b"x", "application/octet-stream")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("response body size exceeds limit"), "{err}");
+        assert!(
+            err.contains(&format!("max {DEFAULT_MAX_STORAGE_METADATA_BYTES}")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn download_still_enforces_object_body_budget() {
+        let transport = FakeTransport::new(vec![StorageResponse::new(200, vec![0xaa; 8])]);
+        let emulator = StorageEmulator::with_transport("p", transport)
+            .unwrap()
+            .with_max_bytes_size(4);
+        let err = emulator.download("test.bin").unwrap_err().to_string();
+        assert!(err.contains("response body size exceeds limit"), "{err}");
+        assert!(err.contains("max 4"), "{err}");
     }
 
     #[test]

@@ -171,6 +171,39 @@ fn storage_emulator_rejects_response_exceeding_max_bytes_budget() {
 }
 
 #[test]
+fn storage_upload_within_bytes_budget_tolerates_normal_metadata_json() {
+    struct MetaTransport;
+    impl StorageTransport for MetaTransport {
+        fn send(
+            &self,
+            _req: &StorageRequest,
+        ) -> Result<StorageResponse, Box<dyn std::error::Error>> {
+            Ok(StorageResponse::new(
+                200,
+                br#"{"name":"tiny.bin","bucket":"p.appspot.com","contentType":"application/octet-stream","size":1,"generation":"1","metageneration":"1"}"#,
+            ))
+        }
+    }
+    let storage = StorageEmulator::with_transport("p", MetaTransport).unwrap();
+    let limits = flare::limits::RuntimeLimits {
+        max_bytes_size: Some(1),
+        ..flare::limits::RuntimeLimits::default()
+    };
+    let mut runtime = flare::runtime::Runtime::with_storage_and_limits(
+        flare::InMemoryFirestore::default(),
+        storage,
+        limits,
+    );
+    let result = runtime
+        .run(r#"storage_upload("tiny.bin", bytes([42]))"#)
+        .unwrap();
+    match result {
+        Value::Map(map) => assert_eq!(map.get("size"), Some(&Value::Int(1))),
+        other => panic!("expected metadata map, got {other:?}"),
+    }
+}
+
+#[test]
 fn storage_emulator_with_unlimited_runtime_limits_allows_large_response() {
     struct HugeTransport;
     impl StorageTransport for HugeTransport {
