@@ -34,9 +34,12 @@ impl RequestTime<'_> {
     }
 }
 
+type DocMap = BTreeMap<String, Value>;
+type DocStore = HashMap<String, Arc<DocMap>>;
+
 pub struct InMemoryFirestore {
-    docs: HashMap<String, BTreeMap<String, Value>>,
-    tx_snapshot: Option<HashMap<String, BTreeMap<String, Value>>>,
+    docs: DocStore,
+    tx_snapshot: Option<DocStore>,
     request_clock: RequestClock,
 }
 
@@ -73,7 +76,10 @@ impl InMemoryFirestore {
 
 impl Firestore for InMemoryFirestore {
     fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>> {
-        Ok(self.docs.get(path).cloned().map(Value::Map))
+        Ok(self
+            .docs
+            .get(path)
+            .map(|doc| Value::Map(doc.as_ref().clone())))
     }
 
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
@@ -83,6 +89,8 @@ impl Firestore for InMemoryFirestore {
             clock: &self.request_clock,
             value: None,
         };
+        // Clone the map (paths + Arc pointers). Unrelated payloads stay shared
+        // until a write `make_mut`s that entry. A failed batch drops `next`.
         let mut next = self.docs.clone();
         for op in writes {
             apply_write_to_docs(&mut next, op, &mut request_time)?;
@@ -176,7 +184,9 @@ impl Firestore for InMemoryFirestore {
 
     fn transaction_get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>> {
         match &self.tx_snapshot {
-            Some(snapshot) => Ok(snapshot.get(path).cloned().map(Value::Map)),
+            Some(snapshot) => Ok(snapshot
+                .get(path)
+                .map(|doc| Value::Map(doc.as_ref().clone()))),
             None => Err("not in transaction".into()),
         }
     }
@@ -223,11 +233,14 @@ impl InMemoryFirestore {
     fn candidates<'a>(
         &'a self,
         source: &'a QuerySource,
-    ) -> impl Iterator<Item = (&'a String, &'a BTreeMap<String, Value>)> + 'a {
-        self.docs.iter().filter(move |(path, _)| match source {
-            QuerySource::Collection(collection) => is_direct_child(collection, path),
-            QuerySource::CollectionGroup(id) => path_in_group(id, path),
-        })
+    ) -> impl Iterator<Item = (&'a String, &'a DocMap)> + 'a {
+        self.docs
+            .iter()
+            .filter(move |(path, _)| match source {
+                QuerySource::Collection(collection) => is_direct_child(collection, path),
+                QuerySource::CollectionGroup(id) => path_in_group(id, path),
+            })
+            .map(|(path, doc)| (path, doc.as_ref()))
     }
 }
 
@@ -247,7 +260,7 @@ fn path_in_group(id: &str, doc_path: &str) -> bool {
 }
 
 fn apply_write_to_docs(
-    docs: &mut HashMap<String, BTreeMap<String, Value>>,
+    docs: &mut DocStore,
     op: WriteOp,
     request_time: &mut RequestTime<'_>,
 ) -> Result<(), Box<dyn Error>> {
@@ -259,11 +272,11 @@ fn apply_write_to_docs(
             merge,
         } => {
             if merge {
-                let current = docs.entry(path).or_default();
+                let current = Arc::make_mut(docs.entry(path).or_default());
                 apply_update_map(current, &mut data, request_time)?;
             } else {
                 resolve_sentinel_map(&mut data, None, request_time)?;
-                docs.insert(path, data);
+                docs.insert(path, Arc::new(data));
             }
             Ok(())
         }
@@ -271,7 +284,7 @@ fn apply_write_to_docs(
             let current = docs
                 .get_mut(&path)
                 .ok_or_else(|| format!("document not found: {path}"))?;
-            apply_update_map(current, &mut data, request_time)?;
+            apply_update_map(Arc::make_mut(current), &mut data, request_time)?;
             Ok(())
         }
         WriteOp::Delete { path } => {
@@ -282,7 +295,7 @@ fn apply_write_to_docs(
 }
 
 fn apply_update_map(
-    current: &mut BTreeMap<String, Value>,
+    current: &mut DocMap,
     updates: &mut BTreeMap<String, Value>,
     request_time: &mut RequestTime<'_>,
 ) -> Result<(), Box<dyn Error>> {
@@ -345,8 +358,8 @@ fn apply_update_map(
 }
 
 fn resolve_sentinel_map(
-    map: &mut BTreeMap<String, Value>,
-    current: Option<&BTreeMap<String, Value>>,
+    map: &mut DocMap,
+    current: Option<&DocMap>,
     request_time: &mut RequestTime<'_>,
 ) -> Result<(), Box<dyn Error>> {
     for (k, v) in map.clone() {
@@ -399,7 +412,7 @@ fn resolve_sentinel_map(
 /// フィールドパスでネストした値を削除する。パスが存在しなければ何もしない。
 /// 中間が存在して Map でなければエラー(insert と同じ厳しさ)。
 fn remove_at_field_path(
-    map: &mut BTreeMap<String, Value>,
+    map: &mut DocMap,
     segments: &[&str],
 ) -> Result<(), Box<dyn Error>> {
     let Some((first, rest)) = segments.split_first() else {
@@ -417,10 +430,7 @@ fn remove_at_field_path(
 }
 
 /// フィールドパスでネストした値を参照する(中間が Map でなければ見つからない)。
-fn lookup_field_path<'a>(
-    map: Option<&'a BTreeMap<String, Value>>,
-    segments: &[&str],
-) -> Option<&'a Value> {
+fn lookup_field_path<'a>(map: Option<&'a DocMap>, segments: &[&str]) -> Option<&'a Value> {
     let mut cur = map?;
     for (i, seg) in segments.iter().enumerate() {
         let v = cur.get(*seg)?;
@@ -464,5 +474,106 @@ mod tests {
         fs.abort_transaction().unwrap();
         fs.begin_transaction().unwrap();
         fs.abort_transaction().unwrap();
+    }
+
+    #[test]
+    fn failed_batch_apply_leaves_prior_docs_unchanged() {
+        let mut fs = InMemoryFirestore::default();
+        fs.apply(vec![WriteOp::Set {
+            path: "users/a".into(),
+            data: BTreeMap::from([("n".into(), Value::Int(1))]),
+            merge: false,
+        }])
+        .unwrap();
+
+        let err = fs
+            .apply(vec![
+                WriteOp::Update {
+                    path: "users/a".into(),
+                    data: BTreeMap::from([("n".into(), Value::Int(99))]),
+                },
+                WriteOp::Update {
+                    path: "users/missing".into(),
+                    data: BTreeMap::from([("n".into(), Value::Int(2))]),
+                },
+            ])
+            .unwrap_err();
+        assert!(err.to_string().contains("document not found"));
+        assert_eq!(
+            fs.get("users/a").unwrap(),
+            Some(Value::Map(BTreeMap::from([("n".into(), Value::Int(1))])))
+        );
+    }
+
+    #[test]
+    fn apply_keeps_shared_payload_for_untouched_docs() {
+        let mut fs = InMemoryFirestore::default();
+        let payload = "x".repeat(8 * 1024);
+        fs.apply(vec![
+            WriteOp::Set {
+                path: "users/a".into(),
+                data: BTreeMap::from([("payload".into(), Value::Str(payload.clone()))]),
+                merge: false,
+            },
+            WriteOp::Set {
+                path: "users/b".into(),
+                data: BTreeMap::from([("payload".into(), Value::Str(payload))]),
+                merge: false,
+            },
+        ])
+        .unwrap();
+
+        let untouched = Arc::as_ptr(fs.docs.get("users/a").unwrap());
+        let updated_before = Arc::as_ptr(fs.docs.get("users/b").unwrap());
+        fs.apply(vec![WriteOp::Update {
+            path: "users/b".into(),
+            data: BTreeMap::from([("n".into(), Value::Int(1))]),
+        }])
+        .unwrap();
+        assert_eq!(
+            Arc::as_ptr(fs.docs.get("users/a").unwrap()),
+            untouched,
+            "untouched document payload must stay shared across apply"
+        );
+        assert_ne!(
+            Arc::as_ptr(fs.docs.get("users/b").unwrap()),
+            updated_before,
+            "updated document must take a private payload"
+        );
+    }
+
+    #[test]
+    fn apply_shares_one_request_time_across_sentinels() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let clock_calls = Arc::clone(&calls);
+        let mut fs = InMemoryFirestore::with_clock(move || {
+            clock_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Timestamp { seconds: 42 })
+        });
+
+        fs.apply(vec![
+            WriteOp::Set {
+                path: "users/a".into(),
+                data: BTreeMap::from([("t".into(), Value::ServerTimestamp)]),
+                merge: false,
+            },
+            WriteOp::Set {
+                path: "users/b".into(),
+                data: BTreeMap::from([("t".into(), Value::ServerTimestamp)]),
+                merge: false,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let expected = Value::Timestamp(Timestamp { seconds: 42 });
+        assert_eq!(
+            fs.get("users/a").unwrap(),
+            Some(Value::Map(BTreeMap::from([("t".into(), expected.clone())])))
+        );
+        assert_eq!(
+            fs.get("users/b").unwrap(),
+            Some(Value::Map(BTreeMap::from([("t".into(), expected)])))
+        );
     }
 }
