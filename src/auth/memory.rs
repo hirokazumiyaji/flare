@@ -98,7 +98,7 @@ impl Auth for InMemoryAuth {
         let Some(stored) = self.users.get(&email) else {
             return Err(AuthError::UserNotFound);
         };
-        if stored.password != password {
+        if stored.password != password || stored.user.disabled {
             return Err(AuthError::InvalidCredentials);
         }
         let user = stored.user.clone();
@@ -166,5 +166,45 @@ mod tests {
             AuthError::WeakPassword
         );
         assert!(auth.current_user().unwrap().is_none());
+    }
+
+    fn seeded_user(email: &str, disabled: bool) -> AuthUser {
+        AuthUser {
+            uid: format!("seed-{email}"),
+            email: email.to_string(),
+            email_verified: true,
+            display_name: None,
+            photo_url: None,
+            disabled,
+            created_at: None,
+            last_login_at: None,
+            provider_id: Some("password".to_string()),
+        }
+    }
+
+    #[test]
+    fn seeded_disabled_user_sign_in_matches_emulator_contract() {
+        let mut auth = InMemoryAuth::default();
+        auth.seed_user(seeded_user("disabled@example.com", true), "password");
+
+        assert_eq!(
+            auth.sign_in("disabled@example.com", "password")
+                .unwrap_err(),
+            AuthError::InvalidCredentials
+        );
+        assert!(auth.session().is_none());
+        assert!(auth.current_user().unwrap().is_none());
+    }
+
+    #[test]
+    fn seeded_enabled_user_can_sign_in() {
+        let mut auth = InMemoryAuth::default();
+        auth.seed_user(seeded_user("enabled@example.com", false), "password");
+
+        let session = auth.sign_in("enabled@example.com", "password").unwrap();
+        assert_eq!(session.user.email, "enabled@example.com");
+        assert!(!session.user.disabled);
+        assert_eq!(auth.current_user().unwrap().unwrap().uid, session.user.uid);
+        assert!(auth.session().is_some());
     }
 }
