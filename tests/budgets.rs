@@ -137,6 +137,32 @@ fn usage_is_observable_after_a_successful_run() {
     assert_eq!(usage.loop_iterations, 3);
     assert_eq!(usage.max_call_depth, 1);
     assert!(usage.max_value_depth >= 1);
+    // finish_execution records wall time; usage() must not zero it afterward.
+    assert!(
+        !usage.elapsed.is_zero(),
+        "post-run elapsed should keep the measured duration, got {:?}",
+        usage.elapsed
+    );
+}
+
+#[test]
+fn usage_elapsed_survives_error_and_clears_on_reset() {
+    let mut rt = runtime_with(RuntimeLimits::default().with_max_steps(1));
+    let err = rt.run("a = 1\nb = 2").unwrap_err();
+    assert_budget_error(err, "step limit exceeded");
+    let after_error = rt.usage();
+    assert!(
+        !after_error.elapsed.is_zero(),
+        "error-path elapsed should keep the measured duration, got {:?}",
+        after_error.elapsed
+    );
+
+    rt.reset_usage();
+    assert_eq!(
+        rt.usage().elapsed,
+        Duration::ZERO,
+        "explicit reset must return elapsed to zero"
+    );
 }
 
 #[test]

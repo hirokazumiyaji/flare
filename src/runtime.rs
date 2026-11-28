@@ -190,13 +190,14 @@ impl<F: Firestore, S: Storage> Runtime<F, S> {
     }
 
     /// Return a snapshot of the counters consumed by the most recent run.
+    ///
+    /// During a run, `elapsed` is live. After the run ends it keeps the
+    /// duration recorded at finish until the next run or `reset_usage`.
     pub fn usage(&self) -> RuntimeUsage {
         let mut usage = self.state.usage;
-        usage.elapsed = self
-            .state
-            .started_at
-            .map(|start| start.elapsed())
-            .unwrap_or_default();
+        if let Some(start) = self.state.started_at {
+            usage.elapsed = start.elapsed();
+        }
         usage
     }
 
