@@ -299,6 +299,12 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     };
 
+    // Auth backend settings are validated before reading a script file or
+    // stdin, matching Firestore and Storage. AuthEmulator construction does
+    // not open a socket, so resolving the backend here is safe and keeps the
+    // required-host check from waiting on input.
+    let selected_auth = select_auth(&auth_backend, project.project_id.as_deref().unwrap())?;
+
     let is_repl = if repl {
         if !inline.is_empty() || !paths.is_empty() || use_stdin {
             eprintln!("error: --repl cannot be combined with a script file, stdin, or -e");
@@ -343,7 +349,6 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let selected_storage = select_storage(storage_backend, storage_config)?;
-    let selected_auth = select_auth(&auth_backend, project.project_id.as_deref().unwrap())?;
     let storage: Box<dyn Storage> = match selected_storage {
         SelectedStorage::Memory => Box::new(InMemoryStorage::default()),
         SelectedStorage::Emulator(mut storage) => {
