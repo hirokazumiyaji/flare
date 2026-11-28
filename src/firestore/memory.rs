@@ -134,9 +134,9 @@ impl Firestore for InMemoryFirestore {
     /// The budget bounds the **matching candidates** the backend walks, not the
     /// page the script receives: `limit` / `offset` shape the page afterwards,
     /// so a `limit(3)` query over 20 matches still succeeds while the scan
-    /// stays bounded.  Counting first and cloning afterwards also keeps the
-    /// extra match that proves the budget was exceeded from ever being
-    /// materialized.
+    /// stays bounded.  One store pass collects borrowed matches (and rejects as
+    /// soon as the budget is exceeded) so payloads are cloned only for the
+    /// page that survives ordering and offset/limit.
     fn run_query_bounded(
         &self,
         query: &QueryRef,
@@ -145,25 +145,21 @@ impl Firestore for InMemoryFirestore {
         super::validate_query_filters(&query.filters)?;
         let (field_paths, normalized_values) = prepare_query_filters(&query.filters)?;
         let order_by = super::parse_order_by(query)?;
-        let mut matched = 0usize;
-        for _ in self.candidates(&query.source).filter(|(path, doc)| {
+        let mut matched = Vec::new();
+        for (path, doc) in self.candidates(&query.source).filter(|(path, doc)| {
             super::matches_filters(path, doc, &query.filters, &field_paths, &normalized_values)
         }) {
-            matched += 1;
-            if matched > max_results {
+            matched.push((path, doc));
+            if matched.len() > max_results {
                 return Err(super::query_result_limit_error(max_results));
             }
         }
-        Ok(super::page_borrowed_candidates(
-            self.candidates(&query.source).filter(|(path, doc)| {
-                super::matches_filters(path, doc, &query.filters, &field_paths, &normalized_values)
-            }),
-            query,
-            &order_by,
+        Ok(
+            super::page_borrowed_candidates(matched.into_iter(), query, &order_by)
+                .into_iter()
+                .map(|(path, doc)| (path.clone(), doc.clone()))
+                .collect(),
         )
-        .into_iter()
-        .map(|(path, doc)| (path.clone(), doc.clone()))
-        .collect())
     }
 
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
@@ -438,6 +434,65 @@ fn lookup_field_path<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::value::{Direction, QueryFilter, QueryOp};
+
+    fn seed_ordered_users() -> InMemoryFirestore {
+        let mut fs = InMemoryFirestore::default();
+        fs.apply(vec![
+            WriteOp::Set {
+                path: "users/c".into(),
+                data: BTreeMap::from([
+                    ("age".into(), Value::Int(30)),
+                    ("ord".into(), Value::Int(3)),
+                    ("payload".into(), Value::Str("c".repeat(64))),
+                ]),
+                merge: false,
+            },
+            WriteOp::Set {
+                path: "users/a".into(),
+                data: BTreeMap::from([
+                    ("age".into(), Value::Int(20)),
+                    ("ord".into(), Value::Int(1)),
+                    ("payload".into(), Value::Str("a".repeat(64))),
+                ]),
+                merge: false,
+            },
+            WriteOp::Set {
+                path: "users/b".into(),
+                data: BTreeMap::from([
+                    ("age".into(), Value::Int(25)),
+                    ("ord".into(), Value::Int(2)),
+                    ("payload".into(), Value::Str("b".repeat(64))),
+                ]),
+                merge: false,
+            },
+            WriteOp::Set {
+                path: "users/skip".into(),
+                data: BTreeMap::from([
+                    ("age".into(), Value::Int(10)),
+                    ("ord".into(), Value::Int(0)),
+                    ("payload".into(), Value::Str("s".repeat(64))),
+                ]),
+                merge: false,
+            },
+        ])
+        .unwrap();
+        fs
+    }
+
+    fn adult_query() -> QueryRef {
+        QueryRef {
+            source: QuerySource::Collection("users".to_string()),
+            filters: vec![QueryFilter {
+                field: "age".to_string(),
+                op: QueryOp::Ge,
+                value: Value::Int(20),
+            }],
+            order_by: vec![("ord".to_string(), Direction::Asc)],
+            offset: Some(1),
+            limit: Some(1),
+        }
+    }
 
     #[test]
     fn failed_commit_keeps_transaction_until_abort() {
@@ -464,5 +519,36 @@ mod tests {
         fs.abort_transaction().unwrap();
         fs.begin_transaction().unwrap();
         fs.abort_transaction().unwrap();
+    }
+
+    #[test]
+    fn filtered_query_count_order_and_page_content_agree() {
+        let fs = seed_ordered_users();
+        let query = adult_query();
+
+        assert_eq!(fs.count_query(&query).unwrap(), 3);
+
+        let unshaped = fs.run_query(&query).unwrap();
+        assert_eq!(unshaped.len(), 3);
+        let mut paths: Vec<_> = unshaped.iter().map(|(path, _)| path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["users/a", "users/b", "users/c"]);
+
+        // order by ord asc, offset 1, limit 1 → middle adult (users/b).
+        let page = fs.run_query_page(&query).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].0, "users/b");
+        assert_eq!(page[0].1.get("ord"), Some(&Value::Int(2)));
+        assert_eq!(page[0].1.get("payload"), Some(&Value::Str("b".repeat(64))));
+
+        let bounded = fs.run_query_bounded(&query, 3).unwrap();
+        assert_eq!(bounded, page);
+
+        let err = fs.run_query_bounded(&query, 2).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("query result limit exceeded (max 2)"),
+            "{err}"
+        );
     }
 }
