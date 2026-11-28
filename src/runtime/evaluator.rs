@@ -102,6 +102,56 @@ impl Drop for ScopeGuard<'_, '_> {
     }
 }
 
+/// Restores the caller's `exec` and scope depth when a staged batch/transaction
+/// block exits, including panic unwind. On the success path `take_writes`
+/// extracts the staged writes and leaves Drop to truncate scopes only.
+struct StagedBlockGuard<'guard, 'runtime> {
+    runtime: &'guard mut Evaluator<'runtime>,
+    prev: Option<ExecCtx>,
+    caller_scope_depth: usize,
+}
+
+impl<'guard, 'runtime> StagedBlockGuard<'guard, 'runtime> {
+    fn enter(
+        runtime: &'guard mut Evaluator<'runtime>,
+        ctx: ExecCtx,
+        caller_scope_depth: usize,
+    ) -> Self {
+        let prev = std::mem::replace(&mut runtime.exec, ctx);
+        runtime.scopes.push(HashMap::new());
+        Self {
+            runtime,
+            prev: Some(prev),
+            caller_scope_depth,
+        }
+    }
+
+    fn take_writes(&mut self) -> Vec<WriteOp> {
+        let prev = self
+            .prev
+            .take()
+            .expect("staged block writes taken more than once");
+        match std::mem::replace(&mut self.runtime.exec, prev) {
+            ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => writes,
+            ExecCtx::Normal => unreachable!("exec ctx changed inside batch/transaction"),
+        }
+    }
+}
+
+impl Drop for StagedBlockGuard<'_, '_> {
+    fn drop(&mut self) {
+        self.runtime.scopes.truncate(self.caller_scope_depth);
+        if let Some(prev) = self.prev.take() {
+            let staged = std::mem::replace(&mut self.runtime.exec, prev);
+            // A panic skipped the caller's abort path. Clear the backend txn
+            // so the next begin does not see "already in transaction".
+            if matches!(staged, ExecCtx::Transaction { .. }) {
+                self.runtime.abort_transaction_best_effort();
+            }
+        }
+    }
+}
+
 impl Evaluator<'_> {
     pub(super) fn eval_program(&mut self, stmts: &[Stmt]) -> Result<Value, Box<dyn Error>> {
         self.with_execution(|rt| {
@@ -398,12 +448,15 @@ impl Evaluator<'_> {
     /// `exec` をステージング用 ctx に差し替え、子スコープでブロックを評価する。
     /// ブロックの成否にかかわらず元の ctx とスコープへ戻し、ステージされた
     /// writes を返す。
+    ///
+    /// A backend panic must not leave the staged `exec` or the child scope
+    /// frame behind: the next `run` reuses this Runtime. An open transaction
+    /// is aborted on unwind so the next begin does not inherit it.
     pub(super) fn run_staged_block(
         &mut self,
         ctx: ExecCtx,
         body: &[Stmt],
     ) -> (Result<ExecFlow, Box<dyn Error>>, Vec<WriteOp>) {
-        let prev = std::mem::replace(&mut self.exec, ctx);
         // batch / transaction は呼び出し元を読める字句的な子スコープで
         // 評価する。ブロック内で定義した変数・関数は外へ漏れず、成功・
         // ランタイムエラー/backend エラーのどちらでも同じスコープを片付ける。
@@ -411,21 +464,17 @@ impl Evaluator<'_> {
         // fallible work is performed. Record only the caller's depth instead
         // of deep-cloning every global and local value for each staged block.
         let caller_scope_depth = self.scopes.len();
-        self.scopes.push(HashMap::new());
-        let flow = self.eval_block(body);
+        let mut guard = StagedBlockGuard::enter(self, ctx, caller_scope_depth);
+        let flow = guard.runtime.eval_block(body);
         // `truncate` would silently discard a frame leaked by a nested call,
         // so assert the balance explicitly. This only runs in debug builds,
         // which is where the test suite executes.
         debug_assert_eq!(
-            self.scopes.len(),
+            guard.runtime.scopes.len(),
             caller_scope_depth + 1,
             "staged block must leave the scope stack balanced"
         );
-        self.scopes.truncate(caller_scope_depth);
-        let writes = match std::mem::replace(&mut self.exec, prev) {
-            ExecCtx::Batch { writes } | ExecCtx::Transaction { writes } => writes,
-            ExecCtx::Normal => unreachable!("exec ctx changed inside batch/transaction"),
-        };
+        let writes = guard.take_writes();
         (flow, writes)
     }
 
