@@ -141,7 +141,15 @@ mod unix {
             .expect("list release archive");
         assert_success(&listing);
         let listing = String::from_utf8_lossy(&listing.stdout);
-        for required in ["README.md", "LICENSE", "docs/spec.md", "SHA256SUMS"] {
+        for required in [
+            "README.md",
+            "LICENSE",
+            "docs/spec.md",
+            "docs/firebase-security.md",
+            "docs/release-checklist.md",
+            "examples/scripts/01_basic.fl",
+            "SHA256SUMS",
+        ] {
             assert!(
                 listing.contains(&format!("{package_name}/{required}")),
                 "release archive is missing {required}: {listing}"
@@ -170,7 +178,16 @@ mod unix {
         assert_success(&extraction);
 
         let package_dir = extracted.join(&package_name);
-        for required in ["fl", "README.md", "LICENSE", "docs/spec.md", "SHA256SUMS"] {
+        for required in [
+            "fl",
+            "README.md",
+            "LICENSE",
+            "docs/spec.md",
+            "docs/firebase-security.md",
+            "docs/release-checklist.md",
+            "examples/scripts/01_basic.fl",
+            "SHA256SUMS",
+        ] {
             assert!(
                 package_dir.join(required).is_file(),
                 "extracted release is missing {required}"
@@ -191,6 +208,34 @@ mod unix {
                 .and_then(|name| name.to_str())
                 .expect("checksum path should be UTF-8"),
         ));
+
+        for (from, relative) in [
+            ("README.md", "docs/spec.md"),
+            ("README.md", "docs/firebase-security.md"),
+            ("README.md", "docs/release-checklist.md"),
+            ("README.md", "examples/scripts"),
+            ("docs/spec.md", "firebase-security.md"),
+        ] {
+            let from_path = package_dir.join(from);
+            let target = from_path.parent().expect("doc parent").join(relative);
+            assert!(
+                target.exists(),
+                "packaged relative link from {from} to {relative} is missing at {}",
+                target.display()
+            );
+        }
+
+        let sums = fs::read_to_string(package_dir.join("SHA256SUMS")).expect("read SHA256SUMS");
+        for required in [
+            "docs/firebase-security.md",
+            "docs/release-checklist.md",
+            "examples/scripts/01_basic.fl",
+        ] {
+            assert!(
+                sums.lines().any(|line| line.ends_with(required)),
+                "SHA256SUMS is missing {required}: {sums}"
+            );
+        }
     }
 
     #[test]

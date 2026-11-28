@@ -152,6 +152,10 @@ jobs:
           test -f "$package_dir/README.md"
           test -f "$package_dir/LICENSE"
           test -f "$package_dir/docs/spec.md"
+          test -f "$package_dir/docs/firebase-security.md"
+          test -f "$package_dir/docs/release-checklist.md"
+          test -d "$package_dir/examples/scripts"
+          test -f "$package_dir/examples/scripts/01_basic.fl"
           if command -v sha256sum >/dev/null 2>&1; then
             (cd "$package_dir" && sha256sum -c SHA256SUMS)
           else
