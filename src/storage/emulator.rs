@@ -249,7 +249,7 @@ impl HttpStorageTransport {
         write_with_deadline(&mut stream, wire.as_bytes(), deadline)?;
         write_with_deadline(&mut stream, &request.body, deadline)?;
 
-        let mut raw = Vec::new();
+        let mut recv = HttpResponseRecv::new(self.max_body_bytes);
         let mut buffer = [0_u8; 8192];
         loop {
             set_remaining_timeout(&stream, deadline, true)?;
@@ -263,37 +263,12 @@ impl HttpStorageTransport {
             if read == 0 {
                 break;
             }
-            if let Some(max_response_bytes) = self.max_response_bytes {
-                if raw.len().saturating_add(read) > max_response_bytes {
-                    return Err(StorageError::backend(format!(
-                        "storage emulator response size limit exceeded (max {max_response_bytes} bytes)",
-                    )));
-                }
-            }
-            raw.extend_from_slice(&buffer[..read]);
-            // A response with Content-Length can be decoded before the peer
-            // closes the socket. This also avoids waiting for keep-alive peers.
-            match parse_http_response_with_limit(&raw, self.max_body_bytes) {
-                Ok((_, complete)) => {
-                    if complete {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    if find_bytes(&raw, b"\r\n\r\n").is_none() {
-                        if raw.len() > STORAGE_HEADER_ALLOWANCE_BYTES {
-                            return Err(StorageError::backend(
-                                "storage emulator response headers exceeded size limit",
-                            ));
-                        }
-                    } else {
-                        return Err(e);
-                    }
-                }
+            // Framed bodies can finish before the peer closes the socket.
+            if recv.push(&buffer[..read], self.max_response_bytes)? {
+                break;
             }
         }
-        let (response, _) = parse_http_response_with_limit(&raw, self.max_body_bytes)?;
-        Ok(response)
+        Ok(recv.into_response()?.0)
     }
 }
 
@@ -825,15 +800,129 @@ fn percent_encode(value: &str) -> String {
     out
 }
 
-pub fn parse_http_response(raw: &[u8]) -> Result<(StorageResponse, bool), StorageError> {
-    parse_http_response_with_limit(raw, Some(DEFAULT_MAX_STORAGE_BODY_BYTES))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BodyFraming {
+    ContentLength(usize),
+    Chunked,
+    UntilClose,
 }
 
-pub fn parse_http_response_with_limit(
+#[derive(Debug, Clone)]
+struct ParsedResponseHead {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body_start: usize,
+    framing: BodyFraming,
+}
+
+/// Incremental HTTP response receiver. Parses headers once and tracks framing
+/// progress so each read does not copy the cumulative body.
+#[derive(Debug)]
+struct HttpResponseRecv {
+    raw: Vec<u8>,
+    head: Option<ParsedResponseHead>,
+    max_body_bytes: Option<usize>,
+}
+
+impl HttpResponseRecv {
+    fn new(max_body_bytes: Option<usize>) -> Self {
+        Self {
+            raw: Vec::new(),
+            head: None,
+            max_body_bytes,
+        }
+    }
+
+    /// Append a read chunk. Returns `true` when a framed body is complete.
+    fn push(
+        &mut self,
+        chunk: &[u8],
+        max_response_bytes: Option<usize>,
+    ) -> Result<bool, StorageError> {
+        if let Some(max_response_bytes) = max_response_bytes {
+            if self.raw.len().saturating_add(chunk.len()) > max_response_bytes {
+                return Err(StorageError::backend(format!(
+                    "storage emulator response size limit exceeded (max {max_response_bytes} bytes)",
+                )));
+            }
+        }
+        self.raw.extend_from_slice(chunk);
+        self.ensure_head()?;
+        self.body_is_complete()
+    }
+
+    fn ensure_head(&mut self) -> Result<(), StorageError> {
+        if self.head.is_some() {
+            return Ok(());
+        }
+        match parse_response_head(&self.raw, self.max_body_bytes) {
+            Ok(head) => {
+                self.head = Some(head);
+                Ok(())
+            }
+            Err(error) => {
+                if find_bytes(&self.raw, b"\r\n\r\n").is_none() {
+                    if self.raw.len() > STORAGE_HEADER_ALLOWANCE_BYTES {
+                        return Err(StorageError::backend(
+                            "storage emulator response headers exceeded size limit",
+                        ));
+                    }
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn body_is_complete(&self) -> Result<bool, StorageError> {
+        let Some(head) = self.head.as_ref() else {
+            return Ok(false);
+        };
+        let body = &self.raw[head.body_start..];
+        match head.framing {
+            BodyFraming::ContentLength(length) => Ok(body.len() >= length),
+            BodyFraming::Chunked => Ok(chunked_body_is_complete(body, self.max_body_bytes)?),
+            BodyFraming::UntilClose => {
+                if let Some(max) = self.max_body_bytes {
+                    if body.len() > max {
+                        return Err(StorageError::backend(format!(
+                            "storage emulator response body size exceeds limit: {} (max {max})",
+                            body.len()
+                        )));
+                    }
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    fn into_response(mut self) -> Result<(StorageResponse, usize), StorageError> {
+        self.ensure_head()?;
+        let head = self.head.take().ok_or_else(|| {
+            StorageError::backend(
+                "invalid storage emulator response: missing HTTP header terminator",
+            )
+        })?;
+        let body = &self.raw[head.body_start..];
+        let (materialized, _complete) =
+            materialize_body(body, head.framing, self.max_body_bytes)?;
+        let body_bytes_copied = materialized.len();
+        Ok((
+            StorageResponse {
+                status: head.status,
+                headers: head.headers,
+                body: materialized,
+            },
+            body_bytes_copied,
+        ))
+    }
+}
+
+fn parse_response_head(
     raw: &[u8],
-    max_body_bytes: impl Into<Option<usize>>,
-) -> Result<(StorageResponse, bool), StorageError> {
-    let max_body_bytes = max_body_bytes.into();
+    max_body_bytes: Option<usize>,
+) -> Result<ParsedResponseHead, StorageError> {
     let Some(header_end) = find_bytes(raw, b"\r\n\r\n") else {
         return Err(StorageError::backend(
             "invalid storage emulator response: missing HTTP header terminator",
@@ -876,20 +965,24 @@ pub fn parse_http_response_with_limit(
         };
         headers.push((name.trim().to_string(), value.trim().to_string()));
     }
-    let body = &raw[header_end + 4..];
+    let framing = body_framing_from_headers(&headers, max_body_bytes)?;
+    Ok(ParsedResponseHead {
+        status,
+        headers,
+        body_start: header_end + 4,
+        framing,
+    })
+}
+
+fn body_framing_from_headers(
+    headers: &[(String, String)],
+    max_body_bytes: Option<usize>,
+) -> Result<BodyFraming, StorageError> {
     let chunked = headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("transfer-encoding") && value.contains("chunked")
     });
     if chunked {
-        let (decoded, complete) = decode_chunked_body(body, max_body_bytes)?;
-        return Ok((
-            StorageResponse {
-                status,
-                headers,
-                body: decoded,
-            },
-            complete,
-        ));
+        return Ok(BodyFraming::Chunked);
     }
     let content_length = headers
         .iter()
@@ -910,27 +1003,27 @@ pub fn parse_http_response_with_limit(
                     )));
                 }
             }
-            if body.len() < length {
-                return Ok((
-                    StorageResponse {
-                        status,
-                        headers,
-                        body: body.to_vec(),
-                    },
-                    false,
-                ));
-            }
-            Ok((
-                StorageResponse {
-                    status,
-                    headers,
-                    body: body[..length].to_vec(),
-                },
-                true,
-            ))
+            Ok(BodyFraming::ContentLength(length))
         }
         Some(Err(error)) => Err(error),
-        None => {
+        None => Ok(BodyFraming::UntilClose),
+    }
+}
+
+fn materialize_body(
+    body: &[u8],
+    framing: BodyFraming,
+    max_body_bytes: Option<usize>,
+) -> Result<(Vec<u8>, bool), StorageError> {
+    match framing {
+        BodyFraming::ContentLength(length) => {
+            if body.len() < length {
+                return Ok((Vec::new(), false));
+            }
+            Ok((body[..length].to_vec(), true))
+        }
+        BodyFraming::Chunked => decode_chunked_body(body, max_body_bytes),
+        BodyFraming::UntilClose => {
             if let Some(max) = max_body_bytes {
                 if body.len() > max {
                     return Err(StorageError::backend(format!(
@@ -939,16 +1032,73 @@ pub fn parse_http_response_with_limit(
                     )));
                 }
             }
-            Ok((
-                StorageResponse {
-                    status,
-                    headers,
-                    body: body.to_vec(),
-                },
-                false,
-            ))
+            Ok((body.to_vec(), false))
         }
     }
+}
+
+/// Walk chunk framing without allocating the decoded body.
+fn chunked_body_is_complete(
+    mut body: &[u8],
+    max_body_bytes: Option<usize>,
+) -> Result<bool, StorageError> {
+    let mut decoded_len = 0_usize;
+    loop {
+        let Some(line_end) = find_bytes(body, b"\r\n") else {
+            return Ok(false);
+        };
+        let line = std::str::from_utf8(&body[..line_end]).map_err(|e| {
+            StorageError::backend(format!("invalid storage emulator chunk header: {e}"))
+        })?;
+        let size_text = line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_text, 16).map_err(|e| {
+            StorageError::backend(format!("invalid storage emulator chunk size: {e}"))
+        })?;
+        if let Some(max) = max_body_bytes {
+            if decoded_len.saturating_add(size) > max {
+                return Err(StorageError::backend(format!(
+                    "storage emulator chunked response size exceeds limit (max {max} bytes)"
+                )));
+            }
+        }
+        body = &body[line_end + 2..];
+        if size == 0 {
+            return Ok(true);
+        }
+        if body.len() < size {
+            return Ok(false);
+        }
+        decoded_len = decoded_len.saturating_add(size);
+        body = &body[size..];
+        if body.len() < 2 || &body[..2] != b"\r\n" {
+            return Err(StorageError::backend(
+                "invalid storage emulator chunk terminator",
+            ));
+        }
+        body = &body[2..];
+    }
+}
+
+pub fn parse_http_response(raw: &[u8]) -> Result<(StorageResponse, bool), StorageError> {
+    parse_http_response_with_limit(raw, Some(DEFAULT_MAX_STORAGE_BODY_BYTES))
+}
+
+pub fn parse_http_response_with_limit(
+    raw: &[u8],
+    max_body_bytes: impl Into<Option<usize>>,
+) -> Result<(StorageResponse, bool), StorageError> {
+    let max_body_bytes = max_body_bytes.into();
+    let head = parse_response_head(raw, max_body_bytes)?;
+    let body = &raw[head.body_start..];
+    let (materialized, complete) = materialize_body(body, head.framing, max_body_bytes)?;
+    Ok((
+        StorageResponse {
+            status: head.status,
+            headers: head.headers,
+            body: materialized,
+        },
+        complete,
+    ))
 }
 
 fn decode_chunked_body(
@@ -1302,5 +1452,129 @@ mod tests {
                 .contains("emulator host must be a loopback address"),
             "{err}"
         );
+    }
+
+    fn content_length_response(body: &[u8]) -> Vec<u8> {
+        let mut raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(body);
+        raw
+    }
+
+    fn feed_recv(
+        chunks: &[&[u8]],
+        max_body_bytes: Option<usize>,
+        max_response_bytes: Option<usize>,
+    ) -> Result<(StorageResponse, usize), StorageError> {
+        let mut recv = HttpResponseRecv::new(max_body_bytes);
+        for chunk in chunks {
+            if recv.push(chunk, max_response_bytes)? {
+                break;
+            }
+        }
+        recv.into_response()
+    }
+
+    fn split_at_offsets<'a>(raw: &'a [u8], offsets: &[usize]) -> Vec<&'a [u8]> {
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        for &offset in offsets {
+            assert!(offset > start && offset < raw.len());
+            chunks.push(&raw[start..offset]);
+            start = offset;
+        }
+        chunks.push(&raw[start..]);
+        chunks
+    }
+
+    #[test]
+    fn incomplete_content_length_parse_does_not_copy_partial_body() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nabcd";
+        let (response, complete) = parse_http_response_with_limit(raw, 1024).unwrap();
+        assert!(!complete);
+        assert!(response.body.is_empty());
+        assert_eq!(response.status, 200);
+    }
+
+    #[test]
+    fn recv_preserves_result_across_split_positions() {
+        let body = b"abcdefghij";
+        let raw = content_length_response(body);
+        let expected = parse_http_response_with_limit(&raw, 1024).unwrap().0;
+        let splits = [
+            vec![10],
+            vec![raw.len() / 2],
+            vec![raw.len() - 3],
+            vec![5, 12, 20],
+            (1..raw.len()).collect::<Vec<_>>(),
+        ];
+        for offsets in splits {
+            let chunks = split_at_offsets(&raw, &offsets);
+            let (response, copied) = feed_recv(&chunks, Some(1024), None).unwrap();
+            assert_eq!(response, expected);
+            assert_eq!(copied, body.len());
+        }
+    }
+
+    #[test]
+    fn recv_preserves_size_limits_across_split_reads() {
+        let raw = content_length_response(&[b'x'; 40]);
+        let chunks = split_at_offsets(&raw, &[8, 16, 24, 32]);
+        // Allow the full wire so the Content-Length check, not the raw cap, fails.
+        let err = feed_recv(&chunks, Some(16), Some(raw.len()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Content-Length exceeds limit"), "{err}");
+
+        let oversized = {
+            let mut wire = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+            wire.extend_from_slice(&[b'y'; 80]);
+            wire
+        };
+        let chunks = split_at_offsets(&oversized, &[10, 30, 50]);
+        let err = feed_recv(&chunks, Some(20), Some(40))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("size limit exceeded"), "{err}");
+    }
+
+    #[test]
+    fn recv_body_copy_stays_linear_across_response_sizes() {
+        // Old receive loop copied the cumulative body on every incomplete
+        // parse. For N one-byte body reads that is N*(N+1)/2 body bytes
+        // copied. The assembler materializes once, so copies equal body len.
+        let sizes = [16_usize, 64, 256, 1024];
+        let mut previous_copied = 0;
+        for &size in &sizes {
+            let body = vec![b'z'; size];
+            let raw = content_length_response(&body);
+            let chunks: Vec<&[u8]> = raw.chunks(1).collect();
+            let (response, copied) = feed_recv(&chunks, Some(size * 2), None).unwrap();
+            assert_eq!(response.body, body);
+            assert_eq!(copied, size);
+            assert!(
+                copied > previous_copied,
+                "larger responses must copy more body bytes once: {copied} vs {previous_copied}"
+            );
+            // Reject the old triangular growth for this size.
+            let triangular = size * (size + 1) / 2;
+            assert!(
+                copied < triangular,
+                "copy volume {copied} must stay below triangular {triangular} for size {size}"
+            );
+            previous_copied = copied;
+        }
+    }
+
+    #[test]
+    fn recv_reassembles_split_chunked_body_without_early_materialize() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n";
+        let chunks = split_at_offsets(raw, &[20, 40, 50]);
+        let (response, copied) = feed_recv(&chunks, Some(1024), None).unwrap();
+        assert_eq!(response.body, b"abcdef");
+        assert_eq!(copied, 6);
     }
 }
