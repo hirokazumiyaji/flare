@@ -494,6 +494,107 @@ fn emulator_server_timestamp_resolves() {
     assert!(matches!(m.get("t"), Some(Value::Timestamp(_))));
 }
 
+fn timestamp_value(seconds: i64, nanos: i32) -> SdkValue {
+    SdkValue {
+        value_type: Some(value::ValueType::TimestampValue(prost_types::Timestamp {
+            seconds,
+            nanos,
+        })),
+    }
+}
+
+#[test]
+fn emulator_timestamp_equality_keeps_same_second_nanos() {
+    // Server timestamps (and other raw writes) keep nanos. Flare reads them
+    // as second-precision Timestamps. Equality and range queries must still
+    // find rows whose stored nanos sit inside that Flare second.
+    let Some(fs) = emulator() else {
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
+        return;
+    };
+    let project = std::env::var("FIRESTORE_PROJECT_ID").unwrap_or_else(|_| "flare-test".into());
+    let collection = format!("ts_eq_{}", unique("run"));
+    let second = 1_700_000_000i64;
+    seed_reference_documents(
+        &project,
+        &collection,
+        [
+            (
+                "start",
+                HashMap::from([("ts".to_string(), timestamp_value(second, 0))]),
+            ),
+            (
+                "mid",
+                HashMap::from([("ts".to_string(), timestamp_value(second, 500_000_000))]),
+            ),
+            (
+                "prev",
+                HashMap::from([("ts".to_string(), timestamp_value(second - 1, 999_999_999))]),
+            ),
+            (
+                "next",
+                HashMap::from([("ts".to_string(), timestamp_value(second + 1, 0))]),
+            ),
+        ],
+    );
+
+    let script = format!(
+        r#"t = timestamp({second})
+[
+  col("{collection}").where("ts", "==", t).get().map {{ |r| r["__name__"] }},
+  col("{collection}").where("ts", ">=", t).get().len(),
+  col("{collection}").where("ts", ">", t).get().len(),
+  col("{collection}").where("ts", "<=", t).get().len(),
+  col("{collection}").where("ts", "<", t).get().len(),
+]"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    let Value::Array(rows) = out else {
+        panic!("expected array, got {out:?}");
+    };
+    assert_eq!(rows.len(), 5);
+    let Value::Array(eq_paths) = &rows[0] else {
+        panic!("expected equality paths, got {:?}", rows[0]);
+    };
+    let mut names: Vec<String> = eq_paths
+        .iter()
+        .map(|value| match value {
+            Value::Str(path) => path.clone(),
+            other => panic!("expected path string, got {other:?}"),
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            format!("{collection}/mid"),
+            format!("{collection}/start"),
+        ]
+    );
+    assert_eq!(rows[1], Value::Int(3)); // start, mid, next
+    assert_eq!(rows[2], Value::Int(1)); // next only
+    assert_eq!(rows[3], Value::Int(3)); // prev, start, mid
+    assert_eq!(rows[4], Value::Int(1)); // prev only
+}
+
+#[test]
+fn emulator_read_back_timestamp_equals_source_doc() {
+    let Some(fs) = emulator() else {
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
+        return;
+    };
+    let collection = test_collection("ts_readback");
+    let path = format!("{collection}/one");
+    let script = format!(
+        r#"set("{path}", {{ts: server_timestamp()}})
+doc = get("{path}")
+t = doc["ts"]
+col("{collection}").where("ts", "==", t).get().len()"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(out, Value::Int(1));
+}
+
 #[test]
 fn emulator_server_timestamp_is_shared_within_batch_and_transaction_commits() {
     let Some(fs) = emulator() else {
