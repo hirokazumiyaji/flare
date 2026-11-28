@@ -5,9 +5,11 @@ on:
   # branch/PR runs and workflow_call runs prevents the release path from
   # drifting from the normal quality gate.
   workflow_call:
+  # Same-repo PR branch pushes also fire pull_request. Limiting push to main
+  # keeps those updates on one run while main, fork PRs, and workflow_call stay covered.
   push:
     branches:
-      - "**"
+      - main
   pull_request:
 
 permissions:
