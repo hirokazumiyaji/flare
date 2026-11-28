@@ -114,11 +114,59 @@ fn module_global_names_share_handlers_and_call_contracts() {
 }
 
 #[test]
+fn module_universal_methods_match_global_and_method_forms() {
+    let modules = [
+        "Firestore",
+        "Auth",
+        "Storage",
+        "IO",
+        "File",
+        "JSON",
+        "CSV",
+        "YAML",
+    ];
+    for module in modules {
+        for method in ["to_s", "inspect", "type_of"] {
+            let method_form = format!("{module}.{method}()");
+            let global_form = format!("{method}({module})");
+            let method_result =
+                run_script_with_services(&method_form, Services::in_memory()).unwrap();
+            let global_result =
+                run_script_with_services(&global_form, Services::in_memory()).unwrap();
+            assert_eq!(
+                method_result, global_result,
+                "{method_form} and {global_form} must agree"
+            );
+        }
+        assert_eq!(
+            run_script_with_services(&format!("{module}.type_of()"), Services::in_memory())
+                .unwrap(),
+            Value::Str("Module".into())
+        );
+        assert_eq!(
+            run_script_with_services(&format!("{module}.to_s()"), Services::in_memory()).unwrap(),
+            Value::Str(module.into())
+        );
+        assert_eq!(
+            run_script_with_services(&format!("{module}.inspect()"), Services::in_memory())
+                .unwrap(),
+            Value::Str(module.into())
+        );
+    }
+}
+
+#[test]
 fn modules_report_unknown_methods_and_reject_modules_in_stored_values() {
     let err = run_script_with_services("Auth.unknown()", Services::in_memory()).unwrap_err();
     assert!(err
         .to_string()
         .contains("unknown module method: Auth.unknown"));
+
+    let err = run_script_with_services("JSON.nope()", Services::in_memory()).unwrap_err();
+    assert!(
+        err.to_string().contains("unknown module method: JSON.nope"),
+        "{err}"
+    );
 
     for source in [
         "Firestore.set(\"users/a\", {m: Auth})",
