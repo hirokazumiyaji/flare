@@ -1,5 +1,5 @@
 use flare::firestore::WriteOp;
-use flare::value::{Timestamp, Value};
+use flare::value::{CollectionGroupRef, Timestamp, Value};
 use flare::{Firestore, InMemoryFirestore};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
@@ -63,13 +63,44 @@ proptest! {
             .expect("in-memory get must succeed")
             .expect("document must exist");
 
-        if let Value::Map(retrieved_map) = retrieved {
-            for (k, v) in &data {
-                prop_assert_eq!(retrieved_map.get(k), Some(v));
+        prop_assert_eq!(retrieved, Value::Map(data));
+    }
+
+    #[test]
+    fn collection_group_selects_documents_owned_by_that_collection(
+        levels in prop::collection::vec(
+            (
+                prop::sample::select(vec!["items", "notes"]),
+                prop::sample::select(vec!["items", "a", "b"]),
+            ),
+            0..8,
+        ),
+    ) {
+        let mut segments = Vec::new();
+        let mut writes = Vec::new();
+        let mut expected = Vec::new();
+        for (collection, document) in levels {
+            segments.extend([collection, document]);
+            let path = segments.join("/");
+            if collection == "items" {
+                expected.push(path.clone());
             }
-        } else {
-            panic!("retrieved document must be a Map");
+            writes.push(WriteOp::Set {
+                path,
+                data: BTreeMap::new(),
+                merge: false,
+            });
         }
+
+        let mut fs = InMemoryFirestore::default();
+        fs.apply(writes).unwrap();
+        let query = CollectionGroupRef { id: "items".into() }.to_query();
+        let paths: Vec<_> = fs.run_query_page(&query).unwrap()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        prop_assert_eq!(fs.count_query(&query).unwrap(), expected.len() as i64);
+        prop_assert_eq!(paths, expected);
     }
 }
 

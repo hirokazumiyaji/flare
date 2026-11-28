@@ -351,6 +351,7 @@ fn emulator_collection_group_query() {
     let script = format!(
         r#"set("{path_x}", {{active: true}})
 set("{path_y}", {{active: true}})
+set("{path_x}/notes/n1", {{active: true}})
 col_group("{group}").where("active", "==", true).get()"#
     );
     let out = run_script_with_firestore(&script, fs).unwrap();
