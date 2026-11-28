@@ -1068,4 +1068,69 @@ mod tests {
         assert!(result.is_err());
         assert!(runtime.run("item").is_err());
     }
+
+    struct PanicTransactionGetFirestore {
+        in_tx: bool,
+        aborted: bool,
+    }
+
+    impl Firestore for PanicTransactionGetFirestore {
+        fn get(&self, _path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+            Ok(None)
+        }
+        fn apply(&mut self, _writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+            Ok(())
+        }
+        fn run_query(
+            &self,
+            _query: &QueryRef,
+        ) -> Result<crate::firestore::QueryCandidates, Box<dyn Error>> {
+            Ok(vec![])
+        }
+        fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+            if self.in_tx {
+                return Err("already in transaction".into());
+            }
+            self.in_tx = true;
+            Ok(())
+        }
+        fn transaction_get(&self, _path: &str) -> Result<Option<Value>, Box<dyn Error>> {
+            panic!("transaction get panic")
+        }
+        fn commit_transaction(&mut self, _writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
+            self.in_tx = false;
+            Ok(())
+        }
+        fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>> {
+            if !self.in_tx {
+                return Ok(());
+            }
+            self.in_tx = false;
+            self.aborted = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn staged_transaction_restores_after_panic_unwind() {
+        let mut runtime = Runtime::new(PanicTransactionGetFirestore {
+            in_tx: false,
+            aborted: false,
+        });
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            runtime.run("transaction { get(\"things/doc\") }")
+        }));
+        assert!(result.is_err());
+
+        assert!(matches!(runtime.state.exec, ExecCtx::Normal));
+        assert_eq!(runtime.state.scopes.len(), 1);
+        assert!(!runtime.state.execution_active);
+        assert!(!runtime.services.firestore.in_tx);
+        assert!(runtime.services.firestore.aborted);
+
+        assert_eq!(runtime.run("1 + 1").unwrap(), Value::Int(2));
+        assert!(runtime.run("transaction { }").is_ok());
+        assert!(!runtime.services.firestore.in_tx);
+    }
 }
