@@ -182,22 +182,19 @@ impl Firestore for InMemoryFirestore {
     }
 
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>> {
-        // Build the committed state from a copy.  A failed write (for
-        // example, an update of a missing document) must not consume the
-        // transaction state: the runtime needs to be able to abort it and a
-        // direct caller may retry after correcting the writes.
+        // Apply onto the live store, not the begin snapshot. Ordinary
+        // `apply` may have succeeded while the transaction was open; those
+        // writes must survive this commit. A failed write must not consume
+        // the transaction: the runtime needs to abort it, and a direct
+        // caller may retry after correcting the writes.
+        if self.tx_snapshot.is_none() {
+            return Err("not in transaction".into());
+        }
         if writes.is_empty() {
-            // Nothing can fail, so the snapshot can be moved instead of
-            // cloned; this keeps `transaction { ... }` with no staged write
-            // from copying the whole store.
-            self.docs = self.tx_snapshot.take().ok_or("not in transaction")?;
+            self.tx_snapshot = None;
             return Ok(());
         }
-        let mut next = self
-            .tx_snapshot
-            .as_ref()
-            .ok_or("not in transaction")?
-            .clone();
+        let mut next = self.docs.clone();
         // transaction も同じ commit request の clock を全 write で共有する。
         let mut request_time = RequestTime {
             clock: &self.request_clock,
@@ -439,15 +436,28 @@ fn lookup_field_path<'a>(
 mod tests {
     use super::*;
 
+    fn set_doc(path: &str, n: i64) -> WriteOp {
+        WriteOp::Set {
+            path: path.into(),
+            data: BTreeMap::from([("n".into(), Value::Int(n))]),
+            merge: false,
+        }
+    }
+
+    fn get_n(fs: &InMemoryFirestore, path: &str) -> Option<i64> {
+        match fs.get(path).unwrap() {
+            Some(Value::Map(m)) => match m.get("n") {
+                Some(Value::Int(n)) => Some(*n),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     #[test]
     fn failed_commit_keeps_transaction_until_abort() {
         let mut fs = InMemoryFirestore::default();
-        fs.apply(vec![WriteOp::Set {
-            path: "users/existing".into(),
-            data: BTreeMap::from([("n".into(), Value::Int(1))]),
-            merge: false,
-        }])
-        .unwrap();
+        fs.apply(vec![set_doc("users/existing", 1)]).unwrap();
         fs.begin_transaction().unwrap();
 
         let err = fs
@@ -464,5 +474,38 @@ mod tests {
         fs.abort_transaction().unwrap();
         fs.begin_transaction().unwrap();
         fs.abort_transaction().unwrap();
+    }
+
+    #[test]
+    fn empty_commit_preserves_interleaved_ordinary_writes() {
+        let mut fs = InMemoryFirestore::default();
+        fs.begin_transaction().unwrap();
+        fs.apply(vec![set_doc("users/alice", 1)]).unwrap();
+        assert_eq!(get_n(&fs, "users/alice"), Some(1));
+
+        fs.commit_transaction(vec![]).unwrap();
+        assert_eq!(get_n(&fs, "users/alice"), Some(1));
+    }
+
+    #[test]
+    fn non_empty_commit_preserves_interleaved_ordinary_writes() {
+        let mut fs = InMemoryFirestore::default();
+        fs.begin_transaction().unwrap();
+        fs.apply(vec![set_doc("users/alice", 1)]).unwrap();
+
+        fs.commit_transaction(vec![set_doc("users/bob", 2)])
+            .unwrap();
+        assert_eq!(get_n(&fs, "users/alice"), Some(1));
+        assert_eq!(get_n(&fs, "users/bob"), Some(2));
+    }
+
+    #[test]
+    fn abort_preserves_interleaved_ordinary_writes() {
+        let mut fs = InMemoryFirestore::default();
+        fs.begin_transaction().unwrap();
+        fs.apply(vec![set_doc("users/alice", 1)]).unwrap();
+
+        fs.abort_transaction().unwrap();
+        assert_eq!(get_n(&fs, "users/alice"), Some(1));
     }
 }

@@ -1042,6 +1042,11 @@ pub trait Firestore {
     fn get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
     /// Apply writes atomically: either all writes persist or none do.
     /// All `ServerTimestamp` sentinels in this call use one request time.
+    ///
+    /// Ordinary `apply` is independent of an open transaction. A successful
+    /// `apply` persists immediately and must survive a later
+    /// [`commit_transaction`](Self::commit_transaction) or
+    /// [`abort_transaction`](Self::abort_transaction) for that transaction.
     fn apply(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>>;
     /// Returns filter-matching candidates as (relative path, document fields).
     /// Ordering, offset, and limit are NOT applied here. This method remains the
@@ -1115,18 +1120,27 @@ pub trait Firestore {
         false
     }
 
+    /// Open a transaction. [`transaction_get`](Self::transaction_get) reads
+    /// the begin-time snapshot. Ordinary [`apply`](Self::apply) may still run
+    /// while the transaction is open; accepted ordinary writes are not rolled
+    /// back by commit or abort.
     fn begin_transaction(&mut self) -> Result<(), Box<dyn Error>>;
     fn transaction_get(&self, path: &str) -> Result<Option<Value>, Box<dyn Error>>;
-    /// Commit transaction writes atomically. A failed preparation or commit
-    /// must leave the transaction available to `abort_transaction`; a
-    /// successful commit closes it. All `ServerTimestamp` sentinels in this
-    /// call use the one request time of this commit.
+    /// Commit transaction writes atomically onto the current store. An empty
+    /// write list closes the transaction without changing the store. A failed
+    /// preparation or commit must leave the transaction available to
+    /// `abort_transaction`; a successful commit closes it. All
+    /// `ServerTimestamp` sentinels in this call use the one request time of
+    /// this commit. Accepted ordinary [`apply`](Self::apply) writes from while
+    /// the transaction was open must still be visible after a successful
+    /// commit.
     fn commit_transaction(&mut self, writes: Vec<WriteOp>) -> Result<(), Box<dyn Error>>;
     /// Rollback an open transaction. Idempotent: succeeds when no
     /// transaction is open. A failed rollback must leave the transaction
     /// available for a retry; a successful rollback closes it. Failures are
     /// returned so callers can decide; `Runtime` ignores them to preserve
-    /// the original block or commit error.
+    /// the original block or commit error. Accepted ordinary
+    /// [`apply`](Self::apply) writes are not undone.
     fn abort_transaction(&mut self) -> Result<(), Box<dyn Error>>;
 }
 
