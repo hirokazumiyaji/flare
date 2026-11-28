@@ -151,6 +151,32 @@ File.write("/mock/output.txt", "result: " + parsed["status"])
 }
 
 #[test]
+fn independent_in_memory_io_isolates_script_side_effects() {
+    let script = r#"
+File.write("out.txt", "from-run")
+File.read("fixture.txt")
+"#;
+
+    let run = || {
+        let io = InMemoryIo::new();
+        io.insert("fixture.txt", "hello from fixture");
+        let services = Services::in_memory().with_io(io.clone());
+        let value = run_script_with_services(script, services).unwrap();
+        (value, io.get("out.txt"), io.get("fixture.txt"))
+    };
+
+    let (first_value, first_out, first_fixture) = run();
+    let (second_value, second_out, second_fixture) = run();
+
+    assert_eq!(first_value, Value::Str("hello from fixture".into()));
+    assert_eq!(second_value, first_value);
+    assert_eq!(first_out.as_deref(), Some(b"from-run".as_slice()));
+    assert_eq!(second_out, first_out);
+    assert_eq!(first_fixture.as_deref(), Some(b"hello from fixture".as_slice()));
+    assert_eq!(second_fixture, first_fixture);
+}
+
+#[test]
 fn max_file_io_bytes_budget_enforced() {
     let temp = TempDirGuard::new("budget");
     let file = temp.path_str("oversized.txt");
