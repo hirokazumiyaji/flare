@@ -661,13 +661,37 @@ fn fl_validates_auth_backend_before_reading_stdin() {
         "{stderr:?}"
     );
 
-    // `--auth-backend emulator` without FIREBASE_AUTH_EMULATOR_HOST must also
-    // fail immediately rather than hanging on stdin.
-    let out = Command::new(FL_EXE)
+    // Leave the child stdin pipe open so EOF cannot mask a hang on read.
+    // `--auth-backend emulator` without FIREBASE_AUTH_EMULATOR_HOST must exit
+    // on the config error without any input being written.
+    let mut child = Command::new(FL_EXE)
         .args(["--auth-backend", "emulator", "-"])
         .env_remove("FIREBASE_AUTH_EMULATOR_HOST")
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("spawn fl");
+    let _stdin = child.stdin.take().expect("piped stdin");
+    let started = std::time::Instant::now();
+    let deadline = std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "fl hung on stdin instead of reporting missing FIREBASE_AUTH_EMULATOR_HOST"
+                );
+            }
+            Err(error) => panic!("wait fl: {error}"),
+        }
+    }
+    let out = child.wait_with_output().expect("collect fl output");
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
