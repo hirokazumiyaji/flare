@@ -955,8 +955,8 @@ fn run_query_candidate_documents(
     )
 }
 
-/// Decode collected documents and re-apply the complete predicate with the
-/// same matcher the in-memory backend uses, so server-specific null and
+/// Decode collected documents and apply the complete predicate with the same
+/// matcher the in-memory backend uses, so server-specific null and
 /// structural-value behavior cannot leak through.  The server query is only a
 /// candidate-generation optimization.
 fn decode_query_documents(
@@ -982,9 +982,6 @@ fn decode_query_documents(
             out.push((rel, fields));
         }
     }
-    out.retain(|(rel, fields)| {
-        super::matches_filters(rel, fields, filters, &field_paths, &normalized_values)
-    });
     Ok(out)
 }
 
