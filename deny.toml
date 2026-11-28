@@ -46,9 +46,11 @@ all-features = false
 # If true, metadata will be collected with `--no-default-features`. The same
 # caveat with `all-features` applies
 no-default-features = false
-# If set, these feature will be enabled when collecting metadata. If `--features`
-# is specified on the cmd line they will take precedence over this option.
-#features = []
+# Match the release binary: CD builds with `--features emulator` (defaults stay
+# on), so advisories/bans/licenses/sources must see firestore and gcloud-sdk.
+# If `--features` is specified on the cmd line they will take precedence over
+# this option.
+features = ["emulator"]
 
 # The output table provides options for how/if diagnostics are outputted
 [output]
@@ -82,6 +84,12 @@ allow = [
     "Apache-2.0",
     "BSL-1.0",
     "NCSA",
+    # Emulator / TLS / IDNA transitive licenses (seen with features = ["emulator"]).
+    "ISC",
+    "BSD-3-Clause",
+    "MIT-0",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
 ]
 unused-allowed-license = "allow"
 # The confidence threshold for detecting a license from license text.
