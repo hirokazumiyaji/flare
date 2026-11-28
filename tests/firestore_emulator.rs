@@ -986,6 +986,41 @@ set("{collection}/r6", {{other: 1}})
 }
 
 #[test]
+fn emulator_unpaged_count_matches_get_len_for_local_filters() {
+    // Same contract as `unpaged_count_matches_get_len_for_local_and_multi_and_filters`.
+    // Reproduces the array_contains case from issue #253: get().len() must equal
+    // count() when filters are evaluated locally.
+    let Some(fs) = emulator() else {
+        eprintln!("skip: FIRESTORE_EMULATOR_HOST is not set");
+        return;
+    };
+    let collection = test_collection("count_local");
+    let script = format!(
+        r#"set("{collection}/a", {{v: 1, tags: []}})
+set("{collection}/z", {{v: 1, tags: ["x"]}})
+set("{collection}/m", {{v: 2, tags: ["x"], active: true}})
+[
+  col("{collection}").where("tags", "array_contains", "x").get().len(),
+  col("{collection}").where("tags", "array_contains", "x").count(),
+  col("{collection}").where("v", "==", 1).where("tags", "array_contains", "x").get().len(),
+  col("{collection}").where("v", "==", 1).where("tags", "array_contains", "x").count(),
+  col("{collection}").where("tags", "array_contains", "x").order_by("v", "desc").offset(1).limit(1).count(),
+]"#
+    );
+    let out = run_script_with_firestore(&script, fs).unwrap();
+    assert_eq!(
+        out,
+        Value::Array(vec![
+            Value::Int(2),
+            Value::Int(2),
+            Value::Int(1),
+            Value::Int(1),
+            Value::Int(2),
+        ])
+    );
+}
+
+#[test]
 fn emulator_count_and_path_page_handle_large_payloads() {
     let Some(fs) = emulator() else {
         eprintln!("skip: no emulator");
