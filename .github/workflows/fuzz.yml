@@ -34,11 +34,14 @@ jobs:
         with:
           toolchain: nightly
 
+      - name: Record nightly rustc
+        run: rustc +nightly --version --verbose
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo +nightly install cargo-fuzz --locked
 
       - name: Run fuzz target (${{ matrix.target }})
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=60
